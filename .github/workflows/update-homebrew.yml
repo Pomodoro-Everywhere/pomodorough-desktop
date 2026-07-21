@@ -43,6 +43,7 @@ jobs:
           URL: ${{ steps.release.outputs.url }}
           SHA256: ${{ steps.release.outputs.sha256 }}
         run: |
+          mkdir -p homebrew-tap/Formula
           sed \
             -e "s|@VERSION@|$VERSION|g" \
             -e "s|@URL@|$URL|g" \
