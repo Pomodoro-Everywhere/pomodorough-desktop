@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pomodorough-linux"
+version = "0.1.0"
+description = "KDE-first, local-first Pomodoro timer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+dependencies = ["PySide6-Essentials>=6.8,<7"]
+
+[project.scripts]
+pomodorough = "pomodorough.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pomodorough = ["resources/*.json", "resources/*.svg"]

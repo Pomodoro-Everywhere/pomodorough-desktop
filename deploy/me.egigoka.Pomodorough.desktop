@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Pomodorough
+GenericName=Pomodoro Timer
+Comment=Local-first focus timer
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Utility;Clock;
+Keywords=pomodoro;timer;focus;break;productivity;
+StartupNotify=true
+StartupWMClass=Pomodorough
+X-KDE-FormFactor=desktop;tablet;
+Actions=Start;
+
+[Desktop Action Start]
+Name=Open Timer
+Exec=@EXEC@

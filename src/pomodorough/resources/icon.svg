@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Pomodorough route clock</title>
+  <desc id="desc">A navy station clock crossed by a yellow time board.</desc>
+  <rect width="512" height="512" fill="#142c5c"/>
+  <circle cx="256" cy="256" r="184" fill="#dceaf1" stroke="#f7f8f2" stroke-width="18"/>
+  <circle cx="256" cy="256" r="145" fill="none" stroke="#8fa8b8" stroke-width="24"/>
+  <path d="M256 111a145 145 0 0 1 138 101" fill="none" stroke="#ff604f" stroke-width="26"/>
+  <path d="M256 70v64" stroke="#111923" stroke-width="18"/>
+  <path d="M231 78h50l-25 35z" fill="#f5d05b" stroke="#111923" stroke-width="10"/>
+  <rect x="72" y="190" width="368" height="132" fill="#111923" stroke="#f7f8f2" stroke-width="12"/>
+  <rect x="108" y="222" width="125" height="68" fill="#f5d05b"/>
+  <rect x="279" y="222" width="125" height="68" fill="#f5d05b"/>
+  <path d="M256 198v116" stroke="#142c5c" stroke-width="12"/>
+</svg>
