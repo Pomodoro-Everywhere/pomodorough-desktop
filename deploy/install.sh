@@ -13,6 +13,8 @@ mkdir -p "$APP_HOME" "$BIN_HOME" "$APPLICATIONS_HOME" "$ICON_HOME"
 python3 -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade "$ROOT"
 ln -sf "$VENV/bin/pomodorough" "$BIN_HOME/pomodorough"
+ln -sf "$VENV/bin/pomodorough-cli" "$BIN_HOME/pomodorough-cli"
+ln -sf "$VENV/bin/pomodorough-tui" "$BIN_HOME/pomodorough-tui"
 cp "$ROOT/src/pomodorough/resources/icon.svg" "$ICON_HOME/me.egigoka.Pomodorough.svg"
 sed \
   -e "s|@EXEC@|$BIN_HOME/pomodorough|g" \
@@ -28,4 +30,4 @@ if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$APPLICATIONS_HOME"
 fi
 
-printf '%s\n' "Installed Pomodorough. Launch from application menu or run $BIN_HOME/pomodorough"
+printf '%s\n' "Installed Pomodorough. Run $BIN_HOME/pomodorough, pomodorough-cli, or pomodorough-tui"

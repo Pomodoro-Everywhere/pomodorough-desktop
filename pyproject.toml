@@ -13,6 +13,8 @@ dependencies = ["PySide6-Essentials>=6.8,<7"]
 
 [project.scripts]
 pomodorough = "pomodorough.app:main"
+pomodorough-cli = "pomodorough.cli:main"
+pomodorough-tui = "pomodorough.tui:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

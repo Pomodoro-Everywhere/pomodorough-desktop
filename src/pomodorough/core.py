@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import unicodedata
+import uuid
 from copy import deepcopy
 from datetime import datetime
 from math import ceil
@@ -12,6 +15,7 @@ PHASES = {
 }
 ACTIVE_STATUSES = {"running", "paused"}
 TERMINAL_STATUSES = {"completed", "cancelled", "superseded"}
+TASK_NAMESPACE = b"pomodorough.task.v1\x00"
 
 
 def empty_timer(phase: str, duration_ms: int) -> dict[str, Any]:
@@ -23,7 +27,95 @@ def empty_timer(phase: str, duration_ms: int) -> dict[str, Any]:
         "elapsedAtAnchorMs": 0,
         "anchorAt": None,
         "lastIntent": None,
+        "taskId": None,
     }
+
+
+def normalize_task_title(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value)
+    start = 0
+    end = len(normalized)
+    while start < end and not normalized[start].isprintable():
+        start += 1
+    while end > start and not normalized[end - 1].isprintable():
+        end -= 1
+    return normalized[start:end]
+
+
+def task_id_for_title(value: str) -> str:
+    title = normalize_task_title(value)
+    digest = bytearray(hashlib.sha256(TASK_NAMESPACE + title.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x80
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def task_from_title(value: str) -> dict[str, str]:
+    title = normalize_task_title(value)
+    if not title:
+        raise ValueError("Enter a task name with at least one printable character.")
+    if len(title.encode("utf-8")) > 512:
+        raise ValueError("Task names must be 512 bytes or fewer.")
+    return {"id": task_id_for_title(title), "title": title}
+
+
+def rebuild_tasks(
+    base_tasks: list[dict[str, Any]], pending: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    tasks = {
+        str(task["id"]): {"id": str(task["id"]), "title": str(task["title"])}
+        for task in base_tasks
+        if task.get("id") and task.get("title")
+    }
+    ordered = sorted(
+        pending,
+        key=lambda item: (
+            int(item.get("hlcWallMs", 0)),
+            int(item.get("hlcCounter", 0)),
+            str(item.get("id", "")),
+        ),
+    )
+    for operation in ordered:
+        task_id = str(operation.get("taskId", ""))
+        if operation.get("type") == "delete":
+            tasks.pop(task_id, None)
+        elif operation.get("type") == "upsert" and operation.get("title"):
+            title = normalize_task_title(str(operation["title"]))
+            if task_id == task_id_for_title(title):
+                tasks[task_id] = {"id": task_id, "title": title}
+    return sorted(tasks.values(), key=lambda task: (task["title"].casefold(), task["id"]))
+
+
+def task_summaries_today(
+    tasks: list[dict[str, Any]], history: list[dict[str, Any]], now: datetime | None = None
+) -> dict[str, dict[str, int]]:
+    local_day = (now or datetime.now().astimezone()).astimezone().date()
+    summaries = {
+        str(task["id"]): {"finished": 0, "timeMs": 0}
+        for task in tasks
+        if task.get("id")
+    }
+    for item in history:
+        task_id = str(item.get("taskId") or "")
+        if (
+            task_id not in summaries
+            or item.get("phase") != "focus"
+            or item.get("status") != "completed"
+        ):
+            continue
+        completed_at = item.get("completedAt") or item.get("endedAt")
+        try:
+            completed_day = datetime.fromisoformat(
+                str(completed_at).replace("Z", "+00:00")
+            ).astimezone().date()
+        except (TypeError, ValueError):
+            continue
+        if completed_day == local_day:
+            summaries[task_id]["finished"] += 1
+            summaries[task_id]["timeMs"] += max(
+                0, int(item.get("plannedDurationMs") or 0)
+            )
+    return summaries
 
 
 def parse_timestamp_ms(value: str | None) -> int | None:
@@ -71,6 +163,7 @@ def reduce_command(
                 "elapsedAtAnchorMs": 0,
                 "anchorAt": command["occurredAt"],
                 "lastIntent": intent,
+                "taskId": command.get("taskId"),
             },
             next_history,
         )
@@ -115,6 +208,7 @@ def reduce_command(
                     "plannedDurationMs": command["plannedDurationMs"],
                     "completedAt": command["occurredAt"],
                     "pending": True,
+                    "taskId": next_timer.get("taskId"),
                 },
             )
     elif command_type == "cancel" and status in ACTIVE_STATUSES:

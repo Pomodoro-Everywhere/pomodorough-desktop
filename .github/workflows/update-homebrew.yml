@@ -1,0 +1,59 @@
+name: Update Homebrew tap
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download release source
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          asset="pomodorough_linux-${version}.tar.gz"
+          mkdir -p dist
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset" --dir dist
+          sha256="$(sha256sum "dist/$asset" | cut -d ' ' -f 1)"
+          url="https://github.com/$REPOSITORY/releases/download/$TAG/$asset"
+          printf 'version=%s\nurl=%s\nsha256=%s\n' "$version" "$url" "$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Check out tap
+        uses: actions/checkout@v4
+        with:
+          repository: egigoka/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: Publish formula
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          URL: ${{ steps.release.outputs.url }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          sed \
+            -e "s|@VERSION@|$VERSION|g" \
+            -e "s|@URL@|$URL|g" \
+            -e "s|@SHA256@|$SHA256|g" \
+            deploy/homebrew/pomodorough.rb.in \
+            > homebrew-tap/Formula/pomodorough.rb
+          git -C homebrew-tap add Formula/pomodorough.rb
+          if git -C homebrew-tap diff --cached --quiet; then
+            exit 0
+          fi
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap commit -m "chore: update pomodorough to $VERSION"
+          git -C homebrew-tap push

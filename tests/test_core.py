@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
-from pomodorough.core import elapsed_ms, format_remaining, next_break_phase, reduce_command
+from pomodorough.core import (
+    elapsed_ms,
+    format_remaining,
+    next_break_phase,
+    normalize_task_title,
+    rebuild_tasks,
+    reduce_command,
+    task_from_title,
+    task_summaries_today,
+)
 
 
-def command(kind: str, sequence: int = 1, observed: int = 0) -> dict:
-    return {
+def command(
+    kind: str, sequence: int = 1, observed: int = 0, task_id: str | None = None
+) -> dict:
+    result = {
         "id": f"command-{sequence:08d}",
         "deviceSequence": sequence,
         "timerId": "timer-00000001",
@@ -18,6 +30,9 @@ def command(kind: str, sequence: int = 1, observed: int = 0) -> dict:
         "hlcCounter": 0,
         "observedElapsedMs": observed,
     }
+    if task_id:
+        result["taskId"] = task_id
+    return result
 
 
 class CoreTests(unittest.TestCase):
@@ -51,6 +66,54 @@ class CoreTests(unittest.TestCase):
     def test_remaining_rounds_up(self) -> None:
         self.assertEqual(format_remaining(60_001), "01:01")
         self.assertEqual(format_remaining(0), "00:00")
+
+    def test_task_identity_normalizes_unicode_and_printability(self) -> None:
+        task = task_from_title("\x00Cafe\u0301\x1f")
+        self.assertEqual(task["title"], "Café")
+        self.assertEqual(task["id"], "aaf83054-24b2-8c0e-901f-a974147bfe82")
+        self.assertEqual(normalize_task_title("\u00a0 spaced \u00a0"), " spaced ")
+
+    def test_task_projection_uses_hlc_order_and_allows_recreation(self) -> None:
+        task = task_from_title("Write release notes")
+        operations = [
+            {
+                "id": "operation-3",
+                "taskId": task["id"],
+                "type": "upsert",
+                "title": task["title"],
+                "hlcWallMs": 20,
+                "hlcCounter": 1,
+            },
+            {
+                "id": "operation-1",
+                "taskId": task["id"],
+                "type": "upsert",
+                "title": task["title"],
+                "hlcWallMs": 10,
+                "hlcCounter": 0,
+            },
+            {
+                "id": "operation-2",
+                "taskId": task["id"],
+                "type": "delete",
+                "hlcWallMs": 20,
+                "hlcCounter": 0,
+            },
+        ]
+        self.assertEqual(rebuild_tasks([], operations), [task])
+
+    def test_timer_task_reaches_history_and_daily_summary(self) -> None:
+        task = task_from_title("Release")
+        timer, history = reduce_command(None, [], command("start", task_id=task["id"]))
+        timer, history = reduce_command(
+            timer, history, command("finish", 2, task_id="ignored-task-id")
+        )
+        self.assertEqual(timer["taskId"], task["id"])
+        self.assertEqual(history[0]["taskId"], task["id"])
+        summaries = task_summaries_today(
+            [task], history, datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+        )
+        self.assertEqual(summaries[task["id"]], {"finished": 1, "timeMs": 1_500_000})
 
 
 if __name__ == "__main__":
