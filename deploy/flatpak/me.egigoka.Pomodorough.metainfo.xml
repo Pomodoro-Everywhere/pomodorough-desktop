@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>me.egigoka.Pomodorough</id>
+  <name>Pomodorough</name>
+  <summary>Local-first Pomodoro timer</summary>
+  <developer id="me.egigoka">
+    <name>Egigoka</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      Pomodorough provides native desktop, command-line, and terminal clients
+      for a durable, local-first focus timer.
+    </p>
+  </description>
+  <launchable type="desktop-id">me.egigoka.Pomodorough.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/egigoka/pomodorough-linux/main/screenshots/screenshot.png</image>
+      <caption>Focus timer paused in the Pomodorough desktop application</caption>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://github.com/egigoka/pomodorough-linux</url>
+  <url type="bugtracker">https://github.com/egigoka/pomodorough-linux/issues</url>
+  <releases>
+    <release version="0.1.1" date="2026-07-22"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

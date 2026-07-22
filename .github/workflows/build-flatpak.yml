@@ -1,0 +1,45 @@
+name: Build Flatpak release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  flatpak:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.10
+      options: --privileged
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Read release version
+        id: release
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb
+        with:
+          bundle: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak
+          manifest-path: deploy/flatpak/me.egigoka.Pomodorough.yml
+          arch: x86_64
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Attach bundle to release
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak

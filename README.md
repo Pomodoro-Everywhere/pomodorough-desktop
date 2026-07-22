@@ -14,6 +14,10 @@
   <a href="https://pomodorough.egigoka.me/openapi.yaml">API specification</a>
 </p>
 
+<p align="center">
+  <img src="screenshots/screenshot.png" alt="Pomodorough timer showing a paused focus session">
+</p>
+
 Pomodorough for Linux combines a native Qt desktop interface with scriptable
 CLI and keyboard-driven TUI clients. All three share one SQLite database. Timer
 actions, tasks, and duration changes are committed locally before they appear
@@ -54,10 +58,29 @@ cross-device synchronization with the production service.
 
 ## Install
 
-Install the desktop entry, icon, virtual environment, and all three executables
-below `~/.local`:
+### Linux distributions
+
+Install Python and its virtual environment support with your distribution's
+package manager. For example:
 
 ```sh
+# Debian or Ubuntu
+sudo apt install python3 python3-venv curl
+
+# Fedora
+sudo dnf install python3 curl
+
+# Arch Linux
+sudo pacman -S python curl
+```
+
+Download the release source and install the desktop entry, icon, virtual
+environment, and all three executables below `~/.local`:
+
+```sh
+curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.1/pomodorough_linux-0.1.1.tar.gz
+tar -xzf pomodorough_linux-0.1.1.tar.gz
+cd pomodorough_linux-0.1.1
 ./deploy/install.sh
 ```
 
@@ -74,6 +97,26 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
   POMODOROUGH_PYTHON=/usr/bin/python3 \
   ./deploy/install.sh
 ```
+
+### NixOS
+
+Install the package directly from the tagged GitHub release:
+
+```sh
+nix profile install github:egigoka/pomodorough-linux/v0.1.1
+```
+
+### Flatpak
+
+Download and install the x86-64 bundle attached to the GitHub release:
+
+```sh
+curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.1/Pomodorough-0.1.1-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.1.1-x86_64.flatpak
+flatpak run me.egigoka.Pomodorough
+```
+
+The bundle is distributed only through GitHub Releases, not Flathub.
 
 ### Homebrew
 
@@ -135,9 +178,9 @@ active task or remain unassigned.
 
 ## Google sign-in
 
-The production Google OAuth desktop client is bundled with the package.
-Authorization opens the system browser, uses PKCE, and returns through a
-temporary loopback callback.
+The production Google OAuth desktop client ID is bundled with the package;
+no client secret is distributed. Authorization opens the system browser, uses
+PKCE, and returns through a temporary loopback callback.
 
 Override the OAuth configuration with either
 `POMODOROUGH_GOOGLE_OAUTH_JSON` or this file:

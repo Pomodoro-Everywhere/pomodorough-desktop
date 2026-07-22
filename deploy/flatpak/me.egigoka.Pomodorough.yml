@@ -1,0 +1,46 @@
+app-id: me.egigoka.Pomodorough
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+command: pomodorough
+
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+
+modules:
+  - name: pomodorough
+    buildsystem: simple
+    build-commands:
+      - pip3 install --verbose --no-index --find-links="file://${PWD}" --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - install -Dm644 src/pomodorough/resources/icon.svg /app/share/icons/hicolor/scalable/apps/me.egigoka.Pomodorough.svg
+      - install -Dm644 deploy/me.egigoka.Pomodorough.desktop /app/share/applications/me.egigoka.Pomodorough.desktop
+      - sed -i 's|/usr/bin/env -u LOCALE_ARCHIVE_2_27 @EXEC@|pomodorough|g; s|@ICON@|me.egigoka.Pomodorough|g' /app/share/applications/me.egigoka.Pomodorough.desktop
+      - install -Dm644 deploy/flatpak/me.egigoka.Pomodorough.metainfo.xml /app/share/metainfo/me.egigoka.Pomodorough.metainfo.xml
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/5c/49/0e1237c4400bec7e335d2c4eeb49bc40d9fd88a9ac44ca9083ce1abdc308/pyside6_essentials-6.11.1-cp310-abi3-manylinux_2_34_x86_64.whl
+        sha256: e3ef7027b41e4e55fadb56e3b3257dc8ee92154b639fe67fc4c8e05e9d976c60
+        only-arches:
+          - x86_64
+      - type: file
+        url: https://files.pythonhosted.org/packages/c7/9b/e0355d8897b5c150770f1d95718aad17d432fcc9c035c04f3f58427d4693/shiboken6-6.11.1-cp310-abi3-manylinux_2_34_x86_64.whl
+        sha256: 9a8bccfafc8805254cabcfa1edfaf55cd52889f4998c91ad0d9a4433fb1bcdbe
+        only-arches:
+          - x86_64
+      - type: file
+        url: https://files.pythonhosted.org/packages/4c/c5/da4c5f23c6540ac5211a1f60177c8dee84b1bf40f2719479587ab8c60731/pyside6_essentials-6.11.1-cp310-abi3-manylinux_2_39_aarch64.whl
+        sha256: a039b6da68a3a4b9d243217b2b98d475eed3f617159ef6be925badab53c11b0d
+        only-arches:
+          - aarch64
+      - type: file
+        url: https://files.pythonhosted.org/packages/57/d5/dd4f1defed400be03340f2ede34b61f846776650b4e7ed9ebaf4c71979a2/shiboken6-6.11.1-cp310-abi3-manylinux_2_39_aarch64.whl
+        sha256: 1bd2f4314414df2d122d9f646e03b731bc6d6b5f77a5f53f99a4fe4e97d84e6f
+        only-arches:
+          - aarch64
+      - type: dir
+        path: ../..

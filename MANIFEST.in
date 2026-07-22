@@ -1,0 +1,4 @@
+include flake.nix
+include flake.lock
+graft deploy
+graft screenshots
