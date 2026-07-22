@@ -19,7 +19,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 API_BASE = "https://pomodorough.egigoka.me"
 
@@ -160,6 +161,50 @@ class Worker(QRunnable):
             self.signals.finished.emit()
 
 
+class _RevisionEventParser:
+    def __init__(self) -> None:
+        self.buffer = b""
+        self.data_lines: list[bytes] = []
+
+    def feed(self, chunk: bytes) -> list[int]:
+        self.buffer += chunk
+        revisions: list[int] = []
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if not line:
+                revision = self._dispatch()
+                if revision is not None:
+                    revisions.append(revision)
+            elif line.startswith(b"data:"):
+                data = line[5:]
+                if data.startswith(b" "):
+                    data = data[1:]
+                self.data_lines.append(data)
+        return revisions
+
+    def _dispatch(self) -> int | None:
+        if not self.data_lines:
+            return None
+        raw = b"\n".join(self.data_lines)
+        self.data_lines = []
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                document = raw.decode()
+            except UnicodeDecodeError:
+                return None
+        value = document.get("revision") if isinstance(document, dict) else document
+        if isinstance(value, bool):
+            return None
+        try:
+            revision = int(value)
+        except (TypeError, ValueError):
+            return None
+        return revision if revision >= 0 else None
+
+
 def _read_oauth_credentials() -> dict[str, str]:
     override = os.environ.get("POMODOROUGH_GOOGLE_OAUTH_JSON")
     user_path = _config_root() / "google-oauth.json"
@@ -219,6 +264,8 @@ class CloudService(QObject):
     signed_in = Signal(object)
     signed_out = Signal()
     sync_ready = Signal(object)
+    revision_available = Signal(object)
+    authorization_stale = Signal()
     failure = Signal(str)
 
     def __init__(self, device_id: str, api_base: str = API_BASE) -> None:
@@ -232,6 +279,14 @@ class CloudService(QObject):
         self.busy = False
         self._sync_queued: dict[str, Any] | None = None
         self._workers: set[Worker] = set()
+        self._network = QNetworkAccessManager(self)
+        self._revision_reply: QNetworkReply | None = None
+        self._revision_parser = _RevisionEventParser()
+        self._revision_reconnect = QTimer(self)
+        self._revision_reconnect.setSingleShot(True)
+        self._revision_reconnect.setInterval(5_000)
+        self._revision_reconnect.timeout.connect(self.start_revision_stream)
+        self._shutting_down = False
 
     def _start(
         self,
@@ -295,6 +350,7 @@ class CloudService(QObject):
                 self.authenticated = True
                 self.signed_in.emit(user)
                 self.status_changed.emit("SYNC READY")
+                self.start_revision_stream()
             else:
                 self.status_changed.emit("LOCAL • SIGN IN TO SYNC")
 
@@ -384,6 +440,7 @@ class CloudService(QObject):
             self.authenticated = True
             self.signed_in.emit(user)
             self.status_changed.emit("SYNC READY")
+            self.start_revision_stream()
 
         def failed(message: str) -> None:
             self.status_changed.emit("LOCAL • SIGN-IN FAILED")
@@ -417,6 +474,7 @@ class CloudService(QObject):
         def synchronized(response: dict[str, Any]) -> None:
             self.sync_ready.emit(response)
             self.status_changed.emit("SYNCED")
+            self.start_revision_stream()
 
         def failed(message: str) -> None:
             self.status_changed.emit("OFFLINE • RETRYING")
@@ -424,9 +482,67 @@ class CloudService(QObject):
 
         self._start(synchronize, synchronized, failed)
 
+    def start_revision_stream(self) -> None:
+        if (
+            self._shutting_down
+            or not self.authenticated
+            or not self.access_token
+            or self._revision_reply is not None
+        ):
+            return
+        self._revision_reconnect.stop()
+        request = QNetworkRequest(QUrl(f"{self.api_base}/api/v1/stream"))
+        request.setRawHeader(b"Accept", b"text/event-stream")
+        request.setRawHeader(
+            b"Authorization", f"Bearer {self.access_token}".encode()
+        )
+        reply = self._network.get(request)
+        self._revision_reply = reply
+        self._revision_parser = _RevisionEventParser()
+        reply.readyRead.connect(lambda reply=reply: self._read_revision_stream(reply))
+        reply.finished.connect(
+            lambda reply=reply: self._revision_stream_finished(reply)
+        )
+
+    def _read_revision_stream(self, reply: QNetworkReply) -> None:
+        if reply is not self._revision_reply:
+            return
+        for revision in self._revision_parser.feed(bytes(reply.readAll())):
+            self.revision_available.emit(revision)
+
+    def _revision_stream_finished(self, reply: QNetworkReply) -> None:
+        if reply is not self._revision_reply:
+            reply.deleteLater()
+            return
+        self._read_revision_stream(reply)
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        self._revision_reply = None
+        reply.deleteLater()
+        if self._shutting_down or not self.authenticated:
+            return
+        if status == 401:
+            self.access_token = None
+            self.authorization_stale.emit()
+            return
+        self._revision_reconnect.start()
+
+    def stop_revision_stream(self) -> None:
+        self._revision_reconnect.stop()
+        reply = self._revision_reply
+        self._revision_reply = None
+        self._revision_parser = _RevisionEventParser()
+        if reply is not None:
+            reply.abort()
+            reply.deleteLater()
+
+    def shutdown(self) -> None:
+        self._shutting_down = True
+        self.stop_revision_stream()
+
     def logout(self) -> None:
         if self.busy:
             return
+        self.stop_revision_stream()
 
         def revoke() -> None:
             try:

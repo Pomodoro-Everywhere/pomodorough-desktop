@@ -26,6 +26,7 @@ def main() -> int:
     store = Store()
     cloud = CloudService(store.device_id)
     window = MainWindow(store, cloud, icon)
+    app.aboutToQuit.connect(cloud.shutdown)
     app.aboutToQuit.connect(store.close)
     window.show()
 

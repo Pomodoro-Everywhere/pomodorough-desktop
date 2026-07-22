@@ -3,7 +3,7 @@ Type=Application
 Name=Pomodorough
 GenericName=Pomodoro Timer
 Comment=Local-first focus timer
-Exec=@EXEC@
+Exec=/usr/bin/env -u LOCALE_ARCHIVE_2_27 @EXEC@
 Icon=@ICON@
 Terminal=false
 Categories=Utility;Clock;
@@ -15,4 +15,4 @@ Actions=Start;
 
 [Desktop Action Start]
 Name=Open Timer
-Exec=@EXEC@
+Exec=/usr/bin/env -u LOCALE_ARCHIVE_2_27 @EXEC@

@@ -8,10 +8,21 @@ VENV="$APP_HOME/venv"
 BIN_HOME="$HOME/.local/bin"
 APPLICATIONS_HOME="$DATA_HOME/applications"
 ICON_HOME="$DATA_HOME/icons/hicolor/scalable/apps"
+PYTHON=${POMODOROUGH_PYTHON:-python3}
 
 mkdir -p "$APP_HOME" "$BIN_HOME" "$APPLICATIONS_HOME" "$ICON_HOME"
-python3 -m venv "$VENV"
-"$VENV/bin/python" -m pip install --upgrade "$ROOT"
+if [ ! -x "$VENV/bin/python" ]; then
+  if command -v uv >/dev/null 2>&1; then
+    uv venv --python "$PYTHON" "$VENV"
+  else
+    "$PYTHON" -m venv "$VENV"
+  fi
+fi
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --python "$VENV/bin/python" --upgrade "$ROOT"
+else
+  "$VENV/bin/python" -m pip install --upgrade "$ROOT"
+fi
 ln -sf "$VENV/bin/pomodorough" "$BIN_HOME/pomodorough"
 ln -sf "$VENV/bin/pomodorough-cli" "$BIN_HOME/pomodorough-cli"
 ln -sf "$VENV/bin/pomodorough-tui" "$BIN_HOME/pomodorough-tui"

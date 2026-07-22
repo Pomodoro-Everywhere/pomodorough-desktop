@@ -187,6 +187,8 @@ class MainWindow(QMainWindow):
         self._compact: bool | None = None
         self._landscape: bool | None = None
         self._account_synced = False
+        self._sync_request: dict[str, Any] | None = None
+        self._sync_waiting = False
         self._task_selector_signature: tuple[Any, ...] | None = None
         self._task_render_signature: tuple[Any, ...] | None = None
         self._load_state()
@@ -210,6 +212,7 @@ class MainWindow(QMainWindow):
     def _load_state(self) -> None:
         state = self.store.load()
         self.settings = state["settings"]
+        self.revision = int(state["snapshot"].get("revision", 0))
         self.base_timer = state["snapshot"].get("canonicalTimer")
         self.base_history = state["snapshot"].get("history", [])
         self.base_tasks = state["snapshot"].get("tasks", [])
@@ -221,6 +224,7 @@ class MainWindow(QMainWindow):
         self.user = state["snapshot"].get("user")
         self.pending = state["pending"]
         self.pending_tasks = state["pendingTasks"]
+        self.pending_durations = state["pendingDurations"]
         self.timer, self.history = rebuild_optimistic(
             self.base_timer, self.base_history, self.pending
         )
@@ -230,9 +234,11 @@ class MainWindow(QMainWindow):
         selected_task_id = self.settings.get("selectedTaskId")
         if selected_task_id and not any(task["id"] == selected_task_id for task in self.tasks):
             self.settings["selectedTaskId"] = None
-            self.store.save_settings(self.settings)
+            self.store.set_selected_task_id(None)
         self._task_selector_signature = None
         self._task_render_signature = None
+        if hasattr(self, "duration_spins"):
+            self._refresh_duration_spins()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -584,6 +590,8 @@ class MainWindow(QMainWindow):
         self.cloud.signed_in.connect(self._signed_in)
         self.cloud.signed_out.connect(self._signed_out)
         self.cloud.sync_ready.connect(self._apply_sync)
+        self.cloud.revision_available.connect(self._remote_revision_available)
+        self.cloud.authorization_stale.connect(self._sync)
         self.cloud.failure.connect(self._cloud_failure)
 
     def _selected_phase(self) -> str:
@@ -592,12 +600,16 @@ class MainWindow(QMainWindow):
 
     def _current_timer(self) -> dict[str, Any]:
         phase = self._selected_phase()
-        return self.timer or empty_timer(phase, int(self.settings["durations"][phase]) * 60_000)
+        return self.timer or empty_timer(
+            phase, int(self.settings["durationsMs"][phase])
+        )
 
     def _render(self) -> None:
         timer = self._current_timer()
         now = int(time.time() * 1000)
         elapsed = elapsed_ms(timer, now)
+        if timer.get("status") == "cancelled":
+            elapsed = 0
         planned = max(1, int(timer["plannedDurationMs"]))
         remaining = max(0, planned - elapsed)
         status = timer.get("status", "idle")
@@ -788,7 +800,7 @@ class MainWindow(QMainWindow):
                 command_type,
                 self.timer,
                 self._selected_phase(),
-                self.settings["durations"],
+                self.settings["durationsMs"],
                 self.settings.get("selectedTaskId"),
             )
         except (OSError, ValueError) as error:
@@ -820,7 +832,7 @@ class MainWindow(QMainWindow):
         if self._current_timer().get("status") in ACTIVE_STATUSES:
             return
         self.settings["selectedPhase"] = phase
-        self.store.save_settings(self.settings)
+        self.store.set_selected_phase(phase)
         if not self.timer:
             self._render()
 
@@ -831,7 +843,7 @@ class MainWindow(QMainWindow):
         if task_id and not any(task["id"] == task_id for task in self.tasks):
             task_id = None
         self.settings["selectedTaskId"] = task_id
-        self.store.save_settings(self.settings)
+        self.store.set_selected_task_id(task_id)
         self._task_selector_signature = None
 
     def _add_task(self) -> None:
@@ -840,7 +852,7 @@ class MainWindow(QMainWindow):
             if not any(existing["id"] == task["id"] for existing in self.tasks):
                 self.store.queue_task_operation("upsert", task)
             self.settings["selectedTaskId"] = task["id"]
-            self.store.save_settings(self.settings)
+            self.store.set_selected_task_id(task["id"])
         except (OSError, ValueError) as error:
             self.notice.emit(str(error))
             return
@@ -857,7 +869,7 @@ class MainWindow(QMainWindow):
             self.store.queue_task_operation("delete", task)
             if self.settings.get("selectedTaskId") == task_id:
                 self.settings["selectedTaskId"] = None
-                self.store.save_settings(self.settings)
+                self.store.set_selected_task_id(None)
         except (OSError, ValueError) as error:
             self.notice.emit(str(error))
             return
@@ -866,30 +878,85 @@ class MainWindow(QMainWindow):
         self._sync()
 
     def _duration_changed(self, phase: str, value: int) -> None:
-        self.settings["durations"][phase] = value
-        self.store.save_settings(self.settings)
+        try:
+            self.store.queue_duration_operation(phase, value * 60_000)
+        except (OSError, ValueError) as error:
+            self._load_state()
+            self.notice.emit(str(error))
+            return
+        self._load_state()
         if not self.timer and phase == self._selected_phase():
             self._render()
+        self._sync()
+
+    def _refresh_duration_spins(self) -> None:
+        for phase, spin in self.duration_spins.items():
+            previous = spin.blockSignals(True)
+            spin.setValue(int(self.settings["durations"][phase]))
+            spin.blockSignals(previous)
 
     def _auto_breaks_changed(self, enabled: bool) -> None:
         self.settings["autoStartBreaks"] = enabled
-        self.store.save_settings(self.settings)
+        self.store.set_auto_start_breaks(enabled)
 
     def _sync(self) -> None:
+        if not self.cloud.authenticated:
+            return
         payload = self.store.sync_payload()
-        if self.cloud.authenticated and (payload["commands"] or payload["taskOperations"]):
+        has_pending = bool(
+            payload["commands"]
+            or payload["taskOperations"]
+            or payload["durationOperations"]
+        )
+        if has_pending:
             self._set_account_state(False)
+        if self.cloud.busy:
+            self._sync_when_available()
+            return
+        self._sync_request = payload
         self.cloud.sync(payload)
 
+    def _sync_when_available(self) -> None:
+        if self._sync_waiting:
+            return
+        self._sync_waiting = True
+        QTimer.singleShot(100, self._retry_sync)
+
+    def _retry_sync(self) -> None:
+        if self.cloud.busy:
+            QTimer.singleShot(100, self._retry_sync)
+            return
+        self._sync_waiting = False
+        self._sync()
+
+    def _remote_revision_available(self, revision: int) -> None:
+        if revision > self.revision:
+            self._sync()
+
     def _apply_sync(self, response: dict[str, Any]) -> None:
-        notices = self.store.apply_sync(response)
+        request = self._sync_request
+        self._sync_request = None
+        if request is None:
+            self._set_account_state(False)
+            self.notice.emit("Sync response did not match an active request.")
+            return
+        try:
+            notices = self.store.apply_sync(response, request)
+        except (KeyError, TypeError, ValueError) as error:
+            self._set_account_state(False)
+            self.notice.emit(str(error))
+            return
         self._load_state()
         self._render()
         payload = self.store.sync_payload()
-        has_pending = bool(payload["commands"] or payload["taskOperations"])
+        has_pending = bool(
+            payload["commands"]
+            or payload["taskOperations"]
+            or payload["durationOperations"]
+        )
         self._set_account_state(not has_pending)
         if has_pending:
-            self.cloud.sync(payload)
+            self._sync()
         if notices:
             self.notice.emit("Server resolved a sync conflict: " + "; ".join(notices))
 
@@ -942,6 +1009,7 @@ class MainWindow(QMainWindow):
             self.cloud.login()
 
     def _cloud_failure(self, message: str) -> None:
+        self._sync_request = None
         if self.cloud.authenticated:
             self._set_account_state(False)
         if "Sign in to sync" not in message:

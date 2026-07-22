@@ -36,6 +36,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(state["phase"], "long_break")
         self.assertEqual(state["plannedDurationMs"], 120_000)
+        stored = self.store.load()
+        self.assertEqual(stored["settings"]["durations"]["long_break"], 15)
+        self.assertEqual(
+            stored["settings"]["durationsMs"]["long_break"], 15 * 60_000
+        )
+        self.assertEqual(stored["pendingDurations"], [])
 
     def test_invalid_transition_returns_error(self) -> None:
         result, output, error = self.invoke("finish")

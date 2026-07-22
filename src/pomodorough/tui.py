@@ -44,6 +44,10 @@ def build_lines(
         lines.insert(6, f"TASK: {state['taskTitle']}")
     if state["pendingCommands"]:
         lines.append(f"{state['pendingCommands']} command(s) pending sync")
+    if state["pendingDurationOperations"]:
+        lines.append(
+            f"{state['pendingDurationOperations']} duration preference(s) pending sync"
+        )
     if message:
         lines.extend(("", message))
     lines.extend(("", "RECENT ARRIVALS"))

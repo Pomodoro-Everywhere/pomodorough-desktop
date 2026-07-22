@@ -53,6 +53,11 @@ def _print_state(state: dict[str, Any], stream: TextIO) -> None:
         print(f"Task: {state['taskTitle']}", file=stream)
     if state["pendingCommands"]:
         print(f"{state['pendingCommands']} command(s) pending sync", file=stream)
+    if state["pendingDurationOperations"]:
+        print(
+            f"{state['pendingDurationOperations']} duration preference(s) pending sync",
+            file=stream,
+        )
 
 
 def _history_time(value: str | None) -> str:

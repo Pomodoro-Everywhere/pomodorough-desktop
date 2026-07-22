@@ -50,6 +50,7 @@ class LocalTimer:
         self.tasks: list[dict[str, Any]] = []
         self.known_tasks: dict[str, dict[str, Any]] = {}
         self.pending: list[dict[str, Any]] = []
+        self.pending_durations: list[dict[str, Any]] = []
         self.reload()
 
     def reload(self) -> None:
@@ -57,6 +58,7 @@ class LocalTimer:
         self.settings = state["settings"]
         snapshot = state["snapshot"]
         self.pending = state["pending"]
+        self.pending_durations = state["pendingDurations"]
         self.tasks = rebuild_tasks(
             snapshot.get("tasks", []), state.get("pendingTasks", [])
         )
@@ -72,7 +74,7 @@ class LocalTimer:
             task["id"] == selected_task_id for task in self.tasks
         ):
             self.settings["selectedTaskId"] = None
-            self.store.save_settings(self.settings)
+            self.store.set_selected_task_id(None)
         self.timer, self.history = rebuild_optimistic(
             snapshot.get("canonicalTimer"),
             snapshot.get("history", []),
@@ -86,7 +88,7 @@ class LocalTimer:
 
     def current_timer(self) -> dict[str, Any]:
         phase = self.selected_phase
-        duration_ms = int(self.settings["durations"][phase]) * 60_000
+        duration_ms = int(self.settings["durationsMs"][phase])
         return self.timer or empty_timer(phase, duration_ms)
 
     def state(
@@ -96,6 +98,8 @@ class LocalTimer:
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         timer = self.current_timer()
         elapsed = elapsed_ms(timer, now_ms)
+        if timer.get("status") == "cancelled":
+            elapsed = 0
         planned = max(1, int(timer["plannedDurationMs"]))
 
         if auto_finish and timer.get("status") == "running" and elapsed >= planned:
@@ -118,6 +122,7 @@ class LocalTimer:
             "remaining": format_remaining(remaining),
             "progress": min(1.0, elapsed / planned),
             "pendingCommands": len(self.pending),
+            "pendingDurationOperations": len(self.pending_durations),
         }
 
     def issue(
@@ -144,21 +149,21 @@ class LocalTimer:
             raise InvalidAction(f"Cannot {command_type} timer while it is {status}.")
 
         selected_phase = normalize_phase(phase) if phase else self.selected_phase
-        durations = deepcopy(self.settings["durations"])
+        durations_ms = deepcopy(self.settings["durationsMs"])
         if minutes is not None:
             if not 1 <= minutes <= 180:
                 raise InvalidAction("Duration must be between 1 and 180 minutes.")
-            durations[selected_phase] = minutes
+            durations_ms[selected_phase] = minutes * 60_000
 
         if command_type == "start" and selected_phase != self.selected_phase:
             self.settings["selectedPhase"] = selected_phase
-            self.store.save_settings(self.settings)
+            self.store.set_selected_phase(selected_phase)
 
         command = self.store.queue_command(
             command_type,
             self.timer,
             selected_phase,
-            durations,
+            durations_ms,
             self.settings.get("selectedTaskId"),
             now_ms=now_ms,
         )
@@ -183,7 +188,7 @@ class LocalTimer:
         if self.current_timer().get("status") in ACTIVE_STATUSES:
             raise InvalidAction("Cannot change phase while timer is active.")
         self.settings["selectedPhase"] = normalize_phase(phase)
-        self.store.save_settings(self.settings)
+        self.store.set_selected_phase(self.settings["selectedPhase"])
         self.reload()
 
     def adjust_duration(self, delta: int) -> int:
@@ -191,8 +196,9 @@ class LocalTimer:
         phase = self.selected_phase
         current = int(self.settings["durations"][phase])
         updated = min(180, max(1, current + delta))
-        self.settings["durations"][phase] = updated
-        self.store.save_settings(self.settings)
+        if updated == current:
+            return current
+        self.store.queue_duration_operation(phase, updated * 60_000)
         self.reload()
         return updated
 
