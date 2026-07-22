@@ -41,6 +41,20 @@ class LocalTimerTests(unittest.TestCase):
         self.assertEqual(state["status"], "completed")
         self.assertEqual(state["remaining"], "00:00")
 
+    def test_signed_in_terminal_auto_starts_break_without_sync(self) -> None:
+        self.store.set_user({"id": "user-1"})
+        self.store.set_auto_start_breaks(True, now_ms=100)
+
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+        self.timer.issue("finish", now_ms=61_000)
+
+        state = self.timer.state(now_ms=61_000)
+        self.assertEqual((state["phase"], state["status"]), ("short_break", "running"))
+        self.assertEqual(
+            [command["type"] for command in self.store.load()["pending"]],
+            ["start", "finish", "start"],
+        )
+
     def test_cancelled_timer_resets_display(self) -> None:
         self.timer.issue("start", minutes=1, now_ms=1_000)
         self.timer.issue("pause", now_ms=31_000)

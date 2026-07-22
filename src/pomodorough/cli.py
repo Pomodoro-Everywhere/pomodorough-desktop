@@ -58,6 +58,11 @@ def _print_state(state: dict[str, Any], stream: TextIO) -> None:
             f"{state['pendingDurationOperations']} duration preference(s) pending sync",
             file=stream,
         )
+    if state["pendingAutoStartOperations"]:
+        print(
+            f"{state['pendingAutoStartOperations']} auto-start preference operation(s) pending sync",
+            file=stream,
+        )
     if state["historyResolutionPending"]:
         print("Account history resolution pending; timer changes are blocked.", file=stream)
 
@@ -96,10 +101,15 @@ def run(args: argparse.Namespace, timer: LocalTimer, stream: TextIO) -> None:
             print(f"{when} | {phase} | {minutes} min{pending}", file=stream)
         return
 
-    timer.state(auto_finish=True)
-    if args.command == "start":
+    previous = timer.current_timer()
+    state = timer.state(auto_finish=True)
+    auto_transitioned = (
+        state["timerId"] != (previous.get("id") or None)
+        or state["status"] != previous.get("status")
+    )
+    if args.command == "start" and not auto_transitioned:
         timer.issue("start", phase=args.phase, minutes=args.minutes)
-    elif args.command != "status":
+    elif args.command != "status" and not auto_transitioned:
         timer.issue(args.command)
 
     state = timer.state(auto_finish=True)

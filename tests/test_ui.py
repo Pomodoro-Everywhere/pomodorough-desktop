@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
@@ -102,6 +102,7 @@ class MainWindowDurationTests(unittest.TestCase):
             "acknowledgements": [],
             "taskAcknowledgements": [],
             "durationAcknowledgements": [],
+            "autoStartAcknowledgements": [],
             "revision": revision,
             "canonicalTimer": None,
             "history": history or [],
@@ -111,6 +112,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "short_break": 5 * 60_000,
                 "long_break": 15 * 60_000,
             },
+            "autoStartBreaks": False,
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
         }
@@ -618,6 +620,254 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.cloud.payloads[-1]["durationOperations"], [operation])
         self.assertFalse(self.window._account_synced)
 
+    def test_auto_start_toggle_syncs_and_remote_preference_refreshes_checkbox(
+        self,
+    ) -> None:
+        self.window.auto_breaks.setChecked(True)
+
+        operation = self.store.load()["pendingAutoStarts"][0]
+        self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], [operation])
+        response = self._bootstrap_response(revision=1)
+        response["autoStartAcknowledgements"] = [
+            {"operationId": operation["id"], "outcome": "applied", "reason": ""}
+        ]
+        response["autoStartBreaks"] = True
+        self.window._apply_sync(response)
+        self.assertTrue(self.window.auto_breaks.isChecked())
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [])
+
+        self.window._sync()
+        remote = self._bootstrap_response(revision=2)
+        remote["autoStartBreaks"] = False
+        self.window._apply_sync(remote)
+        self.assertFalse(self.window.auto_breaks.isChecked())
+        self.assertFalse(self.window.settings["autoStartBreaks"])
+
+    def test_auto_start_operation_survives_lost_malformed_and_expired_sync(
+        self,
+    ) -> None:
+        owner = {"id": "user-1"}
+        self.store.set_user(owner)
+        self.window._load_state()
+        self.window.auto_breaks.setChecked(True)
+        operation = self.store.load()["pendingAutoStarts"][0]
+        sent = self.cloud.payloads[-1]
+
+        self.window._cloud_failure("network unavailable")
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
+        self.window._sync()
+        self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], [operation])
+        self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], sent["autoStartOperations"])
+
+        malformed = self._bootstrap_response(revision=1)
+        malformed.pop("autoStartBreaks")
+        with patch.object(QMessageBox, "warning"):
+            self.window._apply_sync(malformed)
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
+
+        self.cloud.authenticated = False
+        self.window._session_expired()
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
+        self.assertEqual(self.window.user, owner)
+
+    def test_synced_local_focus_completion_auto_starts_one_short_break(self) -> None:
+        owner = {"id": "user-1"}
+        self.store.set_user(owner)
+        self.window._load_state()
+        self.window.auto_breaks.setChecked(True)
+        preference = self.store.load()["pendingAutoStarts"][0]
+        preference_response = self._bootstrap_response(revision=1)
+        preference_response["autoStartAcknowledgements"] = [
+            {
+                "operationId": preference["id"],
+                "outcome": "applied",
+                "reason": "",
+            }
+        ]
+        preference_response["autoStartBreaks"] = True
+        self.window._apply_sync(preference_response)
+
+        self.window._issue("start")
+        start = self.window.pending[-1]
+        running_response = self._bootstrap_response(revision=2)
+        running_response["acknowledgements"] = [
+            {"commandId": start["id"], "outcome": "applied", "reason": ""}
+        ]
+        running_response["canonicalTimer"] = dict(self.window.timer)
+        running_response["autoStartBreaks"] = True
+        self.window._apply_sync(running_response)
+
+        self.window._issue("finish")
+        finish = self.window.pending[-1]
+        canonical_history = dict(self.window.history[0])
+        canonical_history.pop("pending", None)
+        completed_response = self._bootstrap_response(
+            revision=3, history=[canonical_history]
+        )
+        completed_response["acknowledgements"] = [
+            {"commandId": finish["id"], "outcome": "applied", "reason": ""}
+        ]
+        completed_response["canonicalTimer"] = dict(self.window.timer)
+        completed_response["autoStartBreaks"] = True
+        self.cloud.busy = True
+        self.window._apply_sync(completed_response)
+        self.cloud.busy = False
+
+        self.assertEqual(self.window.timer["status"], "completed")
+        with patch(
+            "pomodorough.ui.time.monotonic",
+            return_value=self.window._auto_break_not_before + 0.1,
+        ):
+            self.assertTrue(self.window._maybe_auto_start_break())
+
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+        break_starts = [
+            command
+            for command in self.store.load()["pending"]
+            if command["type"] == "start" and command["phase"] == "short_break"
+        ]
+        self.assertEqual(len(break_starts), 1)
+        self.assertEqual(
+            self.cloud.payloads[-1]["autoStartOperations"], []
+        )
+
+    def test_local_focus_completion_waits_before_auto_starting_break(self) -> None:
+        self.window.auto_breaks.setChecked(True)
+        self.window._issue("start")
+        with patch("pomodorough.ui.time.monotonic", return_value=100.0):
+            self.window._issue("finish")
+
+        with patch("pomodorough.ui.time.monotonic", return_value=100.25):
+            self.window._tick()
+        self.assertEqual(self.window.timer["status"], "completed")
+
+        with patch("pomodorough.ui.time.monotonic", return_value=101.2):
+            self.window._tick()
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+
+    def test_signed_in_sync_failure_schedules_offline_auto_break(self) -> None:
+        self.store.set_user({"id": "user-1"})
+        self.store.set_auto_start_breaks(True, now_ms=1)
+        self.window._load_state()
+        self.window._issue("start")
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.0),
+            patch.object(QTimer, "singleShot"),
+        ):
+            self.window._issue("finish")
+        self.assertEqual(self.window.timer["status"], "completed")
+
+        scheduled = []
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.25),
+            patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: scheduled.append((delay, callback)),
+            ),
+        ):
+            self.window._cloud_failure("network unavailable")
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertGreaterEqual(scheduled[0][0], 950)
+        with patch("pomodorough.ui.time.monotonic", return_value=101.2):
+            scheduled[0][1]()
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+
+    def test_malformed_finish_response_schedules_offline_auto_break(self) -> None:
+        self.store.set_user({"id": "user-1"})
+        self.store.set_auto_start_breaks(True, now_ms=1)
+        self.window._load_state()
+        self.window._issue("start")
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.0),
+            patch.object(QTimer, "singleShot"),
+        ):
+            self.window._issue("finish")
+
+        malformed = self._bootstrap_response(revision=1)
+        malformed.pop("canonicalTimer")
+        scheduled = []
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.25),
+            patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: scheduled.append((delay, callback)),
+            ),
+            patch.object(QMessageBox, "warning"),
+        ):
+            self.window._apply_sync(malformed)
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertTrue(self.store.has_pending_auto_break())
+        with patch("pomodorough.ui.time.monotonic", return_value=101.2):
+            scheduled[0][1]()
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+
+    def test_session_expiry_retries_pending_auto_break_offline(self) -> None:
+        owner = {"id": "user-1"}
+        self.store.set_user(owner)
+        self.store.set_auto_start_breaks(True, now_ms=1)
+        self.window._load_state()
+        self.window._issue("start")
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.0),
+            patch.object(QTimer, "singleShot"),
+        ):
+            self.window._issue("finish")
+
+        scheduled = []
+        self.cloud.authenticated = False
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.25),
+            patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: scheduled.append((delay, callback)),
+            ),
+        ):
+            self.window._session_expired()
+
+        self.assertEqual(len(scheduled), 1)
+        with patch("pomodorough.ui.time.monotonic", return_value=101.2):
+            scheduled[0][1]()
+
+        self.assertEqual(self.window.user, owner)
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+        started = [
+            command
+            for command in self.store.load()["pending"]
+            if command["type"] == "start" and command["phase"] == "short_break"
+        ]
+        self.assertEqual(len(started), 1)
+
+        self.cloud.authenticated = True
+        self.window._signed_in(owner)
+        with patch("pomodorough.ui.time.monotonic", return_value=102.0):
+            self.window._tick()
+        restarted = [
+            command
+            for command in self.store.load()["pending"]
+            if command["type"] == "start" and command["phase"] == "short_break"
+        ]
+        self.assertEqual(restarted, started)
+
     def test_unauthenticated_sync_does_not_queue_unowned_request(self) -> None:
         self.cloud.authenticated = False
         self.cloud.busy = True
@@ -657,6 +907,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "commands": [],
                 "taskOperations": [],
                 "durationOperations": [],
+                "autoStartOperations": [],
             },
         )
 
@@ -667,6 +918,22 @@ class MainWindowDurationTests(unittest.TestCase):
 
         self.assertEqual(len(self.cloud.payloads), before + 1)
 
+    def test_arrivals_is_separate_tab_next_to_tasks(self) -> None:
+        self.assertEqual(
+            [button.text() for button in self.window.screen_buttons],
+            ["TIMER", "TASKS", "ARRIVALS"],
+        )
+        self.assertIs(self.window.page_stack.widget(2), self.window.arrivals_page)
+        self.assertTrue(self.window.arrivals_page.isAncestorOf(self.window.history_list))
+        self.assertFalse(self.window.right_panel.isAncestorOf(self.window.history_list))
+
+        before = len(self.cloud.payloads)
+        self.window._show_screen(2)
+
+        self.assertIs(self.window.page_stack.currentWidget(), self.window.arrivals_page)
+        self.assertTrue(self.window.screen_buttons[2].isChecked())
+        self.assertEqual(len(self.cloud.payloads), before + 1)
+
     def test_synced_task_can_be_selected_while_timer_is_paused(self) -> None:
         task = task_from_title("Remote task")
         self.window._sync()
@@ -675,6 +942,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "acknowledgements": [],
                 "taskAcknowledgements": [],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": {
                     "id": "timer-remote",
@@ -692,6 +960,7 @@ class MainWindowDurationTests(unittest.TestCase):
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": 1_000,
                 "serverHlcCounter": 0,
             }
@@ -759,6 +1028,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "acknowledgements": [],
                 "taskAcknowledgements": [],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": None,
                 "history": [],
@@ -768,6 +1038,7 @@ class MainWindowDurationTests(unittest.TestCase):
                     "short_break": 10 * 60_000,
                     "long_break": 20 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": 1_000,
                 "serverHlcCounter": 0,
             }
@@ -797,6 +1068,7 @@ class MainWindowDurationTests(unittest.TestCase):
                         "reason": "",
                     }
                 ],
+                "autoStartAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": None,
                 "history": [],
@@ -806,6 +1078,7 @@ class MainWindowDurationTests(unittest.TestCase):
                     "short_break": 6 * 60_000,
                     "long_break": 16 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": 1_000,
                 "serverHlcCounter": 0,
             }

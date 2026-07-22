@@ -55,7 +55,6 @@ from .core import (
     elapsed_ms,
     empty_timer,
     format_remaining,
-    next_break_phase,
     rebuild_optimistic,
     rebuild_tasks,
     task_from_title,
@@ -182,6 +181,7 @@ class MainWindow(QMainWindow):
         self.quitting = False
         self._notified_timer_id: str | None = None
         self._auto_finish_in_progress = False
+        self._auto_break_not_before = 0.0
         self._tray_progress_state: tuple[bool, int] | None = None
         self._palette_key: int | None = None
         self._compact: bool | None = None
@@ -235,6 +235,7 @@ class MainWindow(QMainWindow):
         self.pending = state["pending"]
         self.pending_tasks = state["pendingTasks"]
         self.pending_durations = state["pendingDurations"]
+        self.pending_auto_starts = state["pendingAutoStarts"]
         self.timer, self.history = rebuild_optimistic(
             self.base_timer, self.base_history, self.pending
         )
@@ -250,6 +251,12 @@ class MainWindow(QMainWindow):
         self._task_render_signature = None
         if hasattr(self, "duration_spins"):
             self._refresh_duration_spins()
+        if hasattr(self, "auto_breaks"):
+            previous = self.auto_breaks.blockSignals(True)
+            self.auto_breaks.setChecked(
+                bool(self.settings.get("autoStartBreaks"))
+            )
+            self.auto_breaks.blockSignals(previous)
 
     def _activate_persisted_resolution(self) -> bool:
         pending = self.store.pending_resolution()
@@ -282,7 +289,7 @@ class MainWindow(QMainWindow):
         self.screen_group = QButtonGroup(self)
         self.screen_group.setExclusive(True)
         self.screen_buttons: list[QPushButton] = []
-        for index, label in enumerate(("TIMER", "TASKS")):
+        for index, label in enumerate(("TIMER", "TASKS", "ARRIVALS")):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setProperty("screen", True)
@@ -401,33 +408,14 @@ class MainWindow(QMainWindow):
         self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
         self.auto_breaks.toggled.connect(self._auto_breaks_changed)
         self.right_layout.addWidget(self.auto_breaks)
-
-        self.history_panel = QWidget()
-        history_layout = QVBoxLayout(self.history_panel)
-        history_layout.setContentsMargins(0, 0, 0, 0)
-        history_layout.setSpacing(8)
-        arrivals_header = QHBoxLayout()
-        arrivals = QLabel("RECENT ARRIVALS")
-        arrivals.setObjectName("sectionTitle")
-        self.history_count = QLabel("0")
-        self.history_count.setObjectName("countBadge")
-        arrivals_header.addWidget(arrivals)
-        arrivals_header.addStretch()
-        arrivals_header.addWidget(self.history_count)
-        history_layout.addLayout(arrivals_header)
-        self.history_list = QListWidget()
-        self.history_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        history_layout.addWidget(self.history_list, 1)
-        self.device_label = QLabel(f"DEVICE  {self.store.device_id[-8:].upper()}")
-        self.device_label.setObjectName("device")
-        history_layout.addWidget(self.device_label)
-        self.right_layout.addWidget(self.history_panel, 1)
+        self.right_layout.addStretch()
         self.content_layout.addWidget(self.right_panel, 2)
         self.right_panel.hide()
         self.page_stack.addWidget(self.timer_page)
         self.tasks_page = self._build_tasks_page()
         self.page_stack.addWidget(self.tasks_page)
+        self.arrivals_page = self._build_arrivals_page()
+        self.page_stack.addWidget(self.arrivals_page)
         self.outer_layout.addWidget(self.page_stack, 1)
 
         self.shortcuts = [
@@ -493,6 +481,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tasks_empty)
         return page
 
+    def _build_arrivals_page(self) -> QWidget:
+        page = QFrame()
+        page.setObjectName("ticket")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("RECENT ARRIVALS")
+        title.setObjectName("sectionTitle")
+        self.history_count = QLabel("0")
+        self.history_count.setObjectName("countBadge")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.history_count)
+        layout.addLayout(header)
+
+        self.history_list = QListWidget()
+        self.history_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout.addWidget(self.history_list, 1)
+        self.device_label = QLabel(f"DEVICE  {self.store.device_id[-8:].upper()}")
+        self.device_label.setObjectName("device")
+        layout.addWidget(self.device_label)
+        return page
+
     def _refresh_stylesheet(self) -> None:
         palette_key = QApplication.palette().cacheKey()
         if palette_key == self._palette_key:
@@ -511,7 +525,7 @@ class MainWindow(QMainWindow):
         self.screen_buttons[index].setChecked(True)
         self.settings_button.setVisible(index == 0)
         self._render()
-        if index == 1:
+        if index:
             self._sync()
 
     def _apply_responsive_layout(self) -> None:
@@ -533,7 +547,6 @@ class MainWindow(QMainWindow):
         if compact == self._compact:
             return
         self._compact = compact
-        self.history_panel.setVisible(not compact)
         self.outer_layout.setContentsMargins(
             12 if compact else 24,
             10 if compact else 18,
@@ -551,7 +564,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
-        if hasattr(self, "history_panel"):
+        if hasattr(self, "arrivals_page"):
             self._apply_responsive_layout()
 
     def changeEvent(self, event: Any) -> None:
@@ -810,6 +823,12 @@ class MainWindow(QMainWindow):
         return f"{remaining} min"
 
     def _tick(self) -> None:
+        if (
+            (self.user is None or not self.cloud.authenticated)
+            and not self.cloud.busy
+            and self.store.has_pending_auto_break()
+        ):
+            self._maybe_auto_start_break(require_canonical=False)
         timer = self._current_timer()
         if timer.get("status") == "running":
             if self._history_resolution_active:
@@ -887,18 +906,43 @@ class MainWindow(QMainWindow):
         self._sync()
         if command_type == "finish":
             self._auto_finish_in_progress = False
-            if self.timer and self.timer.get("phase") == "focus" and self.settings.get("autoStartBreaks"):
-                phase = next_break_phase(self.history)
-                QTimer.singleShot(1200, lambda: self._start_break(phase))
+            if self.timer and self.timer.get("phase") == "focus":
+                self._auto_break_not_before = time.monotonic() + 1.2
+                QTimer.singleShot(1200, self._maybe_auto_start_break)
         if automatic:
             self._show_window()
 
-    def _start_break(self, phase: str) -> None:
-        if self._current_timer().get("status") not in TERMINAL_STATUSES:
-            return
-        self._issue("clear")
-        self._select_phase(phase)
-        self._issue("start")
+    def _maybe_auto_start_break(
+        self,
+        *,
+        sync: bool = True,
+        allow_busy: bool = False,
+        require_canonical: bool | None = None,
+    ) -> bool:
+        if (
+            time.monotonic() < self._auto_break_not_before
+            or self._history_resolution_active
+            or (self.cloud.busy and not allow_busy)
+        ):
+            return False
+        try:
+            commands = self.store.process_auto_break(
+                require_canonical=(
+                    self.user is not None and self.cloud.authenticated
+                    if require_canonical is None
+                    else require_canonical
+                )
+            )
+        except (OSError, ValueError) as error:
+            self.notice.emit(str(error))
+            return False
+        if not commands:
+            return False
+        self._load_state()
+        self._render()
+        if sync:
+            self._sync()
+        return True
 
     def _select_phase(self, phase: str) -> None:
         if self._mutation_blocked():
@@ -990,8 +1034,17 @@ class MainWindow(QMainWindow):
             self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
             self.auto_breaks.blockSignals(previous)
             return
-        self.settings["autoStartBreaks"] = enabled
-        self.store.set_auto_start_breaks(enabled)
+        try:
+            self.store.set_auto_start_breaks(enabled)
+        except (OSError, ValueError) as error:
+            self._load_state()
+            previous = self.auto_breaks.blockSignals(True)
+            self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
+            self.auto_breaks.blockSignals(previous)
+            self.notice.emit(str(error))
+            return
+        self._load_state()
+        self._sync()
 
     def _sync(self) -> None:
         if (
@@ -1011,6 +1064,7 @@ class MainWindow(QMainWindow):
             payload["commands"]
             or payload["taskOperations"]
             or payload["durationOperations"]
+            or payload["autoStartOperations"]
         )
         if has_pending:
             self._set_account_state(False)
@@ -1172,16 +1226,18 @@ class MainWindow(QMainWindow):
         try:
             notices = self.store.apply_sync(response, request)
         except (KeyError, TypeError, ValueError) as error:
-            self._set_account_state(False)
+            self._cloud_failure(str(error))
             self.notice.emit(str(error))
             return
         self._load_state()
         self._render()
+        self._maybe_auto_start_break(sync=False, allow_busy=True)
         payload = self.store.sync_payload()
         has_pending = bool(
             payload["commands"]
             or payload["taskOperations"]
             or payload["durationOperations"]
+            or payload["autoStartOperations"]
         )
         self._set_account_state(not has_pending)
         if has_pending:
@@ -1210,11 +1266,13 @@ class MainWindow(QMainWindow):
         self._resolution_user = None
         self._load_state()
         self._render()
+        self._maybe_auto_start_break(sync=False, allow_busy=True)
         payload = self.store.sync_payload()
         has_pending = bool(
             payload["commands"]
             or payload["taskOperations"]
             or payload["durationOperations"]
+            or payload["autoStartOperations"]
         )
         self._set_account_state(not has_pending)
         if has_pending:
@@ -1320,6 +1378,7 @@ class MainWindow(QMainWindow):
         self._activate_persisted_resolution()
         self._set_account_state(False)
         self._render()
+        self._schedule_pending_auto_break()
 
     def _set_account_state(self, synced: bool) -> None:
         self._account_synced = synced and self.cloud.authenticated
@@ -1424,8 +1483,26 @@ class MainWindow(QMainWindow):
         self._sync_request = None
         if self.cloud.authenticated:
             self._set_account_state(False)
+        self._schedule_pending_auto_break(require_canonical=False)
         if "Sign in to sync" not in message:
             self.statusBar().showMessage(message, 10_000)
+
+    def _schedule_pending_auto_break(
+        self, *, require_canonical: bool | None = None
+    ) -> None:
+        if self.store.has_pending_auto_break():
+            delay_ms = max(
+                0,
+                math.ceil(
+                    (self._auto_break_not_before - time.monotonic()) * 1000
+                ),
+            )
+            QTimer.singleShot(
+                delay_ms,
+                lambda: self._maybe_auto_start_break(
+                    allow_busy=True, require_canonical=require_canonical
+                ),
+            )
 
     def _show_notice(self, message: str) -> None:
         QMessageBox.warning(self, "Pomodorough", message)

@@ -70,7 +70,7 @@ cross-device synchronization with the production service.
 ### Windows
 
 Download `Pomodorough-<version>-windows-x86_64.exe` and its matching `.sha256`
-file from the [latest GitHub release](https://github.com/egigoka/pomodorough-linux/releases/latest).
+file from the [latest GitHub release](https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/latest).
 The executable includes Python, Qt, and all application dependencies, so it can
 run directly without installation.
 
@@ -98,9 +98,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.3/pomodorough_linux-0.1.3.tar.gz
-tar -xzf pomodorough_linux-0.1.3.tar.gz
-cd pomodorough_linux-0.1.3
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.4/pomodorough_linux-0.1.4.tar.gz
+tar -xzf pomodorough_linux-0.1.4.tar.gz
+cd pomodorough_linux-0.1.4
 ./deploy/install.sh
 ```
 
@@ -123,7 +123,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:egigoka/pomodorough-linux/v0.1.3
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.4
 ```
 
 ### Flatpak
@@ -131,8 +131,8 @@ nix profile install github:egigoka/pomodorough-linux/v0.1.3
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.3/Pomodorough-0.1.3-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.1.3-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.4/Pomodorough-0.1.4-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.1.4-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 
@@ -249,10 +249,10 @@ sh -n deploy/install.sh
 
 ## Pomodorough projects
 
-- [Server, Web/PWA, and synchronization](https://github.com/egigoka/pomodorough-server)
-- [iOS, iPadOS, and macOS](https://github.com/egigoka/pomodorough-ios)
-- [Android](https://github.com/egigoka/pomodorough-android)
-- [Linux and Windows (this repository)](https://github.com/egigoka/pomodorough-linux)
+- [Server, Web/PWA, and synchronization](https://github.com/Pomodoro-Everywhere/pomodorough-server)
+- [Apple](https://github.com/Pomodoro-Everywhere/pomodorough-apple)
+- [Android](https://github.com/Pomodoro-Everywhere/pomodorough-android)
+- [Desktop (this repository)](https://github.com/Pomodoro-Everywhere/pomodorough-desktop)
 
 ## License
 

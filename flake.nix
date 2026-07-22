@@ -16,7 +16,7 @@
         {
           default = pkgs.python3.pkgs.buildPythonApplication {
             pname = "pomodorough-linux";
-            version = "0.1.3";
+            version = "0.1.4";
             pyproject = true;
             src = pkgs.lib.fileset.toSource {
               root = ./.;
@@ -51,7 +51,7 @@
 
             meta = {
               description = "KDE-first, local-first Pomodoro timer";
-              homepage = "https://github.com/egigoka/pomodorough-linux";
+              homepage = "https://github.com/Pomodoro-Everywhere/pomodorough-desktop";
               license = pkgs.lib.licenses.gpl3Plus;
               mainProgram = "pomodorough";
               platforms = pkgs.lib.platforms.linux;

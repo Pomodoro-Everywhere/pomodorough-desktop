@@ -2,7 +2,7 @@ class Pomodorough < Formula
   include Language::Python::Virtualenv
 
   desc "Local-first Pomodoro timer with desktop, CLI, and TUI clients"
-  homepage "https://github.com/egigoka/pomodorough-linux"
+  homepage "https://github.com/Pomodoro-Everywhere/pomodorough-desktop"
   url "@URL@"
   sha256 "@SHA256@"
   license "GPL-3.0-or-later"

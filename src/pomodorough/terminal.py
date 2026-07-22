@@ -52,6 +52,7 @@ class LocalTimer:
         self.known_tasks: dict[str, dict[str, Any]] = {}
         self.pending: list[dict[str, Any]] = []
         self.pending_durations: list[dict[str, Any]] = []
+        self.pending_auto_starts: list[dict[str, Any]] = []
         self.resolution_pending = False
         self.reload()
 
@@ -61,6 +62,7 @@ class LocalTimer:
         snapshot = state["snapshot"]
         self.pending = state["pending"]
         self.pending_durations = state["pendingDurations"]
+        self.pending_auto_starts = state["pendingAutoStarts"]
         self.resolution_pending = state["pendingResolution"] is not None
         self.tasks = rebuild_tasks(
             snapshot.get("tasks", []), state.get("pendingTasks", [])
@@ -105,6 +107,14 @@ class LocalTimer:
     ) -> dict[str, Any]:
         self.reload()
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        if not self.resolution_pending and self.store.has_pending_auto_break():
+            self._store_action(
+                lambda: self.store.process_auto_break(
+                    require_canonical=False,
+                    now_ms=now_ms,
+                )
+            )
+            self.reload()
         timer = self.current_timer()
         elapsed = elapsed_ms(timer, now_ms)
         if timer.get("status") == "cancelled":
@@ -137,6 +147,7 @@ class LocalTimer:
             "progress": min(1.0, elapsed / planned),
             "pendingCommands": len(self.pending),
             "pendingDurationOperations": len(self.pending_durations),
+            "pendingAutoStartOperations": len(self.pending_auto_starts),
             "historyResolutionPending": self.resolution_pending,
         }
 
@@ -193,6 +204,13 @@ class LocalTimer:
                 now_ms=now_ms,
             )
         )
+        if command_type == "finish":
+            self._store_action(
+                lambda: self.store.process_auto_break(
+                    require_canonical=False,
+                    now_ms=now_ms,
+                )
+            )
         self.reload()
         return command
 

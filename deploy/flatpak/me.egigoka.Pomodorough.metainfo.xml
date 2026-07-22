@@ -17,13 +17,14 @@
   <launchable type="desktop-id">me.egigoka.Pomodorough.desktop</launchable>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/egigoka/pomodorough-linux/main/screenshots/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/Pomodoro-Everywhere/pomodorough-desktop/main/screenshots/screenshot.png</image>
       <caption>Focus timer paused in the Pomodorough desktop application</caption>
     </screenshot>
   </screenshots>
-  <url type="homepage">https://github.com/egigoka/pomodorough-linux</url>
-  <url type="bugtracker">https://github.com/egigoka/pomodorough-linux/issues</url>
+  <url type="homepage">https://github.com/Pomodoro-Everywhere/pomodorough-desktop</url>
+  <url type="bugtracker">https://github.com/Pomodoro-Everywhere/pomodorough-desktop/issues</url>
   <releases>
+    <release version="0.1.4" date="2026-07-23"/>
     <release version="0.1.3" date="2026-07-22"/>
     <release version="0.1.2" date="2026-07-22"/>
     <release version="0.1.1" date="2026-07-22"/>

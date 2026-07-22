@@ -86,6 +86,24 @@ def rebuild_tasks(
     return sorted(tasks.values(), key=lambda task: (task["title"].casefold(), task["id"]))
 
 
+def project_auto_start_breaks(
+    canonical: bool, pending: list[dict[str, Any]]
+) -> bool:
+    enabled = canonical
+    for operation in sorted(
+        pending,
+        key=lambda item: (
+            int(item.get("hlcWallMs", 0)),
+            int(item.get("hlcCounter", 0)),
+            str(item.get("deviceId", "")),
+            str(item.get("id", "")),
+        ),
+    ):
+        if isinstance(operation.get("enabled"), bool):
+            enabled = operation["enabled"]
+    return enabled
+
+
 def task_summaries_today(
     tasks: list[dict[str, Any]], history: list[dict[str, Any]], now: datetime | None = None
 ) -> dict[str, dict[str, int]]:

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from pomodorough.cli import main
+from pomodorough.core import rebuild_optimistic
 from pomodorough.storage import Store
 
 
@@ -48,6 +49,56 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(output, "")
         self.assertIn("Cannot finish timer while it is idle", error)
+
+    def test_expired_focus_transition_consumes_explicit_timer_command(self) -> None:
+        for action in ("start", "pause", "resume", "finish", "cancel", "clear"):
+            with self.subTest(action=action):
+                self.store.reset_account_data()
+                self.store.set_auto_start_breaks(True, now_ms=1)
+                settings = self.store.load()["settings"]
+                self.store.queue_command(
+                    "start",
+                    None,
+                    "focus",
+                    {**settings["durationsMs"], "focus": 60_000},
+                    now_ms=2,
+                )
+
+                result, output, error = self.invoke(action)
+
+                self.assertEqual(result, 0)
+                self.assertIn("Short break | running", output)
+                self.assertEqual(error, "")
+                self.assertEqual(
+                    [command["type"] for command in self.store.load()["pending"]],
+                    ["start", "finish", "start"],
+                )
+
+    def test_restarted_auto_break_transition_consumes_explicit_command(self) -> None:
+        for action in ("start", "pause", "resume", "finish", "cancel", "clear"):
+            with self.subTest(action=action):
+                self.store.reset_account_data()
+                self.store.set_auto_start_breaks(True, now_ms=1)
+                settings = self.store.load()["settings"]
+                self.store.queue_command(
+                    "start", None, "focus", settings["durationsMs"], now_ms=2
+                )
+                running, _history = rebuild_optimistic(
+                    None, [], self.store.load()["pending"]
+                )
+                self.store.queue_command(
+                    "finish", running, "focus", settings["durationsMs"], now_ms=3
+                )
+
+                result, output, error = self.invoke(action)
+
+                self.assertEqual(result, 0)
+                self.assertIn("Short break | running", output)
+                self.assertEqual(error, "")
+                self.assertEqual(
+                    [command["type"] for command in self.store.load()["pending"]],
+                    ["start", "finish", "start"],
+                )
 
     def test_pending_resolution_status_is_safe_and_mutation_is_action_error(
         self,

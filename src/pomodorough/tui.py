@@ -48,6 +48,10 @@ def build_lines(
         lines.append(
             f"{state['pendingDurationOperations']} duration preference(s) pending sync"
         )
+    if state["pendingAutoStartOperations"]:
+        lines.append(
+            f"{state['pendingAutoStartOperations']} auto-start preference operation(s) pending sync"
+        )
     if state["historyResolutionPending"]:
         lines.append("Account history resolution pending; timer changes are blocked.")
     if message:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -10,7 +11,12 @@ from queue import Queue
 from threading import Barrier, Event, Thread
 from unittest.mock import patch
 
-from pomodorough.core import rebuild_optimistic, rebuild_tasks, task_from_title
+from pomodorough.core import (
+    project_auto_start_breaks,
+    rebuild_optimistic,
+    rebuild_tasks,
+    task_from_title,
+)
 from pomodorough.storage import Store, default_data_path
 
 
@@ -50,7 +56,15 @@ class StorageTests(unittest.TestCase):
         revision: int = 1,
         history: list[dict[str, object]] | None = None,
         tasks: list[dict[str, str]] | None = None,
+        auto_start_breaks: bool | None = None,
     ) -> dict[str, object]:
+        auto_start_operations = request.get("autoStartOperations", [])
+        if auto_start_breaks is None:
+            auto_start_breaks = (
+                auto_start_operations[-1]["enabled"]
+                if auto_start_operations
+                else False
+            )
         return {
             "acknowledgements": [
                 {"commandId": item["id"], "outcome": "applied", "reason": ""}
@@ -64,6 +78,10 @@ class StorageTests(unittest.TestCase):
                 {"operationId": item["id"], "outcome": "applied", "reason": ""}
                 for item in request["durationOperations"]
             ],
+            "autoStartAcknowledgements": [
+                {"operationId": item["id"], "outcome": "applied", "reason": ""}
+                for item in auto_start_operations
+            ],
             "revision": revision,
             "canonicalTimer": None,
             "history": history or [],
@@ -73,6 +91,7 @@ class StorageTests(unittest.TestCase):
                 "short_break": 5 * 60_000,
                 "long_break": 15 * 60_000,
             },
+            "autoStartBreaks": auto_start_breaks,
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
         }
@@ -143,6 +162,7 @@ class StorageTests(unittest.TestCase):
                 "commands",
                 "taskOperations",
                 "durationOperations",
+                "autoStartOperations",
             },
         )
         self.assertEqual(request["taskOperations"], [operation])
@@ -294,13 +314,16 @@ class StorageTests(unittest.TestCase):
                 self.store.set_auto_start_breaks(True)
                 request = self.store.prepare_resolution(user, 4, strategy)
                 expected_counts = (
-                    (0, 0, 0) if strategy == "keep_remote" else (2, 1, 1)
+                    (0, 0, 0, 0)
+                    if strategy == "keep_remote"
+                    else (2, 1, 1, 1)
                 )
                 self.assertEqual(
                     (
                         len(request["commands"]),
                         len(request["taskOperations"]),
                         len(request["durationOperations"]),
+                        len(request["autoStartOperations"]),
                     ),
                     expected_counts,
                 )
@@ -327,7 +350,7 @@ class StorageTests(unittest.TestCase):
                                 "long_break": 16,
                             },
                             "durationsMs": response["durationsMs"],
-                            "autoStartBreaks": True,
+                            "autoStartBreaks": strategy != "keep_remote",
                             "selectedTaskId": None,
                         },
                         "snapshot": {
@@ -336,11 +359,13 @@ class StorageTests(unittest.TestCase):
                             "history": history,
                             "tasks": tasks,
                             "knownTasks": known_tasks,
+                            "autoStartBreaks": strategy != "keep_remote",
                             "user": user,
                         },
                         "pending": [],
                         "pendingTasks": [],
                         "pendingDurations": [],
+                        "pendingAutoStarts": [],
                         "pendingResolution": None,
                     },
                 )
@@ -374,6 +399,7 @@ class StorageTests(unittest.TestCase):
                         "commands": [old_command["id"]],
                         "taskOperations": [old_task["id"]],
                         "durationOperations": [old_duration["id"]],
+                        "autoStartOperations": [],
                     },
                 )
 
@@ -524,11 +550,13 @@ class StorageTests(unittest.TestCase):
             "acknowledgements",
             "taskAcknowledgements",
             "durationAcknowledgements",
+            "autoStartAcknowledgements",
             "revision",
             "canonicalTimer",
             "history",
             "tasks",
             "durationsMs",
+            "autoStartBreaks",
             "serverHlcWallMs",
             "serverHlcCounter",
         )
@@ -701,11 +729,13 @@ class StorageTests(unittest.TestCase):
                 "history": [],
                 "tasks": [],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [],
                 "durationsMs": {
                     "focus": 25 * 60_000,
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": queued["hlcWallMs"],
                 "serverHlcCounter": queued["hlcCounter"],
             },
@@ -739,11 +769,13 @@ class StorageTests(unittest.TestCase):
                 "history": [],
                 "tasks": [task],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [],
                 "durationsMs": {
                     "focus": 25 * 60_000,
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": operation["hlcWallMs"],
                 "serverHlcCounter": operation["hlcCounter"],
             },
@@ -927,7 +959,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.load()["pendingDurations"], [second])
         self.assertEqual(self.store.load()["settings"]["durations"]["focus"], 27)
 
-    def test_stale_general_settings_save_preserves_new_duration(self) -> None:
+    def test_stale_general_settings_save_preserves_synced_preferences(self) -> None:
         stale = self.store.load()["settings"]
         other = Store(self.path)
         try:
@@ -940,7 +972,7 @@ class StorageTests(unittest.TestCase):
 
         settings = self.store.load()["settings"]
         self.assertEqual(settings["durationsMs"]["focus"], 30 * 60_000)
-        self.assertTrue(settings["autoStartBreaks"])
+        self.assertFalse(settings["autoStartBreaks"])
 
     def test_sync_applies_canonical_then_replays_newer_in_flight_edit(self) -> None:
         sent = self.store.queue_duration_operation(
@@ -956,6 +988,7 @@ class StorageTests(unittest.TestCase):
             "durationAcknowledgements": [
                 {"operationId": sent["id"], "outcome": "applied", "reason": ""}
             ],
+            "autoStartAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -965,6 +998,7 @@ class StorageTests(unittest.TestCase):
                 "short_break": 6 * 60_000,
                 "long_break": 16 * 60_000,
             },
+            "autoStartBreaks": False,
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
         }
@@ -1004,6 +1038,7 @@ class StorageTests(unittest.TestCase):
             "durationAcknowledgements": [
                 {"operationId": sent["id"], "outcome": "applied", "reason": ""}
             ],
+            "autoStartAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -1013,6 +1048,7 @@ class StorageTests(unittest.TestCase):
                 "short_break": 6 * 60_000,
                 "long_break": 16 * 60_000,
             },
+            "autoStartBreaks": False,
             "serverHlcWallMs": server_wall,
             "serverHlcCounter": 0,
         }
@@ -1100,6 +1136,7 @@ class StorageTests(unittest.TestCase):
         duration_operation = self.store.queue_duration_operation(
             "focus", 30 * 60_000, now_ms=1_000
         )
+        auto_start_operation = self.store.set_auto_start_breaks(True, now_ms=1_001)
         request = self.store.sync_payload()
         response: dict[str, object] = {
             "acknowledgements": [
@@ -1123,6 +1160,13 @@ class StorageTests(unittest.TestCase):
                     "reason": "",
                 }
             ],
+            "autoStartAcknowledgements": [
+                {
+                    "operationId": auto_start_operation["id"],
+                    "outcome": "applied",
+                    "reason": "",
+                }
+            ],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -1132,6 +1176,7 @@ class StorageTests(unittest.TestCase):
                 "short_break": 6 * 60_000,
                 "long_break": 16 * 60_000,
             },
+            "autoStartBreaks": False,
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
         }
@@ -1140,6 +1185,7 @@ class StorageTests(unittest.TestCase):
             ("acknowledgements", "command"),
             ("taskAcknowledgements", "task"),
             ("durationAcknowledgements", "duration"),
+            ("autoStartAcknowledgements", "auto-start"),
         )
         for key, label in invalid_sets:
             for invalid in ([], [*response[key], *response[key]]):
@@ -1160,6 +1206,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(loaded["pending"], [command])
         self.assertEqual(loaded["pendingTasks"], [task_operation])
         self.assertEqual(loaded["pendingDurations"], [duration_operation])
+        self.assertEqual(loaded["pendingAutoStarts"], [auto_start_operation])
         self.assertEqual(loaded["settings"]["durations"]["focus"], 30)
         self.assertEqual(loaded["snapshot"]["revision"], 0)
 
@@ -1175,6 +1222,7 @@ class StorageTests(unittest.TestCase):
                 "commands",
                 "taskOperations",
                 "durationOperations",
+                "autoStartOperations",
             },
         )
         server_hlc_wall_ms = int(time.time() * 1000) + 60_000
@@ -1183,6 +1231,14 @@ class StorageTests(unittest.TestCase):
                 "acknowledgements": [],
                 "taskAcknowledgements": [],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [
+                    {
+                        "operationId": item["id"],
+                        "outcome": "applied",
+                        "reason": "",
+                    }
+                    for item in request["autoStartOperations"]
+                ],
                 "revision": 1,
                 "canonicalTimer": None,
                 "history": [],
@@ -1192,6 +1248,7 @@ class StorageTests(unittest.TestCase):
                     "short_break": 60_000,
                     "long_break": 10_800_000,
                 },
+                "autoStartBreaks": True,
                 "serverHlcWallMs": server_hlc_wall_ms,
                 "serverHlcCounter": 7,
             },
@@ -1239,6 +1296,7 @@ class StorageTests(unittest.TestCase):
                             "acknowledgements": [],
                             "taskAcknowledgements": [],
                             "durationAcknowledgements": [],
+                            "autoStartAcknowledgements": [],
                             "revision": 1,
                             "canonicalTimer": None,
                             "history": [],
@@ -1248,6 +1306,7 @@ class StorageTests(unittest.TestCase):
                                 "short_break": 5 * 60_000,
                                 "long_break": 15 * 60_000,
                             },
+                            "autoStartBreaks": False,
                             "serverHlcWallMs": 1_000,
                             "serverHlcCounter": 0,
                         },
@@ -1329,6 +1388,915 @@ class StorageTests(unittest.TestCase):
             self.store.load()["pendingDurations"][0]["id"], operation_id
         )
 
+    def test_v013_keep_remote_resolution_discards_auto_start_migration(self) -> None:
+        self.store.close()
+        self.path.unlink()
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE pending_commands (
+                id TEXT PRIMARY KEY,
+                device_sequence INTEGER NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE pending_task_operations (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE pending_duration_operations (
+                id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            );
+            """
+        )
+        user = {"id": "user-1"}
+        resolution_request = {
+            "requestId": "legacy-resolution",
+            "deviceId": "desktop-v013",
+            "expectedRevision": 0,
+            "strategy": "keep_remote",
+            "commands": [],
+            "taskOperations": [],
+            "durationOperations": [],
+        }
+        legacy = {
+            "deviceId": "desktop-v013",
+            "deviceSequence": 0,
+            "hlc": {"wallMs": 0, "counter": 0},
+            "settings": {
+                "selectedPhase": "focus",
+                "durations": {"focus": 25, "short_break": 5, "long_break": 15},
+                "durationsMs": {
+                    "focus": 25 * 60_000,
+                    "short_break": 5 * 60_000,
+                    "long_break": 15 * 60_000,
+                },
+                "autoStartBreaks": True,
+                "selectedTaskId": None,
+            },
+            "snapshot": {
+                "revision": 0,
+                "canonicalTimer": None,
+                "history": [],
+                "tasks": [],
+                "knownTasks": [],
+                "user": None,
+            },
+            "pendingResolution": {
+                "owner": user,
+                "request": resolution_request,
+                "queueIds": {
+                    "commands": [],
+                    "taskOperations": [],
+                    "durationOperations": [],
+                },
+            },
+            "durationMigrationComplete": True,
+        }
+        connection.executemany(
+            "INSERT INTO meta(key, value) VALUES (?, ?)",
+            (
+                (key, json.dumps(value, separators=(",", ":")))
+                for key, value in legacy.items()
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        self.store = Store(self.path)
+        loaded = self.store.load()
+
+        self.assertTrue(loaded["settings"]["autoStartBreaks"])
+        self.assertFalse(loaded["snapshot"]["autoStartBreaks"])
+        self.assertEqual(len(loaded["pendingAutoStarts"]), 1)
+        self.assertTrue(loaded["pendingAutoStarts"][0]["enabled"])
+        self.assertFalse(self.store.has_pending_auto_break())
+
+        self.store.apply_resolution(
+            self._canonical_response(
+                resolution_request, revision=1, auto_start_breaks=False
+            ),
+            user,
+        )
+        resolved = self.store.load()
+        self.assertEqual(resolved["pendingAutoStarts"], [])
+        self.assertFalse(resolved["settings"]["autoStartBreaks"])
+        self.assertFalse(resolved["snapshot"]["autoStartBreaks"])
+        self.assertIsNone(self.store.pending_resolution())
+
+    def test_legacy_auto_start_migration_queues_true_once_and_persists(self) -> None:
+        settings = self.store.load()["settings"]
+        settings["autoStartBreaks"] = True
+        self.store.set_meta("settings", settings)
+        self.store.set_meta("autoStartMigrationComplete", False)
+        self.store.close()
+
+        self.store = Store(self.path)
+        loaded = self.store.load()
+        self.assertTrue(loaded["settings"]["autoStartBreaks"])
+        self.assertEqual(len(loaded["pendingAutoStarts"]), 1)
+        operation = loaded["pendingAutoStarts"][0]
+        self.assertEqual(
+            set(operation),
+            {
+                "id",
+                "deviceId",
+                "enabled",
+                "occurredAt",
+                "hlcWallMs",
+                "hlcCounter",
+            },
+        )
+        self.assertEqual(operation["deviceId"], self.store.device_id)
+        self.assertTrue(operation["enabled"])
+        self.assertEqual(
+            (operation["occurredAt"], operation["hlcWallMs"], operation["hlcCounter"]),
+            ("1970-01-01T00:00:00.000Z", 0, 0),
+        )
+
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
+
+    def test_legacy_untouched_false_preserves_remote_true_on_replacement(
+        self,
+    ) -> None:
+        settings = self.store.load()["settings"]
+        settings["autoStartBreaks"] = False
+        snapshot = self.store.load()["snapshot"]
+        snapshot.pop("autoStartBreaks")
+        self.store.set_meta("settings", settings)
+        self.store.set_meta("snapshot", snapshot)
+        self.store.set_meta("autoStartMigrationComplete", False)
+        self.store.close()
+
+        self.store = Store(self.path)
+        self.assertTrue(self.store.get_meta("autoStartLegacyDefaultUnknown"))
+        request = self.store.prepare_resolution(
+            {"id": "user-1"}, 1, "replace_remote"
+        )
+        self.assertNotIn("autoStartOperations", request)
+        self.store.apply_resolution(
+            self._canonical_response(
+                request, revision=1, auto_start_breaks=True
+            ),
+            {"id": "user-1"},
+        )
+        self.assertTrue(self.store.load()["settings"]["autoStartBreaks"])
+        self.assertFalse(self.store.get_meta("autoStartLegacyDefaultUnknown"))
+
+        explicit_false = self.store.set_auto_start_breaks(False, now_ms=2_000)
+        explicit = self.store.prepare_resolution(
+            {"id": "user-1"}, 2, "replace_remote"
+        )
+        self.assertEqual(explicit["autoStartOperations"], [explicit_false])
+
+    def test_auto_start_toggles_are_immutable_durable_operations(self) -> None:
+        enabled = self.store.set_auto_start_breaks(True, now_ms=1_000)
+        disabled = self.store.set_auto_start_breaks(False, now_ms=1_000)
+
+        loaded = self.store.load()
+        self.assertEqual(loaded["pendingAutoStarts"], [enabled, disabled])
+        self.assertFalse(loaded["settings"]["autoStartBreaks"])
+        self.assertEqual(
+            disabled["hlcCounter"], enabled["hlcCounter"] + 1
+        )
+
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(
+            self.store.load()["pendingAutoStarts"], [enabled, disabled]
+        )
+
+    def test_auto_start_true_false_sync_and_remote_pull(self) -> None:
+        for revision, enabled in ((1, True), (2, False)):
+            with self.subTest(enabled=enabled):
+                operation = self.store.set_auto_start_breaks(
+                    enabled, now_ms=revision * 1_000
+                )
+                request = self.store.sync_payload()
+                response = self._canonical_response(
+                    request,
+                    revision=revision,
+                    auto_start_breaks=enabled,
+                )
+                self.store.apply_sync(response, request)
+                loaded = self.store.load()
+                self.assertEqual(
+                    response["autoStartAcknowledgements"][0]["operationId"],
+                    operation["id"],
+                )
+                self.assertEqual(loaded["pendingAutoStarts"], [])
+                self.assertEqual(loaded["settings"]["autoStartBreaks"], enabled)
+                self.assertEqual(
+                    loaded["snapshot"]["autoStartBreaks"], enabled
+                )
+
+        pull = self.store.sync_payload()
+        self.store.apply_sync(
+            self._canonical_response(
+                pull, revision=3, auto_start_breaks=True
+            ),
+            pull,
+        )
+        self.assertTrue(self.store.load()["settings"]["autoStartBreaks"])
+
+    def test_auto_start_sync_batches_257_operations_and_rebases(self) -> None:
+        operations = [
+            self.store.set_auto_start_breaks(index % 2 == 0, now_ms=1_000)
+            for index in range(257)
+        ]
+
+        first = self.store.sync_payload()
+        self.assertEqual(first["autoStartOperations"], operations[:256])
+        self.store.apply_sync(
+            self._canonical_response(
+                first, revision=1, auto_start_breaks=operations[255]["enabled"]
+            ),
+            first,
+        )
+        loaded = self.store.load()
+        self.assertEqual(loaded["pendingAutoStarts"], [operations[256]])
+        self.assertEqual(
+            loaded["settings"]["autoStartBreaks"], operations[256]["enabled"]
+        )
+
+        second = self.store.sync_payload()
+        self.assertEqual(second["autoStartOperations"], [operations[256]])
+        self.store.apply_sync(
+            self._canonical_response(
+                second, revision=2, auto_start_breaks=operations[256]["enabled"]
+            ),
+            second,
+        )
+        self.assertEqual(self.store.load()["pendingAutoStarts"], [])
+
+    def test_auto_start_projection_has_deterministic_lww_ties(self) -> None:
+        operations = [
+            {
+                "id": "operation-z",
+                "deviceId": "device-a",
+                "enabled": False,
+                "hlcWallMs": 10,
+                "hlcCounter": 2,
+            },
+            {
+                "id": "operation-a",
+                "deviceId": "device-b",
+                "enabled": True,
+                "hlcWallMs": 10,
+                "hlcCounter": 2,
+            },
+            {
+                "id": "operation-b",
+                "deviceId": "device-b",
+                "enabled": False,
+                "hlcWallMs": 10,
+                "hlcCounter": 2,
+            },
+        ]
+        self.assertFalse(project_auto_start_breaks(True, operations))
+        self.assertTrue(project_auto_start_breaks(False, operations[:2]))
+
+    def test_auto_start_sync_rebases_toggle_created_in_flight(self) -> None:
+        sent = self.store.set_auto_start_breaks(True, now_ms=1_000)
+        request = self.store.sync_payload()
+        replacement = self.store.set_auto_start_breaks(False, now_ms=2_000)
+
+        self.store.apply_sync(
+            self._canonical_response(
+                request, revision=1, auto_start_breaks=True
+            ),
+            request,
+        )
+
+        loaded = self.store.load()
+        self.assertEqual(request["autoStartOperations"], [sent])
+        self.assertEqual(loaded["pendingAutoStarts"], [replacement])
+        self.assertFalse(loaded["settings"]["autoStartBreaks"])
+        self.assertTrue(loaded["snapshot"]["autoStartBreaks"])
+
+    def test_bootstrap_auto_start_presence_legacy_omission_and_exact_retry(
+        self,
+    ) -> None:
+        user = {"id": "user-1"}
+        request = self.store.prepare_resolution(user, 3, "replace_remote")
+        self.assertIn("autoStartOperations", request)
+        self.assertEqual(request["autoStartOperations"], [])
+
+        pending = self.store.pending_resolution(user["id"])
+        legacy_request = dict(pending["request"])
+        legacy_request.pop("autoStartOperations")
+        legacy_queue_ids = dict(pending["queueIds"])
+        legacy_queue_ids.pop("autoStartOperations")
+        self.store.set_meta(
+            "pendingResolution",
+            {
+                "owner": user,
+                "request": legacy_request,
+                "queueIds": legacy_queue_ids,
+            },
+        )
+        self.store.close()
+
+        self.store = Store(self.path)
+        retry = self.store.prepare_resolution(user, 99, "keep_remote")
+        self.assertEqual(retry, legacy_request)
+        self.assertNotIn("autoStartOperations", retry)
+        response = self._canonical_response(
+            retry, revision=4, auto_start_breaks=True
+        )
+        self.store.apply_resolution(response, user)
+        self.assertTrue(self.store.load()["settings"]["autoStartBreaks"])
+
+        self.store.reset_account_data()
+        explicit = self.store.prepare_resolution(user, 5, "replace_remote")
+        self.assertEqual(explicit["autoStartOperations"], [])
+        self.store.apply_resolution(
+            self._canonical_response(
+                explicit, revision=5, auto_start_breaks=False
+            ),
+            user,
+        )
+        self.assertFalse(self.store.load()["settings"]["autoStartBreaks"])
+
+    def test_auto_start_resolution_limit_accepts_4096_and_rejects_4097(self) -> None:
+        rows = []
+        for index in range(4_097):
+            operation = {
+                "id": f"auto-operation-{index}",
+                "deviceId": self.store.device_id,
+                "enabled": bool(index % 2),
+                "occurredAt": "1970-01-01T00:00:00.000Z",
+                "hlcWallMs": index,
+                "hlcCounter": 0,
+            }
+            rows.append(
+                (operation["id"], json.dumps(operation, separators=(",", ":")))
+            )
+        self.store.connection.executemany(
+            "INSERT INTO pending_auto_start_operations(id, payload) VALUES (?, ?)",
+            rows[:4_096],
+        )
+        self.store.connection.commit()
+        request = self.store.prepare_resolution({"id": "user-1"}, 1, "merge")
+        self.assertEqual(len(request["autoStartOperations"]), 4_096)
+
+        self.store.clear_pending_resolution()
+        self.store.connection.execute(
+            "INSERT INTO pending_auto_start_operations(id, payload) VALUES (?, ?)",
+            rows[4_096],
+        )
+        self.store.connection.commit()
+        with self.assertRaisesRegex(ValueError, "at most 4096 auto-start operations"):
+            self.store.prepare_resolution({"id": "user-1"}, 2, "merge")
+
+    def test_concurrent_auto_start_toggles_serialize_hlc_and_projection(self) -> None:
+        barrier = Barrier(3)
+        results = Queue()
+
+        def toggle(enabled: bool) -> None:
+            store = Store(self.path)
+            try:
+                barrier.wait()
+                results.put(store.set_auto_start_breaks(enabled, now_ms=1_000))
+            finally:
+                store.close()
+
+        threads = [Thread(target=toggle, args=(enabled,)) for enabled in (True, False)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+        operations = sorted(
+            [results.get_nowait(), results.get_nowait()],
+            key=lambda item: (item["hlcWallMs"], item["hlcCounter"]),
+        )
+        self.assertEqual(operations[0]["hlcWallMs"], operations[1]["hlcWallMs"])
+        self.assertEqual(
+            operations[1]["hlcCounter"], operations[0]["hlcCounter"] + 1
+        )
+        loaded = self.store.load()
+        self.assertEqual(loaded["pendingAutoStarts"], operations)
+        self.assertEqual(
+            loaded["settings"]["autoStartBreaks"], operations[-1]["enabled"]
+        )
+
+    def test_auto_start_off_and_remote_completion_do_not_start_break(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        timer = {
+            "id": start["timerId"],
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": start["plannedDurationMs"],
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": start["occurredAt"],
+            "taskId": None,
+        }
+        self.store.queue_command(
+            "finish", timer, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.store.set_auto_start_breaks(True, now_ms=2_500)
+        before = len(self.store.load()["pending"])
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
+        )
+        self.assertEqual(len(self.store.load()["pending"]), before)
+        self.assertFalse(self.store.has_pending_auto_break())
+
+        self.store.reset_account_data()
+        operation = self.store.set_auto_start_breaks(True, now_ms=4_000)
+        request = self.store.sync_payload()
+        remote = self._history_item("remote-focus")
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=[remote],
+            auto_start_breaks=True,
+        )
+        self.store.apply_sync(response, request)
+        self.assertEqual(
+            response["autoStartAcknowledgements"][0]["operationId"], operation["id"]
+        )
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=True, now_ms=5_000), []
+        )
+        self.assertEqual(self.store.load()["pending"], [])
+
+    def test_converged_focus_count_starts_one_long_break_after_local_completion(
+        self,
+    ) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=True, now_ms=3_000), []
+        )
+
+        request = self.store.sync_payload()
+        completed, local_history = rebuild_optimistic(None, [], request["commands"])
+        canonical_local = dict(local_history[0])
+        canonical_local.pop("pending", None)
+        remote_history = [self._history_item(f"remote-{index}") for index in range(3)]
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=[canonical_local, *remote_history],
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = completed
+        self.store.apply_sync(response, request)
+
+        commands = self.store.process_auto_break(
+            require_canonical=True, now_ms=3_000
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["phase"], "long_break")
+        self.assertEqual(commands[0]["type"], "start")
+        self.assertEqual(finish["id"], canonical_local["commandId"])
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=True, now_ms=4_000), []
+        )
+        self.assertEqual(
+            [command["id"] for command in self.store.load()["pending"]],
+            [commands[0]["id"]],
+        )
+
+    def test_duplicate_finish_queued_in_flight_keeps_auto_break_trigger(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        first_finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        request = self.store.sync_payload()
+        duplicate_finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_001
+        )
+        canonical_timer, canonical_history = rebuild_optimistic(
+            None, [], request["commands"]
+        )
+        for item in canonical_history:
+            item.pop("pending", None)
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=canonical_history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(response, request)
+
+        started = self.store.process_auto_break(
+            require_canonical=True, now_ms=3_000
+        )
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["phase"], "short_break")
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(first_finish["id"], canonical_history[0]["commandId"])
+        self.assertEqual(
+            [command["id"] for command in self.store.load()["pending"]],
+            [duplicate_finish["id"], started[0]["id"]],
+        )
+
+    def test_stale_auto_break_trigger_does_not_block_newer_valid_trigger(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        first_running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish",
+            first_running,
+            "focus",
+            settings["durationsMs"],
+            now_ms=2_000,
+        )
+        first_completed, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "clear",
+            first_completed,
+            "focus",
+            settings["durationsMs"],
+            now_ms=2_001,
+        )
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=3_000
+        )
+        second_running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish",
+            second_running,
+            "focus",
+            settings["durationsMs"],
+            now_ms=4_000,
+        )
+        trigger_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM pending_auto_breaks"
+        ).fetchone()[0]
+        self.assertEqual(trigger_count, 2)
+
+        started = self.store.process_auto_break(
+            require_canonical=False, now_ms=5_000
+        )
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual((started[0]["type"], started[0]["phase"]), ("start", "short_break"))
+        self.assertFalse(self.store.has_pending_auto_break())
+
+    def test_auto_break_trigger_survives_restart_without_duplicate_start(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        before = len(self.store.load()["pending"])
+        self.store.close()
+
+        self.store = Store(self.path)
+        self.assertTrue(self.store.has_pending_auto_break())
+        started = self.store.process_auto_break(
+            require_canonical=False, now_ms=3_000
+        )
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(self.store.load()["pending"]), before + 1)
+        self.store.close()
+
+        self.store = Store(self.path)
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=False, now_ms=4_000), []
+        )
+        self.assertEqual(len(self.store.load()["pending"]), before + 1)
+
+    def test_crash_after_ack_discards_stale_auto_break_trigger_offline(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        completed, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "clear", completed, "focus", settings["durationsMs"], now_ms=2_001
+        )
+        newer_start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=2_002
+        )
+        request = self.store.sync_payload()
+        canonical_timer, canonical_history = rebuild_optimistic(
+            None, [], request["commands"]
+        )
+        for item in canonical_history:
+            item.pop("pending", None)
+        response = self._canonical_response(
+            request,
+            history=canonical_history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(response, request)
+        self.store.close()
+        self.store = Store(self.path)
+
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
+        )
+        loaded = self.store.load()
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(loaded["pending"], [])
+        self.assertEqual(
+            loaded["snapshot"]["canonicalTimer"]["id"], newer_start["timerId"]
+        )
+
+    def test_remote_finish_cannot_consume_rejected_local_trigger_offline(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        request = self.store.sync_payload()
+        completed, history = rebuild_optimistic(None, [], request["commands"])
+        remote_command_id = "remote-finish"
+        completed["lastIntent"]["commandId"] = remote_command_id
+        history[0]["id"] = f"{start['timerId']}:{remote_command_id}"
+        history[0]["commandId"] = remote_command_id
+        history[0].pop("pending", None)
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = completed
+        response["acknowledgements"] = [
+            {"commandId": start["id"], "outcome": "applied", "reason": ""},
+            {
+                "commandId": finish["id"],
+                "outcome": "rejected",
+                "reason": "superseded by remote finish",
+            },
+        ]
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
+        )
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(self.store.load()["pending"], [])
+
+    def test_remote_start_discards_stale_local_auto_break_trigger(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        request = self.store.sync_payload()
+        _completed, canonical_history = rebuild_optimistic(
+            None, [], request["commands"]
+        )
+        for item in canonical_history:
+            item.pop("pending", None)
+        remote_timer = {
+            "id": "remote-break",
+            "phase": "short_break",
+            "status": "running",
+            "plannedDurationMs": 5 * 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": "1970-01-01T00:00:03.000Z",
+            "taskId": None,
+        }
+        response = self._canonical_response(
+            request,
+            history=canonical_history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = remote_timer
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=True, now_ms=4_000), []
+        )
+        loaded = self.store.load()
+        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertEqual(loaded["pending"], [])
+        self.assertEqual(loaded["snapshot"]["canonicalTimer"], remote_timer)
+
+    def test_concurrent_instances_cannot_duplicate_auto_break_start(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        barrier = Barrier(3)
+        results = Queue()
+
+        def process() -> None:
+            store = Store(self.path)
+            try:
+                barrier.wait()
+                results.put(
+                    store.process_auto_break(
+                        require_canonical=False, now_ms=3_000
+                    )
+                )
+            finally:
+                store.close()
+
+        threads = [Thread(target=process) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+        outcomes = [results.get_nowait(), results.get_nowait()]
+        self.assertEqual(sorted(len(outcome) for outcome in outcomes), [0, 1])
+        starts = [
+            command
+            for command in self.store.load()["pending"]
+            if command["type"] == "start" and command["phase"] == "short_break"
+        ]
+        self.assertEqual(len(starts), 1)
+
+    def test_full_auto_start_cycle_converges_timer_history_tasks_and_durations(
+        self,
+    ) -> None:
+        from pomodorough.terminal import LocalTimer
+
+        task = task_from_title("Cycle task")
+        self.store.queue_task_operation("upsert", task, now_ms=100)
+        self.store.set_selected_task_id(task["id"])
+        custom_durations = {
+            "focus": 2 * 60_000,
+            "short_break": 3 * 60_000,
+            "long_break": 4 * 60_000,
+        }
+        for index, (phase, duration_ms) in enumerate(custom_durations.items()):
+            self.store.queue_duration_operation(phase, duration_ms, now_ms=200 + index)
+        self.store.set_auto_start_breaks(True, now_ms=300)
+        timer = LocalTimer(self.store)
+
+        now_ms = 1_000
+        timer.issue("start", phase="focus", now_ms=now_ms)
+        for focus_number in range(1, 5):
+            now_ms += custom_durations["focus"]
+            timer.issue("finish", now_ms=now_ms)
+            state = timer.state(now_ms=now_ms)
+            expected_break = "long_break" if focus_number == 4 else "short_break"
+            self.assertEqual((state["phase"], state["status"]), (expected_break, "running"))
+            self.assertEqual(state["plannedDurationMs"], custom_durations[expected_break])
+            self.assertIsNone(state["taskId"])
+            if focus_number == 4:
+                break
+            now_ms += custom_durations["short_break"]
+            timer.issue("finish", now_ms=now_ms)
+            timer.issue("clear", now_ms=now_ms + 1)
+            timer.issue("start", phase="focus", now_ms=now_ms + 2)
+            focus_state = timer.state(now_ms=now_ms + 2)
+            self.assertEqual(focus_state["taskId"], task["id"])
+            self.assertEqual(
+                focus_state["plannedDurationMs"], custom_durations["focus"]
+            )
+
+        completed = timer.completed_history()
+        self.assertEqual(
+            [item["phase"] for item in completed],
+            [
+                "focus",
+                "short_break",
+                "focus",
+                "short_break",
+                "focus",
+                "short_break",
+                "focus",
+            ][::-1],
+        )
+        focus_history = [item for item in completed if item["phase"] == "focus"]
+        self.assertEqual(len(focus_history), 4)
+        self.assertTrue(all(item["taskId"] == task["id"] for item in focus_history))
+        self.assertEqual(self.store.load()["settings"]["selectedTaskId"], task["id"])
+
+        request = self.store.sync_payload()
+        canonical_history = []
+        for item in completed:
+            canonical_item = dict(item)
+            canonical_item.pop("pending", None)
+            canonical_item.pop("taskTitle", None)
+            canonical_history.append(canonical_item)
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=canonical_history,
+            tasks=[task],
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = deepcopy(timer.timer)
+        response["durationsMs"] = custom_durations
+        response["serverHlcWallMs"] = max(
+            operation["hlcWallMs"]
+            for key in (
+                "commands",
+                "taskOperations",
+                "durationOperations",
+                "autoStartOperations",
+            )
+            for operation in request[key]
+        )
+        self.store.apply_sync(response, request)
+
+        loaded = self.store.load()
+        self.assertEqual(loaded["pending"], [])
+        self.assertEqual(loaded["pendingTasks"], [])
+        self.assertEqual(loaded["pendingDurations"], [])
+        self.assertEqual(loaded["pendingAutoStarts"], [])
+        self.assertEqual(loaded["snapshot"]["history"], canonical_history)
+        self.assertEqual(loaded["snapshot"]["tasks"], [task])
+        self.assertEqual(loaded["settings"]["durationsMs"], custom_durations)
+        self.assertTrue(loaded["settings"]["autoStartBreaks"])
+
+    def test_auto_start_lost_and_malformed_responses_preserve_exact_operation(
+        self,
+    ) -> None:
+        operation = self.store.set_auto_start_breaks(True, now_ms=1_000)
+        request = self.store.sync_payload()
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.sync_payload()["autoStartOperations"], [operation])
+
+        malformed = self._canonical_response(
+            request, revision=1, auto_start_breaks=True
+        )
+        malformed["autoStartAcknowledgements"] = []
+        before = self.store.load()
+        with self.assertRaisesRegex(ValueError, "auto-start acknowledgement set"):
+            self.store.apply_sync(malformed, request)
+        self.assertEqual(self.store.load(), before)
+
     def test_focus_start_has_task_but_break_start_does_not(self) -> None:
         settings = self.store.load()["settings"]
         task = task_from_title("Release")
@@ -1353,11 +2321,13 @@ class StorageTests(unittest.TestCase):
                 "history": [],
                 "tasks": [],
                 "durationAcknowledgements": [],
+                "autoStartAcknowledgements": [],
                 "durationsMs": {
                     "focus": 25 * 60_000,
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
+                "autoStartBreaks": False,
                 "serverHlcWallMs": focus["hlcWallMs"],
                 "serverHlcCounter": focus["hlcCounter"],
             },
@@ -1399,7 +2369,7 @@ class StorageTests(unittest.TestCase):
             },
         )
         self.assertEqual(loaded["settings"]["selectedPhase"], "long_break")
-        self.assertTrue(loaded["settings"]["autoStartBreaks"])
+        self.assertFalse(loaded["settings"]["autoStartBreaks"])
 
         self.store.close()
         self.store = Store(self.path)
