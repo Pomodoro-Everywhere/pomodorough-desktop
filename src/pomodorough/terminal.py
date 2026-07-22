@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -51,6 +52,7 @@ class LocalTimer:
         self.known_tasks: dict[str, dict[str, Any]] = {}
         self.pending: list[dict[str, Any]] = []
         self.pending_durations: list[dict[str, Any]] = []
+        self.resolution_pending = False
         self.reload()
 
     def reload(self) -> None:
@@ -59,6 +61,7 @@ class LocalTimer:
         snapshot = state["snapshot"]
         self.pending = state["pending"]
         self.pending_durations = state["pendingDurations"]
+        self.resolution_pending = state["pendingResolution"] is not None
         self.tasks = rebuild_tasks(
             snapshot.get("tasks", []), state.get("pendingTasks", [])
         )
@@ -74,7 +77,13 @@ class LocalTimer:
             task["id"] == selected_task_id for task in self.tasks
         ):
             self.settings["selectedTaskId"] = None
-            self.store.set_selected_task_id(None)
+            if not self.resolution_pending:
+                try:
+                    self.store.set_selected_task_id(None)
+                except ValueError:
+                    self.resolution_pending = (
+                        self.store.pending_resolution() is not None
+                    )
         self.timer, self.history = rebuild_optimistic(
             snapshot.get("canonicalTimer"),
             snapshot.get("history", []),
@@ -102,7 +111,12 @@ class LocalTimer:
             elapsed = 0
         planned = max(1, int(timer["plannedDurationMs"]))
 
-        if auto_finish and timer.get("status") == "running" and elapsed >= planned:
+        if (
+            auto_finish
+            and not self.resolution_pending
+            and timer.get("status") == "running"
+            and elapsed >= planned
+        ):
             self.issue("finish", now_ms=now_ms)
             return self.state(now_ms=now_ms)
 
@@ -123,7 +137,15 @@ class LocalTimer:
             "progress": min(1.0, elapsed / planned),
             "pendingCommands": len(self.pending),
             "pendingDurationOperations": len(self.pending_durations),
+            "historyResolutionPending": self.resolution_pending,
         }
+
+    def _store_action(self, action: Callable[[], Any]) -> Any:
+        try:
+            return action()
+        except ValueError as error:
+            self.reload()
+            raise InvalidAction(str(error)) from error
 
     def issue(
         self,
@@ -156,16 +178,20 @@ class LocalTimer:
             durations_ms[selected_phase] = minutes * 60_000
 
         if command_type == "start" and selected_phase != self.selected_phase:
+            self._store_action(
+                lambda: self.store.set_selected_phase(selected_phase)
+            )
             self.settings["selectedPhase"] = selected_phase
-            self.store.set_selected_phase(selected_phase)
 
-        command = self.store.queue_command(
-            command_type,
-            self.timer,
-            selected_phase,
-            durations_ms,
-            self.settings.get("selectedTaskId"),
-            now_ms=now_ms,
+        command = self._store_action(
+            lambda: self.store.queue_command(
+                command_type,
+                self.timer,
+                selected_phase,
+                durations_ms,
+                self.settings.get("selectedTaskId"),
+                now_ms=now_ms,
+            )
         )
         self.reload()
         return command
@@ -187,8 +213,8 @@ class LocalTimer:
         self.reload()
         if self.current_timer().get("status") in ACTIVE_STATUSES:
             raise InvalidAction("Cannot change phase while timer is active.")
-        self.settings["selectedPhase"] = normalize_phase(phase)
-        self.store.set_selected_phase(self.settings["selectedPhase"])
+        selected_phase = normalize_phase(phase)
+        self._store_action(lambda: self.store.set_selected_phase(selected_phase))
         self.reload()
 
     def adjust_duration(self, delta: int) -> int:
@@ -198,7 +224,9 @@ class LocalTimer:
         updated = min(180, max(1, current + delta))
         if updated == current:
             return current
-        self.store.queue_duration_operation(phase, updated * 60_000)
+        self._store_action(
+            lambda: self.store.queue_duration_operation(phase, updated * 60_000)
+        )
         self.reload()
         return updated
 

@@ -69,6 +69,57 @@ class LocalTimerTests(unittest.TestCase):
             self.timer.issue("pause")
         self.assertEqual(self.store.load()["pending"], [])
 
+    def test_pending_resolution_reports_status_and_blocks_with_domain_errors(
+        self,
+    ) -> None:
+        self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
+        before = self.store.load()
+
+        state = self.timer.state(auto_finish=True)
+
+        self.assertTrue(state["historyResolutionPending"])
+        rendered = "\n".join(build_lines(state, [], 80))
+        self.assertIn("history resolution pending", rendered)
+        actions = (
+            lambda: self.timer.issue("start"),
+            lambda: self.timer.select_phase("short-break"),
+            lambda: self.timer.adjust_duration(1),
+            lambda: handle_key(self.timer, ord("+")),
+        )
+        for action in actions:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(InvalidAction, "pending account history"):
+                    action()
+                self.assertEqual(self.store.load(), before)
+
+    def test_pending_resolution_status_does_not_auto_finish_elapsed_timer(
+        self,
+    ) -> None:
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+        self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
+
+        state = self.timer.state(now_ms=61_000, auto_finish=True)
+
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["remainingMs"], 0)
+        self.assertTrue(state["historyResolutionPending"])
+        self.assertEqual(len(self.store.load()["pending"]), 1)
+
+    def test_pending_resolution_status_skips_stale_selection_cleanup(self) -> None:
+        task = task_from_title("Pending selection")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.set_selected_task_id(task["id"])
+        self.store.queue_task_operation("delete", task, now_ms=2)
+        self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
+
+        state = self.timer.state()
+
+        self.assertTrue(state["historyResolutionPending"])
+        self.assertIsNone(self.timer.settings["selectedTaskId"])
+        self.assertEqual(
+            self.store.load()["settings"]["selectedTaskId"], task["id"]
+        )
+
     def test_tui_duration_adjustment_queues_compacted_preference(self) -> None:
         handle_key(self.timer, ord("+"))
         handle_key(self.timer, ord("+"))

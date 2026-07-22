@@ -189,9 +189,18 @@ class MainWindow(QMainWindow):
         self._account_synced = False
         self._sync_request: dict[str, Any] | None = None
         self._sync_waiting = False
+        self._history_resolution_active = False
+        self._resolution_user: dict[str, Any] | None = None
+        self._resolution_phase: str | None = None
+        self._resolution_preview: dict[str, Any] | None = None
+        self._resolution_request_id: str | None = None
+        self._resolution_retry_paused = False
+        self._resolution_retry_scheduled = False
+        self._account_switch_user: dict[str, Any] | None = None
         self._task_selector_signature: tuple[Any, ...] | None = None
         self._task_render_signature: tuple[Any, ...] | None = None
         self._load_state()
+        self._activate_persisted_resolution()
         self.setWindowTitle("Pomodorough — Time, in transit")
         self.setWindowIcon(app_icon)
         self.setMinimumSize(600, 340)
@@ -211,6 +220,7 @@ class MainWindow(QMainWindow):
 
     def _load_state(self) -> None:
         state = self.store.load()
+        pending_resolution = self.store.pending_resolution()
         self.settings = state["settings"]
         self.revision = int(state["snapshot"].get("revision", 0))
         self.base_timer = state["snapshot"].get("canonicalTimer")
@@ -234,11 +244,24 @@ class MainWindow(QMainWindow):
         selected_task_id = self.settings.get("selectedTaskId")
         if selected_task_id and not any(task["id"] == selected_task_id for task in self.tasks):
             self.settings["selectedTaskId"] = None
-            self.store.set_selected_task_id(None)
+            if pending_resolution is None:
+                self.store.set_selected_task_id(None)
         self._task_selector_signature = None
         self._task_render_signature = None
         if hasattr(self, "duration_spins"):
             self._refresh_duration_spins()
+
+    def _activate_persisted_resolution(self) -> bool:
+        pending = self.store.pending_resolution()
+        if pending is None:
+            return False
+        self._history_resolution_active = True
+        self._resolution_user = pending["owner"]
+        self._resolution_phase = "resolve"
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        return True
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -444,11 +467,11 @@ class MainWindow(QMainWindow):
         self.task_input.setPlaceholderText("Add a task")
         self.task_input.setAccessibleName("Task name")
         self.task_input.returnPressed.connect(self._add_task)
-        add_button = QPushButton("ADD TASK")
-        add_button.setObjectName("primaryButton")
-        add_button.clicked.connect(self._add_task)
+        self.add_task_button = QPushButton("ADD TASK")
+        self.add_task_button.setObjectName("primaryButton")
+        self.add_task_button.clicked.connect(self._add_task)
         form.addWidget(self.task_input, 1)
-        form.addWidget(add_button)
+        form.addWidget(self.add_task_button)
         layout.addLayout(form)
 
         self.task_table = QTableWidget(0, 4)
@@ -591,7 +614,11 @@ class MainWindow(QMainWindow):
     def _connect_cloud(self) -> None:
         self.cloud.signed_in.connect(self._signed_in)
         self.cloud.signed_out.connect(self._signed_out)
+        self.cloud.session_expired.connect(self._session_expired)
         self.cloud.sync_ready.connect(self._apply_sync)
+        self.cloud.bootstrap_ready.connect(self._bootstrap_ready)
+        self.cloud.bootstrap_resolved.connect(self._apply_resolution)
+        self.cloud.bootstrap_conflict.connect(self._bootstrap_conflict)
         self.cloud.revision_available.connect(self._remote_revision_available)
         self.cloud.authorization_stale.connect(self._sync)
         self.cloud.failure.connect(self._cloud_failure)
@@ -633,12 +660,19 @@ class MainWindow(QMainWindow):
         self._render_task_selector(timer, active)
         self._update_tray_progress(elapsed / planned, active)
         self.primary_button.setText("PAUSE" if status == "running" else "RESUME" if status == "paused" else "START")
-        self.primary_button.setEnabled(status in {"idle"} | ACTIVE_STATUSES | TERMINAL_STATUSES)
-        self.finish_button.setEnabled(active)
-        self.cancel_button.setEnabled(active)
+        mutations_enabled = not self._history_resolution_active
+        self.primary_button.setEnabled(
+            mutations_enabled
+            and status in {"idle"} | ACTIVE_STATUSES | TERMINAL_STATUSES
+        )
+        self.finish_button.setEnabled(mutations_enabled and active)
+        self.cancel_button.setEnabled(mutations_enabled and active)
+        for spin in self.duration_spins.values():
+            spin.setEnabled(mutations_enabled)
         for phase, button in self.phase_buttons.items():
             button.setChecked(phase == self._selected_phase())
-            button.setEnabled(not active)
+            button.setEnabled(mutations_enabled and not active)
+        self.auto_breaks.setEnabled(mutations_enabled)
         if self.tray:
             self.tray.setToolTip(f"Pomodorough • {format_remaining(remaining)} • {status_labels.get(status, status)}")
             self.tray_primary.setText(self.primary_button.text().title())
@@ -688,6 +722,7 @@ class MainWindow(QMainWindow):
             timer.get("status"),
             self._selected_phase(),
             selected_task_id,
+            self._history_resolution_active,
             tuple((task["id"], task["title"]) for task in choices),
         )
         if signature == self._task_selector_signature:
@@ -704,7 +739,11 @@ class MainWindow(QMainWindow):
                 selected_index = self.task_combo.count() - 1
         self.task_combo.setCurrentIndex(selected_index)
         self.task_combo.blockSignals(False)
-        self.task_combo.setEnabled(not running and self._selected_phase() == "focus")
+        self.task_combo.setEnabled(
+            not self._history_resolution_active
+            and not running
+            and self._selected_phase() == "focus"
+        )
         self.task_combo.setToolTip(
             "Select task for next focus session; paused session keeps its current task."
             if active
@@ -714,6 +753,7 @@ class MainWindow(QMainWindow):
     def _render_tasks(self) -> None:
         signature = (
             datetime.now().astimezone().date(),
+            self._history_resolution_active,
             tuple((task["id"], task["title"]) for task in self.tasks),
             tuple(
                 (
@@ -736,6 +776,8 @@ class MainWindow(QMainWindow):
         self.task_totals.setText(
             f"{total_finished} POMODOROS • {self._format_task_time(total_ms).upper()} TODAY"
         )
+        self.task_input.setEnabled(not self._history_resolution_active)
+        self.add_task_button.setEnabled(not self._history_resolution_active)
         self.task_table.setRowCount(len(self.tasks))
         for row, task in enumerate(self.tasks):
             summary = summaries[task["id"]]
@@ -749,6 +791,7 @@ class MainWindow(QMainWindow):
             delete = QPushButton("DELETE")
             delete.setObjectName("dangerButton")
             delete.setAccessibleName(f'Delete {task["title"]}')
+            delete.setEnabled(not self._history_resolution_active)
             delete.clicked.connect(
                 lambda checked=False, task_id=task["id"]: self._delete_task(task_id)
             )
@@ -769,12 +812,30 @@ class MainWindow(QMainWindow):
     def _tick(self) -> None:
         timer = self._current_timer()
         if timer.get("status") == "running":
+            if self._history_resolution_active:
+                self._render()
+                return
             if elapsed_ms(timer, int(time.time() * 1000)) >= int(timer["plannedDurationMs"]):
                 if not self._auto_finish_in_progress:
                     self._auto_finish_in_progress = True
                     self._issue("finish", automatic=True)
             else:
                 self._render()
+
+    def _mutation_blocked(self) -> bool:
+        if (
+            not self._history_resolution_active
+            and self.store.pending_resolution() is not None
+        ):
+            self._activate_persisted_resolution()
+            self._render()
+            self._set_account_state(False)
+        if not self._history_resolution_active:
+            return False
+        self.notice.emit(
+            "Resolve local and synced history before changing timers, tasks, or durations."
+        )
+        return True
 
     def _primary_action(self) -> None:
         status = self._current_timer().get("status")
@@ -790,6 +851,9 @@ class MainWindow(QMainWindow):
                 self._issue("start")
 
     def _issue(self, command_type: str, automatic: bool = False) -> None:
+        if self._mutation_blocked():
+            self._auto_finish_in_progress = False
+            return
         timer = self._current_timer()
         status = timer.get("status")
         valid = {
@@ -837,6 +901,9 @@ class MainWindow(QMainWindow):
         self._issue("start")
 
     def _select_phase(self, phase: str) -> None:
+        if self._mutation_blocked():
+            self._render()
+            return
         if self._current_timer().get("status") in ACTIVE_STATUSES:
             return
         self.settings["selectedPhase"] = phase
@@ -845,6 +912,13 @@ class MainWindow(QMainWindow):
             self._render()
 
     def _task_selection_changed(self, index: int) -> None:
+        if self._mutation_blocked():
+            self._task_selector_signature = None
+            self._render_task_selector(
+                self._current_timer(),
+                self._current_timer().get("status") in ACTIVE_STATUSES,
+            )
+            return
         if self._current_timer().get("status") == "running":
             return
         task_id = self.task_combo.itemData(index)
@@ -855,6 +929,8 @@ class MainWindow(QMainWindow):
         self._task_selector_signature = None
 
     def _add_task(self) -> None:
+        if self._mutation_blocked():
+            return
         try:
             task = task_from_title(self.task_input.text())
             if not any(existing["id"] == task["id"] for existing in self.tasks):
@@ -870,6 +946,8 @@ class MainWindow(QMainWindow):
         self._sync()
 
     def _delete_task(self, task_id: str) -> None:
+        if self._mutation_blocked():
+            return
         task = self.known_tasks.get(task_id)
         if not task:
             return
@@ -886,6 +964,9 @@ class MainWindow(QMainWindow):
         self._sync()
 
     def _duration_changed(self, phase: str, value: int) -> None:
+        if self._mutation_blocked():
+            self._refresh_duration_spins()
+            return
         try:
             self.store.queue_duration_operation(phase, value * 60_000)
         except (OSError, ValueError) as error:
@@ -904,11 +985,26 @@ class MainWindow(QMainWindow):
             spin.blockSignals(previous)
 
     def _auto_breaks_changed(self, enabled: bool) -> None:
+        if self._mutation_blocked():
+            previous = self.auto_breaks.blockSignals(True)
+            self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
+            self.auto_breaks.blockSignals(previous)
+            return
         self.settings["autoStartBreaks"] = enabled
         self.store.set_auto_start_breaks(enabled)
 
     def _sync(self) -> None:
+        if (
+            not self._history_resolution_active
+            and self.store.pending_resolution() is not None
+        ):
+            self._activate_persisted_resolution()
+            self._render()
+            self._set_account_state(False)
         if not self.cloud.authenticated:
+            return
+        if self._history_resolution_active:
+            self._continue_history_resolution()
             return
         payload = self.store.sync_payload()
         has_pending = bool(
@@ -936,6 +1032,131 @@ class MainWindow(QMainWindow):
             return
         self._sync_waiting = False
         self._sync()
+
+    def _schedule_resolution_retry(self) -> None:
+        if self._resolution_retry_scheduled:
+            return
+        self._resolution_retry_scheduled = True
+        QTimer.singleShot(100, self._retry_history_resolution)
+
+    def _retry_history_resolution(self) -> None:
+        self._resolution_retry_scheduled = False
+        self._continue_history_resolution()
+
+    def _resume_history_resolution(self) -> None:
+        if not self._history_resolution_active:
+            return
+        self._resolution_retry_paused = False
+        if self._resolution_phase == "choice" and self._resolution_preview is not None:
+            self._bootstrap_ready(self._resolution_preview)
+            return
+        self._continue_history_resolution()
+
+    def _continue_history_resolution(self) -> None:
+        if (
+            not self._history_resolution_active
+            or self._resolution_retry_paused
+            or not self.cloud.authenticated
+            or self._resolution_user is None
+            or self._account_switch_user is not None
+        ):
+            return
+        if self.cloud.busy:
+            self._schedule_resolution_retry()
+            return
+        if self._resolution_phase == "resolve":
+            pending = self.store.pending_resolution(
+                str(self._resolution_user.get("id", ""))
+            )
+            if pending is None:
+                self._resolution_phase = "preview"
+            else:
+                request = pending["request"]
+                self._resolution_request_id = request.get("requestId")
+                self.cloud.resolve_bootstrap(request)
+                return
+        if self._resolution_phase == "preview":
+            self.cloud.preview_bootstrap()
+
+    def _bootstrap_ready(self, response: dict[str, Any]) -> None:
+        if not self._history_resolution_active or self._resolution_user is None:
+            return
+        self._resolution_phase = "choice"
+        try:
+            plan = self.store.bootstrap_resolution_plan(response)
+        except (KeyError, TypeError, ValueError) as error:
+            self._resolution_phase = "preview"
+            self._resolution_preview = None
+            self._resolution_retry_paused = True
+            self.notice.emit(str(error))
+            return
+        self._resolution_preview = response
+        strategy = plan["strategy"]
+        if strategy is None:
+            strategy = self._prompt_history_resolution()
+            if strategy is None or not self._confirm_history_resolution(strategy):
+                self._resolution_retry_paused = True
+                return
+        try:
+            self.store.prepare_resolution(
+                self._resolution_user,
+                int(plan["expectedRevision"]),
+                strategy,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            self._resolution_retry_paused = True
+            self.notice.emit(str(error))
+            return
+        self._resolution_phase = "resolve"
+        self._continue_history_resolution()
+
+    def _prompt_history_resolution(self) -> str | None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Choose Pomodorough history")
+        dialog.setText("Local and synced histories both contain completed timers.")
+        dialog.setInformativeText("Choose which history should become canonical.")
+        keep_local = dialog.addButton(
+            "Keep Local", QMessageBox.ButtonRole.AcceptRole
+        )
+        keep_remote = dialog.addButton(
+            "Keep Remote", QMessageBox.ButtonRole.AcceptRole
+        )
+        keep_both = dialog.addButton("Keep Both", QMessageBox.ButtonRole.AcceptRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return {
+            keep_local: "replace_remote",
+            keep_remote: "keep_remote",
+            keep_both: "merge",
+        }.get(dialog.clickedButton())
+
+    def _confirm_history_resolution(self, strategy: str) -> bool:
+        messages = {
+            "replace_remote": (
+                "Replace synced history?",
+                "Keep Local permanently replaces synced timer history with this device's history.",
+            ),
+            "keep_remote": (
+                "Discard local history?",
+                "Keep Remote permanently discards this device's local timer history and pending changes.",
+            ),
+            "merge": (
+                "Combine both histories?",
+                "Keep Both can produce timer conflicts or sync errors. Continue only if you accept that risk.",
+            ),
+        }
+        title, message = messages[strategy]
+        answer = QMessageBox.warning(
+            self,
+            title,
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _remote_revision_available(self, revision: int) -> None:
         if revision > self.revision:
@@ -968,18 +1189,135 @@ class MainWindow(QMainWindow):
         if notices:
             self.notice.emit("Server resolved a sync conflict: " + "; ".join(notices))
 
+    def _apply_resolution(self, response: dict[str, Any]) -> None:
+        if not self._history_resolution_active or self._resolution_user is None:
+            return
+        try:
+            notices = self.store.apply_resolution(
+                response,
+                self._resolution_user,
+                self._resolution_request_id,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            self._resolution_retry_paused = True
+            self.notice.emit(str(error))
+            return
+        self._history_resolution_active = False
+        self._resolution_phase = None
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        self._resolution_user = None
+        self._load_state()
+        self._render()
+        payload = self.store.sync_payload()
+        has_pending = bool(
+            payload["commands"]
+            or payload["taskOperations"]
+            or payload["durationOperations"]
+        )
+        self._set_account_state(not has_pending)
+        if has_pending:
+            self._sync()
+        if notices:
+            self.notice.emit(
+                "Server resolved a history conflict: " + "; ".join(notices)
+            )
+
+    def _bootstrap_conflict(self, details: dict[str, Any]) -> None:
+        if not self._history_resolution_active or self._resolution_user is None:
+            return
+        user_id = self._resolution_user.get("id")
+        request_id = self._resolution_request_id
+        if (
+            not isinstance(user_id, str)
+            or not isinstance(request_id, str)
+            or not self.store.discard_pending_resolution(user_id, request_id)
+        ):
+            self._resolution_retry_paused = True
+            self.notice.emit("Could not discard stale history resolution request.")
+            return
+        self._resolution_phase = "preview"
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        message = details.get("message") if isinstance(details, dict) else None
+        self.statusBar().showMessage(
+            (message or "History changed before resolution could be applied.")
+            + " Refreshing synced history; local data is preserved.",
+            10_000,
+        )
+        self._continue_history_resolution()
+
     def _signed_in(self, user: dict[str, Any]) -> None:
-        if self.user and self.user.get("id") != user.get("id"):
-            self.store.reset_account_data()
+        pending = self.store.pending_resolution()
+        owner = pending["owner"] if pending is not None else self.user
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+        if owner_id and owner_id != user.get("id"):
+            self._account_switch_user = user
+            self._history_resolution_active = True
+            self._resolution_user = owner
+            self._resolution_phase = "resolve" if pending is not None else None
+            self._resolution_preview = None
+            self._resolution_request_id = None
+            self._resolution_retry_paused = True
+            self._sync_request = None
+            self._render()
+            self._set_account_state(False)
+            return
+
+        self._account_switch_user = None
+        if self.user is not None:
+            self.store.set_user(user)
             self._load_state()
-        self.user = user
-        self.store.set_user(user)
+            self._history_resolution_active = False
+            self._resolution_user = None
+            self._resolution_phase = None
+            self._resolution_preview = None
+            self._resolution_request_id = None
+            self._resolution_retry_paused = False
+            self._render()
+            self._set_account_state(False)
+            self._sync()
+            return
+
+        self._history_resolution_active = True
+        self._resolution_user = user
+        self._resolution_phase = "resolve" if pending is not None else "preview"
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        self._render()
         self._set_account_state(False)
-        self._sync()
+        self._continue_history_resolution()
 
     def _signed_out(self) -> None:
-        self.store.reset_account_data()
+        if self._account_switch_user is None:
+            self.store.reset_account_data()
+        self._account_switch_user = None
+        self._history_resolution_active = False
+        self._resolution_user = None
+        self._resolution_phase = None
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        self._sync_request = None
         self._load_state()
+        self._activate_persisted_resolution()
+        self._set_account_state(False)
+        self._render()
+
+    def _session_expired(self) -> None:
+        self._account_switch_user = None
+        self._history_resolution_active = False
+        self._resolution_user = None
+        self._resolution_phase = None
+        self._resolution_preview = None
+        self._resolution_request_id = None
+        self._resolution_retry_paused = False
+        self._sync_request = None
+        self._load_state()
+        self._activate_persisted_resolution()
         self._set_account_state(False)
         self._render()
 
@@ -995,6 +1333,18 @@ class MainWindow(QMainWindow):
             self.account_button.setText("SIGN IN")
             self.account_button.setToolTip("Sign in with Google")
             self.account_button.setAccessibleName("Sign in with Google")
+        elif self._account_switch_user is not None:
+            self.account_button.setText("!")
+            self.account_button.setToolTip(
+                "Signed-in account differs from local data owner. Click to switch or sign out."
+            )
+            self.account_button.setAccessibleName("Account switch required")
+        elif self._history_resolution_active:
+            self.account_button.setText("!")
+            self.account_button.setToolTip(
+                "Signed in; local and synced history must be resolved. Click to continue."
+            )
+            self.account_button.setAccessibleName("History resolution required")
         elif self._account_synced:
             self.account_button.setText("✓")
             self.account_button.setToolTip("Signed in and synced. Click to sign out.")
@@ -1006,6 +1356,24 @@ class MainWindow(QMainWindow):
 
     def _account_action(self) -> None:
         if self.cloud.authenticated:
+            if self._account_switch_user is not None:
+                action = self._choose_account_switch_action()
+                if action == "switch":
+                    user = self._account_switch_user
+                    self.store.reset_account_data()
+                    self._account_switch_user = None
+                    self._load_state()
+                    self._signed_in(user)
+                elif action == "sign_out":
+                    self.cloud.logout()
+                return
+            if self._history_resolution_active:
+                action = self._choose_resolution_account_action()
+                if action == "continue":
+                    self._resume_history_resolution()
+                elif action == "sign_out":
+                    self.cloud.logout()
+                return
             answer = QMessageBox.question(
                 self,
                 "Sign out of Pomodorough?",
@@ -1015,6 +1383,42 @@ class MainWindow(QMainWindow):
                 self.cloud.logout()
         else:
             self.cloud.login()
+
+    def _choose_resolution_account_action(self) -> str | None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("History resolution required")
+        dialog.setText("Continue resolving history or sign out?")
+        dialog.setInformativeText(
+            "Signing out clears this account's timer, history, tasks, and pending resolution from this device."
+        )
+        resume = dialog.addButton(
+            "Continue Resolution", QMessageBox.ButtonRole.AcceptRole
+        )
+        sign_out = dialog.addButton("Sign Out", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return {resume: "continue", sign_out: "sign_out"}.get(dialog.clickedButton())
+
+    def _choose_account_switch_action(self) -> str | None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Different account detected")
+        dialog.setText("Signed-in account does not own this device's local data.")
+        dialog.setInformativeText(
+            "Clear the previous account's local timer, history, tasks, and pending resolution to switch, or sign out without changing that data."
+        )
+        switch = dialog.addButton(
+            "Clear Data & Switch", QMessageBox.ButtonRole.DestructiveRole
+        )
+        sign_out = dialog.addButton("Sign Out", QMessageBox.ButtonRole.RejectRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return {switch: "switch", sign_out: "sign_out"}.get(dialog.clickedButton())
 
     def _cloud_failure(self, message: str) -> None:
         self._sync_request = None

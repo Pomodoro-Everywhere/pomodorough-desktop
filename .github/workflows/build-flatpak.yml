@@ -3,14 +3,23 @@ name: Build Flatpak release
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: flatpak-${{ inputs.tag || github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   flatpak:
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.10
@@ -22,9 +31,11 @@ jobs:
       - name: Read release version
         id: release
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
-            version="${GITHUB_REF_NAME#v}"
+          if [ -n "$TAG" ]; then
+            version="${TAG#v}"
           else
             version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           fi
@@ -39,7 +50,8 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
 
       - name: Attach bundle to release
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.event_name == 'release' || inputs.tag != '' }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak
+          tag_name: ${{ inputs.tag || github.event.release.tag_name }}

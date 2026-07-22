@@ -48,6 +48,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(timer["status"], "completed")
         self.assertEqual(len(history), 1)
 
+    def test_completion_replay_deduplicates_and_keeps_newest_first(self) -> None:
+        running, _history = reduce_command(None, [], command("start"))
+        older = {
+            "id": "older-completion",
+            "timerId": "timer-older",
+            "commandId": "command-older",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 1_500_000,
+            "completedAt": "2026-07-20T11:00:00.000Z",
+        }
+        finish = command("finish", 2, 1_500_000)
+
+        _completed, history = reduce_command(running, [older], finish)
+        _replayed, replayed_history = reduce_command(running, history, finish)
+
+        self.assertEqual(
+            [item["id"] for item in history],
+            ["timer-00000001:command-00000002", "older-completion"],
+        )
+        self.assertEqual(replayed_history, history)
+
     def test_elapsed_uses_positive_wall_time_and_clamps(self) -> None:
         timer = {
             "status": "running",

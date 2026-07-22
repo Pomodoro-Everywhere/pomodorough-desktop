@@ -26,9 +26,22 @@ API_BASE = "https://pomodorough.egigoka.me"
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        document: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.document = document
+
+    def details(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "message": str(self),
+            "document": self.document,
+        }
 
 
 def _request(
@@ -56,12 +69,21 @@ def _request(
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as error:
         body = error.read()
+        document = None
         try:
             document = json.loads(body)
-            message = document.get("error_description") or document.get("error")
+            message = (
+                document.get("error_description") or document.get("error")
+                if isinstance(document, dict)
+                else None
+            )
         except (json.JSONDecodeError, UnicodeDecodeError):
             message = None
-        raise ApiError(message or f"Server returned HTTP {error.code}.", error.code) from error
+        raise ApiError(
+            message or f"Server returned HTTP {error.code}.",
+            error.code,
+            document if isinstance(document, dict) else None,
+        ) from error
     except (urllib.error.URLError, TimeoutError) as error:
         raise ApiError(f"Could not reach Pomodorough: {error.reason if hasattr(error, 'reason') else error}") from error
 
@@ -141,7 +163,7 @@ class TokenStore:
 
 class WorkerSignals(QObject):
     result = Signal(object)
-    error = Signal(str)
+    error = Signal(object)
     finished = Signal()
 
 
@@ -156,7 +178,7 @@ class Worker(QRunnable):
         try:
             self.signals.result.emit(self.function())
         except Exception as error:  # Background boundary reports failures to UI.
-            self.signals.error.emit(str(error))
+            self.signals.error.emit(error)
         finally:
             self.signals.finished.emit()
 
@@ -263,7 +285,11 @@ class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
     signed_out = Signal()
+    session_expired = Signal()
     sync_ready = Signal(object)
+    bootstrap_ready = Signal(object)
+    bootstrap_resolved = Signal(object)
+    bootstrap_conflict = Signal(object)
     revision_available = Signal(object)
     authorization_stale = Signal()
     failure = Signal(str)
@@ -292,13 +318,15 @@ class CloudService(QObject):
         self,
         function: Callable[[], Any],
         on_result: Callable[[Any], None],
-        on_error: Callable[[str], None] | None = None,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.busy = True
         worker = Worker(function)
         self._workers.add(worker)
         worker.signals.result.connect(on_result)
-        worker.signals.error.connect(on_error or self.failure.emit)
+        worker.signals.error.connect(
+            on_error or (lambda error: self.failure.emit(str(error)))
+        )
         worker.signals.finished.connect(lambda: self._finished(worker))
         QThreadPool.globalInstance().start(worker)
 
@@ -336,6 +364,26 @@ class CloudService(QObject):
         self._accept_tokens(response)
         return self.access_token or ""
 
+    def _authorized_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        token = self._ensure_access()
+        try:
+            return _request(
+                method, f"{self.api_base}{path}", payload, access_token=token
+            )
+        except ApiError as error:
+            if error.status != 401:
+                raise
+            self.access_token = None
+            token = self._ensure_access()
+            return _request(
+                method, f"{self.api_base}{path}", payload, access_token=token
+            )
+
     def restore(self) -> None:
         self.status_changed.emit("CONNECTING")
 
@@ -354,11 +402,14 @@ class CloudService(QObject):
             else:
                 self.status_changed.emit("LOCAL • SIGN IN TO SYNC")
 
-        def failed(message: str) -> None:
+        def failed(error: Exception) -> None:
+            if isinstance(error, ApiError) and error.status == 401:
+                self._expire_session()
+                return
             self.access_token = None
             self.authenticated = False
             self.status_changed.emit("OFFLINE • RETRYING")
-            self.failure.emit(message)
+            self.failure.emit(str(error))
 
         self._start(restore_session, restored, failed)
 
@@ -442,9 +493,9 @@ class CloudService(QObject):
             self.status_changed.emit("SYNC READY")
             self.start_revision_stream()
 
-        def failed(message: str) -> None:
+        def failed(error: Exception) -> None:
             self.status_changed.emit("LOCAL • SIGN-IN FAILED")
-            self.failure.emit(message)
+            self.failure.emit(str(error))
 
         self._start(authorize, authorized, failed)
 
@@ -457,30 +508,70 @@ class CloudService(QObject):
         self.status_changed.emit("SYNCING")
 
         def synchronize() -> dict[str, Any]:
-            token = self._ensure_access()
-            try:
-                return _request(
-                    "POST", f"{self.api_base}/api/v1/sync", payload, access_token=token
-                )
-            except ApiError as error:
-                if error.status != 401:
-                    raise
-                self.access_token = None
-                token = self._ensure_access()
-                return _request(
-                    "POST", f"{self.api_base}/api/v1/sync", payload, access_token=token
-                )
+            return self._authorized_request("POST", "/api/v1/sync", payload)
 
         def synchronized(response: dict[str, Any]) -> None:
             self.sync_ready.emit(response)
             self.status_changed.emit("SYNCED")
             self.start_revision_stream()
 
-        def failed(message: str) -> None:
+        def failed(error: Exception) -> None:
+            if isinstance(error, ApiError) and error.status == 401:
+                self._expire_session()
+                return
             self.status_changed.emit("OFFLINE • RETRYING")
-            self.failure.emit(message)
+            self.failure.emit(str(error))
 
         self._start(synchronize, synchronized, failed)
+
+    def preview_bootstrap(self) -> None:
+        if self.busy or not self.authenticated:
+            return
+        self.status_changed.emit("CHECKING HISTORY")
+
+        def preview() -> dict[str, Any]:
+            return self._authorized_request("GET", "/api/v1/bootstrap")
+
+        def ready(response: dict[str, Any]) -> None:
+            self.bootstrap_ready.emit(response)
+            self.status_changed.emit("HISTORY DECISION")
+
+        def failed(error: Exception) -> None:
+            if isinstance(error, ApiError) and error.status == 401:
+                self._expire_session()
+                return
+            self.status_changed.emit("OFFLINE • HISTORY PRESERVED")
+            self.failure.emit(str(error))
+
+        self._start(preview, ready, failed)
+
+    def resolve_bootstrap(self, payload: dict[str, Any]) -> None:
+        if self.busy or not self.authenticated:
+            return
+        self.status_changed.emit("RESOLVING HISTORY")
+
+        def resolve() -> dict[str, Any]:
+            return self._authorized_request(
+                "POST", "/api/v1/bootstrap/resolve", payload
+            )
+
+        def resolved(response: dict[str, Any]) -> None:
+            self.bootstrap_resolved.emit(response)
+            self.status_changed.emit("SYNCED")
+            self.start_revision_stream()
+
+        def failed(error: Exception) -> None:
+            if isinstance(error, ApiError) and error.status == 409:
+                self.status_changed.emit("HISTORY CONFLICT")
+                self.bootstrap_conflict.emit(error.details())
+                return
+            if isinstance(error, ApiError) and error.status == 401:
+                self._expire_session()
+                return
+            self.status_changed.emit("OFFLINE • HISTORY PRESERVED")
+            self.failure.emit(str(error))
+
+        self._start(resolve, resolved, failed)
 
     def start_revision_stream(self) -> None:
         if (
@@ -534,6 +625,18 @@ class CloudService(QObject):
         if reply is not None:
             reply.abort()
             reply.deleteLater()
+
+    def _expire_session(self) -> None:
+        self.stop_revision_stream()
+        try:
+            self.token_store.clear()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self.access_token = None
+        self.access_expires_at = datetime.min.replace(tzinfo=timezone.utc)
+        self.authenticated = False
+        self.session_expired.emit()
+        self.status_changed.emit("SESSION EXPIRED • SIGN IN AGAIN")
 
     def shutdown(self) -> None:
         self._shutting_down = True

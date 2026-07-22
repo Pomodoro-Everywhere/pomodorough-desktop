@@ -224,11 +224,12 @@ uvx ruff check .
 sh -n deploy/install.sh
 ```
 
-## Related repositories
+## Pomodorough projects
 
-- [Server and PWA](https://github.com/egigoka/pomodorough-server)
-- [Apple platforms](https://github.com/egigoka/pomodorough-ios)
+- [Server, Web/PWA, and synchronization](https://github.com/egigoka/pomodorough-server)
+- [iOS, iPadOS, and macOS](https://github.com/egigoka/pomodorough-ios)
 - [Android](https://github.com/egigoka/pomodorough-android)
+- [Linux (this repository)](https://github.com/egigoka/pomodorough-linux)
 
 ## License
 

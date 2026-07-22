@@ -49,6 +49,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("Cannot finish timer while it is idle", error)
 
+    def test_pending_resolution_status_is_safe_and_mutation_is_action_error(
+        self,
+    ) -> None:
+        self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
+
+        result, output, error = self.invoke("status")
+
+        self.assertEqual(result, 0)
+        self.assertIn("Account history resolution pending", output)
+        self.assertEqual(error, "")
+
+        result, output, error = self.invoke("start")
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertIn("Resolve pending account history", error)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,10 +11,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .core import PHASES, elapsed_ms, task_from_title
+from .core import (
+    PHASES,
+    elapsed_ms,
+    parse_timestamp_ms,
+    rebuild_optimistic,
+    task_from_title,
+)
 
 DURATION_MIN_MS = 60_000
-DURATION_MAX_MS = 10_800_000
+PREFERENCE_DURATION_MAX_MS = 10_800_000
+CANONICAL_DURATION_MAX_MS = 14_400_000
+RESOLUTION_OPERATION_MAX = 4_096
+ACKNOWLEDGEMENT_OUTCOMES = {"applied", "ignored", "rejected"}
 
 
 def default_data_path() -> Path:
@@ -92,6 +101,7 @@ class Store:
                 "knownTasks": [],
                 "user": None,
             },
+            "pendingResolution": None,
         }
         with self._immediate_transaction():
             for key, value in defaults.items():
@@ -137,7 +147,9 @@ class Store:
             except (TypeError, ValueError):
                 duration_ms = 0
             if (
-                not DURATION_MIN_MS <= duration_ms <= DURATION_MAX_MS
+                not DURATION_MIN_MS
+                <= duration_ms
+                <= PREFERENCE_DURATION_MAX_MS
                 or duration_ms % 60_000
             ):
                 legacy_value = durations.get(phase, default_minutes)
@@ -171,11 +183,15 @@ class Store:
         return duration_ms // 60_000
 
     @staticmethod
-    def _duration_ms(value: Any) -> int:
+    def _duration_ms(
+        value: Any, *, maximum: int = PREFERENCE_DURATION_MAX_MS
+    ) -> int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("Duration must be an integer number of milliseconds.")
-        if not DURATION_MIN_MS <= value <= DURATION_MAX_MS:
-            raise ValueError("Duration must be between 60000 and 10800000 milliseconds.")
+        if not DURATION_MIN_MS <= value <= maximum:
+            raise ValueError(
+                f"Duration must be between {DURATION_MIN_MS} and {maximum} milliseconds."
+            )
         if value % 60_000:
             raise ValueError("Duration must be measured in whole minutes.")
         return value
@@ -250,11 +266,13 @@ class Store:
             "pending": pending,
             "pendingTasks": pending_tasks,
             "pendingDurations": pending_durations,
+            "pendingResolution": self.get_meta("pendingResolution"),
         }
 
     def save_settings(self, settings: dict[str, Any]) -> None:
         candidate = self._normalize_settings(settings)
         with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
             current = self._normalize_settings(self.get_meta("settings", {}))
             candidate["durations"] = current["durations"]
             candidate["durationsMs"] = current["durationsMs"]
@@ -262,6 +280,7 @@ class Store:
 
     def _set_local_setting(self, key: str, value: Any) -> None:
         with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
             settings = self._normalize_settings(self.get_meta("settings", {}))
             settings[key] = value
             self._set_meta("settings", settings)
@@ -288,6 +307,7 @@ class Store:
     ) -> dict[str, Any]:
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
             sequence = int(self.get_meta("deviceSequence", 0)) + 1
             old_hlc = self.get_meta("hlc", {"wallMs": 0, "counter": 0})
             old_wall_ms = int(old_hlc.get("wallMs", 0))
@@ -348,6 +368,7 @@ class Store:
 
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
             old_hlc = self.get_meta("hlc", {"wallMs": 0, "counter": 0})
             old_wall_ms = int(old_hlc.get("wallMs", 0))
             wall_ms = max(now_ms, old_wall_ms)
@@ -391,6 +412,7 @@ class Store:
             raise ValueError("Unsupported timer phase.")
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
             settings = self._normalize_settings(self.get_meta("settings", {}))
             operation = self._queue_duration_operation(
                 phase, duration_ms, settings, now_ms
@@ -443,6 +465,7 @@ class Store:
         return operation
 
     def sync_payload(self) -> dict[str, Any]:
+        self._ensure_no_pending_resolution()
         state = self.load()
         return {
             "deviceId": self.device_id,
@@ -451,6 +474,158 @@ class Store:
             "taskOperations": state["pendingTasks"][:256],
             "durationOperations": state["pendingDurations"][:256],
         }
+
+    def pending_resolution(self, user_id: str | None = None) -> dict[str, Any] | None:
+        pending = self.get_meta("pendingResolution")
+        if not isinstance(pending, dict):
+            return None
+        owner = pending.get("owner")
+        request = pending.get("request")
+        queue_ids = pending.get("queueIds")
+        if (
+            not isinstance(owner, dict)
+            or not isinstance(request, dict)
+            or not isinstance(queue_ids, dict)
+            or set(queue_ids) != {"commands", "taskOperations", "durationOperations"}
+            or any(
+                not isinstance(ids, list)
+                or any(not isinstance(item_id, str) for item_id in ids)
+                or len(ids) != len(set(ids))
+                for ids in queue_ids.values()
+            )
+        ):
+            return None
+        if user_id is not None and owner.get("id") != user_id:
+            return None
+        return pending
+
+    def clear_pending_resolution(self) -> None:
+        self.set_meta("pendingResolution", None)
+
+    def _ensure_no_pending_resolution(self) -> None:
+        if self.pending_resolution() is not None:
+            raise ValueError("Resolve pending account history before making changes.")
+
+    def discard_pending_resolution(self, user_id: str, request_id: str) -> bool:
+        with self._immediate_transaction():
+            pending = self.pending_resolution(user_id)
+            if (
+                pending is None
+                or pending["request"].get("requestId") != request_id
+            ):
+                return False
+            self._set_meta("pendingResolution", None)
+        return True
+
+    def bootstrap_resolution_plan(
+        self, response: dict[str, Any]
+    ) -> dict[str, Any]:
+        state = self.load()
+        canonical = self._validated_sync_response(
+            response,
+            {"commands": [], "taskOperations": [], "durationOperations": []},
+        )
+        _timer, local_history = rebuild_optimistic(
+            state["snapshot"].get("canonicalTimer"),
+            state["snapshot"].get("history", []),
+            state["pending"],
+        )
+        local_history_exists = any(
+            item.get("status") == "completed" for item in local_history
+        )
+        remote_history_exists = any(
+            item.get("status") == "completed" for item in canonical["history"]
+        )
+        local_state_exists = bool(
+            state["pending"]
+            or state["pendingTasks"]
+            or state["pendingDurations"]
+            or state["snapshot"].get("canonicalTimer")
+            or state["snapshot"].get("history")
+            or state["snapshot"].get("tasks")
+        )
+        if local_history_exists and remote_history_exists:
+            strategy = None
+        elif local_history_exists:
+            strategy = "replace_remote"
+        elif remote_history_exists:
+            strategy = "keep_remote"
+        elif local_state_exists:
+            strategy = "merge"
+        else:
+            strategy = "keep_remote"
+        return {
+            "expectedRevision": canonical["revision"],
+            "localHistory": local_history_exists,
+            "remoteHistory": remote_history_exists,
+            "strategy": strategy,
+        }
+
+    def prepare_resolution(
+        self,
+        user: dict[str, Any],
+        expected_revision: int,
+        strategy: str,
+    ) -> dict[str, Any]:
+        if strategy not in {"keep_remote", "replace_remote", "merge"}:
+            raise ValueError("Unsupported history resolution strategy.")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("Bootstrap returned an invalid revision.")
+        user_id = user.get("id") if isinstance(user, dict) else None
+        if not isinstance(user_id, str) or not user_id:
+            raise ValueError("Signed-in user has no stable identity.")
+
+        with self._immediate_transaction():
+            pending = self.pending_resolution()
+            if pending is not None:
+                if pending["owner"].get("id") != user_id:
+                    raise ValueError(
+                        "Pending account history belongs to another account."
+                    )
+                return pending["request"]
+            state = self.load()
+            operations = state if strategy != "keep_remote" else None
+            outbound = {
+                "commands": operations["pending"] if operations else [],
+                "taskOperations": operations["pendingTasks"] if operations else [],
+                "durationOperations": (
+                    operations["pendingDurations"] if operations else []
+                ),
+            }
+            labels = {
+                "commands": "timer commands",
+                "taskOperations": "task operations",
+                "durationOperations": "duration operations",
+            }
+            for key, items in outbound.items():
+                if len(items) > RESOLUTION_OPERATION_MAX:
+                    raise ValueError(
+                        f"History resolution supports at most "
+                        f"{RESOLUTION_OPERATION_MAX} {labels[key]}."
+                    )
+            request = {
+                "requestId": str(uuid.uuid4()),
+                "deviceId": self.device_id,
+                "expectedRevision": expected_revision,
+                "strategy": strategy,
+                **outbound,
+            }
+            queue_ids = {
+                "commands": [item["id"] for item in state["pending"]],
+                "taskOperations": [item["id"] for item in state["pendingTasks"]],
+                "durationOperations": [
+                    item["id"] for item in state["pendingDurations"]
+                ],
+            }
+            self._set_meta(
+                "pendingResolution",
+                {"owner": user, "request": request, "queueIds": queue_ids},
+            )
+        return request
 
     @staticmethod
     def _validate_acknowledgements(
@@ -470,7 +645,7 @@ class Store:
             if (
                 not isinstance(acknowledgement, dict)
                 or not isinstance(acknowledgement.get(acknowledgement_id_key), str)
-                or not isinstance(acknowledgement.get("outcome"), str)
+                or acknowledgement.get("outcome") not in ACKNOWLEDGEMENT_OUTCOMES
                 or not isinstance(acknowledgement.get("reason"), str)
             ):
                 raise ValueError(f"Sync returned invalid {label} acknowledgements.")
@@ -486,112 +661,360 @@ class Store:
             )
         return response_items
 
-    def apply_sync(
-        self, response: dict[str, Any], request: dict[str, Any]
+    def _validated_sync_response(
+        self,
+        response: dict[str, Any],
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(response, dict):
+            raise ValueError("Server returned an invalid sync response.")
+        required = {
+            "acknowledgements",
+            "taskAcknowledgements",
+            "durationAcknowledgements",
+            "revision",
+            "canonicalTimer",
+            "history",
+            "tasks",
+            "durationsMs",
+            "serverHlcWallMs",
+            "serverHlcCounter",
+        }
+        missing = required - set(response)
+        if missing:
+            raise ValueError(
+                "Server response omitted canonical fields: "
+                + ", ".join(sorted(missing))
+                + "."
+            )
+        acknowledgements = self._validate_acknowledgements(
+            request.get("commands"), response["acknowledgements"],
+            "commandId",
+            "command",
+        )
+        task_acknowledgements = self._validate_acknowledgements(
+            request.get("taskOperations"), response["taskAcknowledgements"],
+            "operationId",
+            "task",
+        )
+        duration_acknowledgements = self._validate_acknowledgements(
+            request.get("durationOperations"), response["durationAcknowledgements"],
+            "operationId",
+            "duration",
+        )
+        canonical_durations = self._canonical_durations(response["durationsMs"])
+        revision = response["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("Server returned an invalid revision.")
+        history = response["history"]
+        if not isinstance(history, list):
+            raise ValueError("Server returned invalid timer history.")
+        history_ids: list[str] = []
+        for item in history:
+            if not self._valid_history_item(item):
+                raise ValueError("Server returned invalid timer history.")
+            history_ids.append(item["id"])
+        if len(history_ids) != len(set(history_ids)):
+            raise ValueError("Server returned duplicate timer history.")
+        tasks = response["tasks"]
+        if not isinstance(tasks, list):
+            raise ValueError("Server returned invalid tasks.")
+        task_ids: list[str] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                raise ValueError("Server returned invalid tasks.")
+            task_id = task.get("id")
+            title = task.get("title")
+            try:
+                normalized = task_from_title(title) if isinstance(title, str) else None
+            except ValueError:
+                normalized = None
+            if normalized is None or normalized["id"] != task_id:
+                raise ValueError("Server returned invalid tasks.")
+            task_ids.append(task_id)
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("Server returned duplicate tasks.")
+        canonical_timer = response["canonicalTimer"]
+        if canonical_timer is not None and not self._valid_canonical_timer(
+            canonical_timer
+        ):
+            raise ValueError("Server returned an invalid canonical timer.")
+        server_hlc_wall_ms = response["serverHlcWallMs"]
+        server_hlc_counter = response["serverHlcCounter"]
+        if (
+            isinstance(server_hlc_wall_ms, bool)
+            or not isinstance(server_hlc_wall_ms, int)
+            or server_hlc_wall_ms < 0
+            or isinstance(server_hlc_counter, bool)
+            or not isinstance(server_hlc_counter, int)
+            or server_hlc_counter < 0
+        ):
+            raise ValueError("Server returned an invalid logical clock.")
+        return {
+            "acknowledgements": acknowledgements,
+            "taskAcknowledgements": task_acknowledgements,
+            "durationAcknowledgements": duration_acknowledgements,
+            "revision": revision,
+            "canonicalTimer": canonical_timer,
+            "history": history,
+            "tasks": tasks,
+            "durationsMs": canonical_durations,
+            "serverHlcWallMs": server_hlc_wall_ms,
+            "serverHlcCounter": server_hlc_counter,
+        }
+
+    @classmethod
+    def _valid_canonical_timer(cls, timer: Any) -> bool:
+        if not isinstance(timer, dict):
+            return False
+        required = {
+            "id",
+            "phase",
+            "status",
+            "plannedDurationMs",
+            "elapsedAtAnchorMs",
+            "anchorAt",
+        }
+        if required - set(timer):
+            return False
+        try:
+            planned_ms = cls._duration_ms(
+                timer["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS
+            )
+        except ValueError:
+            return False
+        elapsed = timer["elapsedAtAnchorMs"]
+        if (
+            not isinstance(timer["id"], str)
+            or not timer["id"]
+            or timer["phase"] not in PHASES
+            or timer["status"]
+            not in {"running", "paused", "completed", "cancelled", "superseded"}
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, int)
+            or not 0 <= elapsed <= planned_ms
+            or not isinstance(timer["anchorAt"], str)
+            or parse_timestamp_ms(timer["anchorAt"]) is None
+            or not isinstance(timer.get("taskId"), (str, type(None)))
+            or isinstance(timer.get("taskId"), str)
+            and not timer["taskId"]
+        ):
+            return False
+        intent = timer.get("lastIntent")
+        return intent is None or (
+            isinstance(intent, dict)
+            and intent.get("type")
+            in {"start", "pause", "resume", "finish", "cancel", "clear"}
+            and isinstance(intent.get("commandId"), str)
+            and bool(intent["commandId"])
+            and isinstance(intent.get("occurredAt"), str)
+            and parse_timestamp_ms(intent["occurredAt"]) is not None
+        )
+
+    @classmethod
+    def _valid_history_item(cls, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        required = {"id", "timerId", "phase", "status", "plannedDurationMs"}
+        if required - set(item):
+            return False
+        try:
+            cls._duration_ms(
+                item["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS
+            )
+        except ValueError:
+            return False
+        for timestamp_key in ("completedAt", "endedAt"):
+            timestamp = item.get(timestamp_key)
+            if timestamp is not None and (
+                not isinstance(timestamp, str)
+                or parse_timestamp_ms(timestamp) is None
+            ):
+                return False
+        return (
+            isinstance(item["id"], str)
+            and bool(item["id"])
+            and isinstance(item["timerId"], str)
+            and bool(item["timerId"])
+            and item["phase"] in PHASES
+            and item["status"] in {"completed", "cancelled", "superseded"}
+            and isinstance(item.get("commandId"), (str, type(None)))
+            and (item.get("commandId") is None or bool(item["commandId"]))
+            and isinstance(item.get("taskId"), (str, type(None)))
+            and (item.get("taskId") is None or bool(item["taskId"]))
+            and isinstance(item.get("pending", False), bool)
+        )
+
+    def _apply_acknowledgements(
+        self, canonical: dict[str, Any], *, delete: bool = True
     ) -> list[str]:
         notices: list[str] = []
-        with self._immediate_transaction():
-            acknowledgements = self._validate_acknowledgements(
-                request.get("commands"),
-                response.get("acknowledgements"),
+        groups = (
+            (
+                "acknowledgements",
+                "DELETE FROM pending_commands WHERE id = ?",
                 "commandId",
-                "command",
-            )
-            task_acknowledgements = self._validate_acknowledgements(
-                request.get("taskOperations"),
-                response.get("taskAcknowledgements"),
+            ),
+            (
+                "taskAcknowledgements",
+                "DELETE FROM pending_task_operations WHERE id = ?",
                 "operationId",
-                "task",
-            )
-            duration_acknowledgements = self._validate_acknowledgements(
-                request.get("durationOperations"),
-                response.get("durationAcknowledgements"),
+            ),
+            (
+                "durationAcknowledgements",
+                "DELETE FROM pending_duration_operations WHERE id = ?",
                 "operationId",
-                "duration",
-            )
-            canonical_durations = self._canonical_durations(
-                response.get("durationsMs")
-            )
-
-            for acknowledgement in acknowledgements:
-                self.connection.execute(
-                    "DELETE FROM pending_commands WHERE id = ?",
-                    (acknowledgement["commandId"],),
-                )
+            ),
+        )
+        for response_key, delete_statement, id_key in groups:
+            for acknowledgement in canonical[response_key]:
+                if delete:
+                    self.connection.execute(
+                        delete_statement,
+                        (acknowledgement[id_key],),
+                    )
                 if acknowledgement["outcome"] != "applied":
                     notices.append(
                         acknowledgement["reason"] or acknowledgement["outcome"]
                     )
+        return notices
 
-            for acknowledgement in task_acknowledgements:
-                self.connection.execute(
-                    "DELETE FROM pending_task_operations WHERE id = ?",
-                    (acknowledgement["operationId"],),
-                )
-                if acknowledgement["outcome"] != "applied":
-                    notices.append(
-                        acknowledgement["reason"] or acknowledgement["outcome"]
-                    )
+    def _delete_resolution_queue_ids(self, queue_ids: dict[str, list[str]]) -> None:
+        groups = (
+            ("commands", "DELETE FROM pending_commands WHERE id = ?"),
+            (
+                "taskOperations",
+                "DELETE FROM pending_task_operations WHERE id = ?",
+            ),
+            (
+                "durationOperations",
+                "DELETE FROM pending_duration_operations WHERE id = ?",
+            ),
+        )
+        for key, statement in groups:
+            self.connection.executemany(
+                statement, ((item_id,) for item_id in queue_ids[key])
+            )
 
-            for acknowledgement in duration_acknowledgements:
-                self.connection.execute(
-                    "DELETE FROM pending_duration_operations WHERE id = ?",
-                    (acknowledgement["operationId"],),
-                )
-                if acknowledgement["outcome"] != "applied":
-                    reason = acknowledgement["reason"] or acknowledgement["outcome"]
-                    notices.append(reason)
+    def _install_canonical(
+        self,
+        canonical: dict[str, Any],
+        user: dict[str, Any] | None,
+        *,
+        preserve_known_tasks: bool,
+    ) -> None:
+        settings = self._normalize_settings(self.get_meta("settings", {}))
+        settings["durationsMs"] = canonical["durationsMs"]
+        settings["durations"] = {
+            phase: self._display_minutes(duration_ms)
+            for phase, duration_ms in canonical["durationsMs"].items()
+        }
+        for row in self.connection.execute(
+            "SELECT payload FROM pending_duration_operations ORDER BY rowid"
+        ):
+            operation = json.loads(row["payload"])
+            phase = operation.get("phase")
+            if phase in PHASES:
+                duration_ms = self._duration_ms(operation.get("durationMs"))
+                settings["durationsMs"][phase] = duration_ms
+                settings["durations"][phase] = self._display_minutes(duration_ms)
+        self._set_meta("settings", settings)
 
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            settings["durationsMs"] = canonical_durations
-            settings["durations"] = {
-                phase: self._display_minutes(duration_ms)
-                for phase, duration_ms in canonical_durations.items()
-            }
-            for row in self.connection.execute(
-                "SELECT payload FROM pending_duration_operations ORDER BY rowid"
-            ):
-                operation = json.loads(row["payload"])
-                phase = operation.get("phase")
-                if phase in PHASES:
-                    duration_ms = self._duration_ms(operation.get("durationMs"))
-                    settings["durationsMs"][phase] = duration_ms
-                    settings["durations"][phase] = self._display_minutes(duration_ms)
-            self._set_meta("settings", settings)
-
-            previous = self.get_meta("snapshot")
-            tasks = response.get("tasks", previous.get("tasks", []))
-            known = {
+        previous = self.get_meta("snapshot", {})
+        known = (
+            {
                 task["id"]: task
                 for task in previous.get("knownTasks", [])
                 if task.get("id") and task.get("title")
             }
-            for task in tasks:
-                if task.get("id") and task.get("title"):
-                    known[task["id"]] = task
-            self._set_meta(
-                "snapshot",
-                {
-                    "revision": int(response["revision"]),
-                    "canonicalTimer": response.get("canonicalTimer"),
-                    "history": response.get("history", []),
-                    "tasks": tasks,
-                    "knownTasks": sorted(
-                        known.values(),
-                        key=lambda item: (item["title"].casefold(), item["id"]),
-                    ),
-                    "user": previous.get("user"),
-                },
+            if preserve_known_tasks
+            else {}
+        )
+        for task in canonical["tasks"]:
+            if task.get("id") and task.get("title"):
+                known[task["id"]] = task
+        self._set_meta(
+            "snapshot",
+            {
+                "revision": canonical["revision"],
+                "canonicalTimer": canonical["canonicalTimer"],
+                "history": canonical["history"],
+                "tasks": canonical["tasks"],
+                "knownTasks": sorted(
+                    known.values(),
+                    key=lambda item: (item["title"].casefold(), item["id"]),
+                ),
+                "user": user,
+            },
+        )
+        hlc = self.get_meta("hlc", {"wallMs": 0, "counter": 0})
+        merged_wall, merged_counter = max(
+            (int(time.time() * 1000), 0),
+            (int(hlc.get("wallMs", 0)), int(hlc.get("counter", 0))),
+            (canonical["serverHlcWallMs"], canonical["serverHlcCounter"]),
+        )
+        self._set_meta("hlc", {"wallMs": merged_wall, "counter": merged_counter})
+
+    def apply_sync(
+        self, response: dict[str, Any], request: dict[str, Any]
+    ) -> list[str]:
+        with self._immediate_transaction():
+            previous = self.get_meta("snapshot")
+            canonical = self._validated_sync_response(response, request)
+            if canonical["revision"] < int(previous.get("revision", 0)):
+                raise ValueError("Server response would regress canonical revision.")
+            notices = self._apply_acknowledgements(canonical)
+            self._install_canonical(
+                canonical,
+                previous.get("user"),
+                preserve_known_tasks=True,
             )
-            hlc = self.get_meta("hlc", {"wallMs": 0, "counter": 0})
-            merged_wall, merged_counter = max(
-                (int(time.time() * 1000), 0),
-                (int(hlc.get("wallMs", 0)), int(hlc.get("counter", 0))),
-                (int(response["serverHlcWallMs"]), int(response["serverHlcCounter"])),
+        return notices
+
+    def apply_resolution(
+        self,
+        response: dict[str, Any],
+        user: dict[str, Any],
+        request_id: str | None = None,
+    ) -> list[str]:
+        user_id = user.get("id") if isinstance(user, dict) else None
+        with self._immediate_transaction():
+            pending = self.pending_resolution(user_id)
+            if pending is None:
+                raise ValueError("No matching history resolution is pending.")
+            request = pending["request"]
+            if request_id is not None and request.get("requestId") != request_id:
+                raise ValueError("History resolution response matched a stale request.")
+            canonical = self._validated_sync_response(response, request)
+            previous = self.get_meta("snapshot", {})
+            minimum_revision = max(
+                int(previous.get("revision", 0)), int(request["expectedRevision"])
             )
-            self._set_meta(
-                "hlc", {"wallMs": merged_wall, "counter": merged_counter}
+            if canonical["revision"] < minimum_revision:
+                raise ValueError("Server response would regress canonical revision.")
+            strategy = request.get("strategy")
+            if strategy not in {"keep_remote", "replace_remote", "merge"}:
+                raise ValueError("Pending history resolution has an invalid strategy.")
+            queue_ids = pending["queueIds"]
+            request_ids = {
+                key: [item.get("id") for item in request.get(key, [])]
+                for key in ("commands", "taskOperations", "durationOperations")
+            }
+            if strategy == "keep_remote":
+                if any(request_ids.values()):
+                    raise ValueError("Keep-remote resolution contains local operations.")
+            elif request_ids != queue_ids:
+                raise ValueError(
+                    "Pending history resolution does not match captured queue IDs."
+                )
+            notices = self._apply_acknowledgements(canonical, delete=False)
+            self._delete_resolution_queue_ids(queue_ids)
+            self._install_canonical(
+                canonical,
+                user,
+                preserve_known_tasks=strategy != "keep_remote",
             )
+            self._set_meta("pendingResolution", None)
         return notices
 
     def set_user(self, user: dict[str, Any] | None) -> None:
@@ -605,6 +1028,7 @@ class Store:
             self.connection.execute("DELETE FROM pending_commands")
             self.connection.execute("DELETE FROM pending_task_operations")
             self.connection.execute("DELETE FROM pending_duration_operations")
+            self._set_meta("pendingResolution", None)
             settings = self._normalize_settings(self.get_meta("settings", {}))
             settings["durations"] = {
                 phase: int(definition["default_minutes"])

@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from pomodorough.core import task_from_title
 from pomodorough.storage import Store
@@ -20,16 +20,24 @@ from pomodorough.ui import MainWindow
 class FakeCloud(QObject):
     signed_in = Signal(object)
     signed_out = Signal()
+    session_expired = Signal()
     sync_ready = Signal(object)
+    bootstrap_ready = Signal(object)
+    bootstrap_resolved = Signal(object)
+    bootstrap_conflict = Signal(object)
     revision_available = Signal(object)
     authorization_stale = Signal()
     failure = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, authenticated: bool = True, busy: bool = False) -> None:
         super().__init__()
-        self.authenticated = True
-        self.busy = False
+        self.authenticated = authenticated
+        self.busy = busy
         self.payloads: list[dict[str, object]] = []
+        self.bootstrap_previews = 0
+        self.resolutions: list[dict[str, object]] = []
+        self.login_calls = 0
+        self.logout_calls = 0
 
     def restore(self) -> None:
         pass
@@ -37,11 +45,17 @@ class FakeCloud(QObject):
     def sync(self, payload: dict[str, object]) -> None:
         self.payloads.append(payload)
 
+    def preview_bootstrap(self) -> None:
+        self.bootstrap_previews += 1
+
+    def resolve_bootstrap(self, payload: dict[str, object]) -> None:
+        self.resolutions.append(payload)
+
     def login(self) -> None:
-        pass
+        self.login_calls += 1
 
     def logout(self) -> None:
-        pass
+        self.logout_calls += 1
 
 
 class MainWindowDurationTests(unittest.TestCase):
@@ -61,6 +75,540 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window.close()
         self.store.close()
         self.temporary.cleanup()
+
+    def _replace_window(self, cloud: FakeCloud) -> None:
+        self.window.quitting = True
+        self.window.close()
+        self.cloud = cloud
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(self.store, self.cloud, QIcon())
+
+    @staticmethod
+    def _history_item(item_id: str) -> dict[str, object]:
+        return {
+            "id": item_id,
+            "timerId": f"timer-{item_id}",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 25 * 60_000,
+            "completedAt": "2026-07-22T10:00:00.000Z",
+        }
+
+    @staticmethod
+    def _bootstrap_response(
+        *, revision: int = 1, history: list[dict[str, object]] | None = None
+    ) -> dict[str, object]:
+        return {
+            "acknowledgements": [],
+            "taskAcknowledgements": [],
+            "durationAcknowledgements": [],
+            "revision": revision,
+            "canonicalTimer": None,
+            "history": history or [],
+            "tasks": [],
+            "durationsMs": {
+                "focus": 25 * 60_000,
+                "short_break": 5 * 60_000,
+                "long_break": 15 * 60_000,
+            },
+            "serverHlcWallMs": 1_000,
+            "serverHlcCounter": 0,
+        }
+
+    def _queue_completed_timer(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        timer = {
+            "id": start["timerId"],
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": start["plannedDurationMs"],
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": start["occurredAt"],
+            "taskId": None,
+        }
+        self.store.queue_command(
+            "finish", timer, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        self.window._load_state()
+        self.window._render()
+
+    def test_first_unowned_sign_in_previews_before_any_sync(self) -> None:
+        self.store.queue_task_operation("upsert", task_from_title("Local task"))
+
+        self.window._signed_in({"id": "user-1"})
+
+        self.assertEqual(self.cloud.bootstrap_previews, 1)
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.cloud.resolutions, [])
+        self.assertTrue(self.window._history_resolution_active)
+
+    def test_persisted_resolution_blocks_immediately_without_token(self) -> None:
+        task = task_from_title("Persisted pending task")
+        operation = self.store.queue_task_operation("upsert", task, now_ms=1)
+        owner = {"id": "user-1", "email": "one@example.com"}
+        request = self.store.prepare_resolution(owner, 4, "merge")
+        before = self.store.load()
+        self._replace_window(FakeCloud(authenticated=False))
+
+        self.assertTrue(self.window._history_resolution_active)
+        self.assertEqual(self.window._resolution_user, owner)
+        self.assertFalse(self.window.primary_button.isEnabled())
+        self.assertFalse(self.window.auto_breaks.isEnabled())
+        self.window.task_input.setText("Blocked task")
+        with patch.object(QMessageBox, "warning"):
+            self.window._issue("start")
+            self.window._add_task()
+            self.window._duration_changed("focus", 30)
+            self.window._select_phase("long_break")
+            self.window._auto_breaks_changed(True)
+        self.window._sync()
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.cloud.payloads, [])
+
+        self.window._session_expired()
+        self.assertTrue(self.window._history_resolution_active)
+        self.assertEqual(
+            self.store.pending_resolution(owner["id"])["request"], request
+        )
+        self.assertEqual(self.store.load()["pendingTasks"], [operation])
+        self.window._account_action()
+        self.assertEqual(self.cloud.login_calls, 1)
+
+    def test_persisted_resolution_blocks_during_delayed_profile_verification(
+        self,
+    ) -> None:
+        task = task_from_title("Delayed verification task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        owner = {"id": "user-1"}
+        request = self.store.prepare_resolution(owner, 4, "merge")
+        self._replace_window(FakeCloud(authenticated=False, busy=True))
+        before = self.store.load()
+
+        self.assertTrue(self.window._history_resolution_active)
+        with patch.object(QMessageBox, "warning"):
+            self.window._issue("start")
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.cloud.resolutions, [])
+
+        self.cloud.busy = False
+        self.cloud.authenticated = True
+        self.window._signed_in(owner)
+        self.assertEqual(self.cloud.resolutions, [request])
+
+    def test_resolution_persisted_after_launch_activates_gate_before_sync(self) -> None:
+        task = task_from_title("Concurrent claim")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        request = self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
+        before = self.store.load()
+
+        self.window._sync()
+
+        self.assertTrue(self.window._history_resolution_active)
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.cloud.resolutions, [request])
+        with patch.object(QMessageBox, "warning"):
+            self.window._issue("start")
+        self.assertEqual(self.store.load(), before)
+
+    def test_signed_out_local_mode_is_usable_without_pending_resolution(self) -> None:
+        self._replace_window(FakeCloud(authenticated=False))
+
+        self.assertFalse(self.window._history_resolution_active)
+        self.window._issue("start")
+
+        self.assertEqual(len(self.store.load()["pending"]), 1)
+        self.assertEqual(self.cloud.payloads, [])
+
+    def test_session_expiry_preserves_exact_request_for_same_user_reauth(self) -> None:
+        task = task_from_title("Session expiry task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        owner = {"id": "user-1"}
+        request = self.store.prepare_resolution(owner, 4, "merge")
+        self._replace_window(FakeCloud(authenticated=True))
+        self.window._signed_in(owner)
+        self.assertEqual(self.cloud.resolutions, [request])
+
+        self.cloud.authenticated = False
+        self.window._session_expired()
+        self.assertTrue(self.window._history_resolution_active)
+        self.assertEqual(
+            self.store.pending_resolution(owner["id"])["request"], request
+        )
+        self.window._account_action()
+        self.assertEqual(self.cloud.login_calls, 1)
+
+        self.cloud.authenticated = True
+        self.window._signed_in(owner)
+        self.assertEqual(self.cloud.resolutions, [request, request])
+
+    def test_session_expiry_preserves_complete_owner_bound_state(self) -> None:
+        owner = {"id": "user-1", "email": "one@example.com"}
+        task = task_from_title("Preserved task")
+        self.store.set_user(owner)
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=2)
+        self._queue_completed_timer()
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start",
+            None,
+            "focus",
+            settings["durationsMs"],
+            task["id"],
+            now_ms=3_000,
+        )
+        self.window._load_state()
+        before = self.store.load()
+        before_timer = self.window.timer
+        before_history = self.window.history
+        before_tasks = self.window.tasks
+
+        self.cloud.authenticated = False
+        self.window._session_expired()
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.window.user, owner)
+        self.assertEqual(self.window.timer, before_timer)
+        self.assertEqual(self.window.history, before_history)
+        self.assertEqual(self.window.tasks, before_tasks)
+        self.assertEqual(self.window.settings["durationsMs"]["focus"], 30 * 60_000)
+
+    def test_different_user_quarantines_old_resolution_until_explicit_switch(
+        self,
+    ) -> None:
+        task = task_from_title("Different-user task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        old_owner = {"id": "user-old"}
+        old_request = self.store.prepare_resolution(old_owner, 4, "merge")
+        before = self.store.load()
+        self._replace_window(FakeCloud(authenticated=False))
+
+        self.cloud.authenticated = True
+        new_owner = {"id": "user-new"}
+        self.window._signed_in(new_owner)
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(
+            self.store.pending_resolution(old_owner["id"])["request"], old_request
+        )
+        self.assertEqual(self.cloud.resolutions, [])
+        self.assertEqual(self.cloud.bootstrap_previews, 0)
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.window._account_switch_user, new_owner)
+
+        with patch.object(
+            self.window, "_choose_account_switch_action", return_value="switch"
+        ):
+            self.window._account_action()
+
+        self.assertIsNone(self.store.pending_resolution())
+        self.assertEqual(self.store.load()["pendingTasks"], [])
+        self.assertEqual(self.cloud.bootstrap_previews, 1)
+        self.assertEqual(self.window._resolution_user, new_owner)
+
+        self.window._bootstrap_ready(self._bootstrap_response(revision=9))
+
+        fresh = self.store.pending_resolution(new_owner["id"])
+        self.assertEqual(fresh["owner"], new_owner)
+        self.assertNotEqual(fresh["request"]["requestId"], old_request["requestId"])
+        self.assertEqual(fresh["request"]["expectedRevision"], 9)
+        self.assertEqual(fresh["request"]["taskOperations"], [])
+        self.assertEqual(self.cloud.resolutions, [fresh["request"]])
+
+    def test_signing_out_mismatched_account_preserves_quarantined_data(self) -> None:
+        task = task_from_title("Quarantined task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        owner = {"id": "user-old"}
+        request = self.store.prepare_resolution(owner, 4, "merge")
+        before = self.store.load()
+        self._replace_window(FakeCloud(authenticated=True))
+        self.window._signed_in({"id": "user-new"})
+
+        with patch.object(
+            self.window, "_choose_account_switch_action", return_value="sign_out"
+        ):
+            self.window._account_action()
+
+        self.assertEqual(self.cloud.logout_calls, 1)
+        self.cloud.authenticated = False
+        self.window._signed_out()
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(
+            self.store.pending_resolution(owner["id"])["request"], request
+        )
+        self.assertTrue(self.window._history_resolution_active)
+
+    def test_same_owner_syncs_normally_and_explicit_account_switch_resets(self) -> None:
+        old_user = {"id": "user-old"}
+        self.store.set_user(old_user)
+        self.store.queue_task_operation("upsert", task_from_title("Old account"))
+        self.window._load_state()
+
+        self.window._signed_in(old_user)
+        self.assertEqual(self.cloud.bootstrap_previews, 0)
+        self.assertEqual(len(self.cloud.payloads), 1)
+        self.assertEqual(len(self.cloud.payloads[-1]["taskOperations"]), 1)
+
+        self.cloud.payloads.clear()
+        self.window._signed_in({"id": "user-new"})
+        self.assertEqual(self.cloud.payloads, [])
+        with patch.object(
+            self.window, "_choose_account_switch_action", return_value="switch"
+        ):
+            self.window._account_action()
+        self.assertEqual(self.cloud.bootstrap_previews, 1)
+        loaded = self.store.load()
+        self.assertIsNone(loaded["snapshot"]["user"])
+        self.assertEqual(loaded["snapshot"]["knownTasks"], [])
+
+    def test_local_only_and_remote_only_resolve_without_prompt(self) -> None:
+        user = {"id": "user-1"}
+        self._queue_completed_timer()
+        self.window._signed_in(user)
+        with patch.object(self.window, "_prompt_history_resolution") as prompt:
+            self.window._bootstrap_ready(self._bootstrap_response(revision=4))
+        prompt.assert_not_called()
+        self.assertEqual(self.cloud.resolutions[-1]["strategy"], "replace_remote")
+        self.assertEqual(len(self.cloud.resolutions[-1]["commands"]), 2)
+
+        self.store.clear_pending_resolution()
+        self.store.reset_account_data()
+        self.cloud.resolutions.clear()
+        self.window._load_state()
+        self.window._history_resolution_active = False
+        self.window._signed_in(user)
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+        with patch.object(self.window, "_prompt_history_resolution") as prompt:
+            self.window._bootstrap_ready(remote)
+        prompt.assert_not_called()
+        self.assertEqual(self.cloud.resolutions[-1]["strategy"], "keep_remote")
+        self.assertEqual(self.cloud.resolutions[-1]["commands"], [])
+
+    def test_resolution_success_binds_owner_and_installs_canonical_state(self) -> None:
+        user = {"id": "user-1", "email": "one@example.com"}
+        self._queue_completed_timer()
+        self.window._signed_in(user)
+        self.window._bootstrap_ready(self._bootstrap_response(revision=4))
+        request = self.cloud.resolutions[-1]
+        response = self._bootstrap_response(
+            revision=5, history=[self._history_item("canonical")]
+        )
+        response["acknowledgements"] = [
+            {"commandId": item["id"], "outcome": "applied", "reason": ""}
+            for item in request["commands"]
+        ]
+
+        self.window._apply_resolution(response)
+
+        loaded = self.store.load()
+        self.assertFalse(self.window._history_resolution_active)
+        self.assertEqual(loaded["snapshot"]["user"], user)
+        self.assertEqual(loaded["snapshot"]["revision"], 5)
+        self.assertEqual(loaded["snapshot"]["history"][0]["id"], "canonical")
+        self.assertIsNone(loaded["pendingResolution"])
+        self.assertTrue(self.window._account_synced)
+
+    def test_both_histories_block_sync_and_cancel_has_no_side_effects(self) -> None:
+        self._queue_completed_timer()
+        before = self.store.load()
+        self.window._signed_in({"id": "user-1"})
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+
+        with patch.object(
+            self.window, "_prompt_history_resolution", return_value=None
+        ):
+            self.window._bootstrap_ready(remote)
+
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.cloud.resolutions, [])
+        self.assertEqual(self.store.load(), before)
+        self.assertFalse(self.window.primary_button.isEnabled())
+        self.assertFalse(self.window.add_task_button.isEnabled())
+        self.assertTrue(
+            all(not button.isEnabled() for button in self.window.phase_buttons.values())
+        )
+        self.assertFalse(self.window.auto_breaks.isEnabled())
+        self.assertTrue(self.window._resolution_retry_paused)
+        self.window.task_input.setText("Blocked task")
+        with patch.object(QMessageBox, "warning"):
+            self.window._issue("start")
+            self.window._add_task()
+            self.window._duration_changed("focus", 30)
+            self.window._select_phase("long_break")
+            self.window._auto_breaks_changed(True)
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.window._selected_phase(), "focus")
+        self.assertFalse(self.window.auto_breaks.isChecked())
+
+    def test_cancelled_chooser_can_resume_without_signing_out(self) -> None:
+        self._queue_completed_timer()
+        self.window._signed_in({"id": "user-1"})
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+        with patch.object(
+            self.window, "_prompt_history_resolution", return_value=None
+        ):
+            self.window._bootstrap_ready(remote)
+        self.assertTrue(self.window._resolution_retry_paused)
+        self.assertIsNone(self.store.pending_resolution())
+
+        with (
+            patch.object(
+                self.window,
+                "_choose_resolution_account_action",
+                return_value="continue",
+            ),
+            patch.object(
+                self.window, "_prompt_history_resolution", return_value="merge"
+            ) as chooser,
+            patch.object(
+                self.window, "_confirm_history_resolution", return_value=True
+            ),
+        ):
+            self.window._account_action()
+
+        chooser.assert_called_once_with()
+        self.assertFalse(self.window._resolution_retry_paused)
+        self.assertEqual(self.cloud.resolutions[-1]["strategy"], "merge")
+        self.assertIsNotNone(self.store.pending_resolution("user-1"))
+
+    def test_pending_resolution_account_action_can_sign_out(self) -> None:
+        self.store.queue_task_operation(
+            "upsert", task_from_title("Discarded on sign-out"), now_ms=1
+        )
+        owner = {"id": "user-1"}
+        self.store.prepare_resolution(owner, 4, "merge")
+        self.window._signed_in(owner)
+
+        with patch.object(
+            self.window,
+            "_choose_resolution_account_action",
+            return_value="sign_out",
+        ):
+            self.window._account_action()
+
+        self.assertEqual(self.cloud.logout_calls, 1)
+        self.cloud.authenticated = False
+        self.window._signed_out()
+        loaded = self.store.load()
+        self.assertIsNone(loaded["pendingResolution"])
+        self.assertEqual(loaded["pendingTasks"], [])
+        self.assertIsNone(loaded["snapshot"]["user"])
+
+    def test_both_histories_require_confirmation_before_persisting(self) -> None:
+        self._queue_completed_timer()
+        self.window._signed_in({"id": "user-1"})
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+
+        with (
+            patch.object(
+                self.window,
+                "_prompt_history_resolution",
+                return_value="replace_remote",
+            ),
+            patch.object(
+                self.window, "_confirm_history_resolution", return_value=False
+            ) as confirm,
+        ):
+            self.window._bootstrap_ready(remote)
+
+        confirm.assert_called_once_with("replace_remote")
+        self.assertIsNone(self.store.pending_resolution())
+        self.assertEqual(self.cloud.resolutions, [])
+
+    def test_resolution_confirmations_include_destructive_and_merge_warnings(self) -> None:
+        for strategy, expected in (
+            ("replace_remote", "permanently replaces"),
+            ("keep_remote", "permanently discards"),
+            ("merge", "conflicts or sync errors"),
+        ):
+            with self.subTest(strategy=strategy):
+                with patch.object(
+                    QMessageBox,
+                    "warning",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ) as warning:
+                    self.assertTrue(
+                        self.window._confirm_history_resolution(strategy)
+                    )
+                self.assertIn(expected, warning.call_args.args[2])
+                self.assertEqual(
+                    warning.call_args.args[4], QMessageBox.StandardButton.Cancel
+                )
+
+    def test_conflict_discards_stale_request_and_repreviews_without_data_loss(
+        self,
+    ) -> None:
+        self._queue_completed_timer()
+        self.window._signed_in({"id": "user-1"})
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+        with (
+            patch.object(
+                self.window, "_prompt_history_resolution", return_value="merge"
+            ),
+            patch.object(
+                self.window, "_confirm_history_resolution", return_value=True
+            ),
+        ):
+            self.window._bootstrap_ready(remote)
+        stale = self.store.pending_resolution()
+        local = self.store.load()["pending"]
+        preview_count = self.cloud.bootstrap_previews
+
+        self.window._bootstrap_conflict(
+            {"status": 409, "message": "revision conflict"}
+        )
+
+        self.assertIsNone(self.store.pending_resolution())
+        self.assertEqual(self.store.load()["pending"], local)
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.cloud.bootstrap_previews, preview_count + 1)
+        self.assertEqual(self.window._resolution_phase, "preview")
+
+        fresh_remote = self._bootstrap_response(
+            revision=6, history=[self._history_item("fresh-remote")]
+        )
+        with (
+            patch.object(
+                self.window, "_prompt_history_resolution", return_value="merge"
+            ),
+            patch.object(
+                self.window, "_confirm_history_resolution", return_value=True
+            ),
+        ):
+            self.window._bootstrap_ready(fresh_remote)
+
+        fresh = self.store.pending_resolution("user-1")
+        self.assertNotEqual(
+            fresh["request"]["requestId"], stale["request"]["requestId"]
+        )
+        self.assertEqual(fresh["request"]["expectedRevision"], 6)
+        self.assertEqual(fresh["request"]["commands"], local)
+
+    def test_network_failure_preserves_exact_pending_resolution(self) -> None:
+        self._queue_completed_timer()
+        self.window._signed_in({"id": "user-1"})
+        self.window._bootstrap_ready(self._bootstrap_response(revision=5))
+        pending = self.store.pending_resolution("user-1")
+        local = self.store.load()["pending"]
+
+        self.window._cloud_failure("network unavailable")
+
+        self.assertEqual(self.store.pending_resolution("user-1"), pending)
+        self.assertEqual(self.store.load()["pending"], local)
+        self.assertEqual(self.window._resolution_phase, "resolve")
 
     def test_duration_spin_queues_and_triggers_sync(self) -> None:
         self.window.duration_spins["focus"].setValue(30)
@@ -86,7 +634,11 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertIsNotNone(self.window._sync_request)
 
     def test_newer_remote_revision_triggers_sync(self) -> None:
+        self.window.revision = 4
         before = len(self.cloud.payloads)
+
+        self.cloud.revision_available.emit(self.window.revision - 1)
+        self.assertEqual(len(self.cloud.payloads), before)
 
         self.cloud.revision_available.emit(self.window.revision)
         self.assertEqual(len(self.cloud.payloads), before)
@@ -165,6 +717,32 @@ class MainWindowDurationTests(unittest.TestCase):
             True,
         )
         self.assertFalse(self.window.task_combo.isEnabled())
+
+    def test_remote_task_deletion_clears_selection_and_keeps_history_title(self) -> None:
+        task = task_from_title("Historical task")
+        history = self._history_item("remote-completion")
+        history["taskId"] = task["id"]
+        self.window._sync()
+        first = self._bootstrap_response(revision=1, history=[history])
+        first["tasks"] = [task]
+        self.window._apply_sync(first)
+        task_index = self.window.task_combo.findData(task["id"])
+        self.window.task_combo.setCurrentIndex(task_index)
+        self.assertEqual(
+            self.store.load()["settings"]["selectedTaskId"], task["id"]
+        )
+
+        self.window._sync()
+        self.window._apply_sync(
+            self._bootstrap_response(revision=2, history=[history])
+        )
+
+        loaded = self.store.load()
+        self.assertIsNone(self.window.settings["selectedTaskId"])
+        self.assertIsNone(loaded["settings"]["selectedTaskId"])
+        self.assertEqual(loaded["snapshot"]["tasks"], [])
+        self.assertEqual(loaded["snapshot"]["knownTasks"], [task])
+        self.assertIn("Focus · Historical task", self.window.history_list.item(0).text())
 
     def test_stale_stream_authorization_triggers_sync(self) -> None:
         before = len(self.cloud.payloads)

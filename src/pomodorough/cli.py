@@ -58,6 +58,8 @@ def _print_state(state: dict[str, Any], stream: TextIO) -> None:
             f"{state['pendingDurationOperations']} duration preference(s) pending sync",
             file=stream,
         )
+    if state["historyResolutionPending"]:
+        print("Account history resolution pending; timer changes are blocked.", file=stream)
 
 
 def _history_time(value: str | None) -> str:
