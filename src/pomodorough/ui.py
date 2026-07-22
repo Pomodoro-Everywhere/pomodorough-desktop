@@ -488,6 +488,8 @@ class MainWindow(QMainWindow):
         self.screen_buttons[index].setChecked(True)
         self.settings_button.setVisible(index == 0)
         self._render()
+        if index == 1:
+            self._sync()
 
     def _apply_responsive_layout(self) -> None:
         landscape = self.width() > self.height()
@@ -669,9 +671,10 @@ class MainWindow(QMainWindow):
             QListWidgetItem("No arrivals yet.\nStart first service.", self.history_list)
 
     def _render_task_selector(self, timer: dict[str, Any], active: bool) -> None:
+        running = timer.get("status") == "running"
         selected_task_id = (
             timer.get("taskId")
-            if active
+            if running
             else self.settings.get("selectedTaskId")
             if self._selected_phase() == "focus"
             else None
@@ -682,7 +685,7 @@ class MainWindow(QMainWindow):
             choices.append(task or {"id": selected_task_id, "title": "Deleted task"})
 
         signature = (
-            active,
+            timer.get("status"),
             self._selected_phase(),
             selected_task_id,
             tuple((task["id"], task["title"]) for task in choices),
@@ -701,7 +704,12 @@ class MainWindow(QMainWindow):
                 selected_index = self.task_combo.count() - 1
         self.task_combo.setCurrentIndex(selected_index)
         self.task_combo.blockSignals(False)
-        self.task_combo.setEnabled(not active and self._selected_phase() == "focus")
+        self.task_combo.setEnabled(not running and self._selected_phase() == "focus")
+        self.task_combo.setToolTip(
+            "Select task for next focus session; paused session keeps its current task."
+            if active
+            else "Select task for next focus session."
+        )
 
     def _render_tasks(self) -> None:
         signature = (
@@ -837,7 +845,7 @@ class MainWindow(QMainWindow):
             self._render()
 
     def _task_selection_changed(self, index: int) -> None:
-        if self._current_timer().get("status") in ACTIVE_STATUSES:
+        if self._current_timer().get("status") == "running":
             return
         task_id = self.task_combo.itemData(index)
         if task_id and not any(task["id"] == task_id for task in self.tasks):

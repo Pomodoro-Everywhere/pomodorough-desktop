@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pomodorough-linux"
-version = "0.1.1"
+version = "0.1.2"
 description = "KDE-first, local-first Pomodoro timer"
 readme = "README.md"
 requires-python = ">=3.11"

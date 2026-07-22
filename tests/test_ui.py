@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+from pomodorough.core import task_from_title
 from pomodorough.storage import Store
 from pomodorough.ui import MainWindow
 
@@ -92,6 +93,78 @@ class MainWindowDurationTests(unittest.TestCase):
 
         self.cloud.revision_available.emit(self.window.revision + 1)
         self.assertEqual(len(self.cloud.payloads), before + 1)
+
+    def test_periodic_sync_pulls_without_local_changes(self) -> None:
+        self.window.sync_timer.timeout.emit()
+
+        self.assertEqual(
+            self.cloud.payloads[-1],
+            {
+                "deviceId": self.store.device_id,
+                "lastRevision": 0,
+                "commands": [],
+                "taskOperations": [],
+                "durationOperations": [],
+            },
+        )
+
+    def test_opening_tasks_pulls_without_local_changes(self) -> None:
+        before = len(self.cloud.payloads)
+
+        self.window._show_screen(1)
+
+        self.assertEqual(len(self.cloud.payloads), before + 1)
+
+    def test_synced_task_can_be_selected_while_timer_is_paused(self) -> None:
+        task = task_from_title("Remote task")
+        self.window._sync()
+        self.window._apply_sync(
+            {
+                "acknowledgements": [],
+                "taskAcknowledgements": [],
+                "durationAcknowledgements": [],
+                "revision": 1,
+                "canonicalTimer": {
+                    "id": "timer-remote",
+                    "phase": "focus",
+                    "status": "paused",
+                    "plannedDurationMs": 25 * 60_000,
+                    "elapsedAtAnchorMs": 60_000,
+                    "anchorAt": "2026-07-22T06:26:34.649Z",
+                    "taskId": None,
+                },
+                "history": [],
+                "tasks": [task],
+                "durationsMs": {
+                    "focus": 25 * 60_000,
+                    "short_break": 5 * 60_000,
+                    "long_break": 15 * 60_000,
+                },
+                "serverHlcWallMs": 1_000,
+                "serverHlcCounter": 0,
+            }
+        )
+
+        task_index = self.window.task_combo.findData(task["id"])
+        self.assertGreater(task_index, 0)
+        self.assertTrue(self.window.task_combo.isEnabled())
+
+        self.window.task_combo.setCurrentIndex(task_index)
+
+        self.assertEqual(self.window.settings["selectedTaskId"], task["id"])
+        self.assertEqual(
+            self.store.load()["settings"]["selectedTaskId"], task["id"]
+        )
+
+        self.window._render_task_selector(
+            {
+                "phase": "focus",
+                "status": "running",
+                "taskId": task["id"],
+            },
+            True,
+        )
+        self.assertFalse(self.window.task_combo.isEnabled())
 
     def test_stale_stream_authorization_triggers_sync(self) -> None:
         before = len(self.cloud.payloads)
