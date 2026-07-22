@@ -2,3 +2,4 @@ include flake.nix
 include flake.lock
 graft deploy
 graft screenshots
+global-exclude __pycache__ *.py[cod]

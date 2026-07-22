@@ -14,11 +14,12 @@ concurrency:
 
 jobs:
   tests:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, windows-2025]
         python-version: ["3.11", "3.14"]
     steps:
       - name: Check out source
@@ -31,6 +32,7 @@ jobs:
           cache: pip
 
       - name: Install Qt runtime libraries
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
@@ -40,6 +42,9 @@ jobs:
 
       - name: Install package
         run: python -m pip install .
+
+      - name: Import application entry points
+        run: python -c "import pomodorough.app, pomodorough.cli, pomodorough.tui"
 
       - name: Run tests
         env:

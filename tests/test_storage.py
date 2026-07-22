@@ -8,12 +8,21 @@ from copy import deepcopy
 from pathlib import Path
 from queue import Queue
 from threading import Barrier, Event, Thread
+from unittest.mock import patch
 
 from pomodorough.core import rebuild_optimistic, rebuild_tasks, task_from_title
-from pomodorough.storage import Store
+from pomodorough.storage import Store, default_data_path
 
 
 class StorageTests(unittest.TestCase):
+    def test_default_data_path_uses_platform_data_directory(self) -> None:
+        root = Path("platform-data")
+        with patch("pomodorough.storage.user_data_path", return_value=root) as path:
+            self.assertEqual(
+                default_data_path(), root / "pomodorough.sqlite3"
+            )
+        path.assert_called_once_with("pomodorough", appauthor=False)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "state.sqlite3"

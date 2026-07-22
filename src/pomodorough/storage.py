@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 import uuid
@@ -10,6 +9,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from platformdirs import user_data_path
 
 from .core import (
     PHASES,
@@ -27,8 +28,7 @@ ACKNOWLEDGEMENT_OUTCOMES = {"applied", "ignored", "rejected"}
 
 
 def default_data_path() -> Path:
-    root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return root / "pomodorough" / "pomodorough.sqlite3"
+    return user_data_path("pomodorough", appauthor=False) / "pomodorough.sqlite3"
 
 
 def utc_timestamp(milliseconds: int) -> str:

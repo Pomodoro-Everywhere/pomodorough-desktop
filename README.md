@@ -1,11 +1,11 @@
-# Pomodorough for Linux
+# Pomodorough for Linux and Windows
 
 <p align="center">
   <img src="src/pomodorough/resources/icon.svg" alt="Pomodorough" width="96">
 </p>
 
 <p align="center">
-  KDE-first desktop, command-line, and terminal clients for the local-first Pomodorough timer.
+  Desktop, command-line, and terminal clients for the local-first Pomodorough timer.
 </p>
 
 <p align="center">
@@ -18,29 +18,30 @@
   <img src="screenshots/screenshot.png" alt="Pomodorough timer showing a paused focus session">
 </p>
 
-Pomodorough for Linux combines a native Qt desktop interface with scriptable
+Pomodorough combines a native Qt desktop interface with scriptable
 CLI and keyboard-driven TUI clients. All three share one SQLite database. Timer
 actions, tasks, and duration changes are committed locally before they appear
 on screen, then reconciled with the Pomodorough service when signed in.
 
 ## Highlights
 
-- Native PySide6 desktop interface designed for KDE and other Linux desktops
+- Native PySide6 desktop interface for Linux and Windows
+- Standalone Windows executable with no Python installation required
 - CLI with human-readable and JSON output for scripts and status integrations
 - Lightweight TUI for keyboard-first timer control
 - Durable SQLite command, task, and duration queues
 - Fully functional offline mode without an account
 - Google OAuth with PKCE and a temporary loopback callback
-- Secret Service or KWallet token storage with a protected file fallback
+- Secret Service or KWallet token storage on Linux with a user-profile file fallback
 - Server-Sent Event revision stream for low-latency cross-device updates
 - Deterministic hybrid logical clock merge and optimistic local replay
-- User-local installation compatible with SteamOS's immutable root
+- User-local Linux installation compatible with SteamOS's immutable root
 
 ## Requirements
 
 - Python 3.11 or newer
-- A Linux desktop session for the Qt application
-- Optional `secret-tool` integration for Secret Service or KWallet storage
+- Windows 10 or newer, or a Linux desktop session, for the Qt application
+- Optional Linux `secret-tool` integration for Secret Service or KWallet storage
 - Optional [`uv`](https://docs.astral.sh/uv/) for faster installation
 
 PySide6 is installed as a Python dependency.
@@ -53,10 +54,29 @@ python3 -m venv .venv
 .venv/bin/pomodorough
 ```
 
+On Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -e .
+.venv\Scripts\pomodorough.exe
+```
+
 The desktop application can run entirely offline. Google sign-in enables
 cross-device synchronization with the production service.
 
 ## Install
+
+### Windows
+
+Download `Pomodorough-<version>-windows-x86_64.exe` and its matching `.sha256`
+file from the [latest GitHub release](https://github.com/egigoka/pomodorough-linux/releases/latest).
+The executable includes Python, Qt, and all application dependencies, so it can
+run directly without installation.
+
+Windows builds are currently unsigned and may trigger a Microsoft Defender
+SmartScreen warning. Verify the downloaded executable against its published
+SHA-256 checksum before running it.
 
 ### Linux distributions
 
@@ -78,9 +98,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.2/pomodorough_linux-0.1.2.tar.gz
-tar -xzf pomodorough_linux-0.1.2.tar.gz
-cd pomodorough_linux-0.1.2
+curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.3/pomodorough_linux-0.1.3.tar.gz
+tar -xzf pomodorough_linux-0.1.3.tar.gz
+cd pomodorough_linux-0.1.3
 ./deploy/install.sh
 ```
 
@@ -103,7 +123,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:egigoka/pomodorough-linux/v0.1.2
+nix profile install github:egigoka/pomodorough-linux/v0.1.3
 ```
 
 ### Flatpak
@@ -111,8 +131,8 @@ nix profile install github:egigoka/pomodorough-linux/v0.1.2
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.2/Pomodorough-0.1.2-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.1.2-x86_64.flatpak
+curl -LO https://github.com/egigoka/pomodorough-linux/releases/download/v0.1.3/Pomodorough-0.1.3-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.1.3-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 
@@ -197,12 +217,15 @@ when `secret-tool` is available, with a mode-0600 JSON file fallback.
 
 | Data | Default location |
 | --- | --- |
-| Timer, tasks, history, settings, queues | `~/.local/share/pomodorough/pomodorough.sqlite3` |
-| OAuth file fallback and override | `~/.config/pomodorough/` |
-| Installed virtual environment | `~/.local/share/pomodorough/venv` |
-| Executable links | `~/.local/bin/` |
+| Linux timer, tasks, history, settings, queues | `~/.local/share/pomodorough/pomodorough.sqlite3` |
+| Windows timer, tasks, history, settings, queues | `%LOCALAPPDATA%\pomodorough\pomodorough.sqlite3` |
+| Linux OAuth file fallback and override | `~/.config/pomodorough/` |
+| Windows OAuth file fallback and override | `%APPDATA%\pomodorough\` |
+| Linux installed virtual environment | `~/.local/share/pomodorough/venv` |
+| Linux executable links | `~/.local/bin/` |
 
-`XDG_DATA_HOME` and `XDG_CONFIG_HOME` are respected.
+`XDG_DATA_HOME` and `XDG_CONFIG_HOME` are respected on Linux. Windows uses its
+standard local and roaming application-data directories.
 
 ## Architecture
 
@@ -229,9 +252,9 @@ sh -n deploy/install.sh
 - [Server, Web/PWA, and synchronization](https://github.com/egigoka/pomodorough-server)
 - [iOS, iPadOS, and macOS](https://github.com/egigoka/pomodorough-ios)
 - [Android](https://github.com/egigoka/pomodorough-android)
-- [Linux (this repository)](https://github.com/egigoka/pomodorough-linux)
+- [Linux and Windows (this repository)](https://github.com/egigoka/pomodorough-linux)
 
 ## License
 
-Pomodorough for Linux is licensed under the GNU General Public License v3.0 or
+Pomodorough is licensed under the GNU General Public License v3.0 or
 later. See [LICENSE](LICENSE).

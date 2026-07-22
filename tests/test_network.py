@@ -6,6 +6,7 @@ import os
 import unittest
 import urllib.error
 from importlib.resources import files
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,7 +14,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
-from pomodorough.network import ApiError, CloudService, _request, _RevisionEventParser
+from pomodorough.network import (
+    ApiError,
+    CloudService,
+    _config_root,
+    _request,
+    _RevisionEventParser,
+)
 
 
 class RevisionEventParserTests(unittest.TestCase):
@@ -36,6 +43,12 @@ class RevisionEventParserTests(unittest.TestCase):
 
 
 class OAuthResourceTests(unittest.TestCase):
+    def test_config_root_uses_roaming_platform_directory(self) -> None:
+        root = Path("platform-config")
+        with patch("pomodorough.network.user_config_path", return_value=root) as path:
+            self.assertEqual(_config_root(), root)
+        path.assert_called_once_with("pomodorough", appauthor=False, roaming=True)
+
     def test_bundled_desktop_client(self) -> None:
         resource = files("pomodorough").joinpath("resources/oauth-client.json")
         config = json.loads(resource.read_text(encoding="utf-8"))["installed"]

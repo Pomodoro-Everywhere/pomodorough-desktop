@@ -9,6 +9,7 @@ import queue
 import secrets
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable
 
+from platformdirs import user_config_path
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
@@ -51,7 +53,7 @@ def _request(
     access_token: str | None = None,
     form: bool = False,
 ) -> dict[str, Any]:
-    headers = {"Accept": "application/json", "User-Agent": "Pomodorough-Linux/0.1"}
+    headers = {"Accept": "application/json", "User-Agent": "Pomodorough-Desktop/0.1"}
     data = None
     if payload is not None:
         if form:
@@ -89,7 +91,7 @@ def _request(
 
 
 def _config_root() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pomodorough"
+    return user_config_path("pomodorough", appauthor=False, roaming=True)
 
 
 class TokenStore:
@@ -479,7 +481,7 @@ class CloudService(QObject):
                     "idToken": google_tokens["id_token"],
                     "challenge": challenge["challenge"],
                     "deviceId": self.device_id,
-                    "platform": "linux",
+                    "platform": "windows" if sys.platform == "win32" else "linux",
                 },
             )
             self._accept_tokens(response)

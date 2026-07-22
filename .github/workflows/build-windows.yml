@@ -1,0 +1,103 @@
+name: Build Windows release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  executable:
+    runs-on: windows-2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and build tools
+        run: python -m pip install . "pyinstaller>=6.14,<7"
+
+      - name: Read release version
+        id: release
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($env:TAG -and $env:TAG -ne "v$version") {
+            throw "Tag $env:TAG does not match package version $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build standalone executable
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python -m PyInstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --windowed `
+            --name "Pomodorough-$env:VERSION-windows-x86_64" `
+            --collect-data pomodorough `
+            deploy/windows/pomodorough.py
+
+      - name: Smoke test executable
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
+          $env:POMODOROUGH_SCREENSHOT = "$PWD/dist/smoke.png"
+          $process = Start-Process -FilePath $executable -PassThru
+          if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Packaged application did not exit after smoke test"
+          }
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $env:POMODOROUGH_SCREENSHOT)) {
+            throw "Packaged application smoke test failed"
+          }
+          Remove-Item $env:POMODOROUGH_SCREENSHOT
+
+      - name: Create checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
+          $hash = (Get-FileHash $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $executable -Leaf)" | Set-Content "$executable.sha256" -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64
+          path: |
+            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe
+            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe.sha256
+          if-no-files-found: error
+
+      - name: Attach executable to release
+        if: inputs.tag != ''
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: |
+            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe
+            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe.sha256
+          tag_name: ${{ inputs.tag }}

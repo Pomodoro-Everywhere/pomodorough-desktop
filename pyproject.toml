@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pomodorough-linux"
-version = "0.1.2"
-description = "KDE-first, local-first Pomodoro timer"
+version = "0.1.3"
+description = "Cross-platform, local-first Pomodoro timer"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
-dependencies = ["PySide6-Essentials>=6.8,<7"]
+dependencies = [
+    "platformdirs>=4.3,<5",
+    "PySide6-Essentials>=6.8,<7",
+    "windows-curses>=2.4; sys_platform == 'win32'",
+]
 
 [project.scripts]
 pomodorough = "pomodorough.app:main"

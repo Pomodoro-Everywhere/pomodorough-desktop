@@ -99,6 +99,15 @@ jobs:
     with:
       tag: ${{ github.ref_name }}
 
+  windows:
+    name: Build Windows executable
+    needs: package
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      tag: ${{ github.ref_name }}
+
   homebrew:
     name: Update Homebrew
     needs: package
