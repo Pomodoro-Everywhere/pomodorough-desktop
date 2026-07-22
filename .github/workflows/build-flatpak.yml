@@ -9,6 +9,12 @@ on:
         required: true
         type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach artifact to
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write

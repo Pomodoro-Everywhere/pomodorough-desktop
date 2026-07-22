@@ -23,6 +23,9 @@ modules:
       - install -Dm644 deploy/flatpak/me.egigoka.Pomodorough.metainfo.xml /app/share/metainfo/me.egigoka.Pomodorough.metainfo.xml
     sources:
       - type: file
+        url: https://files.pythonhosted.org/packages/7d/68/d8d58938dfb1370b266a1a729e6d77a985be23689a0496498ee17b2cbf90/platformdirs-4.11.0-py3-none-any.whl
+        sha256: 360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74
+      - type: file
         url: https://files.pythonhosted.org/packages/5c/49/0e1237c4400bec7e335d2c4eeb49bc40d9fd88a9ac44ca9083ce1abdc308/pyside6_essentials-6.11.1-cp310-abi3-manylinux_2_34_x86_64.whl
         sha256: e3ef7027b41e4e55fadb56e3b3257dc8ee92154b639fe67fc4c8e05e9d976c60
         only-arches:
