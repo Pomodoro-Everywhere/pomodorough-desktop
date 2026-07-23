@@ -59,7 +59,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS pending_commands (
                 id TEXT PRIMARY KEY,
                 device_sequence INTEGER NOT NULL UNIQUE,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                depends_on_command_id TEXT
             );
             CREATE TABLE IF NOT EXISTS pending_task_operations (
                 id TEXT PRIMARY KEY,
@@ -79,9 +80,39 @@ class Store:
                 timer_id TEXT NOT NULL,
                 finish_device_sequence INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pending_auto_break_starts (
+                source_finish_command_id TEXT PRIMARY KEY,
+                source_timer_id TEXT NOT NULL,
+                start_command_id TEXT NOT NULL UNIQUE,
+                selected_phase_version INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         self.connection.commit()
+        with self._immediate_transaction():
+            command_columns = {
+                str(row["name"])
+                for row in self.connection.execute("PRAGMA table_info(pending_commands)")
+            }
+            if "depends_on_command_id" not in command_columns:
+                self.connection.execute(
+                    "ALTER TABLE pending_commands ADD COLUMN depends_on_command_id TEXT"
+                )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS pending_commands_dependency "
+                "ON pending_commands(depends_on_command_id)"
+            )
+            auto_break_columns = {
+                str(row["name"])
+                for row in self.connection.execute(
+                    "PRAGMA table_info(pending_auto_break_starts)"
+                )
+            }
+            if "selected_phase_version" not in auto_break_columns:
+                self.connection.execute(
+                    "ALTER TABLE pending_auto_break_starts ADD COLUMN "
+                    "selected_phase_version INTEGER NOT NULL DEFAULT 0"
+                )
         self._initialize()
 
     def close(self) -> None:
@@ -92,6 +123,7 @@ class Store:
             "deviceId": f"desktop-{uuid.uuid4()}",
             "deviceSequence": 0,
             "hlc": {"wallMs": 0, "counter": 0},
+            "selectedPhaseVersion": 0,
             "settings": {
                 "selectedPhase": "focus",
                 "durations": {
@@ -271,12 +303,7 @@ class Store:
     def load(self) -> dict[str, Any]:
         settings = self.get_meta("settings")
         snapshot = self.get_meta("snapshot")
-        pending = [
-            json.loads(row["payload"])
-            for row in self.connection.execute(
-                "SELECT payload FROM pending_commands ORDER BY device_sequence"
-            )
-        ]
+        pending = self._pending_commands()
         pending_tasks = [
             json.loads(row["payload"])
             for row in self.connection.execute(
@@ -306,6 +333,16 @@ class Store:
             "pendingAutoStarts": pending_auto_starts,
             "pendingResolution": self.get_meta("pendingResolution"),
         }
+
+    def _pending_commands(self, *, sendable_only: bool = False) -> list[dict[str, Any]]:
+        where = "WHERE depends_on_command_id IS NULL" if sendable_only else ""
+        return [
+            json.loads(row["payload"])
+            for row in self.connection.execute(
+                f"SELECT payload FROM pending_commands {where} "
+                "ORDER BY device_sequence"
+            )
+        ]
 
     def _pending_auto_start_operations(self) -> list[dict[str, Any]]:
         operations = [
@@ -344,7 +381,13 @@ class Store:
     def set_selected_phase(self, phase: str) -> None:
         if phase not in PHASES:
             raise ValueError("Unsupported timer phase.")
-        self._set_local_setting("selectedPhase", phase)
+        with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            settings["selectedPhase"] = phase
+            self._set_meta("settings", settings)
+            version = int(self.get_meta("selectedPhaseVersion", 0)) + 1
+            self._set_meta("selectedPhaseVersion", version)
 
     def set_auto_start_breaks(
         self, enabled: bool, now_ms: int | None = None
@@ -392,6 +435,7 @@ class Store:
         durations_ms: dict[str, int],
         selected_task_id: str | None,
         now_ms: int,
+        depends_on_command_id: str | None = None,
     ) -> dict[str, Any]:
         sequence = int(self.get_meta("deviceSequence", 0)) + 1
         old_hlc = self.get_meta("hlc", {"wallMs": 0, "counter": 0})
@@ -412,6 +456,15 @@ class Store:
             timer_id = str(timer["id"])
             planned_ms = int(timer["plannedDurationMs"])
             observed_ms = round(elapsed_ms(timer, now_ms))
+            if depends_on_command_id is None:
+                for row in self.connection.execute(
+                    "SELECT depends_on_command_id, payload FROM pending_commands "
+                    "WHERE depends_on_command_id IS NOT NULL"
+                ):
+                    pending_command = json.loads(row["payload"])
+                    if pending_command.get("timerId") == timer_id:
+                        depends_on_command_id = str(row["depends_on_command_id"])
+                        break
 
         command = {
             "id": str(uuid.uuid4()),
@@ -428,11 +481,13 @@ class Store:
         if starting and phase == "focus" and selected_task_id:
             command["taskId"] = selected_task_id
         self.connection.execute(
-            "INSERT INTO pending_commands(id, device_sequence, payload) VALUES (?, ?, ?)",
+            "INSERT INTO pending_commands("
+            "id, device_sequence, payload, depends_on_command_id) VALUES (?, ?, ?, ?)",
             (
                 command["id"],
                 sequence,
                 json.dumps(command, separators=(",", ":")),
+                depends_on_command_id,
             ),
         )
         if (
@@ -603,7 +658,7 @@ class Store:
         return {
             "deviceId": self.device_id,
             "lastRevision": int(state["snapshot"].get("revision", 0)),
-            "commands": state["pending"][:256],
+            "commands": self._pending_commands(sendable_only=True)[:256],
             "taskOperations": state["pendingTasks"][:256],
             "durationOperations": state["pendingDurations"][:256],
             "autoStartOperations": state["pendingAutoStarts"][:256],
@@ -738,8 +793,9 @@ class Store:
                 return pending["request"]
             state = self.load()
             operations = state if strategy != "keep_remote" else None
+            sendable_commands = self._pending_commands(sendable_only=True)
             outbound = {
-                "commands": operations["pending"] if operations else [],
+                "commands": sendable_commands if operations else [],
                 "taskOperations": operations["pendingTasks"] if operations else [],
                 "durationOperations": (
                     operations["pendingDurations"] if operations else []
@@ -774,7 +830,14 @@ class Store:
                 **outbound,
             }
             queue_ids = {
-                "commands": [item["id"] for item in state["pending"]],
+                "commands": [
+                    item["id"]
+                    for item in (
+                        state["pending"]
+                        if strategy == "keep_remote"
+                        else sendable_commands
+                    )
+                ],
                 "taskOperations": [item["id"] for item in state["pendingTasks"]],
                 "durationOperations": [
                     item["id"] for item in state["pendingDurations"]
@@ -1020,6 +1083,212 @@ class Store:
             and isinstance(item.get("pending", False), bool)
         )
 
+    def _drop_auto_break_start(self, source_finish_command_id: str) -> None:
+        dependency = self.connection.execute(
+            "SELECT start_command_id, selected_phase_version "
+            "FROM pending_auto_break_starts WHERE source_finish_command_id = ?",
+            (source_finish_command_id,),
+        ).fetchone()
+        provisional_phase = None
+        if dependency is not None:
+            start_row = self.connection.execute(
+                "SELECT payload FROM pending_commands WHERE id = ?",
+                (dependency["start_command_id"],),
+            ).fetchone()
+            if start_row is not None:
+                try:
+                    command = json.loads(start_row["payload"])
+                    if command.get("type") == "start":
+                        provisional_phase = command.get("phase")
+                except (TypeError, json.JSONDecodeError):
+                    pass
+        self.connection.execute(
+            "DELETE FROM pending_commands WHERE depends_on_command_id = ?",
+            (source_finish_command_id,),
+        )
+        self.connection.execute(
+            "DELETE FROM pending_auto_break_starts "
+            "WHERE source_finish_command_id = ?",
+            (source_finish_command_id,),
+        )
+        self.connection.execute(
+            "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
+            (source_finish_command_id,),
+        )
+        if provisional_phase in PHASES and dependency is not None:
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            if (
+                settings["selectedPhase"] == provisional_phase
+                and int(self.get_meta("selectedPhaseVersion", 0))
+                == int(dependency["selected_phase_version"])
+            ):
+                settings["selectedPhase"] = "focus"
+                self._set_meta("settings", settings)
+
+    def _transform_auto_break_chain(
+        self,
+        source_finish_command_id: str,
+        start_command_id: str,
+        phase: str,
+        duration_ms: int,
+    ) -> str | None:
+        rows = self.connection.execute(
+            "SELECT id, device_sequence, payload FROM pending_commands "
+            "WHERE depends_on_command_id = ? ORDER BY device_sequence",
+            (source_finish_command_id,),
+        ).fetchall()
+        provisional_phase: str | None = None
+        generated_timer_id: str | None = None
+        allowed_followups = {"pause", "resume", "finish", "cancel", "clear"}
+        for row in rows:
+            try:
+                command = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                command = None
+            is_generated_start = row["id"] == start_command_id
+            valid = isinstance(command, dict)
+            if is_generated_start:
+                valid = valid and command.get("type") == "start"
+                if valid:
+                    provisional_phase = str(command["phase"])
+                    generated_timer_id = str(command["timerId"])
+            else:
+                valid = (
+                    valid
+                    and generated_timer_id is not None
+                    and command.get("type") in allowed_followups
+                    and command.get("timerId") == generated_timer_id
+                )
+            if not valid:
+                if is_generated_start:
+                    return None
+                self.connection.execute(
+                    "DELETE FROM pending_commands "
+                    "WHERE depends_on_command_id = ? AND device_sequence >= ?",
+                    (source_finish_command_id, int(row["device_sequence"])),
+                )
+                break
+            command["phase"] = phase
+            command["plannedDurationMs"] = duration_ms
+            if "observedElapsedMs" in command:
+                command["observedElapsedMs"] = min(
+                    duration_ms,
+                    max(0, int(command.get("observedElapsedMs", 0))),
+                )
+            self.connection.execute(
+                "UPDATE pending_commands SET payload = ? WHERE id = ?",
+                (json.dumps(command, separators=(",", ":")), row["id"]),
+            )
+        return provisional_phase
+
+    def _resolve_auto_break_dependencies(self, canonical: dict[str, Any]) -> None:
+        acknowledgements = {
+            acknowledgement["commandId"]: acknowledgement
+            for acknowledgement in canonical["acknowledgements"]
+        }
+        if not acknowledgements:
+            return
+        dependencies = {
+            str(row["source_finish_command_id"]): row
+            for row in self.connection.execute(
+                "SELECT source_finish_command_id, source_timer_id, start_command_id, "
+                "selected_phase_version "
+                "FROM pending_auto_break_starts"
+            )
+        }
+        triggers = {
+            str(row["finish_command_id"]): row
+            for row in self.connection.execute(
+                "SELECT finish_command_id, timer_id FROM pending_auto_breaks"
+            )
+        }
+        canonical_timer = canonical["canonicalTimer"]
+        for source_id, acknowledgement in acknowledgements.items():
+            dependency = dependencies.get(source_id)
+            trigger = triggers.get(source_id)
+            if dependency is None and trigger is None:
+                continue
+            source_timer_id = str(
+                dependency["source_timer_id"]
+                if dependency is not None
+                else trigger["timer_id"]
+            )
+            completion = next(
+                (
+                    item
+                    for item in canonical["history"]
+                    if item.get("phase") == "focus"
+                    and item.get("status") == "completed"
+                    and item.get("timerId") == source_timer_id
+                    and item.get("commandId") == source_id
+                ),
+                None,
+            )
+            timer_is_source = canonical_timer is not None and (
+                canonical_timer.get("id") == source_timer_id
+                and canonical_timer.get("phase") == "focus"
+                and canonical_timer.get("status") == "completed"
+            )
+            if (
+                acknowledgement["outcome"] != "applied"
+                or completion is None
+                or not timer_is_source
+            ):
+                self._drop_auto_break_start(source_id)
+                continue
+            if dependency is None:
+                continue
+
+            start_row = self.connection.execute(
+                "SELECT device_sequence, payload FROM pending_commands WHERE id = ?",
+                (dependency["start_command_id"],),
+            ).fetchone()
+            if start_row is None:
+                self._drop_auto_break_start(source_id)
+                continue
+            newer_sendable_commands = self.connection.execute(
+                "SELECT payload FROM pending_commands "
+                "WHERE device_sequence > ? AND depends_on_command_id IS NULL",
+                (int(start_row["device_sequence"]),),
+            ).fetchall()
+            if any(
+                not isinstance(command, dict) or command.get("type") == "start"
+                for command in (
+                    json.loads(row["payload"]) for row in newer_sendable_commands
+                )
+            ):
+                self._drop_auto_break_start(source_id)
+                continue
+
+            phase = next_break_phase(canonical["history"])
+            provisional_phase = self._transform_auto_break_chain(
+                source_id,
+                str(dependency["start_command_id"]),
+                phase,
+                canonical["durationsMs"][phase],
+            )
+            if provisional_phase is None:
+                self._drop_auto_break_start(source_id)
+                continue
+            self.connection.execute(
+                "UPDATE pending_commands SET depends_on_command_id = NULL "
+                "WHERE depends_on_command_id = ?",
+                (source_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM pending_auto_break_starts "
+                "WHERE source_finish_command_id = ?",
+                (source_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
+                (source_id,),
+            )
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            if settings["selectedPhase"] == provisional_phase:
+                settings["selectedPhase"] = phase
+                self._set_meta("settings", settings)
+
     def _apply_acknowledgements(
         self, canonical: dict[str, Any], *, delete: bool = True
     ) -> list[str]:
@@ -1154,6 +1423,7 @@ class Store:
             canonical = self._validated_sync_response(response, request)
             if canonical["revision"] < int(previous.get("revision", 0)):
                 raise ValueError("Server response would regress canonical revision.")
+            self._resolve_auto_break_dependencies(canonical)
             notices = self._apply_acknowledgements(canonical)
             self._install_canonical(
                 canonical,
@@ -1198,10 +1468,14 @@ class Store:
                 raise ValueError(
                     "Pending history resolution does not match captured queue IDs."
                 )
+            self._resolve_auto_break_dependencies(canonical)
             notices = self._apply_acknowledgements(canonical, delete=False)
             self._delete_resolution_queue_ids(queue_ids)
             if strategy == "keep_remote" and "autoStartOperations" not in queue_ids:
                 self.connection.execute("DELETE FROM pending_auto_start_operations")
+            if strategy == "keep_remote":
+                self.connection.execute("DELETE FROM pending_auto_breaks")
+                self.connection.execute("DELETE FROM pending_auto_break_starts")
             self._install_canonical(
                 canonical,
                 user,
@@ -1223,6 +1497,34 @@ class Store:
             ).fetchone()
             is not None
         )
+
+    def provisional_auto_break_timer_ids(self) -> set[str]:
+        timer_ids: set[str] = set()
+        for row in self.connection.execute(
+            "SELECT commands.payload FROM pending_auto_break_starts AS starts "
+            "JOIN pending_commands AS commands ON commands.id = starts.start_command_id"
+        ):
+            timer_id = json.loads(row["payload"]).get("timerId")
+            if isinstance(timer_id, str) and timer_id:
+                timer_ids.add(timer_id)
+        return timer_ids
+
+    def load_with_provisional_auto_breaks(
+        self,
+    ) -> tuple[dict[str, Any], set[str]]:
+        owns_transaction = not self.connection.in_transaction
+        if owns_transaction:
+            self.connection.execute("BEGIN")
+        try:
+            state = self.load()
+            timer_ids = self.provisional_auto_break_timer_ids()
+        except BaseException:
+            if owns_transaction:
+                self.connection.rollback()
+            raise
+        if owns_transaction:
+            self.connection.commit()
+        return state, timer_ids
 
     def process_auto_break(
         self, *, require_canonical: bool, now_ms: int | None = None
@@ -1260,9 +1562,10 @@ class Store:
                         (timer_id,),
                     )
                     continue
-                if require_canonical and any(
+                source_finish_pending = any(
                     command.get("id") == finish_command_id for command in pending
-                ):
+                )
+                if require_canonical and source_finish_pending:
                     return []
 
                 snapshot = self.get_meta("snapshot", {})
@@ -1270,29 +1573,10 @@ class Store:
                     return []
                 canonical_timer = snapshot.get("canonicalTimer")
                 base_history = snapshot.get("history", [])
-                optimistic_timer, optimistic_history = rebuild_optimistic(
-                    canonical_timer, base_history, pending
-                )
-                current_timer = (
-                    canonical_timer if require_canonical else optimistic_timer
-                )
-                if (
-                    not isinstance(current_timer, dict)
-                    or current_timer.get("id") != timer_id
-                    or current_timer.get("phase") != "focus"
-                    or current_timer.get("status") != "completed"
-                ):
-                    self.connection.execute(
-                        "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
-                        (timer_id,),
-                    )
-                    continue
-                settings = self._normalize_settings(self.get_meta("settings", {}))
-                history = base_history if require_canonical else optimistic_history
-                completion = next(
+                canonical_completion = next(
                     (
                         item
-                        for item in history
+                        for item in base_history
                         if item.get("phase") == "focus"
                         and item.get("status") == "completed"
                         and item.get("timerId") == timer_id
@@ -1300,11 +1584,62 @@ class Store:
                     ),
                     None,
                 )
+                canonical_timer_is_source = canonical_timer is not None and (
+                    canonical_timer.get("id") == timer_id
+                    and canonical_timer.get("phase") == "focus"
+                    and canonical_timer.get("status") == "completed"
+                )
+                source_already_accepted = (
+                    not source_finish_pending
+                    and canonical_completion is not None
+                    and canonical_timer_is_source
+                )
+                optimistic_timer, optimistic_history = rebuild_optimistic(
+                    canonical_timer, base_history, pending
+                )
+                current_timer = (
+                    canonical_timer if require_canonical else optimistic_timer
+                )
+                if (
+                    not source_already_accepted
+                    and (
+                        not isinstance(current_timer, dict)
+                        or current_timer.get("id") != timer_id
+                        or current_timer.get("phase") != "focus"
+                        or current_timer.get("status") != "completed"
+                    )
+                ):
+                    self.connection.execute(
+                        "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
+                        (timer_id,),
+                    )
+                    continue
+                settings = self._normalize_settings(self.get_meta("settings", {}))
+                history = (
+                    base_history
+                    if require_canonical or source_already_accepted
+                    else optimistic_history
+                )
+                completion = (
+                    canonical_completion
+                    if require_canonical or source_already_accepted
+                    else next(
+                        (
+                            item
+                            for item in history
+                            if item.get("phase") == "focus"
+                            and item.get("status") == "completed"
+                            and item.get("timerId") == timer_id
+                            and item.get("commandId") == finish_command_id
+                        ),
+                        None,
+                    )
+                )
                 self.connection.execute(
                     "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
                     (timer_id,),
                 )
-                if completion is None or not settings["autoStartBreaks"]:
+                if completion is None:
                     continue
 
                 phase = next_break_phase(history)
@@ -1317,7 +1652,24 @@ class Store:
                     settings["durationsMs"],
                     None,
                     now_ms,
+                    (
+                        finish_command_id
+                        if not require_canonical and not source_already_accepted
+                        else None
+                    ),
                 )
+                if not require_canonical and not source_already_accepted:
+                    self.connection.execute(
+                        "INSERT INTO pending_auto_break_starts("
+                        "source_finish_command_id, source_timer_id, start_command_id, "
+                        "selected_phase_version) VALUES (?, ?, ?, ?)",
+                        (
+                            finish_command_id,
+                            timer_id,
+                            command["id"],
+                            int(self.get_meta("selectedPhaseVersion", 0)),
+                        ),
+                    )
                 return [command]
 
     def reset_account_data(self) -> None:
@@ -1327,6 +1679,7 @@ class Store:
             self.connection.execute("DELETE FROM pending_duration_operations")
             self.connection.execute("DELETE FROM pending_auto_start_operations")
             self.connection.execute("DELETE FROM pending_auto_breaks")
+            self.connection.execute("DELETE FROM pending_auto_break_starts")
             self._set_meta("pendingResolution", None)
             settings = self._normalize_settings(self.get_meta("settings", {}))
             settings["durations"] = {

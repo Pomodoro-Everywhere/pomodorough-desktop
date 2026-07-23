@@ -12,7 +12,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from pomodorough.core import task_from_title
+from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.storage import Store
 from pomodorough.ui import MainWindow
 
@@ -732,6 +732,120 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(len(break_starts), 1)
         self.assertEqual(
             self.cloud.payloads[-1]["autoStartOperations"], []
+        )
+
+    def test_canonical_long_break_replaces_provisional_short_before_notification(
+        self,
+    ) -> None:
+        self.store.set_user({"id": "user-1"})
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        provisional = self.store.process_auto_break(
+            require_canonical=False, now_ms=3_000
+        )[0]
+        self.window._load_state()
+        self.window._render()
+        self.window._sync()
+        request = self.window._sync_request
+        self.assertIsNotNone(request)
+
+        notifications = []
+        with patch.object(
+            self.window,
+            "_notify",
+            side_effect=lambda title, message: notifications.append((title, message)),
+        ):
+            self.window._issue("finish")
+            self.assertEqual(self.window.timer["status"], "completed")
+            self.assertEqual(notifications, [])
+
+            canonical_timer, local_history = rebuild_optimistic(
+                None, [], request["commands"]
+            )
+            for item in local_history:
+                item.pop("pending", None)
+            history = [
+                local_history[0],
+                self._history_item("remote-1"),
+                self._history_item("remote-2"),
+                self._history_item("remote-3"),
+            ]
+            response = self._bootstrap_response(revision=1, history=history)
+            response["acknowledgements"] = [
+                {
+                    "commandId": command["id"],
+                    "outcome": "applied",
+                    "reason": "",
+                }
+                for command in request["commands"]
+            ]
+            response["autoStartAcknowledgements"] = [
+                {
+                    "operationId": operation["id"],
+                    "outcome": "applied",
+                    "reason": "",
+                }
+                for operation in request["autoStartOperations"]
+            ]
+            response["canonicalTimer"] = canonical_timer
+            response["autoStartBreaks"] = True
+            self.window._apply_sync(response)
+
+            self.assertEqual(
+                (self.window.timer["id"], self.window.timer["phase"]),
+                (provisional["timerId"], "long_break"),
+            )
+            self.assertEqual(self.window.timer["status"], "completed")
+            self.assertEqual(self.window.clock.phase_text, "LONG BREAK")
+            self.assertEqual(
+                notifications,
+                [("Service arrived", "Long break completed.")],
+            )
+
+        self.assertEqual(
+            notifications,
+            [("Service arrived", "Long break completed.")],
+        )
+
+    def test_unsigned_offline_provisional_break_notifies_once_on_completion(
+        self,
+    ) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        self.store.process_auto_break(require_canonical=False, now_ms=3_000)
+        self.window._load_state()
+        self.window._render()
+        notifications = []
+
+        with patch.object(
+            self.window,
+            "_notify",
+            side_effect=lambda title, message: notifications.append((title, message)),
+        ):
+            self.window._issue("finish")
+            self.window._render()
+
+        self.assertEqual(
+            notifications,
+            [("Service arrived", "Short break completed.")],
         )
 
     def test_local_focus_completion_waits_before_auto_starting_break(self) -> None:

@@ -219,7 +219,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.cloud.restore)
 
     def _load_state(self) -> None:
-        state = self.store.load()
+        previous_timer = getattr(self, "timer", None)
+        state, provisional_timer_ids = (
+            self.store.load_with_provisional_auto_breaks()
+        )
         pending_resolution = self.store.pending_resolution()
         self.settings = state["settings"]
         self.revision = int(state["snapshot"].get("revision", 0))
@@ -239,6 +242,20 @@ class MainWindow(QMainWindow):
         self.timer, self.history = rebuild_optimistic(
             self.base_timer, self.base_history, self.pending
         )
+        self.provisional_auto_break_timer_ids = (
+            provisional_timer_ids if self.user is not None else set()
+        )
+        if (
+            previous_timer
+            and self.timer
+            and previous_timer.get("id") == self.timer.get("id")
+            and (
+                previous_timer.get("phase") != self.timer.get("phase")
+                or previous_timer.get("status") in TERMINAL_STATUSES
+                and self.timer.get("status") in ACTIVE_STATUSES
+            )
+        ):
+            self._notified_timer_id = None
         self.tasks = rebuild_tasks(self.base_tasks, self.pending_tasks)
         for task in self.tasks:
             self.known_tasks[task["id"]] = task
@@ -692,7 +709,11 @@ class MainWindow(QMainWindow):
             self.tray_primary.setEnabled(self.primary_button.isEnabled())
         self._render_history()
         self._render_tasks()
-        if status == "completed" and timer.get("id") != self._notified_timer_id:
+        if (
+            status == "completed"
+            and timer.get("id") not in self.provisional_auto_break_timer_ids
+            and timer.get("id") != self._notified_timer_id
+        ):
             self._notified_timer_id = timer.get("id")
             self._notify("Service arrived", f'{PHASES[timer["phase"]]["label"]} completed.')
 

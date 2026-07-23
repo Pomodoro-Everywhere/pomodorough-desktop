@@ -114,6 +114,34 @@ class StorageTests(unittest.TestCase):
             "finish", timer, "focus", settings["durationsMs"], now_ms=2_000
         )
 
+    def _queue_offline_auto_break(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        generated = self.store.process_auto_break(
+            require_canonical=False, now_ms=3_000
+        )[0]
+        return start, finish, generated
+
+    @staticmethod
+    def _canonical_completion(
+        commands: list[dict[str, object]],
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        timer, history = rebuild_optimistic(None, [], commands)
+        for item in history:
+            item.pop("pending", None)
+        return timer, history
+
     def test_bootstrap_resolution_strategy_preserves_one_sided_history(self) -> None:
         empty_remote = self._canonical_response(
             {"commands": [], "taskOperations": [], "durationOperations": []},
@@ -1880,6 +1908,614 @@ class StorageTests(unittest.TestCase):
             [command["id"] for command in self.store.load()["pending"]],
             [commands[0]["id"]],
         )
+
+    def test_offline_auto_break_start_waits_for_applied_finish(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        request = self.store.sync_payload()
+        self.assertNotIn(generated, request["commands"])
+        self.assertEqual(
+            self.store.provisional_auto_break_timer_ids(), {generated["timerId"]}
+        )
+        canonical_timer, canonical_history = self._canonical_completion(
+            request["commands"]
+        )
+        response = self._canonical_response(
+            request,
+            revision=1,
+            history=canonical_history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
+        self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
+        timer, _history = rebuild_optimistic(
+            self.store.load()["snapshot"]["canonicalTimer"],
+            self.store.load()["snapshot"]["history"],
+            self.store.load()["pending"],
+        )
+        self.assertEqual((timer["id"], timer["phase"]), (generated["timerId"], "short_break"))
+
+    def test_offline_callback_after_finish_acceptance_queues_sendable_start(
+        self,
+    ) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        request = self.store.sync_payload()
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(response, request)
+
+        generated = self.store.process_auto_break(
+            require_canonical=False, now_ms=3_000
+        )[0]
+
+        self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
+
+    def test_disabling_after_provisional_start_does_not_cancel_decided_break(
+        self,
+    ) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        disabled = self.store.set_auto_start_breaks(False, now_ms=3_500)
+        request = self.store.sync_payload()
+        self.assertIn(disabled, request["autoStartOperations"])
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=False,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
+        self.assertFalse(self.store.load()["settings"]["autoStartBreaks"])
+
+    def test_duplicate_second_instance_finish_does_not_supersede_decided_break(
+        self,
+    ) -> None:
+        start, _finish, generated = self._queue_offline_auto_break()
+        source_running, _history = rebuild_optimistic(None, [], [start])
+        other = Store(self.path)
+        try:
+            duplicate = other.queue_command(
+                "finish",
+                source_running,
+                "focus",
+                self.store.load()["settings"]["durationsMs"],
+                now_ms=4_000,
+            )
+        finally:
+            other.close()
+        request = self.store.sync_payload()
+        self.assertIn(duplicate, request["commands"])
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
+
+    def test_canonical_phase_transforms_dependent_finish_pause_and_resume(self) -> None:
+        cases = {
+            "completed": ["finish"],
+            "paused": ["pause"],
+            "running": ["pause", "resume"],
+        }
+        for expected_status, actions in cases.items():
+            with self.subTest(expected_status=expected_status):
+                self.store.reset_account_data()
+                _start, _finish, generated = self._queue_offline_auto_break()
+                timer, _history = rebuild_optimistic(
+                    None, [], self.store.load()["pending"]
+                )
+                dependent = []
+                for index, action in enumerate(actions):
+                    command = self.store.queue_command(
+                        action,
+                        timer,
+                        "short_break",
+                        self.store.load()["settings"]["durationsMs"],
+                        now_ms=4_000 + index,
+                    )
+                    dependent.append(command)
+                    timer, _history = rebuild_optimistic(
+                        None, [], self.store.load()["pending"]
+                    )
+                request = self.store.sync_payload()
+                canonical_timer, local_history = self._canonical_completion(
+                    request["commands"]
+                )
+                history = [
+                    local_history[0],
+                    self._history_item("remote-1"),
+                    self._history_item("remote-2"),
+                    self._history_item("remote-3"),
+                ]
+                response = self._canonical_response(
+                    request,
+                    history=history,
+                    auto_start_breaks=True,
+                )
+                response["canonicalTimer"] = canonical_timer
+                response["durationsMs"]["long_break"] = 20 * 60_000
+
+                self.store.apply_sync(response, request)
+
+                released = self.store.sync_payload()["commands"]
+                self.assertEqual(
+                    [command["id"] for command in released],
+                    [generated["id"], *[command["id"] for command in dependent]],
+                )
+                self.assertTrue(
+                    all(command["phase"] == "long_break" for command in released)
+                )
+                self.assertTrue(
+                    all(
+                        command["plannedDurationMs"] == 20 * 60_000
+                        for command in released
+                    )
+                )
+                projected, projected_history = rebuild_optimistic(
+                    self.store.load()["snapshot"]["canonicalTimer"],
+                    self.store.load()["snapshot"]["history"],
+                    self.store.load()["pending"],
+                )
+                self.assertEqual(projected["phase"], "long_break")
+                self.assertEqual(projected["status"], expected_status)
+                if expected_status == "completed":
+                    self.assertEqual(projected_history[0]["phase"], "long_break")
+                    self.assertEqual(
+                        projected_history[0]["plannedDurationMs"], 20 * 60_000
+                    )
+
+    def test_canonical_phase_transform_preserves_cancel_intent(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        provisional, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        cancel = self.store.queue_command(
+            "cancel",
+            provisional,
+            "short_break",
+            self.store.load()["settings"]["durationsMs"],
+            now_ms=4_000,
+        )
+        request = self.store.sync_payload()
+        canonical_timer, local_history = self._canonical_completion(request["commands"])
+        history = [
+            local_history[0],
+            self._history_item("remote-1"),
+            self._history_item("remote-2"),
+            self._history_item("remote-3"),
+        ]
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        released = self.store.sync_payload()["commands"]
+        self.assertEqual(
+            [command["id"] for command in released],
+            [generated["id"], cancel["id"]],
+        )
+        self.assertEqual(released[1]["phase"], "long_break")
+        projected, _history = rebuild_optimistic(
+            self.store.load()["snapshot"]["canonicalTimer"],
+            self.store.load()["snapshot"]["history"],
+            self.store.load()["pending"],
+        )
+        self.assertEqual((projected["phase"], projected["status"]), ("long_break", "cancelled"))
+
+    def test_malformed_dependent_chain_drops_invalid_suffix_deterministically(
+        self,
+    ) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        provisional, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        pause = self.store.queue_command(
+            "pause",
+            provisional,
+            "short_break",
+            self.store.load()["settings"]["durationsMs"],
+            now_ms=4_000,
+        )
+        paused, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        resume = self.store.queue_command(
+            "resume",
+            paused,
+            "short_break",
+            self.store.load()["settings"]["durationsMs"],
+            now_ms=4_001,
+        )
+        corrupt = dict(pause)
+        corrupt["type"] = "unknown"
+        self.store.connection.execute(
+            "UPDATE pending_commands SET payload = ? WHERE id = ?",
+            (json.dumps(corrupt, separators=(",", ":")), pause["id"]),
+        )
+        self.store.connection.commit()
+        request = self.store.sync_payload()
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        released = self.store.sync_payload()["commands"]
+        self.assertEqual([command["id"] for command in released], [generated["id"]])
+        self.assertNotIn(pause["id"], [command["id"] for command in released])
+        self.assertNotIn(resume["id"], [command["id"] for command in released])
+
+    def test_canonical_phase_correction_preserves_later_focus_selection(self) -> None:
+        _start, _finish, _generated = self._queue_offline_auto_break()
+        self.assertEqual(self.store.load()["settings"]["selectedPhase"], "short_break")
+        self.store.set_selected_phase("focus")
+        request = self.store.sync_payload()
+        canonical_timer, local_history = self._canonical_completion(request["commands"])
+        history = [
+            local_history[0],
+            self._history_item("remote-1"),
+            self._history_item("remote-2"),
+            self._history_item("remote-3"),
+        ]
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.load()["settings"]["selectedPhase"], "focus")
+
+    def test_ui_projection_load_keeps_pending_timer_and_marker_in_one_snapshot(
+        self,
+    ) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        loaded_state = Event()
+        continue_read = Event()
+        results = Queue()
+
+        class PausingStore(Store):
+            def provisional_auto_break_timer_ids(self) -> set[str]:
+                loaded_state.set()
+                if not continue_read.wait(2):
+                    raise TimeoutError("writer did not release snapshot read")
+                return super().provisional_auto_break_timer_ids()
+
+        def read_projection() -> None:
+            store = PausingStore(self.path)
+            try:
+                results.put(store.load_with_provisional_auto_breaks())
+            finally:
+                store.close()
+
+        thread = Thread(target=read_projection)
+        thread.start()
+        self.assertTrue(loaded_state.wait(2))
+        self.store.connection.execute("DELETE FROM pending_auto_break_starts")
+        self.store.connection.commit()
+        continue_read.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+        state, timer_ids = results.get_nowait()
+        self.assertIn(generated, state["pending"])
+        self.assertEqual(timer_ids, {generated["timerId"]})
+
+    def test_ignored_and_rejected_finish_drop_offline_auto_break_start(self) -> None:
+        for outcome in ("ignored", "rejected"):
+            with self.subTest(outcome=outcome):
+                self.store.reset_account_data()
+                start, finish, generated = self._queue_offline_auto_break()
+                request = self.store.sync_payload()
+                running, _history = rebuild_optimistic(None, [], [start])
+                response = self._canonical_response(
+                    request,
+                    revision=1,
+                    auto_start_breaks=True,
+                )
+                response["canonicalTimer"] = running
+                response["acknowledgements"] = [
+                    {
+                        "commandId": item["id"],
+                        "outcome": outcome if item["id"] == finish["id"] else "applied",
+                        "reason": "finish not accepted" if item["id"] == finish["id"] else "",
+                    }
+                    for item in request["commands"]
+                ]
+
+                notices = self.store.apply_sync(response, request)
+
+                self.assertEqual(notices, ["finish not accepted"])
+                self.assertNotIn(generated, self.store.load()["pending"])
+                self.assertEqual(self.store.sync_payload()["commands"], [])
+                self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
+                self.assertEqual(
+                    self.store.load()["snapshot"]["canonicalTimer"], running
+                )
+                self.assertEqual(
+                    self.store.load()["settings"]["selectedPhase"], "focus"
+                )
+
+    def test_superseded_finish_drops_break_and_restores_source_selection(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        request = self.store.sync_payload()
+        _completed, history = self._canonical_completion(request["commands"])
+        remote_timer = {
+            "id": "remote-focus",
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": 25 * 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": "1970-01-01T00:00:04.000Z",
+            "taskId": None,
+        }
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = remote_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertNotIn(generated, self.store.load()["pending"])
+        self.assertEqual(self.store.load()["settings"]["selectedPhase"], "focus")
+
+    def test_drop_preserves_later_explicit_same_phase_selection(self) -> None:
+        start, finish, generated = self._queue_offline_auto_break()
+        self.store.set_selected_phase("short_break")
+        request = self.store.sync_payload()
+        running, _history = rebuild_optimistic(None, [], [start])
+        response = self._canonical_response(
+            request,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = running
+        response["acknowledgements"] = [
+            {
+                "commandId": command["id"],
+                "outcome": "rejected" if command["id"] == finish["id"] else "applied",
+                "reason": "superseded" if command["id"] == finish["id"] else "",
+            }
+            for command in request["commands"]
+        ]
+
+        self.store.apply_sync(response, request)
+
+        self.assertNotIn(generated, self.store.load()["pending"])
+        self.assertEqual(
+            self.store.load()["settings"]["selectedPhase"], "short_break"
+        )
+
+    def test_lost_finish_response_preserves_withheld_start_across_restart(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        request = self.store.sync_payload()
+        before_timer, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.store.close()
+
+        self.store = Store(self.path)
+        self.assertEqual(self.store.sync_payload(), request)
+        self.assertEqual(
+            self.store.provisional_auto_break_timer_ids(), {generated["timerId"]}
+        )
+        after_timer, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        self.assertEqual(after_timer, before_timer)
+
+        canonical_timer, canonical_history = self._canonical_completion(
+            request["commands"]
+        )
+        response = self._canonical_response(
+            request,
+            history=canonical_history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(response, request)
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
+
+    def test_canonical_fourth_focus_reconciles_provisional_short_to_long(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        self.assertEqual(generated["phase"], "short_break")
+        request = self.store.sync_payload()
+        canonical_timer, local_history = self._canonical_completion(
+            request["commands"]
+        )
+        history = [
+            local_history[0],
+            self._history_item("remote-1"),
+            self._history_item("remote-2"),
+            self._history_item("remote-3"),
+        ]
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        response["durationsMs"]["long_break"] = 20 * 60_000
+
+        self.store.apply_sync(response, request)
+
+        reconciled = self.store.sync_payload()["commands"]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["id"], generated["id"])
+        self.assertEqual(reconciled[0]["phase"], "long_break")
+        self.assertEqual(reconciled[0]["plannedDurationMs"], 20 * 60_000)
+        timer, _history = rebuild_optimistic(
+            self.store.load()["snapshot"]["canonicalTimer"],
+            self.store.load()["snapshot"]["history"],
+            self.store.load()["pending"],
+        )
+        self.assertEqual((timer["phase"], timer["status"]), ("long_break", "running"))
+
+    def test_remote_timer_supersession_drops_withheld_auto_break_start(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        request = self.store.sync_payload()
+        _completed, history = self._canonical_completion(request["commands"])
+        remote_timer = {
+            "id": "newer-remote-timer",
+            "phase": "short_break",
+            "status": "running",
+            "plannedDurationMs": 5 * 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": "1970-01-01T00:00:04.000Z",
+            "taskId": None,
+        }
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = remote_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertNotIn(generated, self.store.load()["pending"])
+        self.assertEqual(self.store.sync_payload()["commands"], [])
+        timer, _history = rebuild_optimistic(
+            remote_timer, self.store.load()["snapshot"]["history"], []
+        )
+        self.assertEqual(timer, remote_timer)
+
+    def test_applied_finish_with_remote_clear_does_not_resurrect_break(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        request = self.store.sync_payload()
+        _completed, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = None
+
+        self.store.apply_sync(response, request)
+
+        loaded = self.store.load()
+        self.assertNotIn(generated, loaded["pending"])
+        self.assertEqual(self.store.sync_payload()["commands"], [])
+        self.assertIsNone(loaded["snapshot"]["canonicalTimer"])
+        self.assertEqual(loaded["settings"]["selectedPhase"], "focus")
+        self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
+
+    def test_process_auto_break_does_not_resurrect_after_canonical_clear(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        finish = self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        request = self.store.sync_payload()
+        _completed, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = None
+        self.store.apply_sync(response, request)
+
+        self.store.connection.execute(
+            "INSERT INTO pending_auto_breaks("
+            "finish_command_id, timer_id, finish_device_sequence) VALUES (?, ?, ?)",
+            (finish["id"], finish["timerId"], finish["deviceSequence"]),
+        )
+        self.store.connection.commit()
+
+        self.assertEqual(
+            self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
+        )
+        self.assertEqual(self.store.load()["pending"], [])
+        self.assertFalse(self.store.has_pending_auto_break())
+
+    def test_manual_start_remains_sendable_and_supersedes_withheld_auto_break(
+        self,
+    ) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        settings = self.store.load()["settings"]
+        manual = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=4_000
+        )
+        request = self.store.sync_payload()
+        self.assertIn(manual, request["commands"])
+        self.assertNotIn(generated, request["commands"])
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertEqual(canonical_timer["id"], manual["timerId"])
+        self.assertNotIn(generated, self.store.load()["pending"])
+        self.assertEqual(
+            self.store.load()["snapshot"]["canonicalTimer"], canonical_timer
+        )
+
+    def test_withheld_auto_break_start_does_not_consume_command_batch_slot(self) -> None:
+        _start, _finish, generated = self._queue_offline_auto_break()
+        settings = self.store.load()["settings"]
+        manual = [
+            self.store.queue_command(
+                "start", None, "focus", settings["durationsMs"], now_ms=4_000 + index
+            )
+            for index in range(255)
+        ]
+
+        request = self.store.sync_payload()
+
+        self.assertEqual(len(request["commands"]), 256)
+        self.assertNotIn(generated, request["commands"])
+        self.assertNotIn(manual[-1], request["commands"])
 
     def test_duplicate_finish_queued_in_flight_keeps_auto_break_trigger(self) -> None:
         self.store.set_auto_start_breaks(True, now_ms=100)
