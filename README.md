@@ -69,8 +69,8 @@ cross-device synchronization with the production service.
 
 ### Windows
 
-Download `Pomodorough-<version>-windows-x86_64.exe` and its matching `.sha256`
-file from the [latest GitHub release](https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/latest).
+Download `Pomodorough-<version>-windows-x86_64.exe` and `SHA256SUMS.txt`
+from the [latest GitHub release](https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/latest).
 The executable includes Python, Qt, and all application dependencies, so it can
 run directly without installation.
 
@@ -98,9 +98,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.5/pomodorough_linux-0.1.5.tar.gz
-tar -xzf pomodorough_linux-0.1.5.tar.gz
-cd pomodorough_linux-0.1.5
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.6/pomodorough_linux-0.1.6.tar.gz
+tar -xzf pomodorough_linux-0.1.6.tar.gz
+cd pomodorough_linux-0.1.6
 ./deploy/install.sh
 ```
 
@@ -123,7 +123,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.5
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.6
 ```
 
 ### Flatpak
@@ -131,8 +131,8 @@ nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.5
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.5/Pomodorough-0.1.5-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.1.5-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.6/Pomodorough-0.1.6-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.1.6-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 

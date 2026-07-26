@@ -10,13 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to attach artifacts to
+        description: Version tag used to name artifacts
         required: false
         type: string
         default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: windows-${{ inputs.tag || github.ref }}
@@ -81,29 +81,11 @@ jobs:
           }
           Remove-Item $env:POMODOROUGH_SCREENSHOT
 
-      - name: Create checksum
-        shell: pwsh
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
-          $hash = (Get-FileHash $executable -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path $executable -Leaf)" | Set-Content "$executable.sha256" -Encoding ascii
-
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64
-          path: |
-            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe
-            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe.sha256
+          name: release-windows
+          path: dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe
           if-no-files-found: error
-
-      - name: Attach executable to release
-        if: inputs.tag != ''
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: |
-            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe
-            dist/Pomodorough-${{ steps.release.outputs.version }}-windows-x86_64.exe.sha256
-          tag_name: ${{ inputs.tag }}
+          overwrite: true
+          retention-days: 7

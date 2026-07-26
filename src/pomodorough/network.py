@@ -10,6 +10,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -100,23 +101,30 @@ class TokenStore:
         self.fallback_path = _config_root() / "session.json"
 
     def load(self) -> dict[str, Any] | None:
+        fallback = self._load_fallback()
+        if fallback is not None:
+            return None if fallback.get("signedOut") is True else fallback
         if shutil.which("secret-tool"):
-            result = subprocess.run(
-                ["secret-tool", "lookup", "service", "pomodorough", "device", self.device_id],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                try:
-                    return json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    pass
-        try:
-            return json.loads(self.fallback_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
+            try:
+                result = subprocess.run(
+                    ["secret-tool", "lookup", "service", "pomodorough", "device", self.device_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            else:
+                if result.returncode == 0 and result.stdout.strip():
+                    try:
+                        document = json.loads(result.stdout)
+                    except json.JSONDecodeError:
+                        pass
+                    else:
+                        if isinstance(document, dict):
+                            return document
+        return None
 
     def save(self, token_response: dict[str, Any]) -> None:
         stored = {
@@ -124,43 +132,89 @@ class TokenStore:
             "refreshTokenExpiresAt": token_response["refreshTokenExpiresAt"],
         }
         encoded = json.dumps(stored, separators=(",", ":"))
+        self._write_fallback(encoded)
         if shutil.which("secret-tool"):
-            result = subprocess.run(
-                [
-                    "secret-tool",
-                    "store",
-                    "--label=Pomodorough",
-                    "service",
-                    "pomodorough",
-                    "device",
-                    self.device_id,
-                ],
-                input=encoded,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if result.returncode == 0:
-                try:
-                    self.fallback_path.unlink()
-                except FileNotFoundError:
-                    pass
-                return
-        self.fallback_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.fallback_path.write_text(encoded)
-        self.fallback_path.chmod(0o600)
+            try:
+                result = subprocess.run(
+                    [
+                        "secret-tool",
+                        "store",
+                        "--label=Pomodorough",
+                        "service",
+                        "pomodorough",
+                        "device",
+                        self.device_id,
+                    ],
+                    input=encoded,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            else:
+                if result.returncode == 0:
+                    try:
+                        self.fallback_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    return
 
     def clear(self) -> None:
+        self._write_fallback('{"signedOut":true}')
+        keyring_cleared = False
         if shutil.which("secret-tool"):
-            subprocess.run(
-                ["secret-tool", "clear", "service", "pomodorough", "device", self.device_id],
-                timeout=10,
-                check=False,
-            )
+            try:
+                result = subprocess.run(
+                    ["secret-tool", "clear", "service", "pomodorough", "device", self.device_id],
+                    timeout=10,
+                    check=False,
+                )
+                keyring_cleared = result.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                keyring_cleared = False
+        # The tombstone remains authoritative until a later successful sign-in.
+        # This keeps a stale keyring token from reviving a signed-out session.
+
+    def _load_fallback(self) -> dict[str, Any] | None:
         try:
-            self.fallback_path.unlink()
-        except FileNotFoundError:
-            pass
+            document = json.loads(self.fallback_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    def _write_fallback(self, encoded: str) -> None:
+        self.fallback_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.fallback_path.name}.",
+            dir=self.fallback_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fallback:
+                descriptor = -1
+                fallback.write(encoded)
+                fallback.flush()
+                os.fsync(fallback.fileno())
+            os.replace(temporary_path, self.fallback_path)
+            if hasattr(os, "O_DIRECTORY"):
+                directory_descriptor = os.open(
+                    self.fallback_path.parent,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class WorkerSignals(QObject):

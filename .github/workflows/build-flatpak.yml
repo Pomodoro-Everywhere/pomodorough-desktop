@@ -1,8 +1,6 @@
 name: Build Flatpak release
 
 on:
-  release:
-    types: [published]
   workflow_call:
     inputs:
       tag:
@@ -11,21 +9,20 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to attach artifact to
+        description: Version tag used to name artifact
         required: false
         type: string
         default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: flatpak-${{ inputs.tag || github.event.release.tag_name || github.ref }}
+  group: flatpak-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
   flatpak:
-    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.10
@@ -38,7 +35,7 @@ jobs:
         id: release
         shell: bash
         env:
-          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           if [ -n "$TAG" ]; then
             version="${TAG#v}"
@@ -55,9 +52,11 @@ jobs:
           arch: x86_64
           cache-key: flatpak-builder-${{ github.sha }}
 
-      - name: Attach bundle to release
-        if: ${{ github.event_name == 'release' || inputs.tag != '' }}
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak
-          tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+          name: release-flatpak
+          path: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7

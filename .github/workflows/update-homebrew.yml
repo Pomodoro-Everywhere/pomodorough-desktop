@@ -1,8 +1,6 @@
 name: Update Homebrew tap
 
 on:
-  release:
-    types: [published]
   workflow_call:
     inputs:
       tag:
@@ -16,12 +14,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: homebrew-${{ inputs.tag || github.event.release.tag_name }}
+  group: homebrew-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   update:
-    if: ${{ github.event_name == 'workflow_call' || !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -32,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           version="${TAG#v}"
           asset="pomodorough_linux-${version}.tar.gz"
@@ -55,6 +52,14 @@ jobs:
           URL: ${{ steps.release.outputs.url }}
           SHA256: ${{ steps.release.outputs.sha256 }}
         run: |
+          current_version="$(sed -nE 's/^[[:space:]]*version "([^"]+)".*/\1/p' homebrew-tap/Formula/pomodorough.rb 2>/dev/null || true)"
+          if [ -n "$current_version" ]; then
+            highest="$(printf '%s\n' "$current_version" "$VERSION" | sort -V | tail -n 1)"
+            if [ "$highest" != "$VERSION" ]; then
+              echo "Tap already contains newer version $current_version; skipping $VERSION"
+              exit 0
+            fi
+          fi
           mkdir -p homebrew-tap/Formula
           sed \
             -e "s|@VERSION@|$VERSION|g" \
