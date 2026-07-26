@@ -162,17 +162,15 @@ class TokenStore:
 
     def clear(self) -> None:
         self._write_fallback('{"signedOut":true}')
-        keyring_cleared = False
         if shutil.which("secret-tool"):
             try:
-                result = subprocess.run(
+                subprocess.run(
                     ["secret-tool", "clear", "service", "pomodorough", "device", self.device_id],
                     timeout=10,
                     check=False,
                 )
-                keyring_cleared = result.returncode == 0
             except (OSError, subprocess.SubprocessError):
-                keyring_cleared = False
+                pass
         # The tombstone remains authoritative until a later successful sign-in.
         # This keeps a stale keyring token from reviving a signed-out session.
 

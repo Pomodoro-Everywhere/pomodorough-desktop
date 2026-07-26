@@ -388,11 +388,16 @@ class TokenStoreTests(unittest.TestCase):
                 ):
                     store.save(response)
 
+                self.assertEqual(len(replacements), 1)
+                mode, document, previous = replacements[0]
+                if os.name == "posix":
+                    self.assertEqual(mode, 0o600)
+                self.assertEqual(document, response)
                 self.assertEqual(
-                    replacements,
-                    [(0o600, response, "previous" if existing_mode is not None else None)],
+                    previous, "previous" if existing_mode is not None else None
                 )
-                self.assertEqual(store.fallback_path.stat().st_mode & 0o777, 0o600)
+                if os.name == "posix":
+                    self.assertEqual(store.fallback_path.stat().st_mode & 0o777, 0o600)
 
     def test_valid_keyring_json_loads_keyring(self) -> None:
         expected = {
