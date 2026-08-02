@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 import os
 import subprocess
+import threading
 import unittest
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
@@ -20,11 +24,124 @@ from PySide6.QtWidgets import QApplication
 from pomodorough.network import (
     ApiError,
     CloudService,
+    DesktopOAuthContract,
+    SystemOAuthBrowserTransport,
     TokenStore,
     _config_root,
+    _read_oauth_credentials,
     _request,
     _RevisionEventParser,
 )
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.body
+
+
+class _FakeSignal:
+    def __init__(self) -> None:
+        self.callbacks = []
+
+    def connect(self, callback) -> None:
+        self.callbacks.append(callback)
+
+
+class _FakeRevisionReply:
+    def __init__(self, body: bytes = b"", status: int | None = 200) -> None:
+        self.body = body
+        self.status = status
+        self.readyRead = _FakeSignal()
+        self.finished = _FakeSignal()
+        self.aborted = False
+        self.deleted = False
+
+    def readAll(self) -> bytes:
+        body, self.body = self.body, b""
+        return body
+
+    def attribute(self, _attribute) -> int | None:
+        return self.status
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def deleteLater(self) -> None:
+        self.deleted = True
+
+
+class _FakeNetworkManager:
+    def __init__(self, reply: _FakeRevisionReply) -> None:
+        self.reply = reply
+        self.requests = []
+
+    def get(self, request):
+        self.requests.append(request)
+        return self.reply
+
+
+class _FakeOAuthBrowser:
+    def __init__(
+        self,
+        callback: dict[str, str] | None = None,
+        *,
+        error: Exception | None = None,
+        redirect_uri: str = "http://127.0.0.1:43123/callback",
+    ) -> None:
+        self.callback = callback or {}
+        self.error = error
+        self.redirect_uri = redirect_uri
+        self.authorization_urls: list[str] = []
+        self.cancelled = False
+
+    def authorize(self, authorization_url):
+        self.authorization_urls.append(authorization_url(self.redirect_uri))
+        if self.error is not None:
+            raise self.error
+        return self.redirect_uri, dict(self.callback)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _FakeOAuthHTTPServer:
+    def __init__(
+        self,
+        handler,
+        callback: dict[str, str] | None,
+    ) -> None:
+        self.handler = handler
+        self.callback = callback
+        self.server_port = 43123
+        self.timeout = None
+        self.handled = False
+        self.closed = False
+
+    def handle_request(self) -> None:
+        self.handled = True
+        if self.callback is not None:
+            self.handler.result_queue.put(dict(self.callback))
+
+    def server_close(self) -> None:
+        self.closed = True
+
+
+def _run_immediately(function, on_result, on_error=None) -> None:
+    try:
+        on_result(function())
+    except Exception as error:
+        if on_error is None:
+            raise
+        on_error(error)
 
 
 class RevisionEventParserTests(unittest.TestCase):
@@ -61,6 +178,687 @@ class OAuthResourceTests(unittest.TestCase):
             "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com",
         )
         self.assertNotIn("client_secret", config)
+
+    def test_credentials_accept_installed_web_and_root_documents(self) -> None:
+        variants = (
+            {"installed": {"client_id": "installed-client"}},
+            {"web": {"client_id": "web-client", "client_secret": "secret"}},
+            {"client_id": "root-client", "auth_uri": "https://auth.test"},
+        )
+
+        for document in variants:
+            with self.subTest(document=document), TemporaryDirectory() as directory:
+                source = Path(directory) / "oauth.json"
+                source.write_text(json.dumps(document))
+                with patch.dict(
+                    os.environ,
+                    {"POMODOROUGH_GOOGLE_OAUTH_JSON": str(source)},
+                ):
+                    credentials = _read_oauth_credentials()
+
+                config = document.get("installed") or document.get("web") or document
+                self.assertEqual(credentials["client_id"], config["client_id"])
+                self.assertEqual(credentials["client_secret"], config.get("client_secret", ""))
+                self.assertEqual(
+                    credentials["auth_uri"],
+                    config.get("auth_uri", "https://accounts.google.com/o/oauth2/v2/auth"),
+                )
+                self.assertEqual(
+                    credentials["token_uri"],
+                    config.get("token_uri", "https://oauth2.googleapis.com/token"),
+                )
+
+    def test_user_credentials_precede_bundled_resource(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "google-oauth.json"
+            source.write_text(json.dumps({"installed": {"client_id": "user-client"}}))
+            with (
+                patch.dict(os.environ, {}, clear=False),
+                patch("pomodorough.network._config_root", return_value=Path(directory)),
+            ):
+                os.environ.pop("POMODOROUGH_GOOGLE_OAUTH_JSON", None)
+                credentials = _read_oauth_credentials()
+
+        self.assertEqual(credentials["client_id"], "user-client")
+
+    def test_invalid_credentials_report_source_path(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "oauth.json"
+            source.write_text("{}")
+            with patch.dict(
+                os.environ,
+                {"POMODOROUGH_GOOGLE_OAUTH_JSON": str(source)},
+            ):
+                with self.assertRaises(ApiError) as raised:
+                    _read_oauth_credentials()
+
+        self.assertIn(str(source), str(raised.exception))
+
+
+class DesktopOAuthContractTests(unittest.TestCase):
+    credentials = {
+        "client_id": "desktop-client",
+        "client_secret": "desktop-secret",
+        "auth_uri": "https://accounts.example.test/authorize",
+        "token_uri": "https://accounts.example.test/token",
+    }
+
+    def test_authorization_url_has_exact_pkce_state_nonce_and_redirect_contract(self) -> None:
+        verifier = "fixed/verifier+value"
+        expected_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).decode().rstrip("=")
+
+        url = DesktopOAuthContract.authorization_url(
+            self.credentials,
+            "http://127.0.0.1:43123/callback",
+            "nonce-value",
+            "state-value",
+            verifier,
+        )
+
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(
+            urllib.parse.urlunparse(parsed._replace(query="")),
+            "https://accounts.example.test/authorize",
+        )
+        self.assertEqual(
+            query,
+            {
+                "client_id": ["desktop-client"],
+                "redirect_uri": ["http://127.0.0.1:43123/callback"],
+                "response_type": ["code"],
+                "scope": ["openid email profile"],
+                "nonce": ["nonce-value"],
+                "state": ["state-value"],
+                "code_challenge": [expected_challenge],
+                "code_challenge_method": ["S256"],
+                "prompt": ["select_account"],
+            },
+        )
+
+    def test_callback_accepts_exact_state_and_rejects_state_errors_and_missing_code(self) -> None:
+        self.assertEqual(
+            DesktopOAuthContract.authorization_code(
+                {"state": "state-value", "code": "  code-value  "},
+                "state-value",
+            ),
+            "code-value",
+        )
+        cases = (
+            ({"state": "wrong", "code": "code"}, "invalid state"),
+            (
+                {
+                    "state": "state-value",
+                    "error": "fallback",
+                    "error_description": "provider description",
+                },
+                "provider description",
+            ),
+            ({"state": "state-value", "error": "access_denied"}, "access_denied"),
+            ({"state": "state-value", "code": "   "}, "cancelled"),
+        )
+        for callback, message in cases:
+            with self.subTest(callback=callback), self.assertRaises(ApiError) as raised:
+                DesktopOAuthContract.authorization_code(callback, "state-value")
+            self.assertIn(message, str(raised.exception))
+
+    def test_token_payload_includes_optional_secret_and_exact_redirect_verifier(self) -> None:
+        expected = {
+            "client_id": "desktop-client",
+            "client_secret": "desktop-secret",
+            "code": "code-value",
+            "code_verifier": "verifier-value",
+            "grant_type": "authorization_code",
+            "redirect_uri": "http://127.0.0.1:43123/callback",
+        }
+        self.assertEqual(
+            DesktopOAuthContract.token_payload(
+                self.credentials,
+                "code-value",
+                "http://127.0.0.1:43123/callback",
+                "verifier-value",
+            ),
+            expected,
+        )
+        without_secret = dict(self.credentials, client_secret="")
+        self.assertNotIn(
+            "client_secret",
+            DesktopOAuthContract.token_payload(
+                without_secret,
+                "code-value",
+                "http://127.0.0.1:43123/callback",
+                "verifier-value",
+            ),
+        )
+
+
+class SystemOAuthBrowserTransportTests(unittest.TestCase):
+    def test_browser_transport_returns_callback_and_always_closes_server(self) -> None:
+        created = []
+
+        def create_server(_address, handler):
+            server = _FakeOAuthHTTPServer(
+                handler,
+                {"state": "state-value", "code": "code-value"},
+            )
+            created.append(server)
+            return server
+
+        with (
+            patch("pomodorough.network.HTTPServer", side_effect=create_server),
+            patch("pomodorough.network.webbrowser.open", return_value=True) as opened,
+        ):
+            redirect_uri, callback = SystemOAuthBrowserTransport().authorize(
+                lambda redirect: f"https://accounts.example.test?redirect={redirect}"
+            )
+
+        self.assertEqual(redirect_uri, "http://127.0.0.1:43123/callback")
+        self.assertEqual(callback, {"state": "state-value", "code": "code-value"})
+        opened.assert_called_once_with(
+            "https://accounts.example.test?redirect=http://127.0.0.1:43123/callback",
+            new=1,
+            autoraise=True,
+        )
+        self.assertEqual(created[0].timeout, 0.25)
+        self.assertTrue(created[0].handled)
+        self.assertTrue(created[0].closed)
+
+    def test_browser_transport_reports_open_failure_and_timeout_and_closes_server(self) -> None:
+        for opened, callback, message in (
+            (False, None, "Could not open"),
+            (True, None, "timed out"),
+        ):
+            with self.subTest(opened=opened):
+                created = []
+
+                def create_server(_address, handler):
+                    server = _FakeOAuthHTTPServer(handler, callback)
+                    created.append(server)
+                    return server
+
+                if opened:
+                    with (
+                        patch(
+                            "pomodorough.network.HTTPServer",
+                            side_effect=create_server,
+                        ),
+                        patch(
+                            "pomodorough.network.webbrowser.open",
+                            return_value=True,
+                        ),
+                        patch(
+                            "pomodorough.network.time.monotonic",
+                            side_effect=[0, 181],
+                        ),
+                        self.assertRaises(ApiError) as raised,
+                    ):
+                        SystemOAuthBrowserTransport().authorize(
+                            lambda _redirect: "https://auth"
+                        )
+                else:
+                    with (
+                        patch(
+                            "pomodorough.network.HTTPServer",
+                            side_effect=create_server,
+                        ),
+                        patch(
+                            "pomodorough.network.webbrowser.open",
+                            return_value=False,
+                        ),
+                        self.assertRaises(ApiError) as raised,
+                    ):
+                        SystemOAuthBrowserTransport().authorize(
+                            lambda _redirect: "https://auth"
+                        )
+
+                self.assertIn(message, str(raised.exception))
+                self.assertTrue(created[0].closed)
+                self.assertFalse(created[0].handled)
+
+    def test_cancel_unblocks_active_callback_listener(self) -> None:
+        entered = threading.Event()
+        released = threading.Event()
+        created = []
+
+        def create_server(_address, handler):
+            server = _FakeOAuthHTTPServer(handler, None)
+
+            def handle_request() -> None:
+                server.handled = True
+                entered.set()
+                released.wait(timeout=1)
+
+            server.handle_request = handle_request
+            created.append(server)
+            return server
+
+        transport = SystemOAuthBrowserTransport()
+        errors = []
+
+        def authorize() -> None:
+            try:
+                transport.authorize(lambda _redirect: "https://auth")
+            except Exception as error:
+                errors.append(error)
+
+        with (
+            patch("pomodorough.network.HTTPServer", side_effect=create_server),
+            patch("pomodorough.network.webbrowser.open", return_value=True),
+        ):
+            worker = threading.Thread(target=authorize)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=1))
+            transport.cancel()
+            released.set()
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ApiError)
+        self.assertEqual(str(errors[0]), "Google sign-in was cancelled.")
+        self.assertTrue(created[0].closed)
+
+
+class DesktopOAuthTransactionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    credentials = {
+        "client_id": "desktop-client",
+        "client_secret": "desktop-secret",
+        "auth_uri": "https://accounts.example.test/authorize",
+        "token_uri": "https://accounts.example.test/token",
+    }
+    token_response = {
+        "accessToken": "native-access",
+        "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+        "refreshToken": "native-refresh",
+        "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+    }
+
+    def cloud(self, browser: _FakeOAuthBrowser, generated: list[str]) -> CloudService:
+        values = iter(generated)
+        cloud = CloudService(
+            "device-1",
+            "https://example.test",
+            oauth_browser=browser,
+            token_urlsafe=lambda _size: next(values),
+        )
+        self.addCleanup(cloud.shutdown)
+        return cloud
+
+    def test_full_transaction_preserves_exact_contract_and_persists_after_profile(self) -> None:
+        browser = _FakeOAuthBrowser({"state": "state-value", "code": "code-value"})
+        cloud = self.cloud(browser, ["state-value", "verifier-value"])
+        calls = []
+
+        def request(method, url, payload=None, access_token=None, form=False):
+            calls.append((method, url, payload, access_token, form))
+            if url.endswith("/challenge"):
+                return {"nonce": "nonce-value", "challenge": "native-challenge"}
+            if url == self.credentials["token_uri"]:
+                return {"id_token": "google-id-token"}
+            if url.endswith("/exchange"):
+                return dict(self.token_response)
+            if url.endswith("/me"):
+                return {"user": {"id": "user-1"}}
+            self.fail(f"unexpected request: {url}")
+
+        with (
+            patch("pomodorough.network._read_oauth_credentials", return_value=self.credentials),
+            patch("pomodorough.network._request", side_effect=request),
+            patch.object(cloud.token_store, "save") as save,
+        ):
+            user = cloud._authorize_google()
+
+        self.assertEqual(user, {"id": "user-1"})
+        self.assertEqual(len(browser.authorization_urls), 1)
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(browser.authorization_urls[0]).query
+        )
+        self.assertEqual(query["nonce"], ["nonce-value"])
+        self.assertEqual(query["state"], ["state-value"])
+        self.assertEqual(
+            query["code_challenge"],
+            [
+                base64.urlsafe_b64encode(
+                    hashlib.sha256(b"verifier-value").digest()
+                ).decode().rstrip("=")
+            ],
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "https://example.test/api/v1/auth/google/challenge",
+                    {},
+                    None,
+                    False,
+                ),
+                (
+                    "POST",
+                    "https://accounts.example.test/token",
+                    {
+                        "client_id": "desktop-client",
+                        "client_secret": "desktop-secret",
+                        "code": "code-value",
+                        "code_verifier": "verifier-value",
+                        "grant_type": "authorization_code",
+                        "redirect_uri": "http://127.0.0.1:43123/callback",
+                    },
+                    None,
+                    True,
+                ),
+                (
+                    "POST",
+                    "https://example.test/api/v1/auth/google/exchange",
+                    {
+                        "idToken": "google-id-token",
+                        "challenge": "native-challenge",
+                        "deviceId": "device-1",
+                        "platform": "linux",
+                    },
+                    None,
+                    False,
+                ),
+                (
+                    "GET",
+                    "https://example.test/api/v1/me",
+                    None,
+                    "native-access",
+                    False,
+                ),
+            ],
+        )
+        save.assert_called_once_with(self.token_response)
+        self.assertEqual(cloud.access_token, "native-access")
+
+    def test_callback_and_google_token_failures_stop_before_native_exchange(self) -> None:
+        cases = (
+            (
+                _FakeOAuthBrowser({"state": "wrong", "code": "code"}),
+                {"id_token": "unused"},
+                "invalid state",
+                1,
+            ),
+            (
+                _FakeOAuthBrowser({"state": "state-value", "code": "code"}),
+                {},
+                "identity token",
+                2,
+            ),
+        )
+        for browser, google_tokens, message, request_count in cases:
+            with self.subTest(message=message):
+                cloud = self.cloud(browser, ["state-value", "verifier-value"])
+                responses = iter(
+                    [
+                        {"nonce": "nonce", "challenge": "challenge"},
+                        google_tokens,
+                    ]
+                )
+                with (
+                    patch(
+                        "pomodorough.network._read_oauth_credentials",
+                        return_value=self.credentials,
+                    ),
+                    patch(
+                        "pomodorough.network._request",
+                        side_effect=lambda *_args, **_kwargs: next(responses),
+                    ) as request,
+                    patch.object(cloud.token_store, "save") as save,
+                    self.assertRaises(ApiError) as raised,
+                ):
+                    cloud._authorize_google()
+
+                self.assertIn(message, str(raised.exception))
+                self.assertEqual(request.call_count, request_count)
+                save.assert_not_called()
+                self.assertIsNone(cloud.access_token)
+
+    def test_native_exchange_failure_does_not_persist_session(self) -> None:
+        browser = _FakeOAuthBrowser(
+            {"state": "state-value", "code": "code-value"}
+        )
+        cloud = self.cloud(browser, ["state-value", "verifier-value"])
+
+        def request(_method, url, _payload=None, access_token=None, form=False):
+            if url.endswith("/challenge"):
+                return {"nonce": "nonce", "challenge": "challenge"}
+            if url == self.credentials["token_uri"]:
+                return {"id_token": "google-token"}
+            if url.endswith("/exchange"):
+                raise ApiError("transaction failed", 503)
+            self.fail(f"unexpected request: {url}")
+
+        with (
+            patch(
+                "pomodorough.network._read_oauth_credentials",
+                return_value=self.credentials,
+            ),
+            patch("pomodorough.network._request", side_effect=request),
+            patch.object(cloud.token_store, "save") as save,
+            self.assertRaises(ApiError) as raised,
+        ):
+            cloud._authorize_google()
+
+        self.assertEqual(str(raised.exception), "transaction failed")
+        save.assert_not_called()
+        self.assertIsNone(cloud.access_token)
+
+    def test_profile_failure_keeps_issued_session_for_restore(self) -> None:
+        browser = _FakeOAuthBrowser(
+            {"state": "state-value", "code": "code-value"}
+        )
+        cloud = self.cloud(browser, ["state-value", "verifier-value"])
+
+        def request(_method, url, _payload=None, access_token=None, form=False):
+            if url.endswith("/challenge"):
+                return {"nonce": "nonce", "challenge": "challenge"}
+            if url == self.credentials["token_uri"]:
+                return {"id_token": "google-token"}
+            if url.endswith("/exchange"):
+                return dict(self.token_response)
+            if url.endswith("/me"):
+                self.assertEqual(access_token, "native-access")
+                raise ApiError("profile unavailable", 503)
+            self.fail(f"unexpected request: {url}")
+
+        with (
+            patch(
+                "pomodorough.network._read_oauth_credentials",
+                return_value=self.credentials,
+            ),
+            patch("pomodorough.network._request", side_effect=request),
+            patch.object(cloud.token_store, "save") as save,
+            self.assertRaises(ApiError) as raised,
+        ):
+            cloud._authorize_google()
+
+        self.assertEqual(str(raised.exception), "profile unavailable")
+        save.assert_called_once_with(self.token_response)
+        self.assertEqual(cloud.access_token, "native-access")
+
+    def test_malformed_native_token_response_stops_before_profile_and_persistence(self) -> None:
+        for response in (
+            {},
+            dict(self.token_response, accessToken=""),
+            dict(self.token_response, accessTokenExpiresAt="not-a-date"),
+            dict(self.token_response, accessTokenExpiresAt=123),
+            {key: value for key, value in self.token_response.items() if key != "refreshToken"},
+        ):
+            with self.subTest(response=response):
+                browser = _FakeOAuthBrowser(
+                    {"state": "state-value", "code": "code-value"}
+                )
+                cloud = self.cloud(browser, ["state-value", "verifier-value"])
+
+                def request(_method, url, _payload=None, access_token=None, form=False):
+                    if url.endswith("/challenge"):
+                        return {"nonce": "nonce", "challenge": "challenge"}
+                    if url == self.credentials["token_uri"]:
+                        return {"id_token": "google-token"}
+                    if url.endswith("/exchange"):
+                        return response
+                    self.fail(f"unexpected request: {url}")
+
+                with (
+                    patch(
+                        "pomodorough.network._read_oauth_credentials",
+                        return_value=self.credentials,
+                    ),
+                    patch("pomodorough.network._request", side_effect=request),
+                    patch.object(cloud.token_store, "save") as save,
+                    self.assertRaises(ApiError) as raised,
+                ):
+                    cloud._authorize_google()
+
+                self.assertEqual(
+                    str(raised.exception), "Server returned an invalid token response."
+                )
+                save.assert_not_called()
+                self.assertIsNone(cloud.access_token)
+
+    def test_login_composition_emits_success_and_failure_states(self) -> None:
+        success_browser = _FakeOAuthBrowser(
+            {"state": "state-value", "code": "code-value"}
+        )
+        successful = self.cloud(success_browser, ["state-value", "verifier-value"])
+        users = []
+        statuses = []
+        successful.signed_in.connect(users.append)
+        successful.status_changed.connect(statuses.append)
+        with (
+            patch.object(successful, "_start", side_effect=_run_immediately),
+            patch.object(successful, "_authorize_google", return_value={"id": "user-1"}),
+            patch.object(successful, "start_revision_stream") as stream,
+        ):
+            successful.login()
+        self.assertTrue(successful.authenticated)
+        self.assertEqual(users, [{"id": "user-1"}])
+        self.assertEqual(statuses, ["WAITING FOR GOOGLE", "SYNC READY"])
+        stream.assert_called_once_with()
+
+        failed = self.cloud(
+            _FakeOAuthBrowser(error=ApiError("browser failed")),
+            ["state-value", "verifier-value"],
+        )
+        failures = []
+        failed_statuses = []
+        failed.failure.connect(failures.append)
+        failed.status_changed.connect(failed_statuses.append)
+        with (
+            patch.object(failed, "_start", side_effect=_run_immediately),
+            patch.object(failed, "_authorize_google", side_effect=ApiError("browser failed")),
+        ):
+            failed.login()
+        self.assertFalse(failed.authenticated)
+        self.assertEqual(failures, ["browser failed"])
+        self.assertEqual(
+            failed_statuses,
+            ["WAITING FOR GOOGLE", "LOCAL • SIGN-IN FAILED"],
+        )
+
+    def test_shutdown_cancels_browser_and_blocks_late_token_persistence(self) -> None:
+        browser = _FakeOAuthBrowser(
+            {"state": "state-value", "code": "code-value"}
+        )
+        cloud = self.cloud(browser, ["state-value", "verifier-value"])
+
+        cloud.shutdown()
+        with (
+            patch.object(cloud.token_store, "save") as save,
+            self.assertRaises(ApiError) as raised,
+        ):
+            cloud._accept_login_tokens(self.token_response)
+
+        self.assertEqual(str(raised.exception), "Google sign-in was cancelled.")
+        self.assertTrue(browser.cancelled)
+        save.assert_not_called()
+        self.assertIsNone(cloud.access_token)
+
+
+class HTTPRequestTests(unittest.TestCase):
+    def test_request_encodes_json_headers_bearer_and_timeout(self) -> None:
+        response = _FakeHTTPResponse(b'{"ok":true}')
+        with patch("urllib.request.urlopen", return_value=response) as urlopen:
+            result = _request(
+                "POST",
+                "https://example.test/items",
+                {"title": "A/B"},
+                access_token="access-token",
+            )
+
+        self.assertEqual(result, {"ok": True})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(urlopen.call_args.kwargs, {"timeout": 20})
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.data, b'{"title":"A/B"}')
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(request.get_header("Authorization"), "Bearer access-token")
+        self.assertEqual(request.get_header("User-agent"), "Pomodorough-Desktop/0.1")
+
+    def test_request_form_encodes_and_empty_success_returns_object(self) -> None:
+        response = _FakeHTTPResponse(b"")
+        with patch("urllib.request.urlopen", return_value=response) as urlopen:
+            result = _request(
+                "POST",
+                "https://oauth.test/token",
+                {"code": "a+b c"},
+                form=True,
+            )
+
+        self.assertEqual(result, {})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.data, b"code=a%2Bb+c")
+        self.assertEqual(
+            request.get_header("Content-type"),
+            "application/x-www-form-urlencoded",
+        )
+
+    def test_request_normalizes_http_error_documents(self) -> None:
+        cases = (
+            (b'{"error":"fallback","error_description":"preferred"}', "preferred", {"error": "fallback", "error_description": "preferred"}),
+            (b'{"error":"fallback"}', "fallback", {"error": "fallback"}),
+            (b"not-json", "Server returned HTTP 503.", None),
+        )
+        for body, message, document in cases:
+            with self.subTest(body=body):
+                error = urllib.error.HTTPError(
+                    "https://example.test/fail",
+                    503,
+                    "Unavailable",
+                    {},
+                    io.BytesIO(body),
+                )
+                with patch("urllib.request.urlopen", side_effect=error):
+                    with self.assertRaises(ApiError) as raised:
+                        _request("GET", error.url)
+
+                self.assertEqual(str(raised.exception), message)
+                self.assertEqual(raised.exception.status, 503)
+                self.assertEqual(raised.exception.document, document)
+                self.assertIs(raised.exception.__cause__, error)
+
+    def test_request_normalizes_transport_failures_with_cause(self) -> None:
+        failures = (
+            urllib.error.URLError("dns unavailable"),
+            TimeoutError("timed out"),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure), patch(
+                "urllib.request.urlopen", side_effect=failure
+            ):
+                with self.assertRaises(ApiError) as raised:
+                    _request("GET", "https://example.test")
+
+            self.assertIn("Could not reach Pomodorough:", str(raised.exception))
+            self.assertIs(raised.exception.__cause__, failure)
 
 
 class AuthenticationNetworkTests(unittest.TestCase):
@@ -235,6 +1033,35 @@ class AuthenticationNetworkTests(unittest.TestCase):
         )
         load.assert_called_once_with()
         save.assert_called_once_with(refresh_response)
+
+    def test_authorized_request_captures_http_wall_and_monotonic_timing(self) -> None:
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        cloud.access_token = "fresh-access"
+        cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        with (
+            patch("pomodorough.network.time.time", side_effect=[1_000.0, 1_000.12]),
+            patch(
+                "pomodorough.network.time.monotonic_ns",
+                side_effect=[5_000_000_000, 5_120_000_000],
+            ),
+            patch(
+                "pomodorough.network._request", return_value={"revision": 7}
+            ),
+        ):
+            response = cloud._authorized_request("GET", "/api/v1/bootstrap")
+
+        self.assertEqual(response, {"revision": 7})
+        self.assertEqual(
+            response.timing,
+            {
+                "requestPhysicalMs": 1_000_000,
+                "receivedPhysicalMs": 1_000_120,
+                "requestMonotonicMs": 5_000,
+                "receivedMonotonicMs": 5_120,
+            },
+        )
 
     def test_authorized_request_propagates_non_401_without_retry(self) -> None:
         cloud = CloudService("device-1", "https://example.test")
@@ -733,6 +1560,334 @@ class TokenStoreTests(unittest.TestCase):
 
             run.assert_not_called()
             self.assertEqual(json.loads(store.fallback_path.read_text()), {"signedOut": True})
+
+
+class RevisionStreamTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def cloud_with_reply(self, reply: _FakeRevisionReply):
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        cloud.authenticated = True
+        cloud.access_token = "stream-access"
+        manager = _FakeNetworkManager(reply)
+        cloud._network = manager
+        return cloud, manager
+
+    def test_start_builds_authenticated_stream_and_ignores_duplicate(self) -> None:
+        reply = _FakeRevisionReply()
+        cloud, manager = self.cloud_with_reply(reply)
+        cloud._revision_reconnect.start()
+
+        cloud.start_revision_stream()
+        cloud.start_revision_stream()
+
+        self.assertEqual(len(manager.requests), 1)
+        request = manager.requests[0]
+        self.assertEqual(request.url().toString(), "https://example.test/api/v1/stream")
+        self.assertEqual(bytes(request.rawHeader("Accept")), b"text/event-stream")
+        self.assertEqual(
+            bytes(request.rawHeader("Authorization")),
+            b"Bearer stream-access",
+        )
+        self.assertFalse(cloud._revision_reconnect.isActive())
+        self.assertEqual(len(reply.readyRead.callbacks), 1)
+        self.assertEqual(len(reply.finished.callbacks), 1)
+
+    def test_ready_read_emits_chunked_revisions_and_stale_reply_is_ignored(self) -> None:
+        reply = _FakeRevisionReply(b'data: {"revision":17}\n\ndata: 18\n\n')
+        cloud, _manager = self.cloud_with_reply(reply)
+        revisions = []
+        cloud.revision_available.connect(revisions.append)
+        cloud.start_revision_stream()
+
+        reply.readyRead.callbacks[0]()
+        cloud._read_revision_stream(_FakeRevisionReply(b"data: 99\n\n"))
+
+        self.assertEqual(revisions, [17, 18])
+
+    def test_unauthorized_finish_clears_access_and_does_not_reconnect(self) -> None:
+        reply = _FakeRevisionReply(status=401)
+        cloud, _manager = self.cloud_with_reply(reply)
+        stale = []
+        cloud.authorization_stale.connect(lambda: stale.append(True))
+        cloud.start_revision_stream()
+
+        reply.finished.callbacks[0]()
+
+        self.assertEqual(stale, [True])
+        self.assertIsNone(cloud.access_token)
+        self.assertFalse(cloud._revision_reconnect.isActive())
+        self.assertTrue(reply.deleted)
+
+    def test_non_401_finish_reconnects_unless_shutdown_or_signed_out(self) -> None:
+        for shutdown, authenticated in ((False, True), (True, True), (False, False)):
+            with self.subTest(shutdown=shutdown, authenticated=authenticated):
+                reply = _FakeRevisionReply(status=503)
+                cloud, _manager = self.cloud_with_reply(reply)
+                cloud.start_revision_stream()
+                cloud._shutting_down = shutdown
+                cloud.authenticated = authenticated
+
+                reply.finished.callbacks[0]()
+
+                self.assertEqual(
+                    cloud._revision_reconnect.isActive(),
+                    not shutdown and authenticated,
+                )
+                cloud._revision_reconnect.stop()
+
+    def test_stale_finish_only_deletes_stale_reply(self) -> None:
+        active = _FakeRevisionReply()
+        stale = _FakeRevisionReply()
+        cloud, _manager = self.cloud_with_reply(active)
+        cloud.start_revision_stream()
+
+        cloud._revision_stream_finished(stale)
+
+        self.assertTrue(stale.deleted)
+        self.assertIs(cloud._revision_reply, active)
+
+    def test_stop_resets_parser_and_disposes_reply_idempotently(self) -> None:
+        reply = _FakeRevisionReply(b"data: 12")
+        cloud, _manager = self.cloud_with_reply(reply)
+        cloud.start_revision_stream()
+        cloud._revision_parser.feed(b"data: 11")
+
+        cloud.stop_revision_stream()
+        cloud.stop_revision_stream()
+
+        self.assertIsNone(cloud._revision_reply)
+        self.assertEqual(cloud._revision_parser.buffer, b"")
+        self.assertTrue(reply.aborted)
+        self.assertTrue(reply.deleted)
+
+
+class CloudOrchestrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def cloud(self) -> CloudService:
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        return cloud
+
+    def test_restore_without_session_stays_local_without_profile_request(self) -> None:
+        cloud = self.cloud()
+        statuses = []
+        cloud.status_changed.connect(statuses.append)
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud.token_store, "load", return_value=None),
+            patch("pomodorough.network._request") as request,
+        ):
+            cloud.restore()
+
+        self.assertEqual(statuses, ["CONNECTING", "LOCAL • SIGN IN TO SYNC"])
+        self.assertFalse(cloud.authenticated)
+        request.assert_not_called()
+
+    def test_restore_valid_session_signs_in_and_starts_stream(self) -> None:
+        cloud = self.cloud()
+        user = {"id": "user-1"}
+        users = []
+        statuses = []
+        cloud.signed_in.connect(users.append)
+        cloud.status_changed.connect(statuses.append)
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
+            patch.object(cloud, "_ensure_access", return_value="access"),
+            patch("pomodorough.network._request", return_value={"user": user}) as request,
+            patch.object(cloud, "start_revision_stream") as stream,
+        ):
+            cloud.restore()
+
+        self.assertTrue(cloud.authenticated)
+        self.assertEqual(users, [user])
+        self.assertEqual(statuses, ["CONNECTING", "SYNC READY"])
+        request.assert_called_once_with(
+            "GET",
+            "https://example.test/api/v1/me",
+            access_token="access",
+        )
+        stream.assert_called_once_with()
+
+    def test_restore_401_expires_session_and_generic_error_reports_offline(self) -> None:
+        for error, expected_status, expires in (
+            (ApiError("expired", 401), "SESSION EXPIRED • SIGN IN AGAIN", True),
+            (ApiError("unavailable", 503), "OFFLINE • RETRYING", False),
+        ):
+            with self.subTest(error=error):
+                cloud = self.cloud()
+                statuses = []
+                failures = []
+                expired = []
+                cloud.status_changed.connect(statuses.append)
+                cloud.failure.connect(failures.append)
+                cloud.session_expired.connect(lambda: expired.append(True))
+                with (
+                    patch.object(cloud, "_start", side_effect=_run_immediately),
+                    patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
+                    patch.object(cloud, "_ensure_access", side_effect=error),
+                    patch.object(cloud.token_store, "clear") as clear,
+                ):
+                    cloud.restore()
+
+                self.assertEqual(statuses[-1], expected_status)
+                self.assertEqual(expired, [True] if expires else [])
+                self.assertEqual(failures, [] if expires else [str(error)])
+                self.assertEqual(clear.call_count, 1 if expires else 0)
+                self.assertFalse(cloud.authenticated)
+
+    def test_busy_sync_keeps_latest_payload_and_finished_dispatches_once(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.busy = True
+        first = {"lastRevision": 1}
+        latest = {"lastRevision": 2}
+        worker = Mock()
+        cloud._workers.add(worker)
+
+        cloud.sync(first)
+        cloud.sync(latest)
+        with patch.object(cloud, "sync") as sync:
+            cloud._finished(worker)
+
+        sync.assert_called_once_with(latest)
+        self.assertIsNone(cloud._sync_queued)
+        self.assertFalse(cloud.busy)
+
+    def test_sync_guards_success_and_failures(self) -> None:
+        payload = {"lastRevision": 4}
+        unauthenticated = self.cloud()
+        with patch.object(unauthenticated, "_start") as start:
+            unauthenticated.sync(payload)
+        start.assert_not_called()
+
+        successful = self.cloud()
+        successful.authenticated = True
+        responses = []
+        statuses = []
+        successful.sync_ready.connect(responses.append)
+        successful.status_changed.connect(statuses.append)
+        with (
+            patch.object(successful, "_start", side_effect=_run_immediately),
+            patch.object(successful, "_authorized_request", return_value={"revision": 5}) as request,
+            patch.object(successful, "start_revision_stream") as stream,
+        ):
+            successful.sync(payload)
+        request.assert_called_once_with("POST", "/api/v1/sync", payload)
+        self.assertEqual(responses, [{"revision": 5}])
+        self.assertEqual(statuses, ["SYNCING", "SYNCED"])
+        stream.assert_called_once_with()
+
+        for error, expected_status, expires in (
+            (ApiError("expired", 401), "SESSION EXPIRED • SIGN IN AGAIN", True),
+            (ApiError("down", 503), "OFFLINE • RETRYING", False),
+        ):
+            with self.subTest(error=error):
+                failed = self.cloud()
+                failed.authenticated = True
+                statuses = []
+                failures = []
+                failed.status_changed.connect(statuses.append)
+                failed.failure.connect(failures.append)
+                with (
+                    patch.object(failed, "_start", side_effect=_run_immediately),
+                    patch.object(failed, "_authorized_request", side_effect=error),
+                    patch.object(failed.token_store, "clear"),
+                ):
+                    failed.sync(payload)
+                self.assertEqual(statuses[-1], expected_status)
+                self.assertEqual(failures, [] if expires else [str(error)])
+
+    def test_bootstrap_guards_success_and_preserved_failure(self) -> None:
+        cloud = self.cloud()
+        with patch.object(cloud, "_start") as start:
+            cloud.preview_bootstrap()
+            cloud.resolve_bootstrap({"requestId": "request-1"})
+        start.assert_not_called()
+
+        cloud.authenticated = True
+        previews = []
+        resolved = []
+        statuses = []
+        cloud.bootstrap_ready.connect(previews.append)
+        cloud.bootstrap_resolved.connect(resolved.append)
+        cloud.status_changed.connect(statuses.append)
+        payload = {"requestId": "request-1"}
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(
+                cloud,
+                "_authorized_request",
+                side_effect=[{"revision": 4}, {"revision": 5}],
+            ) as request,
+            patch.object(cloud, "start_revision_stream") as stream,
+        ):
+            cloud.preview_bootstrap()
+            cloud.resolve_bootstrap(payload)
+
+        self.assertEqual(previews, [{"revision": 4}])
+        self.assertEqual(resolved, [{"revision": 5}])
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call("GET", "/api/v1/bootstrap"),
+                call("POST", "/api/v1/bootstrap/resolve", payload),
+            ],
+        )
+        self.assertEqual(statuses, ["CHECKING HISTORY", "HISTORY DECISION", "RESOLVING HISTORY", "SYNCED"])
+        stream.assert_called_once_with()
+
+        error = ApiError("unavailable", 503)
+        failures = []
+        cloud.failure.connect(failures.append)
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud, "_authorized_request", side_effect=error),
+        ):
+            cloud.resolve_bootstrap(payload)
+        self.assertEqual(failures, [str(error)])
+        self.assertEqual(statuses[-2:], ["RESOLVING HISTORY", "OFFLINE • HISTORY PRESERVED"])
+
+    def test_logout_busy_guard_and_revoke_failure_still_clear_locally(self) -> None:
+        busy = self.cloud()
+        busy.busy = True
+        with (
+            patch.object(busy, "stop_revision_stream") as stop,
+            patch.object(busy, "_start") as start,
+        ):
+            busy.logout()
+        stop.assert_not_called()
+        start.assert_not_called()
+
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "logout-access"
+        signed_out = []
+        statuses = []
+        cloud.signed_out.connect(lambda: signed_out.append(True))
+        cloud.status_changed.connect(statuses.append)
+        with (
+            patch.object(cloud, "stop_revision_stream") as stop,
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud, "_ensure_access", return_value="logout-access"),
+            patch("pomodorough.network._request", side_effect=ApiError("down", 503)),
+            patch.object(cloud.token_store, "clear") as clear,
+        ):
+            cloud.logout()
+
+        stop.assert_called_once_with()
+        clear.assert_called_once_with()
+        self.assertFalse(cloud.authenticated)
+        self.assertIsNone(cloud.access_token)
+        self.assertEqual(signed_out, [True])
+        self.assertEqual(statuses, ["LOCAL • SIGN IN TO SYNC"])
 
 
 class BootstrapNetworkTests(unittest.TestCase):

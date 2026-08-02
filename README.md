@@ -98,9 +98,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.7/pomodorough_linux-0.1.7.tar.gz
-tar -xzf pomodorough_linux-0.1.7.tar.gz
-cd pomodorough_linux-0.1.7
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.8/pomodorough_linux-0.1.8.tar.gz
+tar -xzf pomodorough_linux-0.1.8.tar.gz
+cd pomodorough_linux-0.1.8
 ./deploy/install.sh
 ```
 
@@ -123,7 +123,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.7
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.8
 ```
 
 ### Flatpak
@@ -131,8 +131,8 @@ nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.1.7
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.7/Pomodorough-0.1.7-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.1.7-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.1.8/Pomodorough-0.1.8-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.1.8-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 

@@ -1,0 +1,180 @@
+{
+  "version": 2,
+  "epoch": "2026-07-20T12:00:00.000Z",
+  "cases": [
+    {
+      "name": "lifecycle-source-metadata",
+      "nowMs": 40000,
+      "commands": [
+        {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0,"taskId":"task-source"},
+        {"id":"c2","sequence":2,"deviceId":"device-a","timerId":"timer-a","type":"pause","phase":"short_break","durationMs":300000,"atMs":10000,"wallMs":200,"counter":0,"elapsedMs":10000},
+        {"id":"c3","sequence":3,"deviceId":"device-a","timerId":"timer-a","type":"resume","phase":"long_break","durationMs":900000,"atMs":20000,"wallMs":300,"counter":0,"elapsedMs":10000},
+        {"id":"c4","sequence":4,"deviceId":"device-a","timerId":"timer-a","type":"finish","phase":"short_break","durationMs":300000,"atMs":40000,"wallMs":400,"counter":0,"elapsedMs":30000}
+      ],
+      "expected": {
+        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":40000,"lastCommandId":"c4","taskId":"task-source"},
+        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"commandId":"c4","endedMs":40000,"taskId":"task-source"}]
+      }
+    },
+    {
+      "name": "supersede-and-resume",
+      "nowMs": 20000,
+      "commands": [
+        {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":120000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0,"taskId":"task-a"},
+        {"id":"c2","sequence":2,"deviceId":"device-b","timerId":"timer-b","type":"start","phase":"short_break","durationMs":300000,"atMs":10000,"wallMs":200,"counter":0,"elapsedMs":0,"taskId":"task-b"},
+        {"id":"c3","sequence":3,"deviceId":"device-a","timerId":"timer-a","type":"resume","phase":"long_break","durationMs":900000,"atMs":20000,"wallMs":300,"counter":0,"elapsedMs":30000}
+      ],
+      "expected": {
+        "timer": {"id":"timer-a","status":"running","phase":"focus","durationMs":120000,"elapsedMs":30000,"anchorMs":20000,"lastCommandId":"c3","taskId":"task-a"},
+        "history": [{"timerId":"timer-b","status":"superseded","phase":"short_break","durationMs":300000,"commandId":"c3","endedMs":20000,"taskId":"task-b"}]
+      }
+    },
+    {
+      "name": "deadline-finish-claims-completion",
+      "nowMs": 70000,
+      "commands": [
+        {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0,"taskId":"task-source"},
+        {"id":"c2","sequence":2,"deviceId":"device-a","timerId":"timer-a","type":"finish","phase":"long_break","durationMs":900000,"atMs":70000,"wallMs":200,"counter":0,"elapsedMs":60000}
+      ],
+      "expected": {
+        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":60000,"lastCommandId":"c2","taskId":"task-source"},
+        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"commandId":"c2","endedMs":60000,"taskId":"task-source"}]
+      }
+    },
+    {
+      "name": "deadline-rejects-late-cancel-and-duplicate-start",
+      "nowMs": 80000,
+      "commands": [
+        {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0},
+        {"id":"c2","sequence":2,"deviceId":"device-a","timerId":"timer-a","type":"cancel","phase":"short_break","durationMs":300000,"atMs":70000,"wallMs":200,"counter":0,"elapsedMs":50000},
+        {"id":"c3","sequence":3,"deviceId":"device-b","timerId":"timer-a","type":"start","phase":"long_break","durationMs":900000,"atMs":80000,"wallMs":300,"counter":0,"elapsedMs":0}
+      ],
+      "expected": {
+        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":60000,"lastCommandId":"c1"},
+        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"endedMs":60000}]
+      }
+    },
+    {
+      "name": "cancel-then-clear-retains-history",
+      "nowMs": 30000,
+      "commands": [
+        {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0,"taskId":"task-source"},
+        {"id":"c2","sequence":2,"deviceId":"device-a","timerId":"timer-a","type":"cancel","phase":"long_break","durationMs":900000,"atMs":20000,"wallMs":200,"counter":0,"elapsedMs":15000},
+        {"id":"c3","sequence":3,"deviceId":"device-a","timerId":"timer-a","type":"clear","phase":"short_break","durationMs":300000,"atMs":30000,"wallMs":300,"counter":0,"elapsedMs":15000}
+      ],
+      "expected": {
+        "history": [{"timerId":"timer-a","status":"cancelled","phase":"focus","durationMs":60000,"commandId":"c2","endedMs":20000,"taskId":"task-source"}]
+      }
+    },
+    {
+      "name": "crossed-sequence-hlc-order",
+      "nowMs": 10000,
+      "commands": [
+        {"id":"command-b","sequence":1,"deviceId":"device-a","timerId":"timer-b","type":"start","phase":"short_break","durationMs":300000,"atMs":10000,"wallMs":200,"counter":0,"elapsedMs":0},
+        {"id":"command-a","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0}
+      ],
+      "expected": {
+        "timer": {"id":"timer-b","status":"running","phase":"short_break","durationMs":300000,"elapsedMs":0,"anchorMs":10000,"lastCommandId":"command-b"},
+        "history": [{"timerId":"timer-a","status":"superseded","phase":"focus","durationMs":60000,"commandId":"command-b","endedMs":10000}]
+      }
+    },
+    {
+      "name": "same-device-command-id-tie",
+      "nowMs": 10000,
+      "commands": [
+        {"id":"command-b","sequence":1,"deviceId":"device-a","timerId":"timer-b","type":"start","phase":"short_break","durationMs":300000,"atMs":10000,"wallMs":100,"counter":0,"elapsedMs":0},
+        {"id":"command-a","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0}
+      ],
+      "expected": {
+        "timer": {"id":"timer-b","status":"running","phase":"short_break","durationMs":300000,"elapsedMs":0,"anchorMs":10000,"lastCommandId":"command-b"},
+        "history": [{"timerId":"timer-a","status":"superseded","phase":"focus","durationMs":60000,"commandId":"command-b","endedMs":10000}]
+      }
+    }
+  ],
+  "projectionCases": [
+    {
+      "name": "task-duration-auto-start-lww",
+      "taskOperations": [
+        {"id":"task-operation-a","deviceId":"device-a","taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71","type":"upsert","title":"Alpha","atMs":0,"wallMs":1784548800000,"counter":0},
+        {"id":"task-operation-b","deviceId":"device-a","taskId":"dbbd578d-e71b-8d4c-8525-426366e4bb07","type":"upsert","title":"Beta","atMs":1000,"wallMs":1784548801000,"counter":0},
+        {"id":"task-operation-c","deviceId":"device-a","taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71","type":"delete","atMs":2000,"wallMs":1784548802000,"counter":0},
+        {"id":"task-operation-d","deviceId":"device-a","taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71","type":"upsert","title":"Alpha","atMs":2000,"wallMs":1784548802000,"counter":0}
+      ],
+      "durationOperations": [
+        {"id":"duration-operation-a","deviceId":"device-a","phase":"focus","durationMs":1800000,"atMs":0,"wallMs":1784548800000,"counter":0},
+        {"id":"duration-operation-b","deviceId":"device-a","phase":"focus","durationMs":2700000,"atMs":0,"wallMs":1784548800000,"counter":0},
+        {"id":"duration-operation-c","deviceId":"device-a","phase":"short_break","durationMs":600000,"atMs":1000,"wallMs":1784548801000,"counter":0},
+        {"id":"duration-operation-d","deviceId":"device-a","phase":"long_break","durationMs":1200000,"atMs":2000,"wallMs":1784548802000,"counter":0}
+      ],
+      "autoStartOperations": [
+        {"id":"00000000-0000-7000-8000-000000000001","deviceId":"device-a","enabled":true,"atMs":3000,"wallMs":1784548803000,"counter":0},
+        {"id":"00000000-0000-7000-8000-000000000002","deviceId":"device-a","enabled":false,"atMs":3000,"wallMs":1784548803000,"counter":0},
+        {"id":"00000000-0000-7000-8000-000000000003","deviceId":"device-b","enabled":true,"atMs":3000,"wallMs":1784548803000,"counter":0}
+      ],
+      "expected": {
+        "tasks": [
+          {"id":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71","title":"Alpha"},
+          {"id":"dbbd578d-e71b-8d4c-8525-426366e4bb07","title":"Beta"}
+        ],
+        "durationsMs": {"focus":2700000,"short_break":600000,"long_break":1200000},
+        "autoStartBreaks": true
+      }
+    }
+  ],
+  "responseCases": [
+    {
+      "name": "mixed-outcome-canonical-rebase",
+      "local": {
+        "commands": [
+          {"id":"sync-command-sent","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":1784548800000,"counter":0,"elapsedMs":0,"taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71"},
+          {"id":"sync-command-retained","sequence":2,"deviceId":"device-a","timerId":"timer-b","type":"start","phase":"short_break","durationMs":300000,"atMs":5000,"wallMs":1784548805000,"counter":0,"elapsedMs":0}
+        ],
+        "taskOperations": [
+          {"id":"sync-task-sent","deviceId":"device-a","taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71","type":"upsert","title":"Alpha","atMs":0,"wallMs":1784548800000,"counter":0},
+          {"id":"sync-task-retained","deviceId":"device-a","taskId":"dbbd578d-e71b-8d4c-8525-426366e4bb07","type":"upsert","title":"Beta","atMs":6000,"wallMs":1784548806000,"counter":0}
+        ],
+        "durationOperations": [
+          {"id":"sync-duration-sent","deviceId":"device-a","phase":"focus","durationMs":1800000,"atMs":0,"wallMs":1784548800000,"counter":0},
+          {"id":"sync-duration-retained","deviceId":"device-a","phase":"long_break","durationMs":1200000,"atMs":6000,"wallMs":1784548806000,"counter":0}
+        ],
+        "autoStartOperations": [
+          {"id":"00000000-0000-7000-8000-000000000101","deviceId":"device-a","enabled":true,"atMs":0,"wallMs":1784548800000,"counter":0},
+          {"id":"00000000-0000-7000-8000-000000000102","deviceId":"device-a","enabled":false,"atMs":6000,"wallMs":1784548806000,"counter":0}
+        ]
+      },
+      "sentIds": {
+        "commands": ["sync-command-sent"],
+        "taskOperations": ["sync-task-sent"],
+        "durationOperations": ["sync-duration-sent"],
+        "autoStartOperations": ["00000000-0000-7000-8000-000000000101"]
+      },
+      "acknowledgements": {
+        "commands": [{"id":"sync-command-sent","outcome":"applied","reason":""}],
+        "taskOperations": [{"id":"sync-task-sent","outcome":"ignored","reason":"superseded"}],
+        "durationOperations": [{"id":"sync-duration-sent","outcome":"rejected","reason":"lost race"}],
+        "autoStartOperations": [{"id":"00000000-0000-7000-8000-000000000101","outcome":"applied","reason":""}]
+      },
+      "canonical": {
+        "timer": {"id":"timer-a","status":"running","phase":"focus","durationMs":60000,"elapsedMs":0,"anchorMs":0,"lastCommandId":"sync-command-sent","taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71"},
+        "history": [],
+        "tasks": [{"id":"f2102573-8fcc-8fa2-8d69-6ecbb5a30bfd","title":"Gamma"}],
+        "durationsMs": {"focus":1800000,"short_break":300000,"long_break":900000},
+        "autoStartBreaks": true
+      },
+      "expected": {
+        "commandIds": ["sync-command-retained"],
+        "taskOperationIds": ["sync-task-retained"],
+        "durationOperationIds": ["sync-duration-retained"],
+        "autoStartOperationIds": ["00000000-0000-7000-8000-000000000102"],
+        "timer": {"id":"timer-b","status":"running","phase":"short_break","durationMs":300000,"elapsedMs":0,"anchorMs":5000,"lastCommandId":"sync-command-retained"},
+        "history": [{"timerId":"timer-a","status":"superseded","phase":"focus","durationMs":60000,"commandId":"sync-command-retained","endedMs":5000,"taskId":"8d42fcde-20c0-8634-b2f6-4ef6a1162f71"}],
+        "tasks": [
+          {"id":"dbbd578d-e71b-8d4c-8525-426366e4bb07","title":"Beta"},
+          {"id":"f2102573-8fcc-8fa2-8d69-6ecbb5a30bfd","title":"Gamma"}
+        ],
+        "durationsMs": {"focus":1800000,"short_break":300000,"long_break":1200000},
+        "autoStartBreaks": false
+      }
+    }
+  ]
+}

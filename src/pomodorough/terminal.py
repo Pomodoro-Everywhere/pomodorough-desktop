@@ -57,9 +57,10 @@ class LocalTimer:
         self.reload()
 
     def reload(self) -> None:
-        state = self.store.load()
+        state = self.store.load(projection=True)
         self.settings = state["settings"]
         snapshot = state["snapshot"]
+        projection_snapshot = state.get("projectionSnapshot", snapshot)
         self.pending = state["pending"]
         self.pending_durations = state["pendingDurations"]
         self.pending_auto_starts = state["pendingAutoStarts"]
@@ -87,9 +88,9 @@ class LocalTimer:
                         self.store.pending_resolution() is not None
                     )
         self.timer, self.history = rebuild_optimistic(
-            snapshot.get("canonicalTimer"),
-            snapshot.get("history", []),
-            self.pending,
+            projection_snapshot.get("canonicalTimer"),
+            projection_snapshot.get("history", []),
+            state.get("projectionPending", self.pending),
         )
 
     @property
@@ -106,17 +107,26 @@ class LocalTimer:
         self, now_ms: int | None = None, auto_finish: bool = False
     ) -> dict[str, Any]:
         self.reload()
-        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        supplied_now_ms = now_ms is not None
+        physical_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         if not self.resolution_pending and self.store.has_pending_auto_break():
             self._store_action(
                 lambda: self.store.process_auto_break(
                     require_canonical=False,
-                    now_ms=now_ms,
+                    now_ms=physical_now_ms if supplied_now_ms else None,
                 )
             )
             self.reload()
         timer = self.current_timer()
-        elapsed = elapsed_ms(timer, now_ms)
+        effective_now_ms = (
+            physical_now_ms
+            if supplied_now_ms
+            else self.store.effective_timer_now_ms(
+                timer,
+                physical_ms=physical_now_ms,
+            )
+        )
+        elapsed = elapsed_ms(timer, effective_now_ms)
         if timer.get("status") == "cancelled":
             elapsed = 0
         planned = max(1, int(timer["plannedDurationMs"]))
@@ -127,8 +137,10 @@ class LocalTimer:
             and timer.get("status") == "running"
             and elapsed >= planned
         ):
-            self.issue("finish", now_ms=now_ms)
-            return self.state(now_ms=now_ms)
+            self.issue(
+                "finish", now_ms=physical_now_ms if supplied_now_ms else None
+            )
+            return self.state(now_ms=physical_now_ms)
 
         remaining = max(0, planned - elapsed)
         task_id = timer.get("taskId")
@@ -202,15 +214,9 @@ class LocalTimer:
                 durations_ms,
                 self.settings.get("selectedTaskId"),
                 now_ms=now_ms,
+                generate_auto_break=command_type == "finish",
             )
         )
-        if command_type == "finish":
-            self._store_action(
-                lambda: self.store.process_auto_break(
-                    require_canonical=False,
-                    now_ms=now_ms,
-                )
-            )
         self.reload()
         return command
 
@@ -224,8 +230,17 @@ class LocalTimer:
         elif status == "idle":
             self.issue("start", now_ms=now_ms)
         elif status in TERMINAL_STATUSES:
-            self.issue("clear", now_ms=now_ms)
-            self.issue("start", now_ms=now_ms)
+            commands = self._store_action(
+                lambda: self.store.queue_restart(
+                    self.timer,
+                    self.selected_phase,
+                    deepcopy(self.settings["durationsMs"]),
+                    self.settings.get("selectedTaskId"),
+                    now_ms=now_ms,
+                )
+            )
+            self.reload()
+            return commands[-1]
 
     def select_phase(self, phase: str) -> None:
         self.reload()

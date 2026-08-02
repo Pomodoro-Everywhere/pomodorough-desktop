@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +14,8 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from pomodorough.core import rebuild_optimistic, task_from_title
-from pomodorough.storage import Store
+from pomodorough.storage import Store, utc_timestamp
+from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
 
 
@@ -98,6 +100,7 @@ class MainWindowDurationTests(unittest.TestCase):
     def _bootstrap_response(
         *, revision: int = 1, history: list[dict[str, object]] | None = None
     ) -> dict[str, object]:
+        now_ms = int(time.time() * 1000)
         return {
             "acknowledgements": [],
             "taskAcknowledgements": [],
@@ -113,7 +116,8 @@ class MainWindowDurationTests(unittest.TestCase):
                 "long_break": 15 * 60_000,
             },
             "autoStartBreaks": False,
-            "serverHlcWallMs": 1_000,
+            "serverTime": utc_timestamp(now_ms),
+            "serverHlcWallMs": now_ms,
             "serverHlcCounter": 0,
         }
 
@@ -214,6 +218,27 @@ class MainWindowDurationTests(unittest.TestCase):
         with patch.object(QMessageBox, "warning"):
             self.window._issue("start")
         self.assertEqual(self.store.load(), before)
+
+    def test_malformed_persisted_resolution_starts_in_blocking_state(self) -> None:
+        task = task_from_title("Corrupted resolution task")
+        operation = self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.set_meta("pendingResolution", [])
+        self._replace_window(FakeCloud(authenticated=True))
+        before = self.store.load()
+
+        self.assertTrue(self.window._history_resolution_active)
+        self.assertTrue(self.window._resolution_retry_paused)
+        self.assertIn("corrupted", self.window._resolution_corruption)
+        with patch.object(QMessageBox, "warning"):
+            self.window._issue("start")
+            self.window._add_task()
+        self.window._sync()
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.store.load()["pendingTasks"], [operation])
+        self.assertEqual(self.cloud.payloads, [])
+        self.assertEqual(self.cloud.bootstrap_previews, 0)
+        self.assertEqual(self.cloud.resolutions, [])
 
     def test_signed_out_local_mode_is_usable_without_pending_resolution(self) -> None:
         self._replace_window(FakeCloud(authenticated=False))
@@ -391,6 +416,24 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.cloud.resolutions[-1]["strategy"], "keep_remote")
         self.assertEqual(self.cloud.resolutions[-1]["commands"], [])
 
+    def test_one_sided_history_with_opposing_task_requires_prompt(self) -> None:
+        user = {"id": "user-1"}
+        self.store.queue_task_operation(
+            "upsert", task_from_title("Local task"), now_ms=100
+        )
+        self.window._signed_in(user)
+        remote = self._bootstrap_response(
+            revision=5, history=[self._history_item("remote")]
+        )
+        with patch.object(
+            self.window, "_prompt_history_resolution", return_value=None
+        ) as prompt:
+            self.window._bootstrap_ready(remote)
+
+        prompt.assert_called_once_with()
+        self.assertEqual(self.cloud.resolutions, [])
+        self.assertTrue(self.window._resolution_retry_paused)
+
     def test_resolution_success_binds_owner_and_installs_canonical_state(self) -> None:
         user = {"id": "user-1", "email": "one@example.com"}
         self._queue_completed_timer()
@@ -446,7 +489,9 @@ class MainWindowDurationTests(unittest.TestCase):
             self.window._select_phase("long_break")
             self.window._auto_breaks_changed(True)
         self.assertEqual(self.store.load(), before)
-        self.assertEqual(self.window._selected_phase(), "focus")
+        self.assertEqual(
+            self.window._selected_phase(), before["settings"]["selectedPhase"]
+        )
         self.assertFalse(self.window.auto_breaks.isChecked())
 
     def test_cancelled_chooser_can_resume_without_signing_out(self) -> None:
@@ -734,7 +779,82 @@ class MainWindowDurationTests(unittest.TestCase):
             self.cloud.payloads[-1]["autoStartOperations"], []
         )
 
-    def test_canonical_long_break_replaces_provisional_short_before_notification(
+    def test_signed_in_terminal_provisional_break_converges_through_ui_sync(
+        self,
+    ) -> None:
+        self.store.set_user({"id": "user-1"})
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        terminal = LocalTimer(self.store)
+        terminal.issue("start", minutes=1, now_ms=1_000)
+        terminal.issue("finish", now_ms=61_000)
+        terminal.state(now_ms=61_000)
+        pending = self.store.load()["pending"]
+        generated = pending[-1]
+
+        self.window._load_state()
+        self.window._sync()
+        first_request = self.cloud.payloads[-1]
+        self.assertEqual(
+            [command["type"] for command in first_request["commands"]],
+            ["start", "finish"],
+        )
+        self.assertNotIn(generated, first_request["commands"])
+
+        completed, history = rebuild_optimistic(
+            None, [], first_request["commands"]
+        )
+        for item in history:
+            item.pop("pending", None)
+        first_response = self._bootstrap_response(revision=1, history=history)
+        first_response["acknowledgements"] = [
+            {"commandId": command["id"], "outcome": "applied", "reason": ""}
+            for command in first_request["commands"]
+        ]
+        first_response["autoStartAcknowledgements"] = [
+            {
+                "operationId": operation["id"],
+                "outcome": "applied",
+                "reason": "",
+            }
+            for operation in first_request["autoStartOperations"]
+        ]
+        first_response["canonicalTimer"] = completed
+        first_response["autoStartBreaks"] = True
+
+        with patch.object(QMessageBox, "warning"):
+            self.window._apply_sync(first_response)
+
+        self.assertEqual(len(self.cloud.payloads), 2)
+        second_request = self.cloud.payloads[-1]
+        self.assertEqual(len(second_request["commands"]), 1)
+        resent = second_request["commands"][0]
+        self.assertEqual(resent["id"], generated["id"])
+        self.assertEqual(resent["phase"], "short_break")
+        running_break, _history = rebuild_optimistic(
+            completed, history, second_request["commands"]
+        )
+        second_response = self._bootstrap_response(revision=2, history=history)
+        second_response["acknowledgements"] = [
+            {
+                "commandId": resent["id"],
+                "outcome": "applied",
+                "reason": "",
+            }
+        ]
+        second_response["canonicalTimer"] = running_break
+        second_response["autoStartBreaks"] = True
+
+        with patch.object(QMessageBox, "warning"):
+            self.window._apply_sync(second_response)
+
+        self.assertEqual(self.store.load()["pending"], [])
+        self.assertEqual(len(self.cloud.payloads), 2)
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+
+    def test_canonical_long_break_preserves_completed_provisional_short_notification(
         self,
     ) -> None:
         self.store.set_user({"id": "user-1"})
@@ -802,18 +922,18 @@ class MainWindowDurationTests(unittest.TestCase):
 
             self.assertEqual(
                 (self.window.timer["id"], self.window.timer["phase"]),
-                (provisional["timerId"], "long_break"),
+                (provisional["timerId"], "short_break"),
             )
             self.assertEqual(self.window.timer["status"], "completed")
-            self.assertEqual(self.window.clock.phase_text, "LONG BREAK")
+            self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
             self.assertEqual(
                 notifications,
-                [("Service arrived", "Long break completed.")],
+                [("Service arrived", "Short break completed.")],
             )
 
         self.assertEqual(
             notifications,
-            [("Service arrived", "Long break completed.")],
+            [("Service arrived", "Short break completed.")],
         )
 
     def test_unsigned_offline_provisional_break_notifies_once_on_completion(
@@ -864,6 +984,47 @@ class MainWindowDurationTests(unittest.TestCase):
             (self.window.timer["phase"], self.window.timer["status"]),
             ("short_break", "running"),
         )
+
+    def test_tick_uses_monotonic_deadline_across_wall_jumps(self) -> None:
+        physical_ms = 1_800_000_000_000
+        settings = self.store.load()["settings"]
+        settings["durationsMs"]["focus"] = 60_000
+        with (
+            patch("pomodorough.storage.time.time", return_value=physical_ms / 1_000),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=10_000_000_000
+            ),
+        ):
+            self.store.queue_command(
+                "start", None, "focus", settings["durationsMs"]
+            )
+            self.window._load_state()
+            self.window._render()
+
+        with (
+            patch(
+                "pomodorough.storage.time.time",
+                return_value=(physical_ms + 3_600_000) / 1_000,
+            ),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=40_000_000_000
+            ),
+        ):
+            self.window._tick()
+        self.assertEqual(self.window.timer["status"], "running")
+        self.assertEqual(self.window.clock.time_text, "00:30")
+
+        with (
+            patch(
+                "pomodorough.storage.time.time",
+                return_value=(physical_ms - 3_600_000) / 1_000,
+            ),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=70_000_000_000
+            ),
+        ):
+            self.window._tick()
+        self.assertEqual(self.window.timer["status"], "completed")
 
     def test_signed_in_sync_failure_schedules_offline_auto_break(self) -> None:
         self.store.set_user({"id": "user-1"})
@@ -1075,7 +1236,8 @@ class MainWindowDurationTests(unittest.TestCase):
                     "long_break": 15 * 60_000,
                 },
                 "autoStartBreaks": False,
-                "serverHlcWallMs": 1_000,
+                "serverTime": utc_timestamp(int(time.time() * 1000)),
+                "serverHlcWallMs": int(time.time() * 1000),
                 "serverHlcCounter": 0,
             }
         )
@@ -1153,7 +1315,8 @@ class MainWindowDurationTests(unittest.TestCase):
                     "long_break": 20 * 60_000,
                 },
                 "autoStartBreaks": False,
-                "serverHlcWallMs": 1_000,
+                "serverTime": utc_timestamp(int(time.time() * 1000)),
+                "serverHlcWallMs": int(time.time() * 1000),
                 "serverHlcCounter": 0,
             }
         )
@@ -1171,37 +1334,54 @@ class MainWindowDurationTests(unittest.TestCase):
         sent = self.cloud.payloads[-1]["durationOperations"][0]
         replacement = self.store.queue_duration_operation("focus", 27 * 60_000)
 
-        self.window._apply_sync(
-            {
-                "acknowledgements": [],
-                "taskAcknowledgements": [],
-                "durationAcknowledgements": [
-                    {
-                        "operationId": sent["id"],
-                        "outcome": "applied",
-                        "reason": "",
-                    }
-                ],
-                "autoStartAcknowledgements": [],
-                "revision": 1,
-                "canonicalTimer": None,
-                "history": [],
-                "tasks": [],
-                "durationsMs": {
-                    "focus": 30 * 60_000,
-                    "short_break": 6 * 60_000,
-                    "long_break": 16 * 60_000,
-                },
-                "autoStartBreaks": False,
-                "serverHlcWallMs": 1_000,
-                "serverHlcCounter": 0,
-            }
-        )
+        response = {
+            "acknowledgements": [],
+            "taskAcknowledgements": [],
+            "durationAcknowledgements": [
+                {
+                    "operationId": sent["id"],
+                    "outcome": "applied",
+                    "reason": "",
+                }
+            ],
+            "autoStartAcknowledgements": [],
+            "revision": 1,
+            "canonicalTimer": None,
+            "history": [],
+            "tasks": [],
+            "durationsMs": {
+                "focus": 30 * 60_000,
+                "short_break": 6 * 60_000,
+                "long_break": 16 * 60_000,
+            },
+            "autoStartBreaks": False,
+            "serverTime": utc_timestamp(int(time.time() * 1000)),
+            "serverHlcWallMs": int(time.time() * 1000),
+            "serverHlcCounter": 0,
+        }
+        self.window._apply_sync(response)
 
-        self.assertEqual(self.store.load()["pendingDurations"], [replacement])
+        retained = self.store.load()["pendingDurations"]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            {
+                key: value
+                for key, value in retained[0].items()
+                if key not in {"occurredAt", "hlcWallMs", "hlcCounter"}
+            },
+            {
+                key: value
+                for key, value in replacement.items()
+                if key not in {"occurredAt", "hlcWallMs", "hlcCounter"}
+            },
+        )
+        self.assertGreater(
+            (retained[0]["hlcWallMs"], retained[0]["hlcCounter"]),
+            (response["serverHlcWallMs"], response["serverHlcCounter"]),
+        )
         self.assertEqual(self.window.duration_spins["focus"].value(), 27)
         self.assertEqual(
-            self.cloud.payloads[-1]["durationOperations"], [replacement]
+            self.cloud.payloads[-1]["durationOperations"], retained
         )
         self.assertFalse(self.window._account_synced)
 

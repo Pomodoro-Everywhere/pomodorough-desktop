@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from platformdirs import user_config_path
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
@@ -45,6 +47,12 @@ class ApiError(RuntimeError):
             "message": str(self),
             "document": self.document,
         }
+
+
+class TimedDocument(dict[str, Any]):
+    def __init__(self, document: dict[str, Any], timing: dict[str, int]) -> None:
+        super().__init__(document)
+        self.timing = timing
 
 
 def _request(
@@ -335,6 +343,119 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         return
 
 
+class OAuthBrowserTransport(Protocol):
+    def authorize(
+        self,
+        authorization_url: Callable[[str], str],
+    ) -> tuple[str, dict[str, str]]: ...
+
+    def cancel(self) -> None: ...
+
+
+class SystemOAuthBrowserTransport:
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+
+    def authorize(
+        self,
+        authorization_url: Callable[[str], str],
+    ) -> tuple[str, dict[str, str]]:
+        callback_results: queue.Queue[dict[str, str]] = queue.Queue(maxsize=1)
+        handler = type(
+            "CallbackHandler",
+            (_CallbackHandler,),
+            {"result_queue": callback_results},
+        )
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        deadline = time.monotonic() + 180
+        redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
+        try:
+            opened = webbrowser.open(
+                authorization_url(redirect_uri),
+                new=1,
+                autoraise=True,
+            )
+            if not opened:
+                raise ApiError("Could not open the system browser for Google sign-in.")
+            while callback_results.empty() and not self._cancelled.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                server.timeout = min(0.25, remaining)
+                server.handle_request()
+        finally:
+            server.server_close()
+        if self._cancelled.is_set():
+            raise ApiError("Google sign-in was cancelled.")
+        try:
+            callback = callback_results.get_nowait()
+        except queue.Empty as error:
+            raise ApiError("Google sign-in timed out.") from error
+        return redirect_uri, callback
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
+class DesktopOAuthContract:
+    @staticmethod
+    def authorization_url(
+        credentials: dict[str, str],
+        redirect_uri: str,
+        nonce: str,
+        state: str,
+        verifier: str,
+    ) -> str:
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).decode().rstrip("=")
+        query = urllib.parse.urlencode(
+            {
+                "client_id": credentials["client_id"],
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "openid email profile",
+                "nonce": nonce,
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "prompt": "select_account",
+            }
+        )
+        return f'{credentials["auth_uri"]}?{query}'
+
+    @staticmethod
+    def authorization_code(callback: dict[str, str], expected_state: str) -> str:
+        if not hmac.compare_digest(callback.get("state", ""), expected_state):
+            raise ApiError("Google sign-in returned an invalid state.")
+        code = callback.get("code", "").strip()
+        if not code:
+            raise ApiError(
+                callback.get("error_description")
+                or callback.get("error")
+                or "Google sign-in was cancelled."
+            )
+        return code
+
+    @staticmethod
+    def token_payload(
+        credentials: dict[str, str],
+        code: str,
+        redirect_uri: str,
+        verifier: str,
+    ) -> dict[str, str]:
+        payload = {
+            "client_id": credentials["client_id"],
+            "code": code,
+            "code_verifier": verifier,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }
+        if credentials.get("client_secret"):
+            payload["client_secret"] = credentials["client_secret"]
+        return payload
+
+
 class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
@@ -348,7 +469,13 @@ class CloudService(QObject):
     authorization_stale = Signal()
     failure = Signal(str)
 
-    def __init__(self, device_id: str, api_base: str = API_BASE) -> None:
+    def __init__(
+        self,
+        device_id: str,
+        api_base: str = API_BASE,
+        oauth_browser: OAuthBrowserTransport | None = None,
+        token_urlsafe: Callable[[int], str] = secrets.token_urlsafe,
+    ) -> None:
         super().__init__()
         self.device_id = device_id
         self.api_base = api_base.rstrip("/")
@@ -367,6 +494,9 @@ class CloudService(QObject):
         self._revision_reconnect.setInterval(5_000)
         self._revision_reconnect.timeout.connect(self.start_revision_stream)
         self._shutting_down = False
+        self._lifecycle_lock = threading.Lock()
+        self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
+        self._token_urlsafe = token_urlsafe
 
     def _start(
         self,
@@ -393,11 +523,45 @@ class CloudService(QObject):
             self.sync(payload)
 
     def _accept_tokens(self, response: dict[str, Any]) -> None:
-        self.access_token = response["accessToken"]
-        self.access_expires_at = datetime.fromisoformat(
-            response["accessTokenExpiresAt"].replace("Z", "+00:00")
-        )
+        try:
+            access_token = response["accessToken"]
+            access_expires_value = response["accessTokenExpiresAt"]
+            refresh_token = response["refreshToken"]
+            refresh_expires_value = response["refreshTokenExpiresAt"]
+            if not all(
+                isinstance(value, str)
+                for value in (
+                    access_token,
+                    access_expires_value,
+                    refresh_token,
+                    refresh_expires_value,
+                )
+            ):
+                raise TypeError("token fields must be strings")
+            access_expires_at = datetime.fromisoformat(
+                access_expires_value.replace("Z", "+00:00")
+            )
+            refresh_expires_at = datetime.fromisoformat(
+                refresh_expires_value.replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApiError("Server returned an invalid token response.") from error
+        if (
+            not access_token.strip()
+            or not refresh_token.strip()
+            or access_expires_at.tzinfo is None
+            or refresh_expires_at.tzinfo is None
+        ):
+            raise ApiError("Server returned an invalid token response.")
         self.token_store.save(response)
+        self.access_token = access_token
+        self.access_expires_at = access_expires_at
+
+    def _accept_login_tokens(self, response: dict[str, Any]) -> None:
+        with self._lifecycle_lock:
+            if self._shutting_down:
+                raise ApiError("Google sign-in was cancelled.")
+            self._accept_tokens(response)
 
     def _ensure_access(self) -> str:
         if self.access_token and self.access_expires_at > datetime.now(timezone.utc) + timedelta(seconds=30):
@@ -426,17 +590,45 @@ class CloudService(QObject):
     ) -> dict[str, Any]:
         token = self._ensure_access()
         try:
-            return _request(
-                method, f"{self.api_base}{path}", payload, access_token=token
+            return self._timed_request(
+                method, path, payload, access_token=token
             )
         except ApiError as error:
             if error.status != 401:
                 raise
             self.access_token = None
             token = self._ensure_access()
-            return _request(
-                method, f"{self.api_base}{path}", payload, access_token=token
+            return self._timed_request(
+                method, path, payload, access_token=token
             )
+
+    def _timed_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None,
+        *,
+        access_token: str,
+    ) -> TimedDocument:
+        request_physical_ms = int(time.time() * 1000)
+        request_monotonic_ms = time.monotonic_ns() // 1_000_000
+        document = _request(
+            method,
+            f"{self.api_base}{path}",
+            payload,
+            access_token=access_token,
+        )
+        received_physical_ms = int(time.time() * 1000)
+        received_monotonic_ms = time.monotonic_ns() // 1_000_000
+        return TimedDocument(
+            document,
+            {
+                "requestPhysicalMs": request_physical_ms,
+                "receivedPhysicalMs": received_physical_ms,
+                "requestMonotonicMs": request_monotonic_ms,
+                "receivedMonotonicMs": received_monotonic_ms,
+            },
+        )
 
     def restore(self) -> None:
         self.status_changed.emit("CONNECTING")
@@ -472,75 +664,6 @@ class CloudService(QObject):
             return
         self.status_changed.emit("WAITING FOR GOOGLE")
 
-        def authorize() -> dict[str, Any]:
-            credentials = _read_oauth_credentials()
-            challenge = _request(
-                "POST", f"{self.api_base}/api/v1/auth/google/challenge", {}
-            )
-            callback_results: queue.Queue[dict[str, str]] = queue.Queue(maxsize=1)
-            handler = type("CallbackHandler", (_CallbackHandler,), {"result_queue": callback_results})
-            server = HTTPServer(("127.0.0.1", 0), handler)
-            server.timeout = 180
-            redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
-            state = secrets.token_urlsafe(32)
-            verifier = secrets.token_urlsafe(64)
-            pkce = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-            query = urllib.parse.urlencode(
-                {
-                    "client_id": credentials["client_id"],
-                    "redirect_uri": redirect_uri,
-                    "response_type": "code",
-                    "scope": "openid email profile",
-                    "nonce": challenge["nonce"],
-                    "state": state,
-                    "code_challenge": pkce,
-                    "code_challenge_method": "S256",
-                    "prompt": "select_account",
-                }
-            )
-            opened = webbrowser.open(f'{credentials["auth_uri"]}?{query}', new=1, autoraise=True)
-            if not opened:
-                server.server_close()
-                raise ApiError("Could not open the system browser for Google sign-in.")
-            server.handle_request()
-            server.server_close()
-            try:
-                callback = callback_results.get_nowait()
-            except queue.Empty as error:
-                raise ApiError("Google sign-in timed out.") from error
-            if not hmac.compare_digest(callback.get("state", ""), state):
-                raise ApiError("Google sign-in returned an invalid state.")
-            if "code" not in callback:
-                raise ApiError(callback.get("error_description") or "Google sign-in was cancelled.")
-            token_payload = {
-                "client_id": credentials["client_id"],
-                "code": callback["code"],
-                "code_verifier": verifier,
-                "grant_type": "authorization_code",
-                "redirect_uri": redirect_uri,
-            }
-            if credentials["client_secret"]:
-                token_payload["client_secret"] = credentials["client_secret"]
-            google_tokens = _request(
-                "POST", credentials["token_uri"], token_payload, form=True
-            )
-            if not google_tokens.get("id_token"):
-                raise ApiError("Google did not return an identity token.")
-            response = _request(
-                "POST",
-                f"{self.api_base}/api/v1/auth/google/exchange",
-                {
-                    "idToken": google_tokens["id_token"],
-                    "challenge": challenge["challenge"],
-                    "deviceId": self.device_id,
-                    "platform": "windows" if sys.platform == "win32" else "linux",
-                },
-            )
-            self._accept_tokens(response)
-            return _request(
-                "GET", f"{self.api_base}/api/v1/me", access_token=self.access_token
-            )["user"]
-
         def authorized(user: dict[str, Any]) -> None:
             self.authenticated = True
             self.signed_in.emit(user)
@@ -551,7 +674,53 @@ class CloudService(QObject):
             self.status_changed.emit("LOCAL • SIGN-IN FAILED")
             self.failure.emit(str(error))
 
-        self._start(authorize, authorized, failed)
+        self._start(self._authorize_google, authorized, failed)
+
+    def _authorize_google(self) -> dict[str, Any]:
+        credentials = _read_oauth_credentials()
+        challenge = _request(
+            "POST", f"{self.api_base}/api/v1/auth/google/challenge", {}
+        )
+        state = self._token_urlsafe(32)
+        verifier = self._token_urlsafe(64)
+        redirect_uri, callback = self._oauth_browser.authorize(
+            lambda redirect: DesktopOAuthContract.authorization_url(
+                credentials,
+                redirect,
+                challenge["nonce"],
+                state,
+                verifier,
+            )
+        )
+        code = DesktopOAuthContract.authorization_code(callback, state)
+        token_payload = DesktopOAuthContract.token_payload(
+            credentials,
+            code,
+            redirect_uri,
+            verifier,
+        )
+        google_tokens = _request(
+            "POST", credentials["token_uri"], token_payload, form=True
+        )
+        if not google_tokens.get("id_token"):
+            raise ApiError("Google did not return an identity token.")
+        response = _request(
+            "POST",
+            f"{self.api_base}/api/v1/auth/google/exchange",
+            {
+                "idToken": google_tokens["id_token"],
+                "challenge": challenge["challenge"],
+                "deviceId": self.device_id,
+                "platform": "windows" if sys.platform == "win32" else "linux",
+            },
+        )
+        self._accept_login_tokens(response)
+        user = _request(
+            "GET",
+            f"{self.api_base}/api/v1/me",
+            access_token=self.access_token,
+        )["user"]
+        return user
 
     def sync(self, payload: dict[str, Any]) -> None:
         if self.busy:
@@ -693,7 +862,9 @@ class CloudService(QObject):
         self.status_changed.emit("SESSION EXPIRED • SIGN IN AGAIN")
 
     def shutdown(self) -> None:
-        self._shutting_down = True
+        with self._lifecycle_lock:
+            self._shutting_down = True
+        self._oauth_browser.cancel()
         self.stop_revision_stream()
 
     def logout(self) -> None:

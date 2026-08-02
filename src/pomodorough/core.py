@@ -4,7 +4,7 @@ import hashlib
 import unicodedata
 import uuid
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from math import ceil
 from typing import Any
 
@@ -76,13 +76,21 @@ def rebuild_tasks(
         ),
     )
     for operation in ordered:
-        task_id = str(operation.get("taskId", ""))
+        task_id = operation.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            continue
         if operation.get("type") == "delete":
             tasks.pop(task_id, None)
-        elif operation.get("type") == "upsert" and operation.get("title"):
-            title = normalize_task_title(str(operation["title"]))
-            if task_id == task_id_for_title(title):
-                tasks[task_id] = {"id": task_id, "title": title}
+        elif operation.get("type") == "upsert":
+            title = operation.get("title")
+            if not isinstance(title, str):
+                continue
+            try:
+                task = task_from_title(title)
+            except ValueError:
+                continue
+            if task_id == task["id"]:
+                tasks[task_id] = task
     return sorted(tasks.values(), key=lambda task: (task["title"].casefold(), task["id"]))
 
 
@@ -102,6 +110,34 @@ def project_auto_start_breaks(
         if isinstance(operation.get("enabled"), bool):
             enabled = operation["enabled"]
     return enabled
+
+
+def project_durations(
+    canonical: dict[str, int], pending: list[dict[str, Any]]
+) -> dict[str, int]:
+    durations = {
+        phase: int(canonical.get(phase, definition["default_minutes"] * 60_000))
+        for phase, definition in PHASES.items()
+    }
+    for operation in sorted(
+        pending,
+        key=lambda item: (
+            int(item.get("hlcWallMs", 0)),
+            int(item.get("hlcCounter", 0)),
+            str(item.get("id", "")),
+        ),
+    ):
+        phase = operation.get("phase")
+        duration_ms = operation.get("durationMs")
+        if (
+            phase in PHASES
+            and isinstance(duration_ms, int)
+            and not isinstance(duration_ms, bool)
+            and 60_000 <= duration_ms <= 10_800_000
+            and duration_ms % 60_000 == 0
+        ):
+            durations[phase] = duration_ms
+    return durations
 
 
 def task_summaries_today(
@@ -171,10 +207,76 @@ def reduce_command(
         "occurredAt": command["occurredAt"],
     }
 
+    def add_terminal_history(source: dict[str, Any], status: str) -> None:
+        if any(item.get("commandId") == command["id"] for item in next_history):
+            return
+        item = {
+            "id": f'{source["id"]}:{command["id"]}',
+            "timerId": source["id"],
+            "commandId": command["id"],
+            "phase": source["phase"],
+            "status": status,
+            "plannedDurationMs": source["plannedDurationMs"],
+            "endedAt": command["occurredAt"],
+            "pending": True,
+            "taskId": source.get("taskId"),
+        }
+        if status == "completed":
+            item["completedAt"] = command["occurredAt"]
+        next_history.insert(0, item)
+
+    if next_timer is not None and next_timer.get("status") == "running":
+        occurred_ms = parse_timestamp_ms(command.get("occurredAt"))
+        anchor_ms = parse_timestamp_ms(next_timer.get("anchorAt"))
+        planned = max(0, int(next_timer.get("plannedDurationMs") or 0))
+        stored_elapsed = min(
+            planned, max(0, int(next_timer.get("elapsedAtAnchorMs") or 0))
+        )
+        if (
+            occurred_ms is not None
+            and anchor_ms is not None
+            and stored_elapsed + max(0, occurred_ms - anchor_ms) >= planned
+        ):
+            completed_ms = anchor_ms + planned - stored_elapsed
+            completed_at = (
+                datetime.fromtimestamp(completed_ms / 1000, tz=timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+            next_timer.update(
+                status="completed",
+                elapsedAtAnchorMs=planned,
+                anchorAt=completed_at,
+            )
+            if not any(
+                item.get("timerId") == next_timer["id"] for item in next_history
+            ):
+                next_history.insert(
+                    0,
+                    {
+                        "id": next_timer["id"],
+                        "timerId": next_timer["id"],
+                        "phase": next_timer["phase"],
+                        "status": "completed",
+                        "plannedDurationMs": planned,
+                        "completedAt": completed_at,
+                        "endedAt": completed_at,
+                        "taskId": next_timer.get("taskId"),
+                    },
+                )
+
     if command_type == "start":
+        timer_id = command["timerId"]
+        if (
+            (next_timer is not None and next_timer.get("id") == timer_id)
+            or any(item.get("timerId") == timer_id for item in next_history)
+        ):
+            return next_timer, next_history
+        if next_timer is not None and next_timer.get("status") in ACTIVE_STATUSES:
+            add_terminal_history(next_timer, "superseded")
         return (
             {
-                "id": command["timerId"],
+                "id": timer_id,
                 "phase": command["phase"],
                 "status": "running",
                 "plannedDurationMs": command["plannedDurationMs"],
@@ -185,6 +287,40 @@ def reduce_command(
             },
             next_history,
         )
+
+    if command_type == "resume" and (
+        not next_timer or command.get("timerId") != next_timer.get("id")
+    ):
+        superseded = next(
+            (
+                item
+                for item in next_history
+                if item.get("timerId") == command.get("timerId")
+                and item.get("status") == "superseded"
+            ),
+            None,
+        )
+        if superseded is not None:
+            if next_timer is not None and next_timer.get("status") in ACTIVE_STATUSES:
+                add_terminal_history(next_timer, "superseded")
+            next_history = [item for item in next_history if item is not superseded]
+            planned = int(superseded["plannedDurationMs"])
+            return (
+                {
+                    "id": superseded["timerId"],
+                    "phase": superseded["phase"],
+                    "status": "running",
+                    "plannedDurationMs": planned,
+                    "elapsedAtAnchorMs": min(
+                        planned,
+                        max(0, int(command.get("observedElapsedMs") or 0)),
+                    ),
+                    "anchorAt": command["occurredAt"],
+                    "lastIntent": intent,
+                    "taskId": superseded.get("taskId"),
+                },
+                next_history,
+            )
 
     if not next_timer or command.get("timerId") != next_timer.get("id"):
         return next_timer, next_history
@@ -200,7 +336,16 @@ def reduce_command(
             anchorAt=command["occurredAt"],
             lastIntent=intent,
         )
-    elif command_type == "resume" and status == "paused":
+    elif command_type == "resume" and status in {"paused", "superseded"}:
+        if status == "superseded":
+            next_history = [
+                item
+                for item in next_history
+                if not (
+                    item.get("timerId") == next_timer["id"]
+                    and item.get("status") == "superseded"
+                )
+            ]
         next_timer.update(
             status="running",
             elapsedAtAnchorMs=observed,
@@ -214,21 +359,22 @@ def reduce_command(
             anchorAt=command["occurredAt"],
             lastIntent=intent,
         )
-        if not any(item.get("commandId") == command["id"] for item in next_history):
-            next_history.insert(
-                0,
-                {
-                    "id": f'{command["timerId"]}:{command["id"]}',
-                    "timerId": command["timerId"],
-                    "commandId": command["id"],
-                    "phase": command["phase"],
-                    "status": "completed",
-                    "plannedDurationMs": command["plannedDurationMs"],
-                    "completedAt": command["occurredAt"],
-                    "pending": True,
-                    "taskId": next_timer.get("taskId"),
-                },
-            )
+        add_terminal_history(next_timer, "completed")
+    elif command_type == "finish" and status == "completed":
+        completion = next(
+            (
+                item
+                for item in next_history
+                if item.get("timerId") == next_timer["id"]
+                and item.get("status") == "completed"
+                and not item.get("commandId")
+            ),
+            None,
+        )
+        if completion is not None:
+            next_timer["lastIntent"] = intent
+            completion["commandId"] = command["id"]
+            completion["pending"] = True
     elif command_type == "cancel" and status in ACTIVE_STATUSES:
         next_timer.update(
             status="cancelled",
@@ -236,7 +382,8 @@ def reduce_command(
             anchorAt=command["occurredAt"],
             lastIntent=intent,
         )
-    elif command_type == "clear" and status not in ACTIVE_STATUSES:
+        add_terminal_history(next_timer, "cancelled")
+    elif command_type == "clear" and status in {"completed", "cancelled"}:
         return None, next_history
 
     return next_timer, next_history
@@ -249,7 +396,9 @@ def rebuild_optimistic(
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     timer = deepcopy(base_timer)
     history = deepcopy(base_history)
-    for command in sorted(pending, key=lambda item: int(item["deviceSequence"])):
+    for command in sorted(
+        pending, key=lambda item: (int(item["deviceSequence"]), str(item["id"]))
+    ):
         timer, history = reduce_command(timer, history, command)
     return timer, history
 

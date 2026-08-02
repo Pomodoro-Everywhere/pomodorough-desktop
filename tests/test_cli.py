@@ -189,6 +189,7 @@ class CliTests(unittest.TestCase):
         for action in ("start", "pause", "resume", "finish", "cancel", "clear"):
             with self.subTest(action=action):
                 self.store.reset_account_data()
+                self.store.set_meta("hlc", {"wallMs": 0, "counter": 0})
                 self.store.set_auto_start_breaks(True, now_ms=1)
                 settings = self.store.load()["settings"]
                 self.store.queue_command(
@@ -213,6 +214,7 @@ class CliTests(unittest.TestCase):
         for action in ("start", "pause", "resume", "finish", "cancel", "clear"):
             with self.subTest(action=action):
                 self.store.reset_account_data()
+                self.store.set_meta("hlc", {"wallMs": 0, "counter": 0})
                 self.store.set_auto_start_breaks(True, now_ms=1)
                 settings = self.store.load()["settings"]
                 self.store.queue_command(

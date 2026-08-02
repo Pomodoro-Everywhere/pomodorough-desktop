@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pomodorough.core import task_from_title
 from pomodorough.storage import Store
@@ -32,6 +33,7 @@ class LocalTimerTests(unittest.TestCase):
         self.timer.issue("finish", now_ms=51_000)
 
         self.assertEqual(self.timer.state(now_ms=51_000)["status"], "completed")
+        self.assertEqual(self.timer.selected_phase, "focus")
         self.assertEqual(len(self.timer.completed_history()), 1)
         self.assertEqual(len(self.store.load()["pending"]), 4)
 
@@ -40,6 +42,77 @@ class LocalTimerTests(unittest.TestCase):
         state = self.timer.state(now_ms=61_000, auto_finish=True)
         self.assertEqual(state["status"], "completed")
         self.assertEqual(state["remaining"], "00:00")
+        self.assertEqual(self.timer.selected_phase, "short_break")
+
+    def test_live_status_deadline_uses_monotonic_time_across_wall_jump(self) -> None:
+        physical_ms = 1_800_000_000_000
+        with (
+            patch("pomodorough.storage.time.time", return_value=physical_ms / 1_000),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=10_000_000_000
+            ),
+        ):
+            self.timer.issue("start", minutes=1)
+            self.assertEqual(self.timer.state()["remainingMs"], 60_000)
+
+        with (
+            patch(
+                "pomodorough.storage.time.time",
+                return_value=(physical_ms + 3_600_000) / 1_000,
+            ),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=40_000_000_000
+            ),
+        ):
+            state = self.timer.state(auto_finish=True)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["elapsedMs"], 30_000)
+
+        with (
+            patch(
+                "pomodorough.storage.time.time",
+                return_value=(physical_ms - 3_600_000) / 1_000,
+            ),
+            patch(
+                "pomodorough.storage.time.monotonic_ns", return_value=70_000_000_000
+            ),
+        ):
+            state = self.timer.state(auto_finish=True)
+        self.assertEqual(state["status"], "completed")
+
+    def test_completion_advances_through_repeating_pomodoro_cycle(self) -> None:
+        expected_breaks = [
+            "short_break",
+            "short_break",
+            "short_break",
+            "long_break",
+            "short_break",
+        ]
+        now_ms = 1_000
+        self.timer.issue("start", now_ms=now_ms)
+
+        for index, expected_break in enumerate(expected_breaks):
+            now_ms += 1_000
+            self.timer.issue("finish", now_ms=now_ms)
+            self.assertEqual(self.timer.selected_phase, expected_break)
+
+            now_ms += 1_000
+            self.timer.primary(now_ms=now_ms)
+            self.assertEqual(self.timer.state(now_ms=now_ms)["phase"], expected_break)
+            now_ms += 1_000
+            self.timer.issue("finish", now_ms=now_ms)
+            self.assertEqual(self.timer.selected_phase, "focus")
+
+            if index < len(expected_breaks) - 1:
+                now_ms += 1_000
+                self.timer.primary(now_ms=now_ms)
+
+        completed_focus = [
+            item
+            for item in self.timer.completed_history()
+            if item["phase"] == "focus"
+        ]
+        self.assertEqual(len(completed_focus), 5)
 
     def test_signed_in_terminal_auto_starts_break_without_sync(self) -> None:
         self.store.set_user({"id": "user-1"})

@@ -196,6 +196,7 @@ class MainWindow(QMainWindow):
         self._resolution_request_id: str | None = None
         self._resolution_retry_paused = False
         self._resolution_retry_scheduled = False
+        self._resolution_corruption: str | None = None
         self._account_switch_user: dict[str, Any] | None = None
         self._task_selector_signature: tuple[Any, ...] | None = None
         self._task_render_signature: tuple[Any, ...] | None = None
@@ -223,11 +224,17 @@ class MainWindow(QMainWindow):
         state, provisional_timer_ids = (
             self.store.load_with_provisional_auto_breaks()
         )
-        pending_resolution = self.store.pending_resolution()
+        try:
+            pending_resolution = self.store.pending_resolution()
+            self._resolution_corruption = None
+        except ValueError as error:
+            pending_resolution = None
+            self._resolution_corruption = str(error)
         self.settings = state["settings"]
         self.revision = int(state["snapshot"].get("revision", 0))
-        self.base_timer = state["snapshot"].get("canonicalTimer")
-        self.base_history = state["snapshot"].get("history", [])
+        projection_snapshot = state.get("projectionSnapshot", state["snapshot"])
+        self.base_timer = projection_snapshot.get("canonicalTimer")
+        self.base_history = projection_snapshot.get("history", [])
         self.base_tasks = state["snapshot"].get("tasks", [])
         self.known_tasks = {
             task["id"]: task
@@ -240,7 +247,9 @@ class MainWindow(QMainWindow):
         self.pending_durations = state["pendingDurations"]
         self.pending_auto_starts = state["pendingAutoStarts"]
         self.timer, self.history = rebuild_optimistic(
-            self.base_timer, self.base_history, self.pending
+            self.base_timer,
+            self.base_history,
+            state.get("projectionPending", self.pending),
         )
         self.provisional_auto_break_timer_ids = (
             provisional_timer_ids if self.user is not None else set()
@@ -262,7 +271,7 @@ class MainWindow(QMainWindow):
         selected_task_id = self.settings.get("selectedTaskId")
         if selected_task_id and not any(task["id"] == selected_task_id for task in self.tasks):
             self.settings["selectedTaskId"] = None
-            if pending_resolution is None:
+            if pending_resolution is None and self._resolution_corruption is None:
                 self.store.set_selected_task_id(None)
         self._task_selector_signature = None
         self._task_render_signature = None
@@ -276,7 +285,17 @@ class MainWindow(QMainWindow):
             self.auto_breaks.blockSignals(previous)
 
     def _activate_persisted_resolution(self) -> bool:
-        pending = self.store.pending_resolution()
+        try:
+            pending = self.store.pending_resolution()
+        except ValueError as error:
+            self._resolution_corruption = str(error)
+            self._history_resolution_active = True
+            self._resolution_user = self.user
+            self._resolution_phase = None
+            self._resolution_preview = None
+            self._resolution_request_id = None
+            self._resolution_retry_paused = True
+            return True
         if pending is None:
             return False
         self._history_resolution_active = True
@@ -653,6 +672,18 @@ class MainWindow(QMainWindow):
         self.cloud.authorization_stale.connect(self._sync)
         self.cloud.failure.connect(self._cloud_failure)
 
+    @staticmethod
+    def _response_timing(response: dict[str, Any]) -> dict[str, int | None]:
+        timing = getattr(response, "timing", None)
+        if not isinstance(timing, dict):
+            return {}
+        return {
+            "request_physical_ms": timing.get("requestPhysicalMs"),
+            "received_physical_ms": timing.get("receivedPhysicalMs"),
+            "request_monotonic_ms": timing.get("requestMonotonicMs"),
+            "received_monotonic_ms": timing.get("receivedMonotonicMs"),
+        }
+
     def _selected_phase(self) -> str:
         value = self.settings.get("selectedPhase", "focus")
         return value if value in PHASES else "focus"
@@ -665,7 +696,7 @@ class MainWindow(QMainWindow):
 
     def _render(self) -> None:
         timer = self._current_timer()
-        now = int(time.time() * 1000)
+        now = self.store.effective_timer_now_ms(timer)
         elapsed = elapsed_ms(timer, now)
         if timer.get("status") == "cancelled":
             elapsed = 0
@@ -855,7 +886,9 @@ class MainWindow(QMainWindow):
             if self._history_resolution_active:
                 self._render()
                 return
-            if elapsed_ms(timer, int(time.time() * 1000)) >= int(timer["plannedDurationMs"]):
+            if elapsed_ms(
+                timer, self.store.effective_timer_now_ms(timer)
+            ) >= int(timer["plannedDurationMs"]):
                 if not self._auto_finish_in_progress:
                     self._auto_finish_in_progress = True
                     self._issue("finish", automatic=True)
@@ -886,9 +919,21 @@ class MainWindow(QMainWindow):
         elif status == "idle":
             self._issue("start")
         elif status in TERMINAL_STATUSES:
-            self._issue("clear")
-            if self._current_timer().get("status") == "idle":
-                self._issue("start")
+            if self._mutation_blocked():
+                return
+            try:
+                self.store.queue_restart(
+                    self.timer,
+                    self._selected_phase(),
+                    self.settings["durationsMs"],
+                    self.settings.get("selectedTaskId"),
+                )
+            except (OSError, ValueError) as error:
+                self.notice.emit(str(error))
+                return
+            self._load_state()
+            self._render()
+            self._sync()
 
     def _issue(self, command_type: str, automatic: bool = False) -> None:
         if self._mutation_blocked():
@@ -919,10 +964,7 @@ class MainWindow(QMainWindow):
             self._auto_finish_in_progress = False
             self.notice.emit(str(error))
             return
-        self.pending.append(command)
-        self.timer, self.history = rebuild_optimistic(
-            self.base_timer, self.base_history, self.pending
-        )
+        self._load_state()
         self._render()
         self._sync()
         if command_type == "finish":
@@ -1158,7 +1200,10 @@ class MainWindow(QMainWindow):
             return
         self._resolution_phase = "choice"
         try:
-            plan = self.store.bootstrap_resolution_plan(response)
+            plan = self.store.bootstrap_resolution_plan(
+                response,
+                **self._response_timing(response),
+            )
         except (KeyError, TypeError, ValueError) as error:
             self._resolution_phase = "preview"
             self._resolution_preview = None
@@ -1189,8 +1234,10 @@ class MainWindow(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setWindowTitle("Choose Pomodorough history")
-        dialog.setText("Local and synced histories both contain completed timers.")
-        dialog.setInformativeText("Choose which history should become canonical.")
+        dialog.setText("Local and synced state both contain meaningful data.")
+        dialog.setInformativeText(
+            "Choose which timers, history, tasks, and settings should become canonical."
+        )
         keep_local = dialog.addButton(
             "Keep Local", QMessageBox.ButtonRole.AcceptRole
         )
@@ -1245,7 +1292,11 @@ class MainWindow(QMainWindow):
             self.notice.emit("Sync response did not match an active request.")
             return
         try:
-            notices = self.store.apply_sync(response, request)
+            notices = self.store.apply_sync(
+                response,
+                request,
+                **self._response_timing(response),
+            )
         except (KeyError, TypeError, ValueError) as error:
             self._cloud_failure(str(error))
             self.notice.emit(str(error))
@@ -1253,13 +1304,7 @@ class MainWindow(QMainWindow):
         self._load_state()
         self._render()
         self._maybe_auto_start_break(sync=False, allow_busy=True)
-        payload = self.store.sync_payload()
-        has_pending = bool(
-            payload["commands"]
-            or payload["taskOperations"]
-            or payload["durationOperations"]
-            or payload["autoStartOperations"]
-        )
+        has_pending = self.store.has_sendable_sync_operations()
         self._set_account_state(not has_pending)
         if has_pending:
             self._sync()
@@ -1274,6 +1319,7 @@ class MainWindow(QMainWindow):
                 response,
                 self._resolution_user,
                 self._resolution_request_id,
+                **self._response_timing(response),
             )
         except (KeyError, TypeError, ValueError) as error:
             self._resolution_retry_paused = True
@@ -1288,13 +1334,7 @@ class MainWindow(QMainWindow):
         self._load_state()
         self._render()
         self._maybe_auto_start_break(sync=False, allow_busy=True)
-        payload = self.store.sync_payload()
-        has_pending = bool(
-            payload["commands"]
-            or payload["taskOperations"]
-            or payload["durationOperations"]
-            or payload["autoStartOperations"]
-        )
+        has_pending = self.store.has_sendable_sync_operations()
         self._set_account_state(not has_pending)
         if has_pending:
             self._sync()
@@ -1329,7 +1369,21 @@ class MainWindow(QMainWindow):
         self._continue_history_resolution()
 
     def _signed_in(self, user: dict[str, Any]) -> None:
-        pending = self.store.pending_resolution()
+        try:
+            pending = self.store.pending_resolution()
+        except ValueError as error:
+            self._resolution_corruption = str(error)
+            self._history_resolution_active = True
+            self._resolution_user = self.user or user
+            self._resolution_phase = None
+            self._resolution_preview = None
+            self._resolution_request_id = None
+            self._resolution_retry_paused = True
+            self._sync_request = None
+            self._render()
+            self._set_account_state(False)
+            self.notice.emit(str(error))
+            return
         owner = pending["owner"] if pending is not None else self.user
         owner_id = owner.get("id") if isinstance(owner, dict) else None
         if owner_id and owner_id != user.get("id"):
