@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -61,6 +63,7 @@ from .core import (
     task_summaries_today,
 )
 from .network import CloudService
+from .iroh_protocol import IrohProtocolError, parse_invite
 from .storage import Store
 
 
@@ -173,11 +176,24 @@ class ClockWidget(QWidget):
 class MainWindow(QMainWindow):
     notice = Signal(str)
 
-    def __init__(self, store: Store, cloud: CloudService, app_icon: QIcon) -> None:
+    def __init__(
+        self,
+        store: Store,
+        cloud: CloudService,
+        app_icon: QIcon,
+        iroh: Any | None = None,
+    ) -> None:
         super().__init__()
         self.store = store
         self.cloud = cloud
         self.app_icon = app_icon
+        self.iroh = iroh
+        self.replication_mode = store.replication_mode
+        self._iroh_status = "NOT CONNECTED"
+        self._iroh_details: dict[str, Any] = {}
+        self._iroh_invite = ""
+        self._cloud_restore_after_iroh_stop = False
+        self._iroh_join_pending = False
         self.quitting = False
         self._notified_timer_id: str | None = None
         self._auto_finish_in_progress = False
@@ -209,6 +225,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._connect_cloud()
+        self._connect_iroh()
         self._render()
 
         self.tick_timer = QTimer(self)
@@ -217,7 +234,7 @@ class MainWindow(QMainWindow):
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self._sync)
         self.sync_timer.start(15_000)
-        QTimer.singleShot(0, self.cloud.restore)
+        QTimer.singleShot(0, self._restore_replication)
 
     def _load_state(self) -> None:
         previous_timer = getattr(self, "timer", None)
@@ -325,7 +342,7 @@ class MainWindow(QMainWindow):
         self.screen_group = QButtonGroup(self)
         self.screen_group.setExclusive(True)
         self.screen_buttons: list[QPushButton] = []
-        for index, label in enumerate(("TIMER", "TASKS", "ARRIVALS")):
+        for index, label in enumerate(("TIMER", "TASKS", "ARRIVALS", "NETWORK")):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setProperty("screen", True)
@@ -452,14 +469,18 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.tasks_page)
         self.arrivals_page = self._build_arrivals_page()
         self.page_stack.addWidget(self.arrivals_page)
+        self.network_page = self._build_network_page()
+        self.page_stack.addWidget(self.network_page)
         self.outer_layout.addWidget(self.page_stack, 1)
 
         self.shortcuts = [
             QShortcut(QKeySequence(Qt.Key.Key_Space), self),
             QShortcut(QKeySequence("Ctrl+Shift+F"), self),
+            QShortcut(QKeySequence("Ctrl+4"), self),
         ]
         self.shortcuts[0].activated.connect(self._primary_action)
         self.shortcuts[1].activated.connect(lambda: self._issue("finish"))
+        self.shortcuts[2].activated.connect(lambda: self._show_screen(3))
         self.notice.connect(self._show_notice)
         self._refresh_stylesheet()
         self._apply_responsive_layout()
@@ -543,6 +564,129 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.device_label)
         return page
 
+    def _build_network_page(self) -> QWidget:
+        page = QFrame()
+        page.setObjectName("ticket")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        heading = QVBoxLayout()
+        title = QLabel("NETWORK CONTROL")
+        title.setObjectName("sectionTitle")
+        subtitle = QLabel("Choose one route for remote replication")
+        subtitle.setObjectName("taskSubtitle")
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header.addLayout(heading)
+        header.addStretch()
+        self.network_status = QLabel("NOT CONNECTED")
+        self.network_status.setObjectName("countBadge")
+        self.network_status.setAccessibleName("Replication status")
+        header.addWidget(self.network_status)
+        layout.addLayout(header)
+
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("ROUTE")
+        mode_label.setObjectName("microLabel")
+        self.replication_mode_combo = QComboBox()
+        self.replication_mode_combo.setAccessibleName("Replication mode")
+        self.replication_mode_combo.addItem("ON DEVICE · OFFLINE", "offline")
+        self.replication_mode_combo.addItem("IROH ROOM · EQUAL PEERS", "iroh")
+        self.replication_mode_combo.addItem("POMODOROUGH CLOUD · CENTRAL", "centralized")
+        self.replication_mode_combo.setCurrentIndex(
+            max(0, self.replication_mode_combo.findData(self.replication_mode))
+        )
+        self.replication_mode_combo.currentIndexChanged.connect(
+            self._replication_mode_changed
+        )
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.replication_mode_combo, 1)
+        layout.addLayout(mode_row)
+
+        self.network_unavailable = QLabel("")
+        self.network_unavailable.setObjectName("privacyNotice")
+        self.network_unavailable.setWordWrap(True)
+        self.network_unavailable.setAccessibleName("Iroh availability")
+        layout.addWidget(self.network_unavailable)
+
+        self.iroh_panel = QFrame()
+        self.iroh_panel.setObjectName("networkPanel")
+        iroh_layout = QGridLayout(self.iroh_panel)
+        iroh_layout.setContentsMargins(12, 12, 12, 12)
+        iroh_layout.setHorizontalSpacing(8)
+        iroh_layout.setVerticalSpacing(8)
+
+        self.room_name_input = QLineEdit()
+        self.room_name_input.setPlaceholderText("Optional room name")
+        self.room_name_input.setMaxLength(64)
+        self.room_name_input.setAccessibleName("Iroh room name")
+        self.create_room_button = QPushButton("OPEN NEW ROOM")
+        self.create_room_button.setObjectName("primaryButton")
+        self.create_room_button.setAccessibleName("Create Iroh room")
+        self.create_room_button.clicked.connect(self._create_iroh_room)
+        iroh_layout.addWidget(self.room_name_input, 0, 0)
+        iroh_layout.addWidget(self.create_room_button, 0, 1)
+
+        self.invite_input = QPlainTextEdit()
+        self.invite_input.setPlaceholderText("Paste pomodorough1. invite code")
+        self.invite_input.setAccessibleName("Iroh room invite code")
+        self.invite_input.setMaximumHeight(70)
+        self.join_room_button = QPushButton("JOIN ROOM")
+        self.join_room_button.setAccessibleName("Join Iroh room")
+        self.join_room_button.clicked.connect(self._join_iroh_room)
+        iroh_layout.addWidget(self.invite_input, 1, 0)
+        iroh_layout.addWidget(self.join_room_button, 1, 1)
+
+        self.invite_output = QPlainTextEdit()
+        self.invite_output.setReadOnly(True)
+        self.invite_output.setPlaceholderText("Room invite appears here after endpoint starts")
+        self.invite_output.setAccessibleName("Shareable Iroh room invite")
+        self.invite_output.setMaximumHeight(70)
+        self.copy_invite_button = QPushButton("COPY INVITE")
+        self.copy_invite_button.setAccessibleName("Copy Iroh room invite")
+        self.copy_invite_button.clicked.connect(self._copy_iroh_invite)
+        iroh_layout.addWidget(self.invite_output, 2, 0)
+        iroh_layout.addWidget(self.copy_invite_button, 2, 1)
+
+        action_row = QHBoxLayout()
+        self.refresh_invite_button = QPushButton("REFRESH TICKET")
+        self.refresh_invite_button.clicked.connect(self._refresh_iroh_invite)
+        self.sync_iroh_button = QPushButton("SYNC NOW")
+        self.sync_iroh_button.clicked.connect(self._sync_iroh_now)
+        self.leave_room_button = QPushButton("LEAVE ROOM")
+        self.leave_room_button.setObjectName("dangerButton")
+        self.leave_room_button.clicked.connect(self._leave_iroh_room)
+        action_row.addWidget(self.refresh_invite_button)
+        action_row.addWidget(self.sync_iroh_button)
+        action_row.addStretch()
+        action_row.addWidget(self.leave_room_button)
+        iroh_layout.addLayout(action_row, 3, 0, 1, 2)
+        layout.addWidget(self.iroh_panel)
+
+        self.network_details = QLabel("NO ROOM ASSIGNED")
+        self.network_details.setObjectName("device")
+        self.network_details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.network_details.setAccessibleName("Iroh room and peer details")
+        layout.addWidget(self.network_details)
+
+        privacy = QLabel(
+            "PRIVACY NOTICE · Direct peers learn each other's IP addresses. Relay traffic is "
+            "end-to-end encrypted, but relay operators can observe endpoint IDs, IP addresses, "
+            "timing, and volume. Invite codes grant full room read/write access and can contain "
+            "network addresses. Iroh v1 has no member revocation; rotate into a new room to remove a member."
+        )
+        privacy.setObjectName("privacyNotice")
+        privacy.setWordWrap(True)
+        privacy.setAccessibleName("Iroh privacy disclosure")
+        layout.addWidget(privacy)
+        layout.addStretch()
+        return page
+
     def _refresh_stylesheet(self) -> None:
         palette_key = QApplication.palette().cacheKey()
         if palette_key == self._palette_key:
@@ -561,7 +705,7 @@ class MainWindow(QMainWindow):
         self.screen_buttons[index].setChecked(True)
         self.settings_button.setVisible(index == 0)
         self._render()
-        if index:
+        if index and self.replication_mode == "centralized":
             self._sync()
 
     def _apply_responsive_layout(self) -> None:
@@ -672,6 +816,279 @@ class MainWindow(QMainWindow):
         self.cloud.authorization_stale.connect(self._sync)
         self.cloud.failure.connect(self._cloud_failure)
 
+    def _connect_iroh(self) -> None:
+        if self.iroh is None:
+            return
+        self.iroh.status_changed.connect(self._iroh_status_changed)
+        self.iroh.details_changed.connect(self._iroh_details_changed)
+        self.iroh.invite_ready.connect(self._iroh_invite_ready)
+        self.iroh.joined.connect(self._iroh_joined)
+        self.iroh.projection_changed.connect(self._iroh_projection_changed)
+        self.iroh.failure.connect(self._iroh_failure)
+
+    def _restore_replication(self) -> None:
+        if self.replication_mode == "centralized":
+            self.cloud.restore()
+            return
+        if self.replication_mode != "iroh":
+            self._render_network()
+            return
+        room_id = self.store.active_iroh_room_id
+        if self.iroh is None or room_id is None:
+            self._iroh_status = "UNAVAILABLE"
+            self._iroh_failure(
+                "Iroh mode is saved, but optional Iroh service or active room metadata is unavailable."
+            )
+            return
+        available, reason = self.iroh.availability()
+        if not available:
+            self._iroh_status = "UNAVAILABLE"
+            self.statusBar().showMessage(reason)
+            self._render_network()
+            return
+        self.iroh.start_room(room_id)
+
+    def _render_network(self) -> None:
+        if not hasattr(self, "network_status"):
+            return
+        status = {
+            "offline": "ON DEVICE",
+            "centralized": "CLOUD ROUTE",
+        }.get(self.replication_mode, self._iroh_status)
+        self.network_status.setText(status)
+        self.account_button.setEnabled(self.replication_mode == "centralized")
+        if self.replication_mode != "centralized":
+            self.account_button.setToolTip(
+                "Cloud account controls are available in Pomodorough Cloud mode."
+            )
+            self.account_button.setAccessibleName("Cloud account controls inactive")
+        room = self.store.iroh_room()
+        active = self.replication_mode == "iroh" and room is not None
+        available = self.iroh is not None and self.iroh.availability()[0]
+        unavailable_reason = (
+            self.iroh.availability()[1]
+            if self.iroh is not None and not available
+            else "Iroh support is not packaged in this build. Offline and centralized modes remain available."
+            if self.iroh is None
+            else ""
+        )
+        self.network_unavailable.setText(unavailable_reason)
+        self.network_unavailable.setVisible(bool(unavailable_reason))
+        self.iroh_panel.setEnabled(available)
+        self.create_room_button.setEnabled(available and not active)
+        self.join_room_button.setEnabled(available and not active)
+        self.refresh_invite_button.setEnabled(available and active)
+        self.sync_iroh_button.setEnabled(available and active)
+        self.leave_room_button.setEnabled(active)
+        self.copy_invite_button.setEnabled(bool(self._iroh_invite))
+        if self.invite_output.toPlainText() != self._iroh_invite:
+            self.invite_output.setPlainText(self._iroh_invite)
+        if room is None:
+            self.network_details.setText(
+                "NO ROOM ASSIGNED" if available else self.iroh.availability()[1] if self.iroh else "IROH SERVICE NOT PACKAGED"
+            )
+            return
+        peer_count = int(self._iroh_details.get("peerCount", room["peerCount"]))
+        operation_count = int(
+            self._iroh_details.get("operationCount", room["operationCount"])
+        )
+        conflict = self._iroh_details.get("conflict", room.get("conflict"))
+        self.leave_room_button.setText(
+            "LEAVE / ROTATE ROOM" if conflict else "LEAVE ROOM"
+        )
+        self.leave_room_button.setAccessibleName(
+            "Leave conflicted Iroh room and prepare rotation"
+            if conflict
+            else "Leave Iroh room"
+        )
+        name = room.get("roomName") or "UNNAMED ROOM"
+        details = (
+            f"ROOM  {name.upper()}  ·  ID {room['roomId'][:10].upper()}…  ·  "
+            f"PEERS {peer_count}  ·  RECORDS {operation_count}"
+        )
+        if conflict:
+            details += "  ·  REPAIR REQUIRED"
+        self.network_details.setText(details)
+
+    def _replication_mode_changed(self, index: int) -> None:
+        mode = self.replication_mode_combo.itemData(index)
+        if not isinstance(mode, str) or mode == self.replication_mode:
+            return
+        if mode == "iroh":
+            if self.iroh is None:
+                self.notice.emit("Iroh support is not packaged in this build.")
+                self._reset_replication_mode_combo()
+                return
+            available, reason = self.iroh.availability()
+            if not available:
+                self.notice.emit(reason)
+                self._reset_replication_mode_combo()
+                return
+        if self.replication_mode == "centralized" and self.cloud.busy:
+            self.notice.emit("Wait for the active Cloud request before changing replication mode.")
+            self._reset_replication_mode_combo()
+            return
+        try:
+            self.store.set_replication_mode(mode)
+        except (OSError, ValueError) as error:
+            self.notice.emit(str(error))
+            self._reset_replication_mode_combo()
+            return
+        previous = self.replication_mode
+        self.replication_mode = mode
+        if previous == "iroh" and self.iroh is not None:
+            self._cloud_restore_after_iroh_stop = mode == "centralized"
+            self.iroh.stop()
+        if mode == "centralized" and previous != "iroh":
+            self.cloud.restore()
+        elif mode == "iroh" and self.iroh is not None:
+            self.cloud.stop_revision_stream()
+            room_id = self.store.active_iroh_room_id
+            if room_id:
+                self.iroh.start_room(room_id)
+        else:
+            self.cloud.stop_revision_stream()
+        self._load_state()
+        self._render()
+
+    def _reset_replication_mode_combo(self) -> None:
+        previous = self.replication_mode_combo.blockSignals(True)
+        self.replication_mode_combo.setCurrentIndex(
+            self.replication_mode_combo.findData(self.replication_mode)
+        )
+        self.replication_mode_combo.blockSignals(previous)
+
+    def _create_iroh_room(self) -> None:
+        if self.iroh is None:
+            self.notice.emit("Iroh support is not packaged in this build.")
+            return
+        available, reason = self.iroh.availability()
+        if not available:
+            self.notice.emit(reason)
+            return
+        if self.replication_mode == "centralized" and self.cloud.busy:
+            self.notice.emit("Wait for the active Cloud request before opening an Iroh room.")
+            return
+        name = self.room_name_input.text().strip() or None
+        try:
+            room_id = self.store.create_iroh_room(secrets.token_bytes(32), name)
+        except (OSError, ValueError) as error:
+            self.notice.emit(str(error))
+            return
+        self.replication_mode = "iroh"
+        self.cloud.stop_revision_stream()
+        self._reset_replication_mode_combo()
+        self._load_state()
+        self._render()
+        self.iroh.start_room(room_id, emit_invite=True)
+
+    def _join_iroh_room(self) -> None:
+        if self.iroh is None:
+            self.notice.emit("Iroh support is not packaged in this build.")
+            return
+        available, reason = self.iroh.availability()
+        if not available:
+            self.notice.emit(reason)
+            return
+        if self.replication_mode == "centralized" and self.cloud.busy:
+            self.notice.emit("Wait for the active Cloud request before joining an Iroh room.")
+            return
+        try:
+            invite = parse_invite(self.invite_input.toPlainText().strip())
+            self.store.prepare_iroh_join(
+                invite.room_id,
+                invite.room_secret,
+                invite.room_name,
+                invite.endpoint_id,
+                invite.endpoint_ticket,
+            )
+        except (IrohProtocolError, OSError, ValueError) as error:
+            self.notice.emit(str(error))
+            return
+        self._iroh_status = "JOINING ROOM"
+        self._iroh_join_pending = True
+        self.cloud.stop_revision_stream()
+        self._render_network()
+        self.iroh.join_room(invite)
+
+    def _leave_iroh_room(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Leave Iroh room?",
+            "Leaving restores state from before room activation. Room log remains saved for later reactivation.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.leave_iroh_room()
+        except (OSError, ValueError) as error:
+            self.notice.emit(str(error))
+            return
+        if self.iroh is not None:
+            self.iroh.stop()
+        self.replication_mode = "offline"
+        self._iroh_invite = ""
+        self._reset_replication_mode_combo()
+        self._load_state()
+        self._render()
+
+    def _refresh_iroh_invite(self) -> None:
+        if self.iroh is not None:
+            self.iroh.refresh_invite()
+
+    def _sync_iroh_now(self) -> None:
+        if self.iroh is not None:
+            try:
+                self.store.capture_local_iroh_records()
+            except (OSError, ValueError) as error:
+                self.notice.emit(str(error))
+                return
+            self.iroh.sync_now()
+
+    def _copy_iroh_invite(self) -> None:
+        if self._iroh_invite:
+            QApplication.clipboard().setText(self._iroh_invite)
+            self.statusBar().showMessage("Invite copied. Treat it as a full-access secret.", 5000)
+
+    def _iroh_status_changed(self, status: str) -> None:
+        self._iroh_status = status
+        if status == "NOT CONNECTED" and self._cloud_restore_after_iroh_stop:
+            self._cloud_restore_after_iroh_stop = False
+            self.cloud.restore()
+        self._render_network()
+
+    def _iroh_details_changed(self, details: dict[str, Any]) -> None:
+        self._iroh_details = details if isinstance(details, dict) else {}
+        self._render_network()
+
+    def _iroh_invite_ready(self, invite: str) -> None:
+        self._iroh_invite = invite
+        self._render_network()
+
+    def _iroh_joined(self) -> None:
+        self._iroh_join_pending = False
+        self.replication_mode = "iroh"
+        self._reset_replication_mode_combo()
+        self.invite_input.clear()
+        self._load_state()
+        self._render()
+
+    def _iroh_projection_changed(self) -> None:
+        if self.replication_mode != "iroh":
+            return
+        self._load_state()
+        self._render()
+
+    def _iroh_failure(self, message: str) -> None:
+        join_failed = self._iroh_join_pending
+        self._iroh_join_pending = False
+        self.statusBar().showMessage(message, 15000)
+        if join_failed and self.store.replication_mode == "centralized":
+            self.cloud.restore()
+        self._render_network()
+
     @staticmethod
     def _response_timing(response: dict[str, Any]) -> dict[str, int | None]:
         timing = getattr(response, "timing", None)
@@ -717,6 +1134,7 @@ class MainWindow(QMainWindow):
             status_labels.get(status, status),
             elapsed / planned,
         )
+        self._render_network()
         active = status in ACTIVE_STATUSES
         self._render_task_selector(timer, active)
         self._update_tray_progress(elapsed / planned, active)
@@ -891,11 +1309,24 @@ class MainWindow(QMainWindow):
             ) >= int(timer["plannedDurationMs"]):
                 if not self._auto_finish_in_progress:
                     self._auto_finish_in_progress = True
-                    self._issue("finish", automatic=True)
+                    if self.replication_mode == "iroh":
+                        try:
+                            self.store.project_iroh_expiry()
+                        except (OSError, ValueError) as error:
+                            self.notice.emit(str(error))
+                        self._auto_finish_in_progress = False
+                        self._load_state()
+                        self._render()
+                        self._sync()
+                    else:
+                        self._issue("finish", automatic=True)
             else:
                 self._render()
 
     def _mutation_blocked(self) -> bool:
+        if self._iroh_join_pending:
+            self.notice.emit("Wait for Iroh room join to finish before changing local state.")
+            return True
         if (
             not self._history_resolution_active
             and self.store.pending_resolution() is not None
@@ -953,7 +1384,7 @@ class MainWindow(QMainWindow):
             self._auto_finish_in_progress = False
             return
         try:
-            command = self.store.queue_command(
+            self.store.queue_command(
                 command_type,
                 self.timer,
                 self._selected_phase(),
@@ -1110,6 +1541,22 @@ class MainWindow(QMainWindow):
         self._sync()
 
     def _sync(self) -> None:
+        if self._iroh_join_pending:
+            return
+        if self.replication_mode == "iroh":
+            try:
+                changed = self.store.capture_local_iroh_records()
+            except (OSError, ValueError) as error:
+                self._iroh_failure(str(error))
+                return
+            if changed:
+                self._load_state()
+                self._render()
+            if self.iroh is not None:
+                self.iroh.sync_now()
+            return
+        if self.replication_mode != "centralized":
+            return
         if (
             not self._history_resolution_active
             and self.store.pending_resolution() is not None
@@ -1631,10 +2078,12 @@ class MainWindow(QMainWindow):
         QPushButton[screen="true"] { min-width: 64px; font-family: "DejaVu Sans Condensed"; letter-spacing: 1px; }
         QPushButton[screen="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
         QFrame#taskSelector { background: palette(base); border: 2px solid palette(mid); }
+        QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
         QLabel#microLabel, QLabel#taskSubtitle { color: palette(mid); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QLabel#emptyState { color: palette(mid); padding: 24px; }
-        QComboBox, QLineEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 6px; }
-        QComboBox:focus, QLineEdit:focus { border: 3px solid palette(highlight); }
+        QComboBox, QLineEdit, QPlainTextEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 6px; }
+        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid palette(highlight); }
+        QLabel#privacyNotice { color: palette(mid); background: palette(alternate-base); border-left: 4px solid palette(highlight); padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
         QTableWidget { background: palette(base); color: palette(text); border: 2px solid palette(mid); gridline-color: palette(alternate-base); outline: none; }
         QHeaderView::section { background: palette(button); color: palette(button-text); border: 1px solid palette(mid); padding: 6px; font-weight: 800; }
         QSpinBox { min-width: 68px; font-family: "DejaVu Sans Mono"; }

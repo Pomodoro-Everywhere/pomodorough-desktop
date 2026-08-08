@@ -36,7 +36,8 @@ class UUID7Tests(unittest.TestCase):
         self.assertEqual(parsed.variant, uuid.RFC_4122)
 
     def test_reservation_is_monotonic_within_one_millisecond(self) -> None:
-        entropy = lambda count: bytes.fromhex("00000000000000000009")
+        def entropy(count: int) -> bytes:
+            return bytes.fromhex("00000000000000000009")
 
         first = reserve_uuid7(1_000, 3, None, entropy=entropy)
         second = reserve_uuid7(1_000, 2, first[-1], entropy=entropy)

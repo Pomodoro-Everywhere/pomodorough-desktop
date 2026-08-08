@@ -30,7 +30,10 @@
             };
 
             build-system = [ pkgs.python3.pkgs.setuptools ];
-            dependencies = [ pkgs.python3.pkgs.pyside6 ];
+            # iroh is binary-wheel-only and unavailable in nixpkgs on every
+            # supported system. Nix build remains fully offline-capable and
+            # reports Iroh as unavailable instead of attempting PyPI resolution.
+            dependencies = [ pkgs.python3.pkgs.platformdirs pkgs.python3.pkgs.pyside6 ];
             pythonRemoveDeps = [ "PySide6-Essentials" ];
             nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
             buildInputs = [ pkgs.qt6.qtwayland ];

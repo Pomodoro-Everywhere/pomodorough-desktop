@@ -137,6 +137,11 @@ class LocalTimer:
             and timer.get("status") == "running"
             and elapsed >= planned
         ):
+            if self.store.replication_mode == "iroh":
+                self._store_action(
+                    lambda: self.store.project_iroh_expiry(physical_now_ms)
+                )
+                return self.state(now_ms=physical_now_ms)
             self.issue(
                 "finish", now_ms=physical_now_ms if supplied_now_ms else None
             )

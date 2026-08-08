@@ -51,6 +51,14 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
 
+      - name: Test optional Iroh runtime
+        if: runner.os == 'Linux' || runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m pip install ".[iroh]"
+          python -c "import iroh; assert len(iroh.SecretKey.generate().to_bytes()) == 32"
+          QT_QPA_PLATFORM=offscreen python -m unittest tests.test_iroh_network -v
+
   quality:
     name: Static checks
     runs-on: ubuntu-24.04

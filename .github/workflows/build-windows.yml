@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install package and build tools
-        run: python -m pip install . "pyinstaller>=6.14,<7"
+        run: python -m pip install ".[iroh]" "pyinstaller>=6.14,<7"
 
       - name: Read release version
         id: release

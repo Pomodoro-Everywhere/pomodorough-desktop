@@ -20,10 +20,13 @@ from .core import (
     parse_timestamp_ms,
     project_auto_start_breaks,
     project_durations,
+    rebuild_tasks,
     rebuild_optimistic,
+    reduce_command,
     task_from_title,
 )
 from .uuid7 import reserve_uuid7, uuid7_parts
+from .secure_store import PlatformSecretStore
 
 DURATION_MIN_MS = 60_000
 PREFERENCE_DURATION_MAX_MS = 10_800_000
@@ -47,10 +50,16 @@ def utc_timestamp(milliseconds: int) -> str:
 
 
 class Store:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        iroh_secret_store: PlatformSecretStore | None = None,
+    ) -> None:
         self._trusted_time_anchor: dict[str, int] | None = None
         self._timer_time_anchor: dict[str, Any] | None = None
         self.path = path or default_data_path()
+        self._iroh_secret_store = iroh_secret_store or PlatformSecretStore()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.path.parent.chmod(0o700)
@@ -130,11 +139,108 @@ class Store:
                     "ALTER TABLE pending_auto_break_starts ADD COLUMN "
                     "selected_phase_version INTEGER NOT NULL DEFAULT 0"
                 )
+            for statement in (
+                """CREATE TABLE IF NOT EXISTS iroh_rooms (
+                    room_id TEXT PRIMARY KEY,
+                    room_secret BLOB NOT NULL,
+                    room_name TEXT,
+                    return_workspace TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    conflict TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS iroh_records (
+                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+                    domain TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    record TEXT NOT NULL,
+                    PRIMARY KEY(room_id, domain, operation_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS iroh_peers (
+                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+                    endpoint_id TEXT NOT NULL,
+                    endpoint_ticket TEXT NOT NULL,
+                    device_id TEXT,
+                    display_name TEXT,
+                    last_seen_at_ms INTEGER,
+                    PRIMARY KEY(room_id, endpoint_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS iroh_conflicts (
+                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+                    domain TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    local_digest TEXT NOT NULL,
+                    received_digest TEXT NOT NULL,
+                    received_record TEXT,
+                    detected_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(room_id, domain, operation_id, received_digest)
+                )""",
+                """CREATE INDEX IF NOT EXISTS iroh_records_inventory
+                    ON iroh_records(room_id, domain, operation_id)""",
+                """CREATE INDEX IF NOT EXISTS iroh_peers_recent
+                    ON iroh_peers(room_id, last_seen_at_ms DESC)""",
+            ):
+                self.connection.execute(statement)
+            self._migrated_iroh_capabilities = self._migrate_plaintext_iroh_capabilities()
+            self._set_meta("irohSchemaVersion", 1)
+        if self._migrated_iroh_capabilities:
+            self.connection.execute("VACUUM")
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._initialize()
         self._restore_trusted_time_anchor()
 
     def close(self) -> None:
         self.connection.close()
+
+    @staticmethod
+    def _room_secret_key(room_id: str) -> str:
+        return f"room-secret:{room_id}"
+
+    @staticmethod
+    def _peer_ticket_key(room_id: str, endpoint_id: str) -> str:
+        return f"peer-ticket:{room_id}:{endpoint_id}"
+
+    @staticmethod
+    def _secure_reference(key: str) -> bytes:
+        return f"secure:{key}".encode("utf-8")
+
+    def _migrate_plaintext_iroh_capabilities(self) -> bool:
+        migrated = False
+        for row in self.connection.execute(
+            "SELECT room_id, room_secret FROM iroh_rooms"
+        ).fetchall():
+            secret = row["room_secret"]
+            if not isinstance(secret, bytes) or len(secret) != 32:
+                continue
+            room_id = str(row["room_id"])
+            key = self._room_secret_key(room_id)
+            self._iroh_secret_store.save(key, bytes(secret))
+            self.connection.execute(
+                "UPDATE iroh_rooms SET room_secret = ? WHERE room_id = ?",
+                (self._secure_reference(key), room_id),
+            )
+            migrated = True
+        for row in self.connection.execute(
+            "SELECT room_id, endpoint_id, endpoint_ticket FROM iroh_peers"
+        ).fetchall():
+            ticket = row["endpoint_ticket"]
+            if not isinstance(ticket, str) or ticket.startswith("secure:"):
+                continue
+            room_id = str(row["room_id"])
+            endpoint_id = str(row["endpoint_id"])
+            key = self._peer_ticket_key(room_id, endpoint_id)
+            self._iroh_secret_store.save(key, ticket.encode("utf-8"))
+            self.connection.execute(
+                "UPDATE iroh_peers SET endpoint_ticket = ? "
+                "WHERE room_id = ? AND endpoint_id = ?",
+                (f"secure:{key}", room_id, endpoint_id),
+            )
+            migrated = True
+        if migrated:
+            self.connection.execute("PRAGMA secure_delete=ON")
+        return migrated
 
     def _initialize(self) -> None:
         defaults: dict[str, Any] = {
@@ -168,6 +274,8 @@ class Store:
             },
             "pendingSync": None,
             "pendingResolution": None,
+            "replicationMode": "centralized",
+            "activeIrohRoomId": None,
         }
         with self._immediate_transaction():
             for key, value in defaults.items():
@@ -1153,6 +1261,7 @@ class Store:
             settings = self._normalize_settings(self.get_meta("settings", {}))
             settings[key] = value
             self._set_meta("settings", settings)
+            self._capture_iroh_after_mutation_locked()
 
     def set_selected_phase(self, phase: str) -> None:
         if phase not in PHASES:
@@ -1164,6 +1273,7 @@ class Store:
             self._set_meta("settings", settings)
             version = int(self.get_meta("selectedPhaseVersion", 0)) + 1
             self._set_meta("selectedPhaseVersion", version)
+            self._capture_iroh_after_mutation_locked()
 
     def set_auto_start_breaks(
         self, enabled: bool, now_ms: int | None = None
@@ -1182,6 +1292,7 @@ class Store:
                 use_server_clock=use_server_clock,
             )
             self._set_meta("autoStartLegacyDefaultUnknown", False)
+            self._capture_iroh_after_mutation_locked()
         return operation
 
     def set_selected_task_id(self, task_id: str | None) -> None:
@@ -1213,6 +1324,10 @@ class Store:
                 and isinstance(timer, dict)
                 and timer.get("phase") == "focus"
                 and settings["autoStartBreaks"]
+                and (
+                    self.replication_mode != "iroh"
+                    or timer.get("startedByDeviceId") == self.device_id
+                )
             )
             trusted_ms, sequences, clocks = self._reserve_generation(
                 effective_now_ms,
@@ -1263,6 +1378,7 @@ class Store:
                     projected_timer,
                     physical_ms=effective_now_ms,
                 )
+            self._capture_iroh_after_mutation_locked()
         return command
 
     def queue_restart(
@@ -1338,6 +1454,7 @@ class Store:
                 clock=clocks[1],
                 command_id=command_ids[1],
             )
+            self._capture_iroh_after_mutation_locked()
         return [cleared, started]
 
     def _queue_command(
@@ -1444,7 +1561,15 @@ class Store:
                     int(self.get_meta("selectedPhaseVersion", 0)),
                 ),
             )
-            if phase == "focus" and settings["autoStartBreaks"]:
+            if (
+                phase == "focus"
+                and settings["autoStartBreaks"]
+                and (
+                    self.replication_mode != "iroh"
+                    or timer is not None
+                    and timer.get("startedByDeviceId") == self.device_id
+                )
+            ):
                 self.connection.execute(
                     "INSERT OR IGNORE INTO pending_auto_breaks("
                     "finish_command_id, timer_id, finish_device_sequence) "
@@ -1566,10 +1691,12 @@ class Store:
             }
             known[normalized["id"]] = normalized
             snapshot["knownTasks"] = sorted(
-                known.values(), key=lambda item: (item["title"].casefold(), item["id"])
+                known.values(),
+                key=lambda item: (item["title"].encode(), item["id"].encode()),
             )
             self._set_meta("snapshot", snapshot)
             self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
+            self._capture_iroh_after_mutation_locked()
         return operation
 
     def queue_duration_operation(
@@ -1592,6 +1719,7 @@ class Store:
                 now_ms,
                 use_server_clock=use_server_clock,
             )
+            self._capture_iroh_after_mutation_locked()
         return operation
 
     def _queue_duration_operation(
@@ -2975,6 +3103,1212 @@ class Store:
             snapshot = self.get_meta("snapshot")
             snapshot["user"] = user
             self._set_meta("snapshot", snapshot)
+
+    @property
+    def replication_mode(self) -> str:
+        mode = self.get_meta("replicationMode", "centralized")
+        return mode if mode in {"offline", "iroh", "centralized"} else "centralized"
+
+    @property
+    def active_iroh_room_id(self) -> str | None:
+        room_id = self.get_meta("activeIrohRoomId")
+        return room_id if isinstance(room_id, str) and room_id else None
+
+    def _capture_workspace(self) -> dict[str, Any]:
+        metadata = {
+            key: self.get_meta(key)
+            for key in (
+                "settings",
+                "snapshot",
+                "deviceSequence",
+                "hlc",
+                "lastUuidV7",
+                "serverClockSample",
+                "commandPhysicalTimes",
+                "selectedPhaseVersion",
+                "autoStartLegacyDefaultUnknown",
+                "pendingSync",
+                "pendingResolution",
+            )
+        }
+        tables = {}
+        for table, columns in (
+            (
+                "pending_commands",
+                ("id", "device_sequence", "payload", "depends_on_command_id"),
+            ),
+            ("pending_task_operations", ("id", "payload")),
+            ("pending_duration_operations", ("id", "phase", "payload")),
+            ("pending_auto_start_operations", ("id", "payload")),
+            (
+                "pending_auto_breaks",
+                ("finish_command_id", "timer_id", "finish_device_sequence"),
+            ),
+            (
+                "pending_auto_break_starts",
+                (
+                    "source_finish_command_id",
+                    "source_timer_id",
+                    "start_command_id",
+                    "selected_phase_version",
+                ),
+            ),
+            (
+                "pending_phase_advances",
+                (
+                    "finish_command_id",
+                    "timer_id",
+                    "source_phase",
+                    "advanced_phase",
+                    "selected_phase_version",
+                ),
+            ),
+        ):
+            tables[table] = [
+                {column: row[column] for column in columns}
+                for row in self.connection.execute(
+                    f"SELECT {', '.join(columns)} FROM {table} ORDER BY rowid"
+                )
+            ]
+        return {"metadata": metadata, "tables": tables}
+
+    def _restore_workspace(self, workspace: dict[str, Any]) -> None:
+        if (
+            not isinstance(workspace, dict)
+            or not isinstance(workspace.get("metadata"), dict)
+            or not isinstance(workspace.get("tables"), dict)
+        ):
+            raise ValueError("Saved replication workspace is invalid.")
+        table_columns = {
+            "pending_commands": (
+                "id",
+                "device_sequence",
+                "payload",
+                "depends_on_command_id",
+            ),
+            "pending_task_operations": ("id", "payload"),
+            "pending_duration_operations": ("id", "phase", "payload"),
+            "pending_auto_start_operations": ("id", "payload"),
+            "pending_auto_breaks": (
+                "finish_command_id",
+                "timer_id",
+                "finish_device_sequence",
+            ),
+            "pending_auto_break_starts": (
+                "source_finish_command_id",
+                "source_timer_id",
+                "start_command_id",
+                "selected_phase_version",
+            ),
+            "pending_phase_advances": (
+                "finish_command_id",
+                "timer_id",
+                "source_phase",
+                "advanced_phase",
+                "selected_phase_version",
+            ),
+        }
+        for table in table_columns:
+            self.connection.execute(f"DELETE FROM {table}")
+        for table, columns in table_columns.items():
+            rows = workspace["tables"].get(table, [])
+            if not isinstance(rows, list):
+                raise ValueError("Saved replication queue is invalid.")
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != set(columns):
+                    raise ValueError("Saved replication queue row is invalid.")
+                self.connection.execute(
+                    f"INSERT INTO {table}({', '.join(columns)}) VALUES "
+                    f"({', '.join('?' for _ in columns)})",
+                    tuple(row[column] for column in columns),
+                )
+        for key, value in workspace["metadata"].items():
+            if key in {
+                "settings",
+                "snapshot",
+                "deviceSequence",
+                "hlc",
+                "lastUuidV7",
+                "serverClockSample",
+                "commandPhysicalTimes",
+                "selectedPhaseVersion",
+                "autoStartLegacyDefaultUnknown",
+                "pendingSync",
+                "pendingResolution",
+            }:
+                self._set_meta(key, value)
+
+    def _projected_local_genesis(self) -> dict[str, Any]:
+        state = self.load()
+        snapshot = state["snapshot"]
+        timer, history = rebuild_optimistic(
+            snapshot.get("canonicalTimer"),
+            snapshot.get("history", []),
+            state["pending"],
+        )
+        tasks = rebuild_tasks(snapshot.get("tasks", []), state["pendingTasks"])
+        durations = project_durations(
+            self._normalize_settings(state["settings"])["durationsMs"],
+            state["pendingDurations"],
+        )
+        auto_start = project_auto_start_breaks(
+            bool(snapshot.get("autoStartBreaks", False)), state["pendingAutoStarts"]
+        )
+        clocks = [
+            (int(operation.get("hlcWallMs", 0)), int(operation.get("hlcCounter", 0)))
+            for operations in (
+                state["pending"],
+                state["pendingTasks"],
+                state["pendingDurations"],
+                state["pendingAutoStarts"],
+            )
+            for operation in operations
+        ]
+        clocks.append(
+            self._logical_clock(
+                self.get_meta("hlc", {"wallMs": 0, "counter": 0}),
+                allow_legacy_zero=True,
+            )
+        )
+        wall, counter = max(clocks, default=(0, 0))
+        clean_history = []
+        for item in history:
+            cleaned = deepcopy(item)
+            cleaned.pop("pending", None)
+            cleaned["id"] = cleaned["timerId"]
+            for key in ("commandId", "taskId", "completedAt", "endedAt"):
+                if cleaned.get(key) is None:
+                    cleaned.pop(key, None)
+            clean_history.append(cleaned)
+        clean_history.sort(key=self._history_order)
+        clean_timer = deepcopy(timer)
+        if clean_timer is not None:
+            for key in ("taskId", "startedByDeviceId", "lastIntent"):
+                if clean_timer.get(key) is None:
+                    clean_timer.pop(key, None)
+            intent = clean_timer.get("lastIntent")
+            if isinstance(intent, dict):
+                intent.pop("deviceId", None)
+        return {
+            "canonicalTimer": clean_timer,
+            "history": clean_history,
+            "tasks": tasks,
+            "durationsMs": durations,
+            "autoStartBreaks": auto_start,
+            "hlcWallMs": wall,
+            "hlcCounter": counter,
+        }
+
+    @staticmethod
+    def _history_order(item: dict[str, Any]) -> tuple[int, bytes]:
+        timestamp = item.get("endedAt") or item.get("completedAt")
+        milliseconds = parse_timestamp_ms(timestamp) if isinstance(timestamp, str) else None
+        return (-(milliseconds or 0), str(item.get("timerId", "")).encode("utf-8"))
+
+    def _empty_iroh_workspace(self, genesis: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._capture_workspace()
+        settings = self._normalize_settings(workspace["metadata"]["settings"])
+        settings["durationsMs"] = deepcopy(genesis["durationsMs"])
+        settings["durations"] = {
+            phase: self._display_minutes(duration)
+            for phase, duration in genesis["durationsMs"].items()
+        }
+        settings["autoStartBreaks"] = genesis["autoStartBreaks"]
+        if settings.get("selectedTaskId") not in {
+            task["id"] for task in genesis["tasks"]
+        }:
+            settings["selectedTaskId"] = None
+        workspace["metadata"].update(
+            settings=settings,
+            snapshot={
+                "revision": 0,
+                "canonicalTimer": deepcopy(genesis["canonicalTimer"]),
+                "history": deepcopy(genesis["history"]),
+                "tasks": sorted(
+                    deepcopy(genesis["tasks"]),
+                    key=lambda item: (item["title"].encode(), item["id"].encode()),
+                ),
+                "knownTasks": sorted(
+                    deepcopy(genesis["tasks"]),
+                    key=lambda item: (item["title"].encode(), item["id"].encode()),
+                ),
+                "autoStartBreaks": genesis["autoStartBreaks"],
+                "user": None,
+            },
+            hlc={"wallMs": genesis["hlcWallMs"], "counter": genesis["hlcCounter"]},
+            serverClockSample=None,
+            commandPhysicalTimes={},
+            pendingSync=None,
+            pendingResolution=None,
+        )
+        for table in workspace["tables"]:
+            workspace["tables"][table] = []
+        return workspace
+
+    def create_iroh_room(
+        self,
+        room_secret: bytes,
+        room_name: str | None = None,
+        *,
+        now_ms: int | None = None,
+    ) -> str:
+        from .iroh_protocol import (
+            IrohProtocolError,
+            record_digest,
+            room_id_for_secret,
+            validate_record,
+        )
+
+        if room_name is not None and not 1 <= len(room_name) <= 64:
+            raise ValueError("Room name must contain 1 through 64 Unicode scalar values.")
+        room_id = room_id_for_secret(room_secret)
+        genesis = self._projected_local_genesis()
+        record = {
+            "domain": "genesis",
+            "deviceId": self.device_id,
+            "operation": genesis,
+        }
+        try:
+            validate_record(record)
+            digest = record_digest(record)
+        except IrohProtocolError as error:
+            raise ValueError(str(error)) from error
+        return_workspace = self._capture_workspace()
+        room_workspace = self._empty_iroh_workspace(genesis)
+        created_at = now_ms if now_ms is not None else int(time.time() * 1000)
+        with self._immediate_transaction():
+            if self.connection.execute(
+                "SELECT 1 FROM iroh_rooms WHERE room_id = ?", (room_id,)
+            ).fetchone():
+                raise ValueError("An Iroh room with this identity already exists.")
+            self.connection.execute(
+                "INSERT INTO iroh_rooms(room_id, room_secret, room_name, "
+                "return_workspace, workspace, created_at_ms, conflict) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    room_id,
+                    self._secure_reference(self._room_secret_key(room_id)),
+                    room_name,
+                    json.dumps(return_workspace, separators=(",", ":")),
+                    json.dumps(room_workspace, separators=(",", ":")),
+                    created_at,
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO iroh_records(room_id, domain, operation_id, device_id, digest, record) "
+                "VALUES (?, 'genesis', 'genesis', ?, ?, ?)",
+                (
+                    room_id,
+                    self.device_id,
+                    digest,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            self._restore_workspace(room_workspace)
+            self._set_meta("activeIrohRoomId", room_id)
+            self._set_meta("replicationMode", "iroh")
+            try:
+                self._iroh_secret_store.save(self._room_secret_key(room_id), room_secret)
+            except Exception:
+                self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
+                raise
+        return room_id
+
+    def prepare_iroh_join(
+        self,
+        room_id: str,
+        room_secret: bytes,
+        room_name: str | None,
+        endpoint_id: str,
+        endpoint_ticket: str,
+        *,
+        now_ms: int | None = None,
+    ) -> None:
+        from .iroh_protocol import room_id_for_secret, valid_room_id
+
+        if (
+            not valid_room_id(room_id)
+            or room_id_for_secret(room_secret) != room_id
+            or room_name is not None
+            and not 1 <= len(room_name) <= 64
+        ):
+            raise ValueError("Iroh room metadata is invalid.")
+        created_at = now_ms if now_ms is not None else int(time.time() * 1000)
+        return_workspace = self._capture_workspace()
+        room_workspace = self._empty_iroh_workspace(
+            {
+                "canonicalTimer": None,
+                "history": [],
+                "tasks": [],
+                "durationsMs": self._normalize_settings(
+                    return_workspace["metadata"]["settings"]
+                )["durationsMs"],
+                "autoStartBreaks": False,
+                "hlcWallMs": 0,
+                "hlcCounter": 0,
+            }
+        )
+        with self._immediate_transaction():
+            existing = self.connection.execute(
+                "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
+            ).fetchone()
+            if existing is not None:
+                saved = self.iroh_room_secret(room_id)
+                if saved != room_secret:
+                    raise ValueError("Saved Iroh room credentials do not match invite.")
+                if existing["conflict"] is not None:
+                    raise ValueError("Saved Iroh room requires immutable-conflict repair.")
+                self._upsert_iroh_peer(
+                    room_id, endpoint_id, endpoint_ticket, None, None, None
+                )
+                return
+            self.connection.execute(
+                "INSERT INTO iroh_rooms(room_id, room_secret, room_name, "
+                "return_workspace, workspace, created_at_ms, conflict) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    room_id,
+                    self._secure_reference(self._room_secret_key(room_id)),
+                    room_name,
+                    json.dumps(return_workspace, separators=(",", ":")),
+                    json.dumps(room_workspace, separators=(",", ":")),
+                    created_at,
+                ),
+            )
+            self._upsert_iroh_peer(
+                room_id, endpoint_id, endpoint_ticket, None, None, None
+            )
+            try:
+                self._iroh_secret_store.save(self._room_secret_key(room_id), room_secret)
+            except Exception:
+                self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
+                raise
+
+    def discard_inactive_iroh_room(self, room_id: str) -> None:
+        with self._immediate_transaction():
+            if self.active_iroh_room_id == room_id:
+                raise ValueError("Active Iroh room cannot be discarded.")
+            conflict = self.connection.execute(
+                "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
+            ).fetchone()
+            if conflict is not None and conflict["conflict"] is not None:
+                return
+            peers = self.connection.execute(
+                "SELECT endpoint_id FROM iroh_peers WHERE room_id = ?", (room_id,)
+            ).fetchall()
+            self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
+            self._iroh_secret_store.delete(self._room_secret_key(room_id))
+            for peer in peers:
+                self._iroh_secret_store.delete(
+                    self._peer_ticket_key(room_id, str(peer["endpoint_id"]))
+                )
+
+    def activate_joined_iroh_room(self, room_id: str) -> None:
+        with self._immediate_transaction():
+            room = self.connection.execute(
+                "SELECT workspace, conflict FROM iroh_rooms WHERE room_id = ?",
+                (room_id,),
+            ).fetchone()
+            genesis = self.connection.execute(
+                "SELECT 1 FROM iroh_records WHERE room_id = ? AND domain = 'genesis' "
+                "AND operation_id = 'genesis'",
+                (room_id,),
+            ).fetchone()
+            if room is None or genesis is None or room["conflict"] is not None:
+                raise ValueError("Joined Iroh room has no valid genesis or requires repair.")
+            projection = self._project_iroh_room(room_id)
+            return_workspace = self._capture_workspace()
+            workspace = self._workspace_with_iroh_projection(
+                json.loads(room["workspace"]), projection
+            )
+            self.connection.execute(
+                "UPDATE iroh_rooms SET return_workspace = ?, workspace = ? WHERE room_id = ?",
+                (
+                    json.dumps(return_workspace, separators=(",", ":")),
+                    json.dumps(workspace, separators=(",", ":")),
+                    room_id,
+                ),
+            )
+            self._restore_workspace(workspace)
+            self._set_meta("activeIrohRoomId", room_id)
+            self._set_meta("replicationMode", "iroh")
+
+    def set_replication_mode(self, mode: str) -> None:
+        if mode not in {"offline", "iroh", "centralized"}:
+            raise ValueError("Replication mode must be offline, iroh, or centralized.")
+        with self._immediate_transaction():
+            current = self.replication_mode
+            if current == mode:
+                return
+            if current == "iroh":
+                room_id = self.active_iroh_room_id
+                if room_id is None:
+                    raise ValueError("Active Iroh room metadata is missing.")
+                room = self.connection.execute(
+                    "SELECT return_workspace, conflict FROM iroh_rooms WHERE room_id = ?",
+                    (room_id,),
+                ).fetchone()
+                if room is None:
+                    raise ValueError("Active Iroh room workspace is missing.")
+                if room["conflict"] is None:
+                    self._capture_local_iroh_records_locked(room_id)
+                else:
+                    self.connection.execute(
+                        "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+                        (
+                            json.dumps(self._capture_workspace(), separators=(",", ":")),
+                            room_id,
+                        ),
+                    )
+                self._restore_workspace(json.loads(room["return_workspace"]))
+                self._set_meta("activeIrohRoomId", None)
+            if mode == "iroh":
+                room = self.connection.execute(
+                    "SELECT room_id, workspace, conflict FROM iroh_rooms "
+                    "WHERE EXISTS (SELECT 1 FROM iroh_records AS records "
+                    "WHERE records.room_id = iroh_rooms.room_id "
+                    "AND records.domain = 'genesis' AND records.operation_id = 'genesis') "
+                    "ORDER BY created_at_ms DESC LIMIT 1"
+                ).fetchone()
+                if room is None:
+                    raise ValueError("Create or join an Iroh room before selecting Iroh mode.")
+                if room["conflict"] is not None:
+                    raise ValueError("Saved Iroh room requires repair before activation.")
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET return_workspace = ? WHERE room_id = ?",
+                    (
+                        json.dumps(self._capture_workspace(), separators=(",", ":")),
+                        room["room_id"],
+                    ),
+                )
+                self._restore_workspace(json.loads(room["workspace"]))
+                self._set_meta("activeIrohRoomId", str(room["room_id"]))
+            self._set_meta("replicationMode", mode)
+
+    def leave_iroh_room(self) -> None:
+        if self.replication_mode != "iroh":
+            raise ValueError("No Iroh room is active.")
+        self.set_replication_mode("offline")
+
+    def iroh_room(self, room_id: str | None = None) -> dict[str, Any] | None:
+        room_id = room_id or self.active_iroh_room_id
+        if room_id is None:
+            return None
+        row = self.connection.execute(
+            "SELECT room_id, room_name, created_at_ms, conflict FROM iroh_rooms "
+            "WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        peer_count = int(
+            self.connection.execute(
+                "SELECT COUNT(*) AS count FROM iroh_peers WHERE room_id = ?",
+                (room_id,),
+            ).fetchone()["count"]
+        )
+        operation_count = int(
+            self.connection.execute(
+                "SELECT COUNT(*) AS count FROM iroh_records WHERE room_id = ?",
+                (room_id,),
+            ).fetchone()["count"]
+        )
+        return {
+            "roomId": str(row["room_id"]),
+            "roomName": row["room_name"],
+            "createdAtMs": int(row["created_at_ms"]),
+            "peerCount": peer_count,
+            "operationCount": operation_count,
+            "conflict": json.loads(row["conflict"]) if row["conflict"] else None,
+        }
+
+    def iroh_room_secret(self, room_id: str) -> bytes:
+        row = self.connection.execute(
+            "SELECT room_secret FROM iroh_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Saved Iroh room secret is unavailable or invalid.")
+        secret = self._iroh_secret_store.load(self._room_secret_key(room_id))
+        if secret is None or len(secret) != 32:
+            raise ValueError("Saved Iroh room secret is unavailable or invalid.")
+        return secret
+
+    def capture_local_iroh_records(self) -> bool:
+        room_id = self.active_iroh_room_id
+        if self.replication_mode != "iroh" or room_id is None:
+            return False
+        with self._immediate_transaction():
+            return self._capture_local_iroh_records_locked(room_id)
+
+    def _capture_iroh_after_mutation(self) -> None:
+        with self._immediate_transaction():
+            self._capture_iroh_after_mutation_locked()
+
+    def _capture_iroh_after_mutation_locked(self) -> None:
+        if self.replication_mode == "iroh":
+            room = self.iroh_room()
+            if room is not None and room.get("conflict") is not None:
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+                    (
+                        json.dumps(self._capture_workspace(), separators=(",", ":")),
+                        room["roomId"],
+                    ),
+                )
+                return
+            self._capture_local_iroh_records_locked(room["roomId"])
+
+    def _capture_local_iroh_records_locked(self, room_id: str) -> bool:
+        pending = self._preflight_pending_queues()
+        records = []
+        for domain, operations in (
+            ("timer", pending["commands"]),
+            ("task", pending["taskOperations"]),
+            ("duration", pending["durationOperations"]),
+            ("autoStart", pending["autoStartOperations"]),
+        ):
+            for operation in operations:
+                wire_operation = deepcopy(operation)
+                if domain == "autoStart":
+                    wire_operation.pop("deviceId", None)
+                records.append(
+                    {
+                        "domain": domain,
+                        "deviceId": self.device_id,
+                        "operation": wire_operation,
+                    }
+                )
+        if not records:
+            self.connection.execute(
+                "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+                (json.dumps(self._capture_workspace(), separators=(",", ":")), room_id),
+            )
+            return False
+        self._insert_iroh_records_locked(room_id, records)
+        command_ids = [record["operation"]["id"] for record in records if record["domain"] == "timer"]
+        self.connection.execute("DELETE FROM pending_commands")
+        self.connection.execute("DELETE FROM pending_task_operations")
+        self.connection.execute("DELETE FROM pending_duration_operations")
+        self.connection.execute("DELETE FROM pending_auto_start_operations")
+        self.connection.executemany(
+            "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
+            ((identifier,) for identifier in command_ids),
+        )
+        self.connection.execute("DELETE FROM pending_auto_break_starts")
+        self._set_meta("commandPhysicalTimes", {})
+        self._set_meta("pendingSync", None)
+        projection = self._project_iroh_room(room_id)
+        room = self.connection.execute(
+            "SELECT workspace FROM iroh_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        if room is None:
+            raise ValueError("Active Iroh room workspace is missing.")
+        workspace = self._workspace_with_iroh_projection(
+            self._capture_workspace(), projection
+        )
+        self.connection.execute(
+            "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+            (json.dumps(workspace, separators=(",", ":")), room_id),
+        )
+        self._restore_workspace(workspace)
+        return True
+
+    def _workspace_with_iroh_projection(
+        self, workspace: dict[str, Any], projection: dict[str, Any]
+    ) -> dict[str, Any]:
+        settings = self._normalize_settings(workspace["metadata"]["settings"])
+        settings["durationsMs"] = deepcopy(projection["durationsMs"])
+        settings["durations"] = {
+            phase: self._display_minutes(duration)
+            for phase, duration in projection["durationsMs"].items()
+        }
+        settings["autoStartBreaks"] = projection["autoStartBreaks"]
+        if settings.get("selectedTaskId") not in {
+            task["id"] for task in projection["tasks"]
+        }:
+            settings["selectedTaskId"] = None
+        previous = workspace["metadata"].get("snapshot", {})
+        known = {
+            item["id"]: item
+            for item in previous.get("knownTasks", [])
+            if isinstance(item, dict) and item.get("id") and item.get("title")
+        }
+        known.update(
+            {
+                item["id"]: item
+                for item in projection.get("knownTasks", projection["tasks"])
+            }
+        )
+        workspace["metadata"].update(
+            settings=settings,
+            snapshot={
+                "revision": 0,
+                "canonicalTimer": projection["canonicalTimer"],
+                "history": projection["history"],
+                "tasks": projection["tasks"],
+                "knownTasks": sorted(
+                    known.values(),
+                    key=lambda item: (item["title"].encode(), item["id"].encode()),
+                ),
+                "autoStartBreaks": projection["autoStartBreaks"],
+                "user": None,
+            },
+            hlc={"wallMs": projection["hlcWallMs"], "counter": projection["hlcCounter"]},
+            serverClockSample=None,
+            commandPhysicalTimes={},
+            pendingSync=None,
+            pendingResolution=None,
+        )
+        for table in (
+            "pending_commands",
+            "pending_task_operations",
+            "pending_duration_operations",
+            "pending_auto_start_operations",
+            "pending_auto_break_starts",
+            "pending_phase_advances",
+        ):
+            workspace["tables"][table] = []
+        return workspace
+
+    def _project_iroh_room(
+        self, room_id: str, *, now_ms: int | None = None
+    ) -> dict[str, Any]:
+        from .iroh_protocol import operation_order, validate_record
+
+        rows = self.connection.execute(
+            "SELECT record FROM iroh_records WHERE room_id = ?", (room_id,)
+        ).fetchall()
+        records = [json.loads(row["record"]) for row in rows]
+        for record in records:
+            validate_record(record)
+        genesis_records = [record for record in records if record["domain"] == "genesis"]
+        if len(genesis_records) != 1:
+            raise ValueError("Iroh room genesis is missing or conflicting.")
+        genesis_record = genesis_records[0]
+        genesis = deepcopy(genesis_record["operation"])
+        timer = genesis["canonicalTimer"]
+        history = genesis["history"]
+        tasks = genesis["tasks"]
+        durations = genesis["durationsMs"]
+        auto_start = genesis["autoStartBreaks"]
+        clocks = [(genesis["hlcWallMs"], genesis["hlcCounter"])]
+        known_tasks = {task["id"]: task for task in genesis["tasks"]}
+        timer_starters = {
+            item["timerId"]: genesis_record["deviceId"]
+            for item in genesis["history"]
+        }
+        if timer is not None:
+            timer_starters[timer["id"]] = timer.get(
+                "startedByDeviceId", genesis_record["deviceId"]
+            )
+        for record in sorted(
+            (record for record in records if record["domain"] != "genesis"),
+            key=operation_order,
+        ):
+            operation = record["operation"]
+            clocks.append((operation["hlcWallMs"], operation["hlcCounter"]))
+            if record["domain"] == "timer":
+                timer, history = reduce_command(timer, history, operation)
+                if (
+                    operation.get("type") == "start"
+                    and timer
+                    and timer.get("id") == operation.get("timerId")
+                    and isinstance(timer.get("lastIntent"), dict)
+                    and timer["lastIntent"].get("commandId") == operation["id"]
+                ):
+                    timer_starters[operation["timerId"]] = record["deviceId"]
+                if timer:
+                    timer["startedByDeviceId"] = timer_starters.get(timer["id"])
+                if (
+                    timer
+                    and isinstance(timer.get("lastIntent"), dict)
+                    and timer["lastIntent"].get("commandId") == operation["id"]
+                ):
+                    timer["lastIntent"]["deviceId"] = record["deviceId"]
+            elif record["domain"] == "task":
+                tasks = rebuild_tasks(tasks, [operation])
+                if operation.get("type") == "upsert":
+                    try:
+                        known = task_from_title(operation.get("title", ""))
+                    except ValueError:
+                        known = None
+                    if known is not None and known["id"] == operation.get("taskId"):
+                        known_tasks[known["id"]] = known
+            elif record["domain"] == "duration":
+                durations = project_durations(durations, [operation])
+            elif record["domain"] == "autoStart":
+                projected_operation = {**operation, "deviceId": record["deviceId"]}
+                auto_start = project_auto_start_breaks(auto_start, [projected_operation])
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        if (
+            timer is not None
+            and timer.get("status") == "running"
+            and elapsed_ms(timer, now_ms) >= int(timer["plannedDurationMs"])
+        ):
+            anchor_ms = parse_timestamp_ms(timer.get("anchorAt"))
+            if anchor_ms is None:
+                raise ValueError("Iroh room timer anchor is invalid.")
+            completed_ms = (
+                anchor_ms
+                + int(timer["plannedDurationMs"])
+                - int(timer.get("elapsedAtAnchorMs", 0))
+            )
+            completed_at = utc_timestamp(completed_ms)
+            timer["status"] = "completed"
+            timer["elapsedAtAnchorMs"] = int(timer["plannedDurationMs"])
+            timer["anchorAt"] = completed_at
+            if not any(item.get("timerId") == timer["id"] for item in history):
+                completion = {
+                    "id": timer["id"],
+                    "timerId": timer["id"],
+                    "phase": timer["phase"],
+                    "status": "completed",
+                    "plannedDurationMs": timer["plannedDurationMs"],
+                    "completedAt": completed_at,
+                    "endedAt": completed_at,
+                }
+                if timer.get("taskId") is not None:
+                    completion["taskId"] = timer["taskId"]
+                history.append(completion)
+        for item in history:
+            if item.get("timerId"):
+                item["id"] = item["timerId"]
+        clean_history = []
+        for item in history:
+            cleaned = deepcopy(item)
+            cleaned.pop("pending", None)
+            for key in ("commandId", "taskId", "completedAt", "endedAt"):
+                if cleaned.get(key) is None:
+                    cleaned.pop(key, None)
+            clean_history.append(cleaned)
+        clean_history.sort(key=self._history_order)
+        if timer is not None and not self._valid_canonical_timer(timer):
+            raise ValueError("Iroh room projected an invalid canonical timer.")
+        if any(not self._valid_history_item(item) for item in clean_history):
+            raise ValueError("Iroh room projected invalid timer history.")
+        wall, counter = max(clocks)
+        return {
+            "canonicalTimer": timer,
+            "history": clean_history,
+            "tasks": tasks,
+            "knownTasks": sorted(
+                known_tasks.values(),
+                key=lambda item: (item["title"].encode(), item["id"].encode()),
+            ),
+            "durationsMs": durations,
+            "autoStartBreaks": auto_start,
+            "hlcWallMs": wall,
+            "hlcCounter": counter,
+        }
+
+    def project_iroh_expiry(self, now_ms: int | None = None) -> bool:
+        room_id = self.active_iroh_room_id
+        if self.replication_mode != "iroh" or room_id is None:
+            return False
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        with self._immediate_transaction():
+            self._capture_local_iroh_records_locked(room_id)
+            before = self.get_meta("snapshot", {}).get("canonicalTimer")
+            projection = self._project_iroh_room(room_id, now_ms=now_ms)
+            expired = (
+                isinstance(before, dict)
+                and before.get("status") == "running"
+                and isinstance(projection.get("canonicalTimer"), dict)
+                and projection["canonicalTimer"].get("id") == before.get("id")
+                and projection["canonicalTimer"].get("status") == "completed"
+            )
+            workspace = self._workspace_with_iroh_projection(
+                self._capture_workspace(), projection
+            )
+            self.connection.execute(
+                "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+                (json.dumps(workspace, separators=(",", ":")), room_id),
+            )
+            self._restore_workspace(workspace)
+            timer = projection.get("canonicalTimer")
+            if (
+                expired
+                and isinstance(timer, dict)
+                and timer.get("phase") == "focus"
+                and timer.get("startedByDeviceId") == self.device_id
+                and projection["autoStartBreaks"]
+            ):
+                settings = self._normalize_settings(self.get_meta("settings", {}))
+                phase = next_break_phase(projection["history"])
+                trusted_ms, sequences, clocks = self._reserve_generation(
+                    now_ms, sequence_count=1, clock_count=1, use_server_clock=False
+                )
+                self._queue_command(
+                    "start",
+                    None,
+                    phase,
+                    settings["durationsMs"],
+                    None,
+                    now_ms,
+                    timer_now_ms=now_ms,
+                    trusted_ms=trusted_ms,
+                    sequence=sequences[0],
+                    clock=clocks[0],
+                    command_id=self._reserve_uuid7_ids(clocks[0][0], 1)[0],
+                )
+                self._capture_local_iroh_records_locked(room_id)
+            return expired
+
+    def insert_remote_iroh_records(
+        self,
+        room_id: str,
+        records: list[dict[str, Any]],
+        advertised_digests: dict[tuple[str, str], str] | None = None,
+    ) -> bool:
+        if not records:
+            raise ValueError("Iroh operation batch must not be empty.")
+        conflict: Exception | None = None
+        with self._immediate_transaction():
+            if advertised_digests is not None:
+                from .iroh_protocol import record_digest, record_id
+
+                returned = {
+                    (record["domain"], record_id(record)): record_digest(record)
+                    for record in records
+                }
+                if returned != advertised_digests:
+                    raise ValueError(
+                        "Fetched Iroh records do not match advertised inventory digests."
+                    )
+            active = self.active_iroh_room_id == room_id and self.replication_mode == "iroh"
+            if active:
+                self._capture_local_iroh_records_locked(room_id)
+            try:
+                inserted = self._insert_iroh_records_locked(room_id, records)
+            except Exception as error:
+                if error.__class__.__name__ != "ImmutableConflict":
+                    raise
+                inserted = False
+                conflict = error
+            if inserted:
+                projection = self._project_iroh_room(room_id)
+                room = self.connection.execute(
+                    "SELECT workspace FROM iroh_rooms WHERE room_id = ?", (room_id,)
+                ).fetchone()
+                if room is None:
+                    raise ValueError("Iroh room workspace is missing.")
+                workspace = self._workspace_with_iroh_projection(
+                    json.loads(room["workspace"]), projection
+                )
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
+                    (json.dumps(workspace, separators=(",", ":")), room_id),
+                )
+                if active:
+                    self._restore_workspace(workspace)
+        if conflict is not None:
+            raise conflict
+        return inserted
+
+    def _insert_iroh_records_locked(
+        self, room_id: str, records: list[dict[str, Any]]
+    ) -> bool:
+        from .iroh_protocol import (
+            ImmutableConflict,
+            MAX_OPERATION_REFS,
+            record_digest,
+            record_id,
+            validate_record,
+        )
+
+        if len(records) > MAX_OPERATION_REFS:
+            raise ValueError("Iroh operation batch exceeds 256 records.")
+        room = self.connection.execute(
+            "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        if room is None:
+            raise ValueError("Iroh room does not exist.")
+        if room["conflict"] is not None:
+            raise ImmutableConflict("Iroh room requires repair before replication can continue.")
+        prepared = []
+        keys = set()
+        for record in records:
+            validate_record(record)
+            identifier = record_id(record)
+            key = (record["domain"], identifier)
+            if key in keys:
+                raise ValueError("Iroh operation batch contains duplicate references.")
+            keys.add(key)
+            prepared.append((record, identifier, record_digest(record)))
+        for record, identifier, digest in prepared:
+            existing = self.connection.execute(
+                "SELECT digest, record FROM iroh_records WHERE room_id = ? "
+                "AND domain = ? AND operation_id = ?",
+                (room_id, record["domain"], identifier),
+            ).fetchone()
+            if existing is not None and existing["digest"] != digest:
+                evidence = {
+                    "domain": record["domain"],
+                    "id": identifier,
+                    "localDigest": str(existing["digest"]),
+                    "receivedDigest": digest,
+                    "detectedAtMs": int(time.time() * 1000),
+                }
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO iroh_conflicts(room_id, domain, operation_id, "
+                    "local_digest, received_digest, received_record, detected_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        room_id,
+                        record["domain"],
+                        identifier,
+                        existing["digest"],
+                        digest,
+                        json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                        evidence["detectedAtMs"],
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET conflict = ? WHERE room_id = ?",
+                    (json.dumps(evidence, separators=(",", ":")), room_id),
+                )
+                raise ImmutableConflict(
+                    "Iroh room contains different immutable payloads for the same operation ID."
+                )
+        sequence_owners: dict[tuple[str, int], str] = {}
+        for row in self.connection.execute(
+            "SELECT device_id, operation_id, record FROM iroh_records "
+            "WHERE room_id = ? AND domain = 'timer'",
+            (room_id,),
+        ):
+            record = json.loads(row["record"])
+            sequence_owners[(str(row["device_id"]), int(record["operation"]["deviceSequence"]))] = str(row["operation_id"])
+        for record, identifier, _digest in prepared:
+            if record["domain"] != "timer":
+                continue
+            key = (record["deviceId"], int(record["operation"]["deviceSequence"]))
+            owner = sequence_owners.get(key)
+            if owner is not None and owner != identifier:
+                raise ValueError("Iroh timer operation reuses a device sequence.")
+            sequence_owners[key] = identifier
+        inserted = False
+        for record, identifier, digest in prepared:
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO iroh_records(room_id, domain, operation_id, "
+                "device_id, digest, record) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    room_id,
+                    record["domain"],
+                    identifier,
+                    record["deviceId"],
+                    digest,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            inserted = inserted or cursor.rowcount > 0
+        return inserted
+
+    def iroh_inventory(
+        self, room_id: str, after: str | None, limit: int
+    ) -> tuple[list[dict[str, str]], str | None]:
+        from .iroh_protocol import MAX_INVENTORY
+
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_INVENTORY:
+            raise ValueError("Iroh inventory limit must be 1 through 1024.")
+        parameters: list[Any] = [room_id]
+        where = "room_id = ?"
+        if after is not None:
+            if not isinstance(after, str) or after.count("\0") != 1:
+                raise ValueError("Iroh inventory cursor is invalid.")
+            domain, identifier = after.split("\0")
+            where += " AND (domain > ? OR (domain = ? AND operation_id > ?))"
+            parameters.extend((domain, domain, identifier))
+        rows = self.connection.execute(
+            "SELECT domain, operation_id, digest FROM iroh_records WHERE "
+            + where
+            + " ORDER BY domain, operation_id LIMIT ?",
+            (*parameters, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        entries = [
+            {
+                "domain": str(row["domain"]),
+                "id": str(row["operation_id"]),
+                "digest": str(row["digest"]),
+            }
+            for row in rows
+        ]
+        next_cursor = (
+            f'{rows[-1]["domain"]}\0{rows[-1]["operation_id"]}'
+            if has_more and rows
+            else None
+        )
+        return entries, next_cursor
+
+    def iroh_operations(
+        self, room_id: str, references: list[dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        from .iroh_protocol import MAX_OPERATION_REFS
+
+        if not 1 <= len(references) <= MAX_OPERATION_REFS:
+            raise ValueError("Iroh operation request must contain 1 through 256 references.")
+        keys = [(item.get("domain"), item.get("id")) for item in references]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Iroh operation request contains duplicate references.")
+        records = []
+        for domain, identifier in keys:
+            row = self.connection.execute(
+                "SELECT record FROM iroh_records WHERE room_id = ? AND domain = ? "
+                "AND operation_id = ?",
+                (room_id, domain, identifier),
+            ).fetchone()
+            if row is None:
+                raise KeyError("Requested Iroh operation was not found.")
+            records.append(json.loads(row["record"]))
+        return records
+
+    def missing_iroh_references(
+        self, room_id: str, remote_entries: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        from .iroh_protocol import ImmutableConflict, MAX_INVENTORY
+
+        if len(remote_entries) > MAX_INVENTORY:
+            raise ValueError("Iroh inventory exceeds 1024 entries.")
+        missing = []
+        conflict: ImmutableConflict | None = None
+        with self._immediate_transaction():
+            for entry in remote_entries:
+                row = self.connection.execute(
+                    "SELECT digest FROM iroh_records WHERE room_id = ? AND domain = ? "
+                    "AND operation_id = ?",
+                    (room_id, entry["domain"], entry["id"]),
+                ).fetchone()
+                if row is None:
+                    missing.append({"domain": entry["domain"], "id": entry["id"]})
+                    continue
+                if row["digest"] == entry["digest"]:
+                    continue
+                evidence = {
+                    "domain": entry["domain"],
+                    "id": entry["id"],
+                    "localDigest": str(row["digest"]),
+                    "receivedDigest": entry["digest"],
+                    "detectedAtMs": int(time.time() * 1000),
+                }
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO iroh_conflicts(room_id, domain, operation_id, "
+                    "local_digest, received_digest, received_record, detected_at_ms) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                    (
+                        room_id,
+                        entry["domain"],
+                        entry["id"],
+                        row["digest"],
+                        entry["digest"],
+                        evidence["detectedAtMs"],
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET conflict = ? WHERE room_id = ?",
+                    (json.dumps(evidence, separators=(",", ":")), room_id),
+                )
+                conflict = ImmutableConflict(
+                    "Iroh room inventory contains an immutable-ID conflict."
+                )
+                break
+        if conflict is not None:
+            raise conflict
+        return missing
+
+    def _upsert_iroh_peer(
+        self,
+        room_id: str,
+        endpoint_id: str,
+        endpoint_ticket: str,
+        device_id: str | None,
+        display_name: str | None,
+        last_seen_at_ms: int | None,
+    ) -> None:
+        from .iroh_protocol import MAX_ENDPOINT_TICKET, MAX_PEERS
+
+        if (
+            not endpoint_id
+            or not endpoint_ticket
+            or len(endpoint_ticket.encode()) > MAX_ENDPOINT_TICKET
+            or display_name is not None
+            and not 1 <= len(display_name) <= 64
+        ):
+            raise ValueError("Iroh peer metadata is invalid.")
+        exists = self.connection.execute(
+            "SELECT 1 FROM iroh_peers WHERE room_id = ? AND endpoint_id = ?",
+            (room_id, endpoint_id),
+        ).fetchone()
+        count = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM iroh_peers WHERE room_id = ?", (room_id,)
+        ).fetchone()["count"]
+        if exists is None and count >= MAX_PEERS:
+            raise ValueError("Iroh room address book contains 64 peers.")
+        ticket_key = self._peer_ticket_key(room_id, endpoint_id)
+        self._iroh_secret_store.save(ticket_key, endpoint_ticket.encode("utf-8"))
+        self.connection.execute(
+            "INSERT INTO iroh_peers(room_id, endpoint_id, endpoint_ticket, device_id, "
+            "display_name, last_seen_at_ms) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(room_id, endpoint_id) DO UPDATE SET "
+            "endpoint_ticket = excluded.endpoint_ticket, device_id = excluded.device_id, "
+            "display_name = excluded.display_name, last_seen_at_ms = excluded.last_seen_at_ms",
+            (
+                room_id,
+                endpoint_id,
+                f"secure:{ticket_key}",
+                device_id,
+                display_name,
+                last_seen_at_ms,
+            ),
+        )
+
+    def upsert_iroh_peer(
+        self,
+        room_id: str,
+        endpoint_id: str,
+        endpoint_ticket: str,
+        device_id: str | None,
+        display_name: str | None,
+        last_seen_at_ms: int | None = None,
+    ) -> None:
+        with self._immediate_transaction():
+            self._upsert_iroh_peer(
+                room_id,
+                endpoint_id,
+                endpoint_ticket,
+                device_id,
+                display_name,
+                last_seen_at_ms,
+            )
+
+    def iroh_peers(self, room_id: str) -> list[dict[str, Any]]:
+        peers = []
+        for row in self.connection.execute(
+            "SELECT endpoint_id, endpoint_ticket, device_id, display_name, "
+            "last_seen_at_ms FROM iroh_peers WHERE room_id = ? "
+            "ORDER BY last_seen_at_ms DESC, endpoint_id",
+            (room_id,),
+        ):
+            endpoint_id = str(row["endpoint_id"])
+            ticket = self._iroh_secret_store.load(
+                self._peer_ticket_key(room_id, endpoint_id)
+            )
+            if ticket is None:
+                raise ValueError("Saved Iroh peer capability is unavailable.")
+            try:
+                endpoint_ticket = ticket.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("Saved Iroh peer capability is invalid.") from error
+            peers.append(
+                {
+                    "endpointId": endpoint_id,
+                    "endpointTicket": endpoint_ticket,
+                    "deviceId": row["device_id"],
+                    "displayName": row["display_name"],
+                    "lastSeenAtMs": row["last_seen_at_ms"],
+                }
+            )
+        return peers
 
     def has_pending_auto_break(self) -> bool:
         return (

@@ -19,6 +19,20 @@ from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
 
 
+class MemorySecretStore:
+    def __init__(self) -> None:
+        self.values: dict[str, bytes] = {}
+
+    def load(self, key: str) -> bytes | None:
+        return self.values.get(key)
+
+    def save(self, key: str, value: bytes) -> None:
+        self.values[key] = value
+
+    def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
 class FakeCloud(QObject):
     signed_in = Signal(object)
     signed_out = Signal()
@@ -40,9 +54,12 @@ class FakeCloud(QObject):
         self.resolutions: list[dict[str, object]] = []
         self.login_calls = 0
         self.logout_calls = 0
+        self.restore_calls = 0
+        self.revision_stops = 0
+        self.revision_starts = 0
 
     def restore(self) -> None:
-        pass
+        self.restore_calls += 1
 
     def sync(self, payload: dict[str, object]) -> None:
         self.payloads.append(payload)
@@ -59,6 +76,50 @@ class FakeCloud(QObject):
     def logout(self) -> None:
         self.logout_calls += 1
 
+    def stop_revision_stream(self) -> None:
+        self.revision_stops += 1
+
+    def start_revision_stream(self) -> None:
+        self.revision_starts += 1
+
+
+class FakeIroh(QObject):
+    status_changed = Signal(str)
+    details_changed = Signal(object)
+    invite_ready = Signal(str)
+    joined = Signal()
+    projection_changed = Signal()
+    failure = Signal(str)
+
+    def __init__(self, available: bool = True) -> None:
+        super().__init__()
+        self.available = available
+        self.started: list[tuple[str, bool]] = []
+        self.joined_invites = []
+        self.stop_calls = 0
+        self.sync_calls = 0
+
+    def availability(self) -> tuple[bool, str]:
+        return self.available, "Iroh test transport ready" if self.available else "Iroh test transport unavailable"
+
+    def start_room(self, room_id: str, *, emit_invite: bool = False) -> None:
+        self.started.append((room_id, emit_invite))
+
+    def join_room(self, invite) -> None:
+        self.joined_invites.append(invite)
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def sync_now(self) -> None:
+        self.sync_calls += 1
+
+    def refresh_invite(self) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
 
 class MainWindowDurationTests(unittest.TestCase):
     @classmethod
@@ -67,7 +128,10 @@ class MainWindowDurationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.temporary.name) / "state.sqlite3")
+        self.store = Store(
+            Path(self.temporary.name) / "state.sqlite3",
+            iroh_secret_store=MemorySecretStore(),
+        )
         self.cloud = FakeCloud()
         with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
             self.window = MainWindow(self.store, self.cloud, QIcon())
@@ -1196,7 +1260,7 @@ class MainWindowDurationTests(unittest.TestCase):
     def test_arrivals_is_separate_tab_next_to_tasks(self) -> None:
         self.assertEqual(
             [button.text() for button in self.window.screen_buttons],
-            ["TIMER", "TASKS", "ARRIVALS"],
+            ["TIMER", "TASKS", "ARRIVALS", "NETWORK"],
         )
         self.assertIs(self.window.page_stack.widget(2), self.window.arrivals_page)
         self.assertTrue(self.window.arrivals_page.isAncestorOf(self.window.history_list))
@@ -1208,6 +1272,37 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertIs(self.window.page_stack.currentWidget(), self.window.arrivals_page)
         self.assertTrue(self.window.screen_buttons[2].isChecked())
         self.assertEqual(len(self.cloud.payloads), before + 1)
+
+    def test_network_page_reports_unavailable_transport_without_fake_sync(self) -> None:
+        iroh = FakeIroh(available=False)
+        self.window.quitting = True
+        self.window.close()
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(self.store, self.cloud, QIcon(), iroh)
+
+        self.window._show_screen(3)
+
+        self.assertEqual(self.window.screen_buttons[3].text(), "NETWORK")
+        self.assertIn("unavailable", self.window.network_unavailable.text().lower())
+        self.assertFalse(self.window.iroh_panel.isEnabled())
+        self.assertEqual(iroh.started, [])
+
+    def test_network_create_uses_fake_transport_and_exposes_invite(self) -> None:
+        iroh = FakeIroh()
+        self.window.quitting = True
+        self.window.close()
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(self.store, self.cloud, QIcon(), iroh)
+        self.window.room_name_input.setText("Design desk")
+
+        self.window._create_iroh_room()
+        iroh.invite_ready.emit("pomodorough1.test")
+
+        self.assertEqual(self.store.replication_mode, "iroh")
+        self.assertEqual(iroh.started, [(self.store.active_iroh_room_id, True)])
+        self.assertEqual(self.window.invite_output.toPlainText(), "pomodorough1.test")
+        self.assertTrue(self.window.copy_invite_button.isEnabled())
+        self.assertGreaterEqual(self.cloud.revision_stops, 1)
 
     def test_synced_task_can_be_selected_while_timer_is_paused(self) -> None:
         task = task_from_title("Remote task")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import unicodedata
 import uuid
 from copy import deepcopy
@@ -16,6 +17,10 @@ PHASES = {
 ACTIVE_STATUSES = {"running", "paused"}
 TERMINAL_STATUSES = {"completed", "cancelled", "superseded"}
 TASK_NAMESPACE = b"pomodorough.task.v1\x00"
+_RFC3339_OFFSET = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d{1,9})?(?P<zone>Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def empty_timer(phase: str, duration_ms: int) -> dict[str, Any]:
@@ -91,7 +96,10 @@ def rebuild_tasks(
                 continue
             if task_id == task["id"]:
                 tasks[task_id] = task
-    return sorted(tasks.values(), key=lambda task: (task["title"].casefold(), task["id"]))
+    return sorted(
+        tasks.values(),
+        key=lambda task: (task["title"].encode("utf-8"), task["id"].encode("utf-8")),
+    )
 
 
 def project_auto_start_breaks(
@@ -173,11 +181,14 @@ def task_summaries_today(
 
 
 def parse_timestamp_ms(value: str | None) -> int | None:
-    if not value:
+    if not value or _RFC3339_OFFSET.fullmatch(value) is None:
         return None
     try:
-        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
-    except (TypeError, ValueError):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            return None
+        return int(parsed.timestamp() * 1000)
+    except (OverflowError, TypeError, ValueError):
         return None
 
 

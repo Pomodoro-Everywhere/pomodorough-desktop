@@ -18,6 +18,7 @@ class AppLifecycleTests(unittest.TestCase):
         icon = MagicMock()
         store = MagicMock(device_id="device-42")
         cloud = MagicMock()
+        iroh = MagicMock()
         window = MagicMock()
         window.quitting = False
         keepalive = MagicMock()
@@ -30,6 +31,7 @@ class AppLifecycleTests(unittest.TestCase):
             patch.object(app_module, "QIcon", return_value=icon) as icon_type,
             patch.object(app_module, "Store", return_value=store) as store_type,
             patch.object(app_module, "CloudService", return_value=cloud) as cloud_type,
+            patch.object(app_module, "_iroh_service", return_value=iroh) as iroh_factory,
             patch.object(app_module, "MainWindow", return_value=window) as window_type,
             patch.object(app_module, "QTimer", return_value=keepalive) as timer_type,
             patch.object(app_module, "resource_path", return_value=icon_path) as resource_path,
@@ -48,9 +50,10 @@ class AppLifecycleTests(unittest.TestCase):
         application.setQuitOnLastWindowClosed.assert_called_once_with(True)
         store_type.assert_called_once_with()
         cloud_type.assert_called_once_with("device-42")
-        window_type.assert_called_once_with(store, cloud, icon)
+        iroh_factory.assert_called_once_with(store)
+        window_type.assert_called_once_with(store, cloud, icon, iroh)
         application.aboutToQuit.connect.assert_has_calls(
-            [call(cloud.shutdown), call(store.close)]
+            [call(cloud.shutdown), call(iroh.shutdown), call(store.close)]
         )
         window.show.assert_called_once_with()
 
@@ -73,6 +76,7 @@ class AppLifecycleTests(unittest.TestCase):
         icon = MagicMock()
         store = MagicMock(device_id="device-42")
         cloud = MagicMock()
+        iroh = MagicMock()
         window = MagicMock()
         keepalive = MagicMock()
         screenshot_path = "/tmp/pomodorough.png"
@@ -90,6 +94,7 @@ class AppLifecycleTests(unittest.TestCase):
             patch.object(app_module, "QIcon", return_value=icon),
             patch.object(app_module, "Store", return_value=store),
             patch.object(app_module, "CloudService", return_value=cloud),
+            patch.object(app_module, "_iroh_service", return_value=iroh),
             patch.object(app_module, "MainWindow", return_value=window),
             patch.object(app_module, "QTimer", return_value=keepalive) as timer_type,
             patch.object(app_module, "resource_path", return_value=Path("/bundle/icon.svg")),

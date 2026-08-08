@@ -15,9 +15,23 @@ class Pomodorough < Formula
     sha256 "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3"
   end
 
+  resource "platformdirs" do
+    url "https://files.pythonhosted.org/packages/7d/68/d8d58938dfb1370b266a1a729e6d77a985be23689a0496498ee17b2cbf90/platformdirs-4.11.0-py3-none-any.whl"
+    sha256 "360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74"
+  end
+
+  on_arm do
+    resource "iroh" do
+      url "https://files.pythonhosted.org/packages/94/2a/f9f1cee7b0d3c71b95c06304b4e60381a7107dbccff7183ed9ff58b38141/iroh-1.1.0-py3-none-macosx_11_0_arm64.whl"
+      sha256 "b1c920f14323badc451e45b747da02d07a6e40ea2c1c97eeed5539e3ebc2b8b7"
+    end
+  end
+
   def install
     venv = virtualenv_create(libexec, "python3.14")
     venv.pip_install resource("setuptools"), build_isolation: false
+    venv.pip_install resource("platformdirs"), build_isolation: false
+    venv.pip_install resource("iroh"), build_isolation: false if Hardware::CPU.arm?
     venv.pip_install_and_link buildpath, build_isolation: false
   end
 
@@ -27,5 +41,6 @@ class Pomodorough < Formula
     assert_match '"status": "idle"', output
     assert_match "Run Pomodorough", shell_output("#{bin}/pomodorough-tui --help")
     system libexec/"bin/python", "-c", "import PySide6"
+    system libexec/"bin/python", "-c", "import iroh" if Hardware::CPU.arm?
   end
 end

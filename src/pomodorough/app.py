@@ -8,9 +8,14 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from .iroh_network import IrohService
 from .network import CloudService
 from .storage import Store
 from .ui import MainWindow, resource_path
+
+
+def _iroh_service(store: Store) -> IrohService:
+    return IrohService(store.path, store.device_id)
 
 
 def main() -> int:
@@ -25,8 +30,10 @@ def main() -> int:
 
     store = Store()
     cloud = CloudService(store.device_id)
-    window = MainWindow(store, cloud, icon)
+    iroh = _iroh_service(store)
+    window = MainWindow(store, cloud, icon, iroh)
     app.aboutToQuit.connect(cloud.shutdown)
+    app.aboutToQuit.connect(iroh.shutdown)
     app.aboutToQuit.connect(store.close)
     window.show()
 

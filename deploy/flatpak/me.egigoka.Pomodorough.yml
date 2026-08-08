@@ -16,7 +16,7 @@ modules:
   - name: pomodorough
     buildsystem: simple
     build-commands:
-      - pip3 install --verbose --no-index --find-links="file://${PWD}" --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - pip3 install --verbose --no-index --find-links="file://${PWD}" --no-build-isolation --prefix=${FLATPAK_DEST} '.[iroh]'
       - install -Dm644 src/pomodorough/resources/icon.svg /app/share/icons/hicolor/scalable/apps/me.egigoka.Pomodorough.svg
       - install -Dm644 deploy/me.egigoka.Pomodorough.desktop /app/share/applications/me.egigoka.Pomodorough.desktop
       - sed -i 's|/usr/bin/env -u LOCALE_ARCHIVE_2_27 @EXEC@|pomodorough|g; s|@ICON@|me.egigoka.Pomodorough|g' /app/share/applications/me.egigoka.Pomodorough.desktop
@@ -43,6 +43,16 @@ modules:
       - type: file
         url: https://files.pythonhosted.org/packages/57/d5/dd4f1defed400be03340f2ede34b61f846776650b4e7ed9ebaf4c71979a2/shiboken6-6.11.1-cp310-abi3-manylinux_2_39_aarch64.whl
         sha256: 1bd2f4314414df2d122d9f646e03b731bc6d6b5f77a5f53f99a4fe4e97d84e6f
+        only-arches:
+          - aarch64
+      - type: file
+        url: https://files.pythonhosted.org/packages/b8/ed/bcc0599f186ca75936b883299596b88871075a4c4312255a7c2b752b6783/iroh-1.1.0-py3-none-manylinux_2_28_x86_64.whl
+        sha256: 4989c7b8f6ab2ebe7afc0c2cf55b7608f7fd05f02bffee1af8d937e05de0e768
+        only-arches:
+          - x86_64
+      - type: file
+        url: https://files.pythonhosted.org/packages/3e/dd/2f0a2bc113ced26981fb141cecc75e0682996ec1f49a4398c97b351c2196/iroh-1.1.0-py3-none-manylinux_2_28_aarch64.whl
+        sha256: abdf089cad4420e2e474a0fe8694aa32f91d7a49f569b559e18edd247a29af03
         only-arches:
           - aarch64
       - type: dir
