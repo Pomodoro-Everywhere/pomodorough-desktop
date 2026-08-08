@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to recover
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +32,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify manual release source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
+          git merge-base --is-ancestor "$RELEASE_TAG" HEAD
+          unexpected_changes="$(git diff --name-only "$RELEASE_TAG" HEAD -- . \
+            ':(exclude).github/**' \
+            ':(exclude).gitattributes' \
+            ':(exclude)tests/**')"
+          if [[ -n "$unexpected_changes" ]]; then
+            echo "Manual release source differs from $RELEASE_TAG outside CI and test files:" >&2
+            printf '%s\n' "$unexpected_changes" >&2
+            exit 1
+          fi
+
       - name: Validate tag and version metadata
         env:
           GH_TOKEN: ${{ github.token }}
@@ -30,8 +56,8 @@ jobs:
         run: |
           set -euo pipefail
           semver_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF_NAME" != v* ]] || [[ ! "$tag_version" =~ $semver_pattern ]]; then
+          tag_version="${RELEASE_TAG#v}"
+          if [[ "$RELEASE_TAG" != v* ]] || [[ ! "$tag_version" =~ $semver_pattern ]]; then
             echo "Release tag must use vMAJOR.MINOR.PATCH format" >&2
             exit 1
           fi
@@ -43,7 +69,7 @@ jobs:
           metainfo_version="$(sed -nE 's/^[[:space:]]*<release version="([^"]+)".*/\1/p' deploy/flatpak/me.egigoka.Pomodorough.metainfo.xml | head -n 1)"
           for source_version in "$package_version" "$module_version" "$flake_version" "$lock_version" "$metainfo_version"; do
             if [[ "$source_version" != "$tag_version" ]]; then
-              echo "Tag $GITHUB_REF_NAME does not match source version $source_version" >&2
+              echo "Tag $RELEASE_TAG does not match source version $source_version" >&2
               exit 1
             fi
           done
@@ -52,14 +78,14 @@ jobs:
           grep -Fq "releases/download/v${tag_version}/Pomodorough-${tag_version}-x86_64.flatpak" README.md
 
           release_state="missing"
-          release_state="$(gh release view "$GITHUB_REF_NAME" \
+          release_state="$(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json isDraft \
             --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null || printf missing)"
           if [[ "$release_state" != "published" ]]; then
             previous_versions=()
             while IFS= read -r candidate; do
-              [[ "$candidate" == "$GITHUB_REF_NAME" ]] && continue
+              [[ "$candidate" == "$RELEASE_TAG" ]] && continue
               candidate_version="${candidate#v}"
               if [[ ! "$candidate_version" =~ $semver_pattern ]]; then
                 echo "Existing release tag $candidate is not strict SemVer" >&2
@@ -156,7 +182,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/build-flatpak.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}
 
   windows:
     name: Build Windows executable
@@ -165,7 +191,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/build-windows.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}
 
   release:
     name: Create GitHub release
@@ -189,7 +215,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           test -f "dist/pomodorough_linux-${version}.tar.gz"
           test -f "dist/pomodorough_linux-${version}-py3-none-any.whl"
           test -f "dist/Pomodorough-${version}-x86_64.flatpak"
@@ -205,7 +231,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           expected_assets=(
             "Pomodorough-${version}-windows-x86_64.exe"
             "Pomodorough-${version}-x86_64.flatpak"
@@ -218,11 +244,11 @@ jobs:
             published_dir="$RUNNER_TEMP/published-release"
             rm -rf "$published_dir"
             mkdir -p "$published_dir"
-            gh release download "$GITHUB_REF_NAME" \
+            gh release download "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --dir "$published_dir"
             printf '%s\n' "${expected_release_assets[@]}" | sort > "$RUNNER_TEMP/expected-assets.txt"
-            gh release view "$GITHUB_REF_NAME" \
+            gh release view "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --json assets \
               --jq '.assets[].name' | sort > "$RUNNER_TEMP/actual-assets.txt"
@@ -237,13 +263,13 @@ jobs:
           }
 
           release_state="missing"
-          if release_state="$(gh release view "$GITHUB_REF_NAME" \
+          if release_state="$(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json isDraft \
             --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null)"; then
             if [[ "$release_state" == "published" ]]; then
               verify_release_assets
-              echo "Release $GITHUB_REF_NAME is already published"
+              echo "Release $RELEASE_TAG is already published"
               exit 0
             fi
           else
@@ -255,32 +281,32 @@ jobs:
             printf '%s\n\n' 'Release assets include Python packages, Flatpak bundle, and standalone Windows executable.'
             gh api --method POST \
               "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-              -f tag_name="$GITHUB_REF_NAME" \
+              -f tag_name="$RELEASE_TAG" \
               --jq .body
           } > "$notes_file"
 
           if [[ "$release_state" == "missing" ]]; then
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
-              --title "Pomodorough Desktop $GITHUB_REF_NAME" \
+              --title "Pomodorough Desktop $RELEASE_TAG" \
               --notes-file "$notes_file"
           fi
           while IFS= read -r asset; do
-            gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+            gh release delete-asset "$RELEASE_TAG" "$asset" \
               --repo "$GITHUB_REPOSITORY" \
               --yes
-          done < <(gh release view "$GITHUB_REF_NAME" \
+          done < <(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
             --jq '.assets[].name')
-          gh release upload "$GITHUB_REF_NAME" dist/* \
+          gh release upload "$RELEASE_TAG" dist/* \
             --repo "$GITHUB_REPOSITORY"
           verify_release_assets
-          gh release edit "$GITHUB_REF_NAME" \
+          gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Pomodorough Desktop $GITHUB_REF_NAME" \
+            --title "Pomodorough Desktop $RELEASE_TAG" \
             --notes-file "$notes_file" \
             --draft=false
 
@@ -291,6 +317,6 @@ jobs:
       contents: read
     uses: ./.github/workflows/update-homebrew.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}
     secrets:
       HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
