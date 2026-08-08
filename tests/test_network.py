@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import unittest
 import urllib.error
@@ -560,7 +561,7 @@ class DesktopOAuthTransactionTests(unittest.TestCase):
                         "idToken": "google-id-token",
                         "challenge": "native-challenge",
                         "deviceId": "device-1",
-                        "platform": "linux",
+                        "platform": "windows" if sys.platform == "win32" else "linux",
                     },
                     None,
                     False,
