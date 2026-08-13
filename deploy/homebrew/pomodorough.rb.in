@@ -10,6 +10,13 @@ class Pomodorough < Formula
   depends_on "pyside"
   depends_on "python@3.14"
 
+  resource "iroh" do
+    on_arm do
+      url "https://files.pythonhosted.org/packages/94/2a/f9f1cee7b0d3c71b95c06304b4e60381a7107dbccff7183ed9ff58b38141/iroh-1.1.0-py3-none-macosx_11_0_arm64.whl"
+      sha256 "b1c920f14323badc451e45b747da02d07a6e40ea2c1c97eeed5539e3ebc2b8b7"
+    end
+  end
+
   resource "setuptools" do
     url "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl"
     sha256 "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3"
@@ -20,18 +27,14 @@ class Pomodorough < Formula
     sha256 "360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74"
   end
 
-  on_arm do
-    resource "iroh" do
-      url "https://files.pythonhosted.org/packages/94/2a/f9f1cee7b0d3c71b95c06304b4e60381a7107dbccff7183ed9ff58b38141/iroh-1.1.0-py3-none-macosx_11_0_arm64.whl"
-      sha256 "b1c920f14323badc451e45b747da02d07a6e40ea2c1c97eeed5539e3ebc2b8b7"
-    end
-  end
-
   def install
     venv = virtualenv_create(libexec, "python3.14")
     venv.pip_install resource("setuptools"), build_isolation: false
     venv.pip_install resource("platformdirs"), build_isolation: false
-    venv.pip_install resource("iroh"), build_isolation: false if Hardware::CPU.arm?
+    if Hardware::CPU.arm?
+      iroh = resource("iroh")
+      iroh.stage { venv.pip_install Pathname.pwd/iroh.downloader.basename, build_isolation: false }
+    end
     venv.pip_install_and_link buildpath, build_isolation: false
   end
 
