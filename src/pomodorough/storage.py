@@ -14,6 +14,7 @@ from typing import Any
 from platformdirs import user_data_path
 
 from .core import (
+    ACTIVE_STATUSES,
     PHASES,
     elapsed_ms,
     next_break_phase,
@@ -91,6 +92,10 @@ class Store:
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS pending_auto_start_operations (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_selected_task_operations (
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
@@ -270,6 +275,7 @@ class Store:
                 "tasks": [],
                 "knownTasks": [],
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "user": None,
             },
             "pendingSync": None,
@@ -303,6 +309,7 @@ class Store:
                 ("tasks", []),
                 ("knownTasks", []),
                 ("autoStartBreaks", False),
+                ("selectedTaskId", None),
             ):
                 if key not in snapshot:
                     snapshot[key] = value
@@ -321,6 +328,18 @@ class Store:
                     and not self._pending_auto_start_operations(),
                 )
                 self._set_meta("autoStartMigrationComplete", True)
+            if not self.get_meta("selectedTaskMigrationComplete", False):
+                selected_task_id = settings.get("selectedTaskId")
+                if selected_task_id is None:
+                    self._set_meta("selectedTaskMigrationComplete", True)
+                elif (
+                    self.get_meta("pendingResolution") is None
+                    and self.get_meta("replicationMode", "centralized") != "iroh"
+                ):
+                    self._queue_selected_task_operation(
+                        selected_task_id, settings, 0, bootstrap=True
+                    )
+                    self._set_meta("selectedTaskMigrationComplete", True)
             pending_auto_starts = self._pending_auto_start_operations()
             projected = project_auto_start_breaks(
                 bool(snapshot["autoStartBreaks"]), pending_auto_starts
@@ -577,31 +596,6 @@ class Store:
         acquired_trusted_ms = self._physical_time_ms(
             server_time_ms + round_trip_ms - midpoint_elapsed_ms
         )
-        previous_sample = self._server_clock_sample(
-            self.get_meta("serverClockSample")
-        )
-        if previous_sample is not None:
-            previous_anchor = self._trusted_time_anchor
-            previous_trusted_ms = (
-                self._physical_time_ms(
-                    previous_anchor["acquiredTrustedMs"]
-                    + received_monotonic_ms
-                    - previous_anchor["acquiredMonotonicMs"]
-                )
-                if previous_anchor == previous_sample
-                and received_monotonic_ms
-                >= previous_anchor["acquiredMonotonicMs"]
-                else self._projected_trusted_time(
-                    previous_sample,
-                    received_physical_ms,
-                    received_monotonic_ms,
-                )
-            )
-            if (
-                previous_trusted_ms is not None
-                and acquired_trusted_ms < previous_trusted_ms
-            ):
-                raise ValueError("Server time sample would regress trusted time.")
         sample = {
             "offsetMs": offset_ms,
             "uncertaintyMs": uncertainty_ms,
@@ -825,7 +819,8 @@ class Store:
             "SELECT id FROM pending_commands "
             "UNION ALL SELECT id FROM pending_task_operations "
             "UNION ALL SELECT id FROM pending_duration_operations "
-            "UNION ALL SELECT id FROM pending_auto_start_operations"
+            "UNION ALL SELECT id FROM pending_auto_start_operations "
+            "UNION ALL SELECT id FROM pending_selected_task_operations"
         )
         for row in rows:
             identifier = str(row["id"])
@@ -925,6 +920,7 @@ class Store:
                 )
             )
             pending_auto_starts = self._pending_auto_start_operations()
+            pending_selected_tasks = self._pending_selected_task_operations()
             try:
                 pending_resolution = self.get_meta("pendingResolution")
             except (TypeError, json.JSONDecodeError):
@@ -936,6 +932,7 @@ class Store:
                 "pendingTasks": pending_tasks,
                 "pendingDurations": pending_durations,
                 "pendingAutoStarts": pending_auto_starts,
+                "pendingSelectedTasks": pending_selected_tasks,
                 "pendingResolution": pending_resolution,
             }
             if projection:
@@ -1055,6 +1052,23 @@ class Store:
         )
         return operations
 
+    def _pending_selected_task_operations(self) -> list[dict[str, Any]]:
+        operations = [
+            json.loads(row["payload"])
+            for row in self.connection.execute(
+                "SELECT payload FROM pending_selected_task_operations ORDER BY rowid"
+            )
+        ]
+        operations.sort(
+            key=lambda operation: (
+                int(operation.get("hlcWallMs", 0)),
+                int(operation.get("hlcCounter", 0)),
+                str(operation.get("deviceId", "")),
+                str(operation.get("id", "")),
+            )
+        )
+        return operations
+
     @staticmethod
     def _pending_object(payload: Any, label: str) -> dict[str, Any]:
         try:
@@ -1158,6 +1172,21 @@ class Store:
             raise ValueError("Pending auto-start operation is invalid.")
         self._operation_clock(operation, allow_legacy_zero=True)
 
+    def _validate_pending_selected_task_operation(
+        self, operation: dict[str, Any], row: sqlite3.Row, device_id: str
+    ) -> None:
+        task_id = operation.get("taskId")
+        if (
+            not self._valid_identity(operation.get("id"))
+            or operation["id"] != row["id"]
+            or operation.get("deviceId") != device_id
+            or not isinstance(task_id, (str, type(None)))
+            or isinstance(task_id, str)
+            and not task_id
+        ):
+            raise ValueError("Pending selected-task operation is invalid.")
+        self._operation_clock(operation, allow_legacy_zero=True)
+
     def _preflight_pending_queues(
         self, *, require_clock_coverage: bool = True
     ) -> dict[str, list[dict[str, Any]]]:
@@ -1225,6 +1254,21 @@ class Store:
                 operation["id"],
             )
         )
+        selected_task_operations = []
+        for row in self.connection.execute(
+            "SELECT id, payload FROM pending_selected_task_operations ORDER BY rowid"
+        ):
+            operation = self._pending_object(row["payload"], "selected-task operation")
+            self._validate_pending_selected_task_operation(operation, row, device_id)
+            selected_task_operations.append(operation)
+        selected_task_operations.sort(
+            key=lambda operation: (
+                operation["hlcWallMs"],
+                operation["hlcCounter"],
+                operation["deviceId"],
+                operation["id"],
+            )
+        )
         clocks = [
             (operation["hlcWallMs"], operation["hlcCounter"])
             for operations in (
@@ -1232,6 +1276,7 @@ class Store:
                 task_operations,
                 duration_operations,
                 auto_start_operations,
+                selected_task_operations,
             )
             for operation in operations
         ]
@@ -1243,6 +1288,7 @@ class Store:
             "taskOperations": task_operations,
             "durationOperations": duration_operations,
             "autoStartOperations": auto_start_operations,
+            "selectedTaskOperations": selected_task_operations,
         }
 
     def save_settings(self, settings: dict[str, Any]) -> None:
@@ -1253,6 +1299,7 @@ class Store:
             candidate["durations"] = current["durations"]
             candidate["durationsMs"] = current["durationsMs"]
             candidate["autoStartBreaks"] = current["autoStartBreaks"]
+            candidate["selectedTaskId"] = current["selectedTaskId"]
             self._set_meta("settings", candidate)
 
     def _set_local_setting(self, key: str, value: Any) -> None:
@@ -1295,8 +1342,28 @@ class Store:
             self._capture_iroh_after_mutation_locked()
         return operation
 
-    def set_selected_task_id(self, task_id: str | None) -> None:
-        self._set_local_setting("selectedTaskId", task_id)
+    def set_selected_task_id(
+        self, task_id: str | None, now_ms: int | None = None
+    ) -> dict[str, Any] | None:
+        if not isinstance(task_id, (str, type(None))) or isinstance(task_id, str) and not task_id:
+            raise ValueError("Selected task identity must be non-empty or null.")
+        use_server_clock = now_ms is None
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            if self.get_meta("replicationMode", "centralized") == "iroh":
+                settings["selectedTaskId"] = task_id
+                self._set_meta("settings", settings)
+                self._capture_iroh_after_mutation_locked()
+                return None
+            operation = self._queue_selected_task_operation(
+                task_id,
+                settings,
+                now_ms,
+                use_server_clock=use_server_clock,
+            )
+        return operation
 
     def queue_command(
         self,
@@ -1317,7 +1384,17 @@ class Store:
                 if not use_server_clock
                 else self.effective_timer_now_ms(timer, physical_ms=now_ms)
             )
-            settings = self._normalize_settings(self.get_meta("settings", {}))
+            state = self.load()
+            settings = self._normalize_settings(state["settings"])
+            if command_type == "start":
+                selected_task_id = settings.get("selectedTaskId")
+                tasks = rebuild_tasks(
+                    state["snapshot"].get("tasks", []), state["pendingTasks"]
+                )
+                if not any(
+                    task.get("id") == selected_task_id for task in tasks
+                ):
+                    selected_task_id = None
             generates_break = bool(
                 generate_auto_break
                 and command_type == "finish"
@@ -1415,6 +1492,11 @@ class Store:
             selected_phase = settings["selectedPhase"]
             durations_ms = settings["durationsMs"]
             selected_task_id = settings.get("selectedTaskId")
+            tasks = rebuild_tasks(
+                state["snapshot"].get("tasks", []), state["pendingTasks"]
+            )
+            if not any(task.get("id") == selected_task_id for task in tasks):
+                selected_task_id = None
             effective_now_ms = (
                 now_ms
                 if not use_server_clock
@@ -1456,6 +1538,78 @@ class Store:
             )
             self._capture_iroh_after_mutation_locked()
         return [cleared, started]
+
+    def queue_cancel_and_clear(
+        self,
+        timer: dict[str, Any],
+        selected_phase: str,
+        durations_ms: dict[str, int],
+        selected_task_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        use_server_clock = now_ms is None
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
+            state = self.load(projection=True)
+            projection_snapshot = state.get("projectionSnapshot", state["snapshot"])
+            current_timer, _history = rebuild_optimistic(
+                projection_snapshot.get("canonicalTimer"),
+                projection_snapshot.get("history", []),
+                state.get("projectionPending", state["pending"]),
+            )
+            if (
+                not isinstance(current_timer, dict)
+                or current_timer.get("status") not in ACTIVE_STATUSES
+                or self._timer_fingerprint(current_timer)
+                != self._timer_fingerprint(timer)
+            ):
+                raise ValueError("Timer changed before cancel could be saved.")
+            settings = self._normalize_settings(state["settings"])
+            selected_phase = settings["selectedPhase"]
+            durations_ms = settings["durationsMs"]
+            selected_task_id = settings.get("selectedTaskId")
+            effective_now_ms = (
+                now_ms
+                if not use_server_clock
+                else self.effective_timer_now_ms(current_timer, physical_ms=now_ms)
+            )
+            trusted_ms, sequences, clocks = self._reserve_generation(
+                effective_now_ms,
+                sequence_count=2,
+                clock_count=2,
+                use_server_clock=use_server_clock,
+                use_monotonic=use_server_clock,
+            )
+            command_ids = self._reserve_uuid7_ids(clocks[0][0], 2)
+            cancelled = self._queue_command(
+                "cancel",
+                current_timer,
+                selected_phase,
+                durations_ms,
+                selected_task_id,
+                now_ms,
+                timer_now_ms=effective_now_ms,
+                trusted_ms=trusted_ms,
+                sequence=sequences[0],
+                clock=clocks[0],
+                command_id=command_ids[0],
+            )
+            cleared = self._queue_command(
+                "clear",
+                current_timer,
+                selected_phase,
+                durations_ms,
+                selected_task_id,
+                now_ms,
+                timer_now_ms=effective_now_ms,
+                trusted_ms=trusted_ms,
+                sequence=sequences[1],
+                clock=clocks[1],
+                command_id=command_ids[1],
+            )
+            self._capture_iroh_after_mutation_locked()
+        return [cancelled, cleared]
 
     def _queue_command(
         self,
@@ -1545,7 +1699,9 @@ class Store:
                 self._pending_commands(),
             )
             advanced_phase = (
-                next_break_phase(history) if phase == "focus" else "focus"
+                next_break_phase(history, command["occurredAt"])
+                if phase == "focus"
+                else "focus"
             )
             settings["selectedPhase"] = advanced_phase
             self._set_meta("settings", settings)
@@ -1611,7 +1767,9 @@ class Store:
         if completion is None:
             raise ValueError("Automatic break generation requires an accepted focus finish.")
         settings = self._normalize_settings(self.get_meta("settings", {}))
-        phase = next_break_phase(history)
+        phase = next_break_phase(
+            history, completion.get("completedAt") or completion.get("endedAt")
+        )
         settings["selectedPhase"] = phase
         self._set_meta("settings", settings)
         self.connection.execute(
@@ -1811,6 +1969,69 @@ class Store:
             self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
         return operation
 
+    def _queue_selected_task_operation(
+        self,
+        task_id: str | None,
+        settings: dict[str, Any],
+        now_ms: int,
+        bootstrap: bool = False,
+        use_server_clock: bool = False,
+    ) -> dict[str, Any]:
+        if bootstrap:
+            occurred_at = utc_timestamp(0)
+            wall_ms = 0
+            counter = 0
+            operation_id = str(uuid.uuid4())
+        else:
+            occurred_ms, _sequences, clocks = self._reserve_generation(
+                now_ms,
+                use_server_clock=use_server_clock,
+                use_monotonic=use_server_clock,
+            )
+            wall_ms, counter = clocks[0]
+            occurred_at = utc_timestamp(occurred_ms)
+            operation_id = self._reserve_uuid7_ids(wall_ms, 1)[0]
+        operation = {
+            "id": operation_id,
+            "deviceId": self.device_id,
+            "taskId": task_id,
+            "occurredAt": occurred_at,
+            "hlcWallMs": wall_ms,
+            "hlcCounter": counter,
+        }
+        self.connection.execute(
+            "INSERT INTO pending_selected_task_operations(id, payload) VALUES (?, ?)",
+            (operation["id"], json.dumps(operation, separators=(",", ":"))),
+        )
+        settings["selectedTaskId"] = task_id
+        self._set_meta("settings", settings)
+        if not bootstrap:
+            self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
+        return operation
+
+    @staticmethod
+    def _wire_preference_operations(
+        operations: Any, error_message: str
+    ) -> list[dict[str, Any]]:
+        if not isinstance(operations, list) or any(
+            not isinstance(operation, dict) for operation in operations
+        ):
+            raise ValueError(error_message)
+        outbound = []
+        for operation in operations:
+            item = dict(operation)
+            item.pop("deviceId", None)
+            outbound.append(item)
+        return outbound
+
+    def _replace_meta_inside_or_outside_transaction(
+        self, key: str, value: Any
+    ) -> None:
+        if self.connection.in_transaction:
+            self._set_meta(key, value)
+        else:
+            self.set_meta(key, value)
+
     def sync_payload(self) -> dict[str, Any]:
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
@@ -1828,7 +2049,14 @@ class Store:
                 "commands": pending["sendableCommands"][:256],
                 "taskOperations": pending["taskOperations"][:256],
                 "durationOperations": pending["durationOperations"][:256],
-                "autoStartOperations": pending["autoStartOperations"][:256],
+                "autoStartOperations": self._wire_preference_operations(
+                    pending["autoStartOperations"][:256],
+                    "Pending auto-start operation is corrupted.",
+                ),
+                "selectedTaskOperations": self._wire_preference_operations(
+                    pending["selectedTaskOperations"][:256],
+                    "Pending selected-task operation is corrupted.",
+                ),
             }
             self._set_meta("pendingSync", payload)
         return payload
@@ -1837,17 +2065,22 @@ class Store:
         pending = self.get_meta("pendingSync")
         if pending is None:
             return None
+        current_keys = {
+            "deviceId",
+            "lastRevision",
+            "commands",
+            "taskOperations",
+            "durationOperations",
+            "autoStartOperations",
+            "selectedTaskOperations",
+        }
+        legacy_keys = current_keys - {"selectedTaskOperations"}
+        original = deepcopy(pending)
+        if isinstance(pending, dict) and set(pending) == legacy_keys:
+            pending = {**pending, "selectedTaskOperations": []}
         if (
             not isinstance(pending, dict)
-            or set(pending)
-            != {
-                "deviceId",
-                "lastRevision",
-                "commands",
-                "taskOperations",
-                "durationOperations",
-                "autoStartOperations",
-            }
+            or set(pending) != current_keys
             or pending.get("deviceId") != self.device_id
             or any(
                 not isinstance(pending.get(key), list)
@@ -1856,6 +2089,7 @@ class Store:
                     "taskOperations",
                     "durationOperations",
                     "autoStartOperations",
+                    "selectedTaskOperations",
                 )
             )
         ):
@@ -1863,6 +2097,19 @@ class Store:
         self._bounded_integer(
             pending.get("lastRevision"), "Pending normal sync revision"
         )
+        pending = {
+            **pending,
+            "autoStartOperations": self._wire_preference_operations(
+                pending["autoStartOperations"],
+                "Pending normal sync claim is corrupted.",
+            ),
+            "selectedTaskOperations": self._wire_preference_operations(
+                pending["selectedTaskOperations"],
+                "Pending normal sync claim is corrupted.",
+            ),
+        }
+        if pending != original:
+            self._replace_meta_inside_or_outside_transaction("pendingSync", pending)
         return pending
 
     def has_sendable_sync_operations(self) -> bool:
@@ -1876,6 +2123,7 @@ class Store:
                     "taskOperations",
                     "durationOperations",
                     "autoStartOperations",
+                    "selectedTaskOperations",
                 )
             )
 
@@ -1904,6 +2152,13 @@ class Store:
                     "durationOperations",
                     "autoStartOperations",
                 },
+                {
+                    "commands",
+                    "taskOperations",
+                    "durationOperations",
+                    "autoStartOperations",
+                    "selectedTaskOperations",
+                },
             )
             or any(
                 not isinstance(ids, list)
@@ -1920,6 +2175,18 @@ class Store:
             not in {"keep_remote", "replace_remote", "merge"}
         ):
             raise ValueError("Pending account history is corrupted.")
+        normalized_request = dict(request)
+        for key in ("autoStartOperations", "selectedTaskOperations"):
+            if key in normalized_request:
+                normalized_request[key] = self._wire_preference_operations(
+                    normalized_request[key],
+                    "Pending account history is corrupted.",
+                )
+        if normalized_request != request:
+            pending = {**pending, "request": normalized_request}
+            self._replace_meta_inside_or_outside_transaction(
+                "pendingResolution", pending
+            )
         if user_id is not None and owner.get("id") != user_id:
             return None
         return pending
@@ -1958,6 +2225,7 @@ class Store:
                 "taskOperations": [],
                 "durationOperations": [],
                 "autoStartOperations": [],
+                "selectedTaskOperations": [],
             },
         )
         with self._immediate_transaction():
@@ -1990,9 +2258,12 @@ class Store:
             or state["pendingTasks"]
             or state["pendingDurations"]
             or state["pendingAutoStarts"]
+            or state["pendingSelectedTasks"]
             or state["snapshot"].get("canonicalTimer")
             or state["snapshot"].get("history")
             or state["snapshot"].get("tasks")
+            or state["snapshot"].get("selectedTaskId") is not None
+            or state["settings"].get("selectedTaskId") is not None
             or state["settings"].get("autoStartBreaks")
             or any(
                 state["settings"].get("durationsMs", {}).get(phase)
@@ -2004,6 +2275,7 @@ class Store:
             canonical["canonicalTimer"]
             or canonical["history"]
             or canonical["tasks"]
+            or canonical["selectedTaskId"] is not None
             or canonical["autoStartBreaks"]
             or any(
                 canonical["durationsMs"].get(phase)
@@ -2076,7 +2348,20 @@ class Store:
                     validated_pending["durationOperations"] if operations else []
                 ),
                 "autoStartOperations": (
-                    validated_pending["autoStartOperations"] if operations else []
+                    self._wire_preference_operations(
+                        validated_pending["autoStartOperations"],
+                        "Pending auto-start operation is corrupted.",
+                    )
+                    if operations
+                    else []
+                ),
+                "selectedTaskOperations": (
+                    self._wire_preference_operations(
+                        validated_pending["selectedTaskOperations"],
+                        "Pending selected-task operation is corrupted.",
+                    )
+                    if operations
+                    else []
                 ),
             }
             if (
@@ -2090,6 +2375,7 @@ class Store:
                 "taskOperations": "task operations",
                 "durationOperations": "duration operations",
                 "autoStartOperations": "auto-start operations",
+                "selectedTaskOperations": "selected-task operations",
             }
             for key, items in outbound.items():
                 if len(items) > RESOLUTION_OPERATION_MAX:
@@ -2121,6 +2407,9 @@ class Store:
                 ],
                 "autoStartOperations": [
                     item["id"] for item in validated_pending["autoStartOperations"]
+                ],
+                "selectedTaskOperations": [
+                    item["id"] for item in validated_pending["selectedTaskOperations"]
                 ],
             }
             self._set_meta(
@@ -2213,6 +2502,24 @@ class Store:
             "operationId",
             "auto-start",
         )
+        selected_task_operations = request.get("selectedTaskOperations", [])
+        has_selected_task_response = (
+            "selectedTaskAcknowledgements" in response and "selectedTaskId" in response
+        )
+        if (
+            ("selectedTaskAcknowledgements" in response)
+            != ("selectedTaskId" in response)
+            or selected_task_operations and not has_selected_task_response
+        ):
+            raise ValueError(
+                "Server response omitted canonical fields: selected-task state."
+            )
+        selected_task_acknowledgements = self._validate_acknowledgements(
+            selected_task_operations,
+            response.get("selectedTaskAcknowledgements", []),
+            "operationId",
+            "selected-task",
+        )
         canonical_durations = self._canonical_durations(response["durationsMs"])
         auto_start_breaks = response["autoStartBreaks"]
         if not isinstance(auto_start_breaks, bool):
@@ -2252,6 +2559,26 @@ class Store:
             task_ids.append(task_id)
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("Server returned duplicate tasks.")
+        if has_selected_task_response:
+            selected_task_id = response["selectedTaskId"]
+        else:
+            previous_selected_task_id = self.get_meta("snapshot", {}).get(
+                "selectedTaskId"
+            )
+            selected_task_id = (
+                previous_selected_task_id
+                if previous_selected_task_id in task_ids
+                else None
+            )
+        if (
+            selected_task_id is not None
+            and (
+                not isinstance(selected_task_id, str)
+                or not selected_task_id
+                or selected_task_id not in task_ids
+            )
+        ):
+            raise ValueError("Server returned an invalid selected-task preference.")
         canonical_timer = response["canonicalTimer"]
         if canonical_timer is not None and not self._valid_canonical_timer(
             canonical_timer
@@ -2284,12 +2611,14 @@ class Store:
             "taskAcknowledgements": task_acknowledgements,
             "durationAcknowledgements": duration_acknowledgements,
             "autoStartAcknowledgements": auto_start_acknowledgements,
+            "selectedTaskAcknowledgements": selected_task_acknowledgements,
             "revision": revision,
             "canonicalTimer": canonical_timer,
             "history": history,
             "tasks": tasks,
             "durationsMs": canonical_durations,
             "autoStartBreaks": auto_start_breaks,
+            "selectedTaskId": selected_task_id,
             "serverTime": server_time,
             "serverTimeMs": server_time_ms,
             "serverHlcWallMs": server_hlc_wall_ms,
@@ -2586,7 +2915,10 @@ class Store:
                 self._drop_auto_break_start(source_id)
                 continue
 
-            phase = next_break_phase(canonical["history"])
+            phase = next_break_phase(
+                canonical["history"],
+                completion.get("completedAt") or completion.get("endedAt"),
+            )
             provisional_phase = self._transform_auto_break_chain(
                 source_id,
                 str(dependency["start_command_id"]),
@@ -2697,6 +3029,11 @@ class Store:
                 "DELETE FROM pending_auto_start_operations WHERE id = ?",
                 "operationId",
             ),
+            (
+                "selectedTaskAcknowledgements",
+                "DELETE FROM pending_selected_task_operations WHERE id = ?",
+                "operationId",
+            ),
         )
         for response_key, delete_statement, id_key in groups:
             for acknowledgement in canonical[response_key]:
@@ -2735,6 +3072,7 @@ class Store:
                 pending["taskOperations"],
                 pending["durationOperations"],
                 pending["autoStartOperations"],
+                pending["selectedTaskOperations"],
             )
             for operation in domain
             if operation["hlcWallMs"] > 0
@@ -2815,18 +3153,32 @@ class Store:
                     operation["id"],
                 ),
             ),
+            "selectedTaskOperations": rebase_domain(
+                [
+                    operation
+                    for operation in pending["selectedTaskOperations"]
+                    if operation["hlcWallMs"] > 0
+                ],
+                lambda operation: (
+                    operation["hlcWallMs"],
+                    operation["hlcCounter"],
+                    operation["id"],
+                ),
+            ),
         }
         tables = {
             "commands": "pending_commands",
             "taskOperations": "pending_task_operations",
             "durationOperations": "pending_duration_operations",
             "autoStartOperations": "pending_auto_start_operations",
+            "selectedTaskOperations": "pending_selected_task_operations",
         }
         operations_by_domain = {
             "commands": pending["commands"],
             "taskOperations": pending["taskOperations"],
             "durationOperations": pending["durationOperations"],
             "autoStartOperations": pending["autoStartOperations"],
+            "selectedTaskOperations": pending["selectedTaskOperations"],
         }
         for domain, domain_replacements in replacements.items():
             if not domain_replacements:
@@ -2867,6 +3219,10 @@ class Store:
                 "autoStartOperations",
                 "DELETE FROM pending_auto_start_operations WHERE id = ?",
             ),
+            (
+                "selectedTaskOperations",
+                "DELETE FROM pending_selected_task_operations WHERE id = ?",
+            ),
         )
         for key, statement in groups:
             if key not in queue_ids:
@@ -2902,6 +3258,7 @@ class Store:
                 pending["taskOperations"],
                 pending["durationOperations"],
                 pending["autoStartOperations"],
+                pending["selectedTaskOperations"],
             )
             for operation in operations
             if operation["hlcWallMs"] > 0
@@ -2933,6 +3290,10 @@ class Store:
         settings["autoStartBreaks"] = project_auto_start_breaks(
             canonical["autoStartBreaks"], self._pending_auto_start_operations()
         )
+        settings["selectedTaskId"] = canonical["selectedTaskId"]
+        pending_selected_tasks = self._pending_selected_task_operations()
+        if pending_selected_tasks:
+            settings["selectedTaskId"] = pending_selected_tasks[-1]["taskId"]
         self._set_meta("settings", settings)
 
         previous = self.get_meta("snapshot", {})
@@ -2960,6 +3321,7 @@ class Store:
                     key=lambda item: (item["title"].casefold(), item["id"]),
                 ),
                 "autoStartBreaks": canonical["autoStartBreaks"],
+                "selectedTaskId": canonical["selectedTaskId"],
                 "user": user,
             },
         )
@@ -3082,6 +3444,8 @@ class Store:
             self._rebase_retained_operations(canonical, trusted_response_ms)
             if strategy == "keep_remote" and "autoStartOperations" not in queue_ids:
                 self.connection.execute("DELETE FROM pending_auto_start_operations")
+            if strategy == "keep_remote" and "selectedTaskOperations" not in queue_ids:
+                self.connection.execute("DELETE FROM pending_selected_task_operations")
             if strategy == "keep_remote":
                 self.connection.execute("DELETE FROM pending_auto_breaks")
                 self.connection.execute("DELETE FROM pending_auto_break_starts")
@@ -3140,6 +3504,7 @@ class Store:
             ("pending_task_operations", ("id", "payload")),
             ("pending_duration_operations", ("id", "phase", "payload")),
             ("pending_auto_start_operations", ("id", "payload")),
+            ("pending_selected_task_operations", ("id", "payload")),
             (
                 "pending_auto_breaks",
                 ("finish_command_id", "timer_id", "finish_device_sequence"),
@@ -3189,6 +3554,7 @@ class Store:
             "pending_task_operations": ("id", "payload"),
             "pending_duration_operations": ("id", "phase", "payload"),
             "pending_auto_start_operations": ("id", "payload"),
+            "pending_selected_task_operations": ("id", "payload"),
             "pending_auto_breaks": (
                 "finish_command_id",
                 "timer_id",
@@ -3333,6 +3699,7 @@ class Store:
                     key=lambda item: (item["title"].encode(), item["id"].encode()),
                 ),
                 "autoStartBreaks": genesis["autoStartBreaks"],
+                "selectedTaskId": settings["selectedTaskId"],
                 "user": None,
             },
             hlc={"wallMs": genesis["hlcWallMs"], "counter": genesis["hlcCounter"]},
@@ -3751,6 +4118,7 @@ class Store:
                     key=lambda item: (item["title"].encode(), item["id"].encode()),
                 ),
                 "autoStartBreaks": projection["autoStartBreaks"],
+                "selectedTaskId": settings["selectedTaskId"],
                 "user": None,
             },
             hlc={"wallMs": projection["hlcWallMs"], "counter": projection["hlcCounter"]},
@@ -3764,6 +4132,7 @@ class Store:
             "pending_task_operations",
             "pending_duration_operations",
             "pending_auto_start_operations",
+            "pending_selected_task_operations",
             "pending_auto_break_starts",
             "pending_phase_advances",
         ):
@@ -3934,7 +4303,7 @@ class Store:
                 and projection["autoStartBreaks"]
             ):
                 settings = self._normalize_settings(self.get_meta("settings", {}))
-                phase = next_break_phase(projection["history"])
+                phase = next_break_phase(projection["history"], timer.get("anchorAt"))
                 trusted_ms, sequences, clocks = self._reserve_generation(
                     now_ms, sequence_count=1, clock_count=1, use_server_clock=False
                 )
@@ -4477,7 +4846,9 @@ class Store:
                 if completion is None:
                     continue
 
-                phase = next_break_phase(history)
+                phase = next_break_phase(
+                    history, completion.get("completedAt") or completion.get("endedAt")
+                )
                 settings["selectedPhase"] = phase
                 self._set_meta("settings", settings)
                 command_id = self._reserve_uuid7_ids(clocks[0][0], 1)[0]
@@ -4518,6 +4889,7 @@ class Store:
             self.connection.execute("DELETE FROM pending_task_operations")
             self.connection.execute("DELETE FROM pending_duration_operations")
             self.connection.execute("DELETE FROM pending_auto_start_operations")
+            self.connection.execute("DELETE FROM pending_selected_task_operations")
             self.connection.execute("DELETE FROM pending_auto_breaks")
             self.connection.execute("DELETE FROM pending_auto_break_starts")
             self.connection.execute("DELETE FROM pending_phase_advances")
@@ -4546,6 +4918,7 @@ class Store:
                     "tasks": [],
                     "knownTasks": [],
                     "autoStartBreaks": False,
+                    "selectedTaskId": None,
                     "user": None,
                 },
             )

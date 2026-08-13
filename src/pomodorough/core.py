@@ -180,6 +180,37 @@ def task_summaries_today(
     return summaries
 
 
+def completed_focus_count_for_day(
+    history: list[dict[str, Any]], now: datetime | str | None = None
+) -> int:
+    if isinstance(now, str):
+        try:
+            reference = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+    else:
+        reference = now or datetime.now().astimezone()
+    local_day = reference.astimezone().date()
+    count = 0
+    for item in history:
+        if item.get("phase") != "focus" or item.get("status") != "completed":
+            continue
+        completed_at = item.get("completedAt") or item.get("endedAt")
+        try:
+            completed_day = datetime.fromisoformat(
+                str(completed_at).replace("Z", "+00:00")
+            ).astimezone().date()
+        except (TypeError, ValueError):
+            continue
+        if completed_day == local_day:
+            count += 1
+    return count
+
+
+def long_break_progress(completed_focus_count: int) -> int:
+    return ((completed_focus_count - 1) % 4) + 1 if completed_focus_count > 0 else 0
+
+
 def parse_timestamp_ms(value: str | None) -> int | None:
     if not value or _RFC3339_OFFSET.fullmatch(value) is None:
         return None
@@ -420,10 +451,8 @@ def format_remaining(duration_ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
-def next_break_phase(history: list[dict[str, Any]]) -> str:
-    completed_focus = sum(
-        1
-        for item in history
-        if item.get("phase") == "focus" and item.get("status") == "completed"
-    )
+def next_break_phase(
+    history: list[dict[str, Any]], now: datetime | str | None = None
+) -> str:
+    completed_focus = completed_focus_count_for_day(history, now)
     return "long_break" if completed_focus > 0 and completed_focus % 4 == 0 else "short_break"

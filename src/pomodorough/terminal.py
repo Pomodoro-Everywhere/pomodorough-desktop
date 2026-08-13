@@ -75,18 +75,6 @@ class LocalTimer:
         }
         for task in self.tasks:
             self.known_tasks[task["id"]] = task
-        selected_task_id = self.settings.get("selectedTaskId")
-        if selected_task_id and not any(
-            task["id"] == selected_task_id for task in self.tasks
-        ):
-            self.settings["selectedTaskId"] = None
-            if not self.resolution_pending:
-                try:
-                    self.store.set_selected_task_id(None)
-                except ValueError:
-                    self.resolution_pending = (
-                        self.store.pending_resolution() is not None
-                    )
         self.timer, self.history = rebuild_optimistic(
             projection_snapshot.get("canonicalTimer"),
             projection_snapshot.get("history", []),
@@ -211,17 +199,29 @@ class LocalTimer:
             )
             self.settings["selectedPhase"] = selected_phase
 
-        command = self._store_action(
-            lambda: self.store.queue_command(
-                command_type,
-                self.timer,
-                selected_phase,
-                durations_ms,
-                self.settings.get("selectedTaskId"),
-                now_ms=now_ms,
-                generate_auto_break=command_type == "finish",
+        if command_type == "cancel":
+            commands = self._store_action(
+                lambda: self.store.queue_cancel_and_clear(
+                    self.timer,
+                    selected_phase,
+                    durations_ms,
+                    self.settings.get("selectedTaskId"),
+                    now_ms=now_ms,
+                )
             )
-        )
+            command = commands[-1]
+        else:
+            command = self._store_action(
+                lambda: self.store.queue_command(
+                    command_type,
+                    self.timer,
+                    selected_phase,
+                    durations_ms,
+                    self.settings.get("selectedTaskId"),
+                    now_ms=now_ms,
+                    generate_auto_break=command_type == "finish",
+                )
+            )
         self.reload()
         return command
 

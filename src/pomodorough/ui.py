@@ -54,9 +54,11 @@ from .core import (
     ACTIVE_STATUSES,
     PHASES,
     TERMINAL_STATUSES,
+    completed_focus_count_for_day,
     elapsed_ms,
     empty_timer,
     format_remaining,
+    long_break_progress,
     rebuild_optimistic,
     rebuild_tasks,
     task_from_title,
@@ -196,6 +198,10 @@ class MainWindow(QMainWindow):
         self._iroh_join_pending = False
         self.quitting = False
         self._notified_timer_id: str | None = None
+        self._sound_active = False
+        self.sound_timer = QTimer(self)
+        self.sound_timer.setInterval(1_200)
+        self.sound_timer.timeout.connect(QApplication.beep)
         self._auto_finish_in_progress = False
         self._auto_break_not_before = 0.0
         self._tray_progress_state: tuple[bool, int] | None = None
@@ -242,10 +248,9 @@ class MainWindow(QMainWindow):
             self.store.load_with_provisional_auto_breaks()
         )
         try:
-            pending_resolution = self.store.pending_resolution()
+            self.store.pending_resolution()
             self._resolution_corruption = None
         except ValueError as error:
-            pending_resolution = None
             self._resolution_corruption = str(error)
         self.settings = state["settings"]
         self.revision = int(state["snapshot"].get("revision", 0))
@@ -268,6 +273,15 @@ class MainWindow(QMainWindow):
             self.base_history,
             state.get("projectionPending", self.pending),
         )
+        if (
+            self._sound_active
+            and previous_timer
+            and self.timer
+            and previous_timer.get("id") != self.timer.get("id")
+            and previous_timer.get("status") in TERMINAL_STATUSES
+            and self.timer.get("status") in ACTIVE_STATUSES
+        ):
+            self._stop_sound()
         self.provisional_auto_break_timer_ids = (
             provisional_timer_ids if self.user is not None else set()
         )
@@ -285,11 +299,6 @@ class MainWindow(QMainWindow):
         self.tasks = rebuild_tasks(self.base_tasks, self.pending_tasks)
         for task in self.tasks:
             self.known_tasks[task["id"]] = task
-        selected_task_id = self.settings.get("selectedTaskId")
-        if selected_task_id and not any(task["id"] == selected_task_id for task in self.tasks):
-            self.settings["selectedTaskId"] = None
-            if pending_resolution is None and self._resolution_corruption is None:
-                self.store.set_selected_task_id(None)
         self._task_selector_signature = None
         self._task_render_signature = None
         if hasattr(self, "duration_spins"):
@@ -358,7 +367,7 @@ class MainWindow(QMainWindow):
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.setCheckable(True)
         self.settings_button.setMinimumSize(40, 40)
-        self.settings_button.setIconSize(QSize(20, 20))
+        self.settings_button.setIconSize(QSize(28, 28))
         settings_icon = QIcon.fromTheme("settings-configure")
         if settings_icon.isNull():
             self.settings_button.setText("⚙")
@@ -388,6 +397,11 @@ class MainWindow(QMainWindow):
         self.left_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom)
         self.clock = ClockWidget()
         self.left_layout.addWidget(self.clock, 1)
+        self.long_break_progress = QLabel("○○○○")
+        self.long_break_progress.setObjectName("microLabel")
+        self.long_break_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.long_break_progress.setAccessibleName("Pomodoro progress")
+        self.left_layout.addWidget(self.long_break_progress)
 
         self.actions_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self.actions_layout.setSpacing(8)
@@ -413,10 +427,14 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("CANCEL")
         self.cancel_button.setObjectName("dangerButton")
         self.cancel_button.clicked.connect(lambda: self._issue("cancel"))
+        self.stop_sound_button = QPushButton("STOP SOUND")
+        self.stop_sound_button.clicked.connect(self._stop_sound_and_clear)
+        self.stop_sound_button.setVisible(False)
         self.actions_layout.addWidget(self.task_selector_panel)
         self.actions_layout.addWidget(self.primary_button, 1)
         self.actions_layout.addWidget(self.finish_button, 1)
         self.actions_layout.addWidget(self.cancel_button, 1)
+        self.actions_layout.addWidget(self.stop_sound_button, 1)
         self.left_layout.addLayout(self.actions_layout)
         self.content_layout.addLayout(self.left_layout, 3)
 
@@ -758,22 +776,23 @@ class MainWindow(QMainWindow):
 
     def _build_tray(self) -> None:
         self.tray: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(self.app_icon, self)
         self.tray.setToolTip("Pomodorough")
-        menu = QMenu()
+        self.tray_menu = QMenu(self)
         show_action = QAction("Show Pomodorough", self)
         show_action.triggered.connect(self._show_window)
         self.tray_primary = QAction("Start", self)
         self.tray_primary.triggered.connect(self._primary_action)
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self._quit)
-        menu.addAction(show_action)
-        menu.addAction(self.tray_primary)
-        menu.addSeparator()
-        menu.addAction(quit_action)
-        self.tray.setContextMenu(menu)
+        self.tray_menu.addAction(show_action)
+        self.tray_menu.addAction(self.tray_primary)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(quit_action)
+        self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(
             lambda reason: self._show_window()
             if reason == QSystemTrayIcon.ActivationReason.Trigger
@@ -1134,6 +1153,14 @@ class MainWindow(QMainWindow):
             status_labels.get(status, status),
             elapsed / planned,
         )
+        focus_count = completed_focus_count_for_day(self.history)
+        break_progress = long_break_progress(focus_count)
+        self.long_break_progress.setText(
+            "●" * break_progress + "○" * (4 - break_progress)
+        )
+        self.long_break_progress.setAccessibleDescription(
+            f"{break_progress} of 4 pomodoros completed today"
+        )
         self._render_network()
         active = status in ACTIVE_STATUSES
         self._render_task_selector(timer, active)
@@ -1146,6 +1173,8 @@ class MainWindow(QMainWindow):
         )
         self.finish_button.setEnabled(mutations_enabled and active)
         self.cancel_button.setEnabled(mutations_enabled and active)
+        self.stop_sound_button.setVisible(self._sound_active)
+        self.stop_sound_button.setEnabled(self._sound_active)
         for spin in self.duration_spins.values():
             spin.setEnabled(mutations_enabled)
         for phase, button in self.phase_buttons.items():
@@ -1384,13 +1413,21 @@ class MainWindow(QMainWindow):
             self._auto_finish_in_progress = False
             return
         try:
-            self.store.queue_command(
-                command_type,
-                self.timer,
-                self._selected_phase(),
-                self.settings["durationsMs"],
-                self.settings.get("selectedTaskId"),
-            )
+            if command_type == "cancel":
+                self.store.queue_cancel_and_clear(
+                    self.timer,
+                    self._selected_phase(),
+                    self.settings["durationsMs"],
+                    self.settings.get("selectedTaskId"),
+                )
+            else:
+                self.store.queue_command(
+                    command_type,
+                    self.timer,
+                    self._selected_phase(),
+                    self.settings["durationsMs"],
+                    self.settings.get("selectedTaskId"),
+                )
         except (OSError, ValueError) as error:
             self._auto_finish_in_progress = False
             self.notice.emit(str(error))
@@ -1462,9 +1499,18 @@ class MainWindow(QMainWindow):
         task_id = self.task_combo.itemData(index)
         if task_id and not any(task["id"] == task_id for task in self.tasks):
             task_id = None
-        self.settings["selectedTaskId"] = task_id
-        self.store.set_selected_task_id(task_id)
+        try:
+            self.store.set_selected_task_id(task_id)
+        except (OSError, ValueError) as error:
+            self._load_state()
+            self._task_selector_signature = None
+            self._render()
+            self.notice.emit(str(error))
+            return
+        self._load_state()
         self._task_selector_signature = None
+        self._render()
+        self._sync()
 
     def _add_task(self) -> None:
         if self._mutation_blocked():
@@ -1575,6 +1621,7 @@ class MainWindow(QMainWindow):
             or payload["taskOperations"]
             or payload["durationOperations"]
             or payload["autoStartOperations"]
+            or payload["selectedTaskOperations"]
         )
         if has_pending:
             self._set_account_state(False)
@@ -2031,8 +2078,24 @@ class MainWindow(QMainWindow):
 
     def _notify(self, title: str, message: str) -> None:
         QApplication.beep()
+        self._sound_active = True
+        self.sound_timer.start()
+        self.stop_sound_button.setVisible(True)
+        self.stop_sound_button.setEnabled(True)
         if self.tray:
             self.tray.showMessage(title, message, self.app_icon, 7000)
+
+    def _stop_sound(self) -> None:
+        self.sound_timer.stop()
+        self._sound_active = False
+        self.stop_sound_button.setVisible(False)
+        self.stop_sound_button.setEnabled(False)
+
+    def _stop_sound_and_clear(self) -> None:
+        status = self._current_timer().get("status")
+        self._stop_sound()
+        if status in TERMINAL_STATUSES:
+            self._issue("clear")
 
     def _show_window(self) -> None:
         self.show()
@@ -2040,6 +2103,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit(self) -> None:
+        self._stop_sound()
         self.quitting = True
         QApplication.quit()
 
@@ -2054,6 +2118,7 @@ class MainWindow(QMainWindow):
                 3500,
             )
         else:
+            self._stop_sound()
             event.accept()
 
     @staticmethod
@@ -2066,20 +2131,22 @@ class MainWindow(QMainWindow):
         QFrame#ticket { background: palette(base); color: palette(text); border: 3px solid palette(highlight); }
         QLabel#sectionTitle { color: palette(text); font-family: "DejaVu Sans Condensed"; font-size: 14px; font-weight: 900; letter-spacing: 1px; }
         QLabel#countBadge { background: palette(highlight); color: palette(highlighted-text); border: 2px solid palette(mid); padding: 2px 8px; font-weight: bold; }
-        QPushButton { min-height: 29px; background: palette(button); color: palette(button-text); border: 2px solid palette(mid); padding: 3px 7px; font-weight: 800; }
+        QPushButton { min-height: 29px; background: palette(button); color: palette(text); border: 2px solid palette(text); padding: 3px 7px; font-weight: 800; }
         QPushButton:hover { border-color: palette(highlight); }
         QPushButton:pressed { padding-top: 5px; padding-left: 9px; }
         QPushButton:focus { border: 3px solid palette(highlight); }
-        QPushButton:disabled { color: palette(mid); border-color: palette(mid); background: palette(button); }
+        QPushButton:disabled { color: palette(text); border-color: palette(text); background: palette(button); }
         QPushButton#primaryButton { background: palette(highlight); color: palette(highlighted-text); min-height: 36px; font-size: 14px; }
         QPushButton#accountButton { border-color: palette(highlight); min-width: 72px; max-width: 150px; }
         QPushButton#accountButton[authenticated="true"] { min-width: 36px; max-width: 36px; min-height: 36px; max-height: 36px; padding: 0; }
         QPushButton[phase="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
         QPushButton[screen="true"] { min-width: 64px; font-family: "DejaVu Sans Condensed"; letter-spacing: 1px; }
         QPushButton[screen="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
+        QToolButton#settingsButton { font-size: 24px; }
         QFrame#taskSelector { background: palette(base); border: 2px solid palette(mid); }
         QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
-        QLabel#microLabel, QLabel#taskSubtitle { color: palette(mid); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
+        QLabel#microLabel { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
+        QLabel#taskSubtitle { color: palette(mid); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QLabel#emptyState { color: palette(mid); padding: 24px; }
         QComboBox, QLineEdit, QPlainTextEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 6px; }
         QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid palette(highlight); }

@@ -87,6 +87,24 @@ class IrohStorageTests(unittest.TestCase):
         self.assertEqual(self.store.replication_mode, "iroh")
         self.assertEqual(self.store.iroh_room(room_id)["operationCount"], 2)
 
+    def test_selected_task_remains_local_in_iroh_mode(self) -> None:
+        room_id = self.store.create_iroh_room(bytes(range(32)))
+
+        self.assertIsNone(
+            self.store.set_selected_task_id("local-room-task", now_ms=1_000)
+        )
+
+        loaded = self.store.load()
+        self.assertEqual(loaded["settings"]["selectedTaskId"], "local-room-task")
+        self.assertEqual(loaded["pendingSelectedTasks"], [])
+        self.assertEqual(self.store.iroh_room(room_id)["operationCount"], 1)
+        inventory, cursor = self.store.iroh_inventory(room_id, None, 1_024)
+        self.assertIsNone(cursor)
+        self.assertNotIn(
+            "selectedTask",
+            {item["domain"] for item in inventory},
+        )
+
     def test_remote_batch_is_atomic_idempotent_and_conflicts_stop_room(self) -> None:
         room_id = self.store.create_iroh_room(bytes(range(32)))
         first = self._duration_record("operation-1", 1_800_000)

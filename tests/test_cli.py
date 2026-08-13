@@ -53,6 +53,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("Cannot finish timer while it is idle", error)
 
+    def test_cancel_resets_timer_and_preserves_cancelled_history(self) -> None:
+        self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
+
+        result, output, error = self.invoke("cancel")
+
+        self.assertEqual(result, 0)
+        self.assertIn("Focus | idle", output)
+        self.assertEqual(error, "")
+        stored = self.store.load()
+        timer, history = rebuild_optimistic(
+            stored["snapshot"].get("canonicalTimer"),
+            stored["snapshot"].get("history", []),
+            stored["pending"],
+        )
+        self.assertIsNone(timer)
+        self.assertEqual([item["status"] for item in history], ["cancelled"])
+        self.assertEqual(
+            [command["type"] for command in stored["pending"]],
+            ["start", "cancel", "clear"],
+        )
+
     def test_empty_history_text_and_json(self) -> None:
         result, output, error = self.invoke("history")
         self.assertEqual((result, output, error), (0, "No completed timers.\n", ""))
@@ -133,9 +154,9 @@ class CliTests(unittest.TestCase):
     def test_status_prints_task_and_pending_operation_counts(self) -> None:
         task = task_from_title("Prepare release")
         self.store.queue_task_operation("upsert", task, now_ms=1)
-        self.store.set_selected_task_id(task["id"])
-        self.store.queue_duration_operation("focus", 2 * 60_000, now_ms=2)
-        self.store.set_auto_start_breaks(True, now_ms=3)
+        self.store.set_selected_task_id(task["id"], now_ms=2)
+        self.store.queue_duration_operation("focus", 2 * 60_000, now_ms=3)
+        self.store.set_auto_start_breaks(True, now_ms=4)
         result, _output, error = self.invoke("start", "focus")
         self.assertEqual(result, 0)
         self.assertEqual(error, "")

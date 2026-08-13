@@ -128,22 +128,28 @@ class LocalTimerTests(unittest.TestCase):
             ["start", "finish", "start"],
         )
 
-    def test_cancelled_timer_resets_display(self) -> None:
+    def test_cancel_resets_timer_and_preserves_cancelled_history(self) -> None:
         self.timer.issue("start", minutes=1, now_ms=1_000)
         self.timer.issue("pause", now_ms=31_000)
         self.timer.issue("cancel", now_ms=31_000)
 
         state = self.timer.state(now_ms=31_000)
 
-        self.assertEqual(state["status"], "cancelled")
+        self.assertEqual(state["status"], "idle")
+        self.assertIsNone(state["timerId"])
         self.assertEqual(state["elapsedMs"], 0)
-        self.assertEqual(state["remaining"], "01:00")
+        self.assertEqual(state["remaining"], "25:00")
         self.assertEqual(state["progress"], 0)
+        self.assertEqual([item["status"] for item in self.timer.history], ["cancelled"])
+        self.assertEqual(
+            [command["type"] for command in self.store.load()["pending"]],
+            ["start", "pause", "cancel", "clear"],
+        )
 
     def test_focus_start_keeps_selected_task(self) -> None:
         task = task_from_title("Write release notes")
         self.store.queue_task_operation("upsert", task, now_ms=500)
-        self.store.set_selected_task_id(task["id"])
+        self.store.set_selected_task_id(task["id"], now_ms=501)
 
         self.timer.issue("start", now_ms=1_000)
 
@@ -192,19 +198,26 @@ class LocalTimerTests(unittest.TestCase):
         self.assertTrue(state["historyResolutionPending"])
         self.assertEqual(len(self.store.load()["pending"]), 1)
 
-    def test_pending_resolution_status_skips_stale_selection_cleanup(self) -> None:
+    def test_pending_resolution_status_preserves_unavailable_selection(self) -> None:
         task = task_from_title("Pending selection")
         self.store.queue_task_operation("upsert", task, now_ms=1)
-        self.store.set_selected_task_id(task["id"])
-        self.store.queue_task_operation("delete", task, now_ms=2)
+        self.store.set_selected_task_id(task["id"], now_ms=2)
+        self.store.queue_task_operation("delete", task, now_ms=3)
         self.store.prepare_resolution({"id": "user-1"}, 4, "merge")
 
         state = self.timer.state()
 
         self.assertTrue(state["historyResolutionPending"])
-        self.assertIsNone(self.timer.settings["selectedTaskId"])
+        self.assertEqual(self.timer.settings["selectedTaskId"], task["id"])
         self.assertEqual(
             self.store.load()["settings"]["selectedTaskId"], task["id"]
+        )
+        self.assertEqual(
+            [
+                operation["taskId"]
+                for operation in self.store.load()["pendingSelectedTasks"]
+            ],
+            [task["id"]],
         )
 
     def test_tui_duration_adjustment_queues_compacted_preference(self) -> None:

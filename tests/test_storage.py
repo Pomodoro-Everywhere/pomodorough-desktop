@@ -47,14 +47,16 @@ class StorageTests(unittest.TestCase):
         self.temporary.cleanup()
 
     @staticmethod
-    def _history_item(item_id: str) -> dict[str, object]:
+    def _history_item(
+        item_id: str, completed_at: str = "2026-07-22T10:00:00.000Z"
+    ) -> dict[str, object]:
         return {
             "id": item_id,
             "timerId": f"timer-{item_id}",
             "phase": "focus",
             "status": "completed",
             "plannedDurationMs": 25 * 60_000,
-            "completedAt": "2026-07-22T10:00:00.000Z",
+            "completedAt": completed_at,
         }
 
     @staticmethod
@@ -66,6 +68,18 @@ class StorageTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _wire_preference_operation(
+        operation: dict[str, object],
+    ) -> dict[str, object]:
+        return {key: value for key, value in operation.items() if key != "deviceId"}
+
+    @classmethod
+    def _wire_preference_operations(
+        cls, operations: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        return [cls._wire_preference_operation(operation) for operation in operations]
+
+    @staticmethod
     def _canonical_response(
         request: dict[str, object],
         *,
@@ -73,6 +87,7 @@ class StorageTests(unittest.TestCase):
         history: list[dict[str, object]] | None = None,
         tasks: list[dict[str, str]] | None = None,
         auto_start_breaks: bool | None = None,
+        selected_task_id: str | None = None,
     ) -> dict[str, object]:
         auto_start_operations = request.get("autoStartOperations", [])
         if auto_start_breaks is None:
@@ -89,6 +104,7 @@ class StorageTests(unittest.TestCase):
                     "taskOperations",
                     "durationOperations",
                     "autoStartOperations",
+                    "selectedTaskOperations",
                 )
                 for item in request.get(key, [])
                 if item.get("hlcWallMs", 0) > 0
@@ -112,6 +128,10 @@ class StorageTests(unittest.TestCase):
                 {"operationId": item["id"], "outcome": "applied", "reason": ""}
                 for item in auto_start_operations
             ],
+            "selectedTaskAcknowledgements": [
+                {"operationId": item["id"], "outcome": "applied", "reason": ""}
+                for item in request.get("selectedTaskOperations", [])
+            ],
             "revision": revision,
             "canonicalTimer": None,
             "history": history or [],
@@ -122,6 +142,7 @@ class StorageTests(unittest.TestCase):
                 "long_break": 15 * 60_000,
             },
             "autoStartBreaks": auto_start_breaks,
+            "selectedTaskId": selected_task_id,
             "serverTime": utc_timestamp(wall_ms),
             "serverHlcWallMs": wall_ms,
             "serverHlcCounter": 0,
@@ -285,6 +306,7 @@ class StorageTests(unittest.TestCase):
                 "taskOperations",
                 "durationOperations",
                 "autoStartOperations",
+                "selectedTaskOperations",
             },
         )
         self.assertEqual(request["taskOperations"], [operation])
@@ -627,9 +649,9 @@ class StorageTests(unittest.TestCase):
                 self.store.set_auto_start_breaks(True)
                 request = self.store.prepare_resolution(user, 4, strategy)
                 expected_counts = (
-                    (0, 0, 0, 0)
+                    (0, 0, 0, 0, 0)
                     if strategy == "keep_remote"
-                    else (2, 1, 1, 1)
+                    else (2, 1, 1, 1, 0)
                 )
                 self.assertEqual(
                     (
@@ -637,6 +659,7 @@ class StorageTests(unittest.TestCase):
                         len(request["taskOperations"]),
                         len(request["durationOperations"]),
                         len(request["autoStartOperations"]),
+                        len(request["selectedTaskOperations"]),
                     ),
                     expected_counts,
                 )
@@ -679,12 +702,14 @@ class StorageTests(unittest.TestCase):
                             "tasks": tasks,
                             "knownTasks": known_tasks,
                             "autoStartBreaks": strategy != "keep_remote",
+                            "selectedTaskId": None,
                             "user": user,
                         },
                         "pending": [],
                         "pendingTasks": [],
                         "pendingDurations": [],
                         "pendingAutoStarts": [],
+                        "pendingSelectedTasks": [],
                         "pendingResolution": None,
                     },
                 )
@@ -719,6 +744,7 @@ class StorageTests(unittest.TestCase):
                         "taskOperations": [old_task["id"]],
                         "durationOperations": [old_duration["id"]],
                         "autoStartOperations": [],
+                        "selectedTaskOperations": [],
                     },
                 )
 
@@ -1168,6 +1194,178 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(loaded["snapshot"]["tasks"], [task])
         self.assertEqual(loaded["snapshot"]["knownTasks"], [task])
 
+    def test_selected_task_syncs_task_null_and_remote_pull(self) -> None:
+        first = task_from_title("First focus task")
+        second = task_from_title("Second focus task")
+        for task, now_ms in ((first, 1_000), (second, 1_001)):
+            self.store.queue_task_operation("upsert", task, now_ms=now_ms)
+        request = self.store.sync_payload()
+        self.store.apply_sync(
+            self._canonical_response(
+                request, revision=1, tasks=[first, second]
+            ),
+            request,
+        )
+
+        selected = self.store.set_selected_task_id(first["id"], now_ms=2_000)
+        request = self.store.sync_payload()
+        self.assertEqual(selected["deviceId"], self.store.device_id)
+        self.assertEqual(
+            request["selectedTaskOperations"],
+            self._wire_preference_operations([selected]),
+        )
+        self.store.apply_sync(
+            self._canonical_response(
+                request,
+                revision=2,
+                tasks=[first, second],
+                selected_task_id=first["id"],
+            ),
+            request,
+        )
+        loaded = self.store.load()
+        self.assertEqual(loaded["pendingSelectedTasks"], [])
+        self.assertEqual(loaded["settings"]["selectedTaskId"], first["id"])
+        self.assertEqual(loaded["snapshot"]["selectedTaskId"], first["id"])
+
+        cleared = self.store.set_selected_task_id(None, now_ms=3_000)
+        request = self.store.sync_payload()
+        self.assertEqual(
+            request["selectedTaskOperations"],
+            self._wire_preference_operations([cleared]),
+        )
+        self.store.apply_sync(
+            self._canonical_response(
+                request, revision=3, tasks=[first, second], selected_task_id=None
+            ),
+            request,
+        )
+        self.assertIsNone(self.store.load()["settings"]["selectedTaskId"])
+
+        pull = self.store.sync_payload()
+        self.store.apply_sync(
+            self._canonical_response(
+                pull,
+                revision=4,
+                tasks=[first, second],
+                selected_task_id=second["id"],
+            ),
+            pull,
+        )
+        self.assertEqual(self.store.load()["settings"]["selectedTaskId"], second["id"])
+
+    def test_selected_task_sync_replays_newer_in_flight_choice(self) -> None:
+        task = task_from_title("In-flight focus task")
+        self.store.queue_task_operation("upsert", task, now_ms=1_000)
+        task_request = self.store.sync_payload()
+        self.store.apply_sync(
+            self._canonical_response(task_request, revision=1, tasks=[task]),
+            task_request,
+        )
+        sent = self.store.set_selected_task_id(task["id"], now_ms=2_000)
+        request = self.store.sync_payload()
+        replacement = self.store.set_selected_task_id(None, now_ms=3_000)
+
+        self.store.apply_sync(
+            self._canonical_response(
+                request,
+                revision=2,
+                tasks=[task],
+                selected_task_id=task["id"],
+            ),
+            request,
+        )
+
+        loaded = self.store.load()
+        self.assertEqual(
+            request["selectedTaskOperations"],
+            self._wire_preference_operations([sent]),
+        )
+        self.assertEqual(loaded["pendingSelectedTasks"], [replacement])
+        self.assertIsNone(loaded["settings"]["selectedTaskId"])
+        self.assertEqual(loaded["snapshot"]["selectedTaskId"], task["id"])
+
+    def test_persisted_preference_claims_upgrade_to_wire_shape(self) -> None:
+        task = task_from_title("Persisted wire preference")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.set_selected_task_id(task["id"], now_ms=2)
+        self.store.set_auto_start_breaks(True, now_ms=3)
+        request = self.store.sync_payload()
+        local = self.store.load()
+        legacy_request = {
+            **request,
+            "autoStartOperations": local["pendingAutoStarts"],
+            "selectedTaskOperations": local["pendingSelectedTasks"],
+        }
+        self.store.set_meta("pendingSync", legacy_request)
+        self.store.close()
+
+        self.store = Store(self.path)
+        retry = self.store.sync_payload()
+        self.assertEqual(
+            retry["autoStartOperations"],
+            self._wire_preference_operations(local["pendingAutoStarts"]),
+        )
+        self.assertEqual(
+            retry["selectedTaskOperations"],
+            self._wire_preference_operations(local["pendingSelectedTasks"]),
+        )
+        self.assertEqual(self.store.get_meta("pendingSync"), retry)
+
+        self.store.set_meta("pendingSync", None)
+        user = {"id": "user-1"}
+        bootstrap_request = self.store.prepare_resolution(user, 0, "merge")
+        pending = self.store.pending_resolution(user["id"])
+        legacy_bootstrap_request = {
+            **bootstrap_request,
+            "autoStartOperations": local["pendingAutoStarts"],
+            "selectedTaskOperations": local["pendingSelectedTasks"],
+        }
+        self.store.set_meta(
+            "pendingResolution",
+            {**pending, "request": legacy_bootstrap_request},
+        )
+        self.store.close()
+
+        self.store = Store(self.path)
+        bootstrap_retry = self.store.prepare_resolution(user, 99, "keep_remote")
+        self.assertEqual(
+            bootstrap_retry["autoStartOperations"],
+            self._wire_preference_operations(local["pendingAutoStarts"]),
+        )
+        self.assertEqual(
+            bootstrap_retry["selectedTaskOperations"],
+            self._wire_preference_operations(local["pendingSelectedTasks"]),
+        )
+        self.assertEqual(
+            self.store.pending_resolution(user["id"])["request"], bootstrap_retry
+        )
+
+    def test_selected_task_response_validation_is_atomic(self) -> None:
+        task = task_from_title("Strict focus task")
+        operation = self.store.set_selected_task_id(task["id"], now_ms=1_000)
+        request = self.store.sync_payload()
+        response = self._canonical_response(
+            request,
+            revision=1,
+            tasks=[task],
+            selected_task_id=task["id"],
+        )
+        before = self.store.load()
+
+        malformed_ack = deepcopy(response)
+        malformed_ack["selectedTaskAcknowledgements"] = []
+        with self.assertRaisesRegex(ValueError, "selected-task acknowledgement"):
+            self.store.apply_sync(malformed_ack, request)
+        self.assertEqual(self.store.load(), before)
+
+        malformed_selection = deepcopy(response)
+        malformed_selection["selectedTaskId"] = "missing-task"
+        with self.assertRaisesRegex(ValueError, "selected-task preference"):
+            self.store.apply_sync(malformed_selection, request)
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(before["pendingSelectedTasks"], [operation])
+
     def test_task_delete_ack_removes_task_but_retains_known_title(self) -> None:
         task = task_from_title("Delete after release")
         upsert = self.store.queue_task_operation("upsert", task, now_ms=1)
@@ -1392,9 +1590,11 @@ class StorageTests(unittest.TestCase):
 
     def test_stale_general_settings_save_preserves_synced_preferences(self) -> None:
         stale = self.store.load()["settings"]
+        task = task_from_title("Concurrent selected task")
         other = Store(self.path)
         try:
             other.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
+            other.set_selected_task_id(task["id"], now_ms=1_001)
         finally:
             other.close()
 
@@ -1404,6 +1604,7 @@ class StorageTests(unittest.TestCase):
         settings = self.store.load()["settings"]
         self.assertEqual(settings["durationsMs"]["focus"], 30 * 60_000)
         self.assertFalse(settings["autoStartBreaks"])
+        self.assertEqual(settings["selectedTaskId"], task["id"])
 
     def test_sync_applies_canonical_then_replays_newer_in_flight_edit(self) -> None:
         sent = self.store.queue_duration_operation(
@@ -1866,7 +2067,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(sample["offsetMs"], -50)
         self.assertEqual(sample["uncertaintyMs"], 550)
 
-    def test_fresh_server_sample_cannot_regress_projected_trusted_time(self) -> None:
+    def test_fresh_server_sample_can_regress_projected_trusted_time(self) -> None:
         server_ms = 1_800_000_000_000
         first_request = self.store.sync_payload()
         first = self._canonical_response(first_request, revision=1)
@@ -1882,8 +2083,6 @@ class StorageTests(unittest.TestCase):
             request_monotonic_ms=10_000,
             received_monotonic_ms=10_100,
         )
-        before = self.store.load()
-        sample_before = self.store.get_meta("serverClockSample")
         second_request = self.store.sync_payload()
         second = self._canonical_response(second_request, revision=2)
         second.update(
@@ -1891,18 +2090,26 @@ class StorageTests(unittest.TestCase):
             serverHlcWallMs=server_ms + 500,
         )
 
-        with self.assertRaisesRegex(ValueError, "regress trusted time"):
-            self.store.apply_sync(
-                second,
-                second_request,
-                request_physical_ms=server_ms + 3_601_000,
-                received_physical_ms=server_ms + 3_601_100,
-                request_monotonic_ms=11_000,
-                received_monotonic_ms=11_100,
-            )
+        self.store.apply_sync(
+            second,
+            second_request,
+            request_physical_ms=server_ms + 3_601_000,
+            received_physical_ms=server_ms + 3_601_100,
+            request_monotonic_ms=11_000,
+            received_monotonic_ms=11_100,
+        )
 
-        self.assertEqual(self.store.load(), before)
-        self.assertEqual(self.store.get_meta("serverClockSample"), sample_before)
+        self.assertEqual(self.store.load()["snapshot"]["revision"], 2)
+        self.assertEqual(
+            self.store.get_meta("serverClockSample"),
+            {
+                "offsetMs": -3_600_550,
+                "uncertaintyMs": 50,
+                "acquiredPhysicalMs": server_ms + 3_601_100,
+                "acquiredMonotonicMs": 11_100,
+                "acquiredTrustedMs": server_ms + 550,
+            },
+        )
 
     def test_fresh_sample_preserves_running_timer_monotonic_continuity(self) -> None:
         physical_ms = 1_800_000_000_000
@@ -2007,6 +2214,65 @@ class StorageTests(unittest.TestCase):
                 "focus",
                 settings["durationsMs"],
                 now_ms=4_000,
+            )
+
+        self.assertEqual(self.store.load(), before)
+
+    def test_cancel_and_clear_is_atomic_ordered_and_restart_safe(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(None, [], [start])
+
+        commands = self.store.queue_cancel_and_clear(
+            running, "focus", settings["durationsMs"], now_ms=31_000
+        )
+
+        self.assertEqual([command["type"] for command in commands], ["cancel", "clear"])
+        self.assertEqual(
+            [command["deviceSequence"] for command in commands],
+            [start["deviceSequence"] + 1, start["deviceSequence"] + 2],
+        )
+        self.assertLess(
+            (commands[0]["hlcWallMs"], commands[0]["hlcCounter"]),
+            (commands[1]["hlcWallMs"], commands[1]["hlcCounter"]),
+        )
+        self.assertEqual(commands[0]["occurredAt"], commands[1]["occurredAt"])
+        self.assertEqual(commands[0]["observedElapsedMs"], 30_000)
+        self.assertEqual(commands[1]["observedElapsedMs"], 30_000)
+
+        reopened = Store(self.path)
+        try:
+            stored = reopened.load()
+            timer, history = rebuild_optimistic(
+                stored["snapshot"].get("canonicalTimer"),
+                stored["snapshot"].get("history", []),
+                stored["pending"],
+            )
+        finally:
+            reopened.close()
+        self.assertIsNone(timer)
+        self.assertEqual([item["status"] for item in history], ["cancelled"])
+        self.assertEqual(
+            [command["type"] for command in stored["pending"]],
+            ["start", "cancel", "clear"],
+        )
+
+    def test_cancel_and_clear_rejects_stale_projection_atomically(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(None, [], [start])
+        self.store.queue_command(
+            "pause", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        before = self.store.load()
+
+        with self.assertRaisesRegex(ValueError, "Timer changed"):
+            self.store.queue_cancel_and_clear(
+                running, "focus", settings["durationsMs"], now_ms=3_000
             )
 
         self.assertEqual(self.store.load(), before)
@@ -2399,7 +2665,10 @@ class StorageTests(unittest.TestCase):
             )
         payload = self.store.sync_payload()
         self.assertEqual(payload["durationOperations"], [duration])
-        self.assertEqual(payload["autoStartOperations"], [auto_start])
+        self.assertEqual(
+            payload["autoStartOperations"],
+            self._wire_preference_operations([auto_start]),
+        )
 
     def test_load_reads_one_snapshot_while_sync_commits(self) -> None:
         task = task_from_title("Atomic load")
@@ -2567,7 +2836,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(request["commands"], commands)
         self.assertEqual(request["taskOperations"], task_operations)
         self.assertEqual(request["durationOperations"], duration_operations)
-        self.assertEqual(request["autoStartOperations"], auto_start_operations)
+        self.assertEqual(
+            request["autoStartOperations"],
+            self._wire_preference_operations(auto_start_operations),
+        )
         response = self._canonical_response(request, revision=1)
         outcomes = ("applied", "ignored", "rejected")
         domains = (
@@ -2667,6 +2939,7 @@ class StorageTests(unittest.TestCase):
                 "taskOperations",
                 "durationOperations",
                 "autoStartOperations",
+                "selectedTaskOperations",
             },
         )
         server_hlc_wall_ms = int(time.time() * 1000) + 60_000
@@ -2970,6 +3243,52 @@ class StorageTests(unittest.TestCase):
         self.store = Store(self.path)
         self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
 
+    def test_legacy_selected_task_migration_queues_choice_once(self) -> None:
+        task = task_from_title("Legacy focus task")
+        settings = self.store.load()["settings"]
+        settings["selectedTaskId"] = task["id"]
+        self.store.set_meta("settings", settings)
+        self.store.set_meta("selectedTaskMigrationComplete", False)
+        self.store.close()
+
+        self.store = Store(self.path)
+        loaded = self.store.load()
+        self.assertEqual(loaded["settings"]["selectedTaskId"], task["id"])
+        self.assertEqual(len(loaded["pendingSelectedTasks"]), 1)
+        operation = loaded["pendingSelectedTasks"][0]
+        self.assertEqual(operation["taskId"], task["id"])
+        self.assertEqual(
+            (operation["occurredAt"], operation["hlcWallMs"], operation["hlcCounter"]),
+            ("1970-01-01T00:00:00.000Z", 0, 0),
+        )
+
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.load()["pendingSelectedTasks"], [operation])
+
+    def test_legacy_selected_task_migration_waits_for_pending_resolution(
+        self,
+    ) -> None:
+        task = task_from_title("Deferred legacy focus task")
+        self.store.prepare_resolution({"id": "user-1"}, 1, "merge")
+        settings = self.store.load()["settings"]
+        settings["selectedTaskId"] = task["id"]
+        self.store.set_meta("settings", settings)
+        self.store.set_meta("selectedTaskMigrationComplete", False)
+        self.store.close()
+
+        self.store = Store(self.path)
+        self.assertFalse(self.store.get_meta("selectedTaskMigrationComplete"))
+        self.assertEqual(self.store.load()["pendingSelectedTasks"], [])
+
+        self.store.clear_pending_resolution()
+        self.store.close()
+        self.store = Store(self.path)
+        loaded = self.store.load()
+        self.assertTrue(self.store.get_meta("selectedTaskMigrationComplete"))
+        self.assertEqual(len(loaded["pendingSelectedTasks"]), 1)
+        self.assertEqual(loaded["pendingSelectedTasks"][0]["taskId"], task["id"])
+
     def test_legacy_untouched_false_preserves_remote_true_on_replacement(
         self,
     ) -> None:
@@ -3001,7 +3320,10 @@ class StorageTests(unittest.TestCase):
         explicit = self.store.prepare_resolution(
             {"id": "user-1"}, 2, "replace_remote"
         )
-        self.assertEqual(explicit["autoStartOperations"], [explicit_false])
+        self.assertEqual(
+            explicit["autoStartOperations"],
+            self._wire_preference_operations([explicit_false]),
+        )
 
     def test_auto_start_toggles_are_immutable_durable_operations(self) -> None:
         enabled = self.store.set_auto_start_breaks(True, now_ms=1_000)
@@ -3060,7 +3382,10 @@ class StorageTests(unittest.TestCase):
         ]
 
         first = self.store.sync_payload()
-        self.assertEqual(first["autoStartOperations"], operations[:256])
+        self.assertEqual(
+            first["autoStartOperations"],
+            self._wire_preference_operations(operations[:256]),
+        )
         self.store.apply_sync(
             self._canonical_response(
                 first, revision=1, auto_start_breaks=operations[255]["enabled"]
@@ -3074,7 +3399,10 @@ class StorageTests(unittest.TestCase):
         )
 
         second = self.store.sync_payload()
-        self.assertEqual(second["autoStartOperations"], [operations[256]])
+        self.assertEqual(
+            second["autoStartOperations"],
+            self._wire_preference_operations([operations[256]]),
+        )
         self.store.apply_sync(
             self._canonical_response(
                 second, revision=2, auto_start_breaks=operations[256]["enabled"]
@@ -3123,7 +3451,10 @@ class StorageTests(unittest.TestCase):
         )
 
         loaded = self.store.load()
-        self.assertEqual(request["autoStartOperations"], [sent])
+        self.assertEqual(
+            request["autoStartOperations"],
+            self._wire_preference_operations([sent]),
+        )
         self.assertEqual(loaded["pendingAutoStarts"], [replacement])
         self.assertFalse(loaded["settings"]["autoStartBreaks"])
         self.assertTrue(loaded["snapshot"]["autoStartBreaks"])
@@ -3139,8 +3470,10 @@ class StorageTests(unittest.TestCase):
         pending = self.store.pending_resolution(user["id"])
         legacy_request = dict(pending["request"])
         legacy_request.pop("autoStartOperations")
+        legacy_request.pop("selectedTaskOperations")
         legacy_queue_ids = dict(pending["queueIds"])
         legacy_queue_ids.pop("autoStartOperations")
+        legacy_queue_ids.pop("selectedTaskOperations")
         self.store.set_meta(
             "pendingResolution",
             {
@@ -3307,7 +3640,11 @@ class StorageTests(unittest.TestCase):
         completed, local_history = rebuild_optimistic(None, [], request["commands"])
         canonical_local = dict(local_history[0])
         canonical_local.pop("pending", None)
-        remote_history = [self._history_item(f"remote-{index}") for index in range(3)]
+        completed_at = str(canonical_local["completedAt"])
+        remote_history = [
+            self._history_item(f"remote-{index}", completed_at)
+            for index in range(3)
+        ]
         response = self._canonical_response(
             request,
             revision=1,
@@ -3399,7 +3736,10 @@ class StorageTests(unittest.TestCase):
         _start, _finish, generated = self._queue_offline_auto_break()
         disabled = self.store.set_auto_start_breaks(False, now_ms=3_500)
         request = self.store.sync_payload()
-        self.assertIn(disabled, request["autoStartOperations"])
+        self.assertIn(
+            self._wire_preference_operation(disabled),
+            request["autoStartOperations"],
+        )
         canonical_timer, history = self._canonical_completion(request["commands"])
         response = self._canonical_response(
             request,
@@ -3491,11 +3831,12 @@ class StorageTests(unittest.TestCase):
                 canonical_timer, local_history = self._canonical_completion(
                     request["commands"]
                 )
+                completed_at = str(local_history[0]["completedAt"])
                 history = [
                     local_history[0],
-                    self._history_item("remote-1"),
-                    self._history_item("remote-2"),
-                    self._history_item("remote-3"),
+                    self._history_item("remote-1", completed_at),
+                    self._history_item("remote-2", completed_at),
+                    self._history_item("remote-3", completed_at),
                 ]
                 response = self._canonical_response(
                     request,
@@ -3599,8 +3940,13 @@ class StorageTests(unittest.TestCase):
                                 )
                                 history = list(local_history)
                                 if corrects_to_long:
+                                    completed_at = str(
+                                        local_history[0]["completedAt"]
+                                    )
                                     history.extend(
-                                        self._history_item(f"matrix-remote-{index}")
+                                        self._history_item(
+                                            f"matrix-remote-{index}", completed_at
+                                        )
                                         for index in range(1, 4)
                                     )
                                 response = self._canonical_response(
@@ -3677,11 +4023,12 @@ class StorageTests(unittest.TestCase):
         )
         request = self.store.sync_payload()
         canonical_timer, local_history = self._canonical_completion(request["commands"])
+        completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1"),
-            self._history_item("remote-2"),
-            self._history_item("remote-3"),
+            self._history_item("remote-1", completed_at),
+            self._history_item("remote-2", completed_at),
+            self._history_item("remote-3", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -3749,11 +4096,12 @@ class StorageTests(unittest.TestCase):
         self.store.set_selected_phase("focus")
         request = self.store.sync_payload()
         canonical_timer, local_history = self._canonical_completion(request["commands"])
+        completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1"),
-            self._history_item("remote-2"),
-            self._history_item("remote-3"),
+            self._history_item("remote-1", completed_at),
+            self._history_item("remote-2", completed_at),
+            self._history_item("remote-3", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -3773,13 +4121,14 @@ class StorageTests(unittest.TestCase):
         self.store.set_selected_phase("short_break")
         request = self.store.sync_payload()
         canonical_timer, local_history = self._canonical_completion(request["commands"])
+        completed_at = str(local_history[0]["completedAt"])
         response = self._canonical_response(
             request,
             history=[
                 local_history[0],
-                self._history_item("remote-1"),
-                self._history_item("remote-2"),
-                self._history_item("remote-3"),
+                self._history_item("remote-1", completed_at),
+                self._history_item("remote-2", completed_at),
+                self._history_item("remote-3", completed_at),
             ],
             auto_start_breaks=True,
         )
@@ -4068,11 +4417,12 @@ class StorageTests(unittest.TestCase):
         canonical_timer, local_history = self._canonical_completion(
             request["commands"]
         )
+        completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1"),
-            self._history_item("remote-2"),
-            self._history_item("remote-3"),
+            self._history_item("remote-1", completed_at),
+            self._history_item("remote-2", completed_at),
+            self._history_item("remote-3", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -4532,7 +4882,7 @@ class StorageTests(unittest.TestCase):
 
         task = task_from_title("Cycle task")
         self.store.queue_task_operation("upsert", task, now_ms=100)
-        self.store.set_selected_task_id(task["id"])
+        self.store.set_selected_task_id(task["id"], now_ms=101)
         custom_durations = {
             "focus": 2 * 60_000,
             "short_break": 3 * 60_000,
@@ -4629,7 +4979,10 @@ class StorageTests(unittest.TestCase):
         request = self.store.sync_payload()
         self.store.close()
         self.store = Store(self.path)
-        self.assertEqual(self.store.sync_payload()["autoStartOperations"], [operation])
+        self.assertEqual(
+            self.store.sync_payload()["autoStartOperations"],
+            self._wire_preference_operations([operation]),
+        )
 
         malformed = self._canonical_response(
             request, revision=1, auto_start_breaks=True
@@ -4641,8 +4994,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.load(), before)
 
     def test_focus_start_has_task_but_break_start_does_not(self) -> None:
-        settings = self.store.load()["settings"]
         task = task_from_title("Release")
+        self.store.queue_task_operation("upsert", task, now_ms=1_784_548_799_998)
+        self.store.set_selected_task_id(task["id"], now_ms=1_784_548_799_999)
+        settings = self.store.load()["settings"]
         focus = self.store.queue_command(
             "start",
             None,
@@ -4653,29 +5008,15 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(focus["taskId"], task["id"])
 
+        request = self.store.sync_payload()
         self.store.apply_sync(
-            {
-                "acknowledgements": [
-                    {"commandId": focus["id"], "outcome": "applied", "reason": ""}
-                ],
-                "taskAcknowledgements": [],
-                "revision": 1,
-                "canonicalTimer": None,
-                "history": [],
-                "tasks": [],
-                "durationAcknowledgements": [],
-                "autoStartAcknowledgements": [],
-                "durationsMs": {
-                    "focus": 25 * 60_000,
-                    "short_break": 5 * 60_000,
-                    "long_break": 15 * 60_000,
-                },
-                "autoStartBreaks": False,
-                "serverTime": focus["occurredAt"],
-                "serverHlcWallMs": focus["hlcWallMs"],
-                "serverHlcCounter": focus["hlcCounter"],
-            },
-            self.store.sync_payload(),
+            self._canonical_response(
+                request,
+                revision=1,
+                tasks=[task],
+                selected_task_id=task["id"],
+            ),
+            request,
         )
         break_start = self.store.queue_command(
             "start",
@@ -4686,6 +5027,27 @@ class StorageTests(unittest.TestCase):
             now_ms=1_784_548_801_000,
         )
         self.assertNotIn("taskId", break_start)
+
+    def test_focus_start_omits_unavailable_selected_task(self) -> None:
+        task = task_from_title("Unavailable focus task")
+        self.store.queue_task_operation("upsert", task, now_ms=1_000)
+        self.store.set_selected_task_id(task["id"], now_ms=2_000)
+        self.store.queue_task_operation("delete", task, now_ms=3_000)
+
+        settings = self.store.load()["settings"]
+        command = self.store.queue_command(
+            "start",
+            None,
+            "focus",
+            settings["durationsMs"],
+            task["id"],
+            now_ms=4_000,
+        )
+
+        self.assertNotIn("taskId", command)
+        self.assertEqual(
+            self.store.load()["settings"]["selectedTaskId"], task["id"]
+        )
 
     def test_reset_clears_account_tasks_and_selection(self) -> None:
         task = task_from_title("Release")

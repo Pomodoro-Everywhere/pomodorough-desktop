@@ -19,6 +19,10 @@ from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
 
 
+def wire_preference_operation(operation: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in operation.items() if key != "deviceId"}
+
+
 class MemorySecretStore:
     def __init__(self) -> None:
         self.values: dict[str, bytes] = {}
@@ -150,14 +154,16 @@ class MainWindowDurationTests(unittest.TestCase):
             self.window = MainWindow(self.store, self.cloud, QIcon())
 
     @staticmethod
-    def _history_item(item_id: str) -> dict[str, object]:
+    def _history_item(
+        item_id: str, completed_at: str = "2026-07-22T10:00:00.000Z"
+    ) -> dict[str, object]:
         return {
             "id": item_id,
             "timerId": f"timer-{item_id}",
             "phase": "focus",
             "status": "completed",
             "plannedDurationMs": 25 * 60_000,
-            "completedAt": "2026-07-22T10:00:00.000Z",
+            "completedAt": completed_at,
         }
 
     @staticmethod
@@ -170,6 +176,7 @@ class MainWindowDurationTests(unittest.TestCase):
             "taskAcknowledgements": [],
             "durationAcknowledgements": [],
             "autoStartAcknowledgements": [],
+            "selectedTaskAcknowledgements": [],
             "revision": revision,
             "canonicalTimer": None,
             "history": history or [],
@@ -180,6 +187,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "long_break": 15 * 60_000,
             },
             "autoStartBreaks": False,
+            "selectedTaskId": None,
             "serverTime": utc_timestamp(now_ms),
             "serverHlcWallMs": now_ms,
             "serverHlcCounter": 0,
@@ -204,6 +212,15 @@ class MainWindowDurationTests(unittest.TestCase):
         )
         self.window._load_state()
         self.window._render()
+
+    def test_tray_retains_owned_context_menu(self) -> None:
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):
+            self.window._build_tray()
+
+        self.assertIsNotNone(self.window.tray)
+        self.assertIsNotNone(self.window.tray_menu)
+        self.assertIs(self.window.tray_menu.parent(), self.window)
+        self.assertIs(self.window.tray.contextMenu(), self.window.tray_menu)
 
     def test_first_unowned_sign_in_previews_before_any_sync(self) -> None:
         self.store.queue_task_operation("upsert", task_from_title("Local task"))
@@ -735,7 +752,10 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window.auto_breaks.setChecked(True)
 
         operation = self.store.load()["pendingAutoStarts"][0]
-        self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], [operation])
+        self.assertEqual(
+            self.cloud.payloads[-1]["autoStartOperations"],
+            [wire_preference_operation(operation)],
+        )
         response = self._bootstrap_response(revision=1)
         response["autoStartAcknowledgements"] = [
             {"operationId": operation["id"], "outcome": "applied", "reason": ""}
@@ -765,7 +785,10 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window._cloud_failure("network unavailable")
         self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
         self.window._sync()
-        self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], [operation])
+        self.assertEqual(
+            self.cloud.payloads[-1]["autoStartOperations"],
+            [wire_preference_operation(operation)],
+        )
         self.assertEqual(self.cloud.payloads[-1]["autoStartOperations"], sent["autoStartOperations"])
 
         malformed = self._bootstrap_response(revision=1)
@@ -957,11 +980,12 @@ class MainWindowDurationTests(unittest.TestCase):
             )
             for item in local_history:
                 item.pop("pending", None)
+            completed_at = str(local_history[0]["completedAt"])
             history = [
                 local_history[0],
-                self._history_item("remote-1"),
-                self._history_item("remote-2"),
-                self._history_item("remote-3"),
+                self._history_item("remote-1", completed_at),
+                self._history_item("remote-2", completed_at),
+                self._history_item("remote-3", completed_at),
             ]
             response = self._bootstrap_response(revision=1, history=history)
             response["acknowledgements"] = [
@@ -1031,6 +1055,39 @@ class MainWindowDurationTests(unittest.TestCase):
             notifications,
             [("Service arrived", "Short break completed.")],
         )
+
+    def test_completion_repeats_sound_until_stop_control_clears_terminal_timer(
+        self,
+    ) -> None:
+        with (
+            patch.object(QApplication, "beep") as beep,
+            patch.object(self.window, "_issue") as issue,
+        ):
+            self._queue_completed_timer()
+
+            beep.assert_called_once_with()
+            self.assertTrue(self.window.sound_timer.isActive())
+            self.assertFalse(self.window.stop_sound_button.isHidden())
+            self.assertEqual(self.window.stop_sound_button.text(), "STOP SOUND")
+
+            self.window.stop_sound_button.click()
+
+        self.assertFalse(self.window.sound_timer.isActive())
+        self.assertTrue(self.window.stop_sound_button.isHidden())
+        issue.assert_called_once_with("clear")
+
+    def test_starting_next_timer_stops_completion_sound(self) -> None:
+        with patch.object(QApplication, "beep"):
+            self._queue_completed_timer()
+            self.assertTrue(self.window.sound_timer.isActive())
+            completed_timer_id = self.window.timer["id"]
+
+            self.window._primary_action()
+
+        self.assertEqual(self.window.timer["status"], "running")
+        self.assertNotEqual(self.window.timer["id"], completed_timer_id)
+        self.assertFalse(self.window.sound_timer.isActive())
+        self.assertTrue(self.window.stop_sound_button.isHidden())
 
     def test_local_focus_completion_waits_before_auto_starting_break(self) -> None:
         self.window.auto_breaks.setChecked(True)
@@ -1247,6 +1304,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "taskOperations": [],
                 "durationOperations": [],
                 "autoStartOperations": [],
+                "selectedTaskOperations": [],
             },
         )
 
@@ -1313,6 +1371,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "taskAcknowledgements": [],
                 "durationAcknowledgements": [],
                 "autoStartAcknowledgements": [],
+                "selectedTaskAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": {
                     "id": "timer-remote",
@@ -1331,6 +1390,7 @@ class MainWindowDurationTests(unittest.TestCase):
                     "long_break": 15 * 60_000,
                 },
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "serverTime": utc_timestamp(int(time.time() * 1000)),
                 "serverHlcWallMs": int(time.time() * 1000),
                 "serverHlcCounter": 0,
@@ -1358,7 +1418,9 @@ class MainWindowDurationTests(unittest.TestCase):
         )
         self.assertFalse(self.window.task_combo.isEnabled())
 
-    def test_remote_task_deletion_clears_selection_and_keeps_history_title(self) -> None:
+    def test_remote_task_deletion_does_not_queue_clear_and_keeps_history_title(
+        self,
+    ) -> None:
         task = task_from_title("Historical task")
         history = self._history_item("remote-completion")
         history["taskId"] = task["id"]
@@ -1373,13 +1435,21 @@ class MainWindowDurationTests(unittest.TestCase):
         )
 
         self.window._sync()
-        self.window._apply_sync(
-            self._bootstrap_response(revision=2, history=[history])
-        )
+        deleted = self._bootstrap_response(revision=2, history=[history])
+        deleted["selectedTaskAcknowledgements"] = [
+            {
+                "operationId": operation["id"],
+                "outcome": "applied",
+                "reason": "",
+            }
+            for operation in self.window._sync_request["selectedTaskOperations"]
+        ]
+        self.window._apply_sync(deleted)
 
         loaded = self.store.load()
         self.assertIsNone(self.window.settings["selectedTaskId"])
         self.assertIsNone(loaded["settings"]["selectedTaskId"])
+        self.assertEqual(loaded["pendingSelectedTasks"], [])
         self.assertEqual(loaded["snapshot"]["tasks"], [])
         self.assertEqual(loaded["snapshot"]["knownTasks"], [task])
         self.assertIn("Focus · Historical task", self.window.history_list.item(0).text())
@@ -1400,6 +1470,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "taskAcknowledgements": [],
                 "durationAcknowledgements": [],
                 "autoStartAcknowledgements": [],
+                "selectedTaskAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": None,
                 "history": [],
@@ -1410,6 +1481,7 @@ class MainWindowDurationTests(unittest.TestCase):
                     "long_break": 20 * 60_000,
                 },
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "serverTime": utc_timestamp(int(time.time() * 1000)),
                 "serverHlcWallMs": int(time.time() * 1000),
                 "serverHlcCounter": 0,
@@ -1440,6 +1512,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 }
             ],
             "autoStartAcknowledgements": [],
+            "selectedTaskAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -1450,6 +1523,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "long_break": 16 * 60_000,
             },
             "autoStartBreaks": False,
+            "selectedTaskId": None,
             "serverTime": utc_timestamp(int(time.time() * 1000)),
             "serverHlcWallMs": int(time.time() * 1000),
             "serverHlcCounter": 0,
@@ -1480,7 +1554,7 @@ class MainWindowDurationTests(unittest.TestCase):
         )
         self.assertFalse(self.window._account_synced)
 
-    def test_cancelled_timer_resets_clock(self) -> None:
+    def test_cancel_resets_timer_and_preserves_cancelled_history(self) -> None:
         timer = None
         start = self.store.queue_command(
             "start", timer, "focus", {"focus": 60_000}, now_ms=1_000
@@ -1503,9 +1577,14 @@ class MainWindowDurationTests(unittest.TestCase):
         with patch("pomodorough.storage.time.time", return_value=31):
             self.window._issue("cancel")
 
-        self.assertEqual(self.window.timer["status"], "cancelled")
-        self.assertEqual(self.window.clock.time_text, "01:00")
+        self.assertIsNone(self.window.timer)
+        self.assertEqual(self.window.clock.time_text, "25:00")
         self.assertEqual(self.window.clock.progress, 0)
+        self.assertEqual([item["status"] for item in self.window.history], ["cancelled"])
+        self.assertEqual(
+            [command["type"] for command in self.store.load()["pending"]],
+            ["start", "pause", "cancel", "clear"],
+        )
 
 
 if __name__ == "__main__":

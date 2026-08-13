@@ -10,8 +10,10 @@ from pathlib import Path
 
 from pomodorough.core import (
     PHASES,
+    completed_focus_count_for_day,
     elapsed_ms,
     format_remaining,
+    long_break_progress,
     next_break_phase,
     normalize_task_title,
     project_auto_start_breaks,
@@ -555,9 +557,27 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(elapsed_ms(timer, 100_000), 60_000)
 
     def test_fourth_focus_uses_long_break(self) -> None:
-        history = [{"phase": "focus", "status": "completed"} for _ in range(4)]
-        self.assertEqual(next_break_phase(history), "long_break")
-        self.assertEqual(next_break_phase(history[:3]), "short_break")
+        now = datetime(2026, 7, 22, 12, tzinfo=timezone.utc)
+        history = [
+            {
+                "phase": "focus",
+                "status": "completed",
+                "completedAt": "2026-07-21T12:00:00Z",
+            },
+            *[
+                {
+                    "phase": "focus",
+                    "status": "completed",
+                    "completedAt": f"2026-07-22T0{index}:00:00Z",
+                }
+                for index in range(1, 5)
+            ],
+        ]
+        self.assertEqual(completed_focus_count_for_day(history, now), 4)
+        self.assertEqual(long_break_progress(4), 4)
+        self.assertEqual(long_break_progress(5), 1)
+        self.assertEqual(next_break_phase(history, now), "long_break")
+        self.assertEqual(next_break_phase(history[:-1], now), "short_break")
 
     def test_remaining_rounds_up(self) -> None:
         self.assertEqual(format_remaining(60_001), "01:01")
