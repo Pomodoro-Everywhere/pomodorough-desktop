@@ -47,6 +47,21 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(stored["pendingDurations"], [])
 
+    def test_completed_json_keeps_source_timer_and_separate_next_display(self) -> None:
+        self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
+        self.assertEqual(self.invoke("finish")[0], 0)
+
+        result, output, error = self.invoke("status", "--json")
+        state = json.loads(output)
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["phase"], "focus")
+        self.assertEqual(state["plannedDurationMs"], 60_000)
+        self.assertIsNotNone(state["timerId"])
+        self.assertEqual(state["display"]["phase"], "short_break")
+        self.assertEqual(state["display"]["remaining"], "05:00")
+
     def test_invalid_transition_returns_error(self) -> None:
         result, output, error = self.invoke("finish")
         self.assertEqual(result, 2)

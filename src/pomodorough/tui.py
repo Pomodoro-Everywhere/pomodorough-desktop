@@ -25,23 +25,24 @@ def build_lines(
     width: int,
     message: str = "",
 ) -> list[str]:
+    display = state.get("display", state)
     bar_width = max(10, min(48, width - 12))
-    filled = round(state["progress"] * bar_width)
+    filled = round(display["progress"] * bar_width)
     progress = "#" * filled + "-" * (bar_width - filled)
     lines = [
         "POMODOROUGH",
         "TIME, IN TRANSIT",
         "",
-        state["phaseLabel"].upper(),
-        state["remaining"],
+        display["phaseLabel"].upper(),
+        display["remaining"],
         STATUS_LABELS.get(state["status"], state["status"].upper()),
         f"[{progress}]",
         "",
         "space start/pause/resume  f finish  x cancel  c clear",
         "1 focus  2 short break  3 long break  +/- duration  q quit",
     ]
-    if state["taskTitle"]:
-        lines.insert(6, f"TASK: {state['taskTitle']}")
+    if display["taskTitle"]:
+        lines.insert(6, f"TASK: {display['taskTitle']}")
     if state["pendingCommands"]:
         lines.append(f"{state['pendingCommands']} command(s) pending sync")
     if state["pendingDurationOperations"]:

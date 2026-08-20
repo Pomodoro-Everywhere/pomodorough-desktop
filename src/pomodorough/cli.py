@@ -45,12 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_state(state: dict[str, Any], stream: TextIO) -> None:
+    display = state.get("display", state)
     print(
-        f"{state['phaseLabel']} | {state['status']} | {state['remaining']}",
+        f"{display['phaseLabel']} | {state['status']} | {display['remaining']}",
         file=stream,
     )
-    if state["taskTitle"]:
-        print(f"Task: {state['taskTitle']}", file=stream)
+    if display["taskTitle"]:
+        print(f"Task: {display['taskTitle']}", file=stream)
     if state["pendingCommands"]:
         print(f"{state['pendingCommands']} command(s) pending sync", file=stream)
     if state["pendingDurationOperations"]:

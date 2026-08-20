@@ -41,7 +41,14 @@ class LocalTimerTests(unittest.TestCase):
         self.timer.issue("start", minutes=1, now_ms=1_000)
         state = self.timer.state(now_ms=61_000, auto_finish=True)
         self.assertEqual(state["status"], "completed")
-        self.assertEqual((state["phase"], state["remaining"]), ("short_break", "05:00"))
+        self.assertEqual((state["phase"], state["remaining"]), ("focus", "00:00"))
+        self.assertEqual(state["plannedDurationMs"], 60_000)
+        self.assertEqual(state["elapsedMs"], 60_000)
+        self.assertEqual(state["progress"], 1.0)
+        self.assertEqual(
+            (state["display"]["phase"], state["display"]["remaining"]),
+            ("short_break", "05:00"),
+        )
         self.assertEqual(self.timer.selected_phase, "short_break")
 
     def test_finished_break_displays_next_focus_duration(self) -> None:
@@ -52,7 +59,11 @@ class LocalTimerTests(unittest.TestCase):
         state = self.timer.state(now_ms=61_000)
 
         self.assertEqual(state["status"], "completed")
-        self.assertEqual((state["phase"], state["remaining"]), ("focus", "25:00"))
+        self.assertEqual((state["phase"], state["remaining"]), ("short_break", "00:00"))
+        self.assertEqual(
+            (state["display"]["phase"], state["display"]["remaining"]),
+            ("focus", "25:00"),
+        )
 
     def test_live_status_deadline_uses_monotonic_time_across_wall_jump(self) -> None:
         physical_ms = 1_800_000_000_000

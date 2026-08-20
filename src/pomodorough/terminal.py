@@ -119,10 +119,10 @@ class LocalTimer:
                 physical_ms=physical_now_ms,
             )
         )
-        elapsed = elapsed_ms(display_timer, effective_now_ms)
+        elapsed = elapsed_ms(timer, effective_now_ms)
         if status == "cancelled":
             elapsed = 0
-        planned = max(1, int(display_timer["plannedDurationMs"]))
+        planned = max(1, int(timer["plannedDurationMs"]))
 
         if (
             auto_finish
@@ -141,12 +141,21 @@ class LocalTimer:
             return self.state(now_ms=physical_now_ms)
 
         remaining = max(0, planned - elapsed)
-        task_id = display_timer.get("taskId")
-        task = self.known_tasks.get(task_id)
+        display_elapsed = elapsed_ms(display_timer, effective_now_ms)
+        display_planned = max(1, int(display_timer["plannedDurationMs"]))
+        display_remaining = max(0, display_planned - display_elapsed)
+        display_task_id = display_timer.get("taskId")
+        display_task = (
+            self.known_tasks.get(display_task_id)
+            if isinstance(display_task_id, str)
+            else None
+        )
+        task_id = timer.get("taskId")
+        task = self.known_tasks.get(task_id) if isinstance(task_id, str) else None
         return {
             "timerId": timer.get("id") or None,
-            "phase": display_timer["phase"],
-            "phaseLabel": PHASES[display_timer["phase"]]["label"],
+            "phase": timer["phase"],
+            "phaseLabel": PHASES[timer["phase"]]["label"],
             "status": status,
             "taskId": task_id,
             "taskTitle": task.get("title") if task else None,
@@ -155,6 +164,17 @@ class LocalTimer:
             "remainingMs": remaining,
             "remaining": format_remaining(remaining),
             "progress": min(1.0, elapsed / planned),
+            "display": {
+                "phase": display_timer["phase"],
+                "phaseLabel": PHASES[display_timer["phase"]]["label"],
+                "taskId": display_task_id,
+                "taskTitle": display_task.get("title") if display_task else None,
+                "plannedDurationMs": display_planned,
+                "elapsedMs": display_elapsed,
+                "remainingMs": display_remaining,
+                "remaining": format_remaining(display_remaining),
+                "progress": min(1.0, display_elapsed / display_planned),
+            },
             "pendingCommands": len(self.pending),
             "pendingDurationOperations": len(self.pending_durations),
             "pendingAutoStartOperations": len(self.pending_auto_starts),
