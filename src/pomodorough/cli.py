@@ -89,7 +89,7 @@ def run(args: argparse.Namespace, timer: LocalTimer, stream: TextIO) -> None:
             print(json.dumps(history, indent=2), file=stream)
             return
         if not history:
-            print("No completed timers.", file=stream)
+            print("No arrivals yet\nYour first run appears here.", file=stream)
             return
         for item in history:
             phase = str(item.get("phase", "timer")).replace("_", " ").title()

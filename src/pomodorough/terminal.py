@@ -14,6 +14,7 @@ from .core import (
     format_remaining,
     rebuild_optimistic,
     rebuild_tasks,
+    timer_for_display,
 )
 from .storage import Store
 
@@ -106,6 +107,10 @@ class LocalTimer:
             )
             self.reload()
         timer = self.current_timer()
+        status = timer.get("status", "idle")
+        display_timer = timer_for_display(
+            timer, self.selected_phase, self.settings["durationsMs"]
+        )
         effective_now_ms = (
             physical_now_ms
             if supplied_now_ms
@@ -114,15 +119,15 @@ class LocalTimer:
                 physical_ms=physical_now_ms,
             )
         )
-        elapsed = elapsed_ms(timer, effective_now_ms)
-        if timer.get("status") == "cancelled":
+        elapsed = elapsed_ms(display_timer, effective_now_ms)
+        if status == "cancelled":
             elapsed = 0
-        planned = max(1, int(timer["plannedDurationMs"]))
+        planned = max(1, int(display_timer["plannedDurationMs"]))
 
         if (
             auto_finish
             and not self.resolution_pending
-            and timer.get("status") == "running"
+            and status == "running"
             and elapsed >= planned
         ):
             if self.store.replication_mode == "iroh":
@@ -136,13 +141,13 @@ class LocalTimer:
             return self.state(now_ms=physical_now_ms)
 
         remaining = max(0, planned - elapsed)
-        task_id = timer.get("taskId")
+        task_id = display_timer.get("taskId")
         task = self.known_tasks.get(task_id)
         return {
             "timerId": timer.get("id") or None,
-            "phase": timer["phase"],
-            "phaseLabel": PHASES[timer["phase"]]["label"],
-            "status": timer.get("status", "idle"),
+            "phase": display_timer["phase"],
+            "phaseLabel": PHASES[display_timer["phase"]]["label"],
+            "status": status,
             "taskId": task_id,
             "taskTitle": task.get("title") if task else None,
             "plannedDurationMs": planned,

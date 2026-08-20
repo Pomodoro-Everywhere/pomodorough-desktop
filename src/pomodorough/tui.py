@@ -58,7 +58,12 @@ def build_lines(
         lines.extend(("", message))
     lines.extend(("", "RECENT ARRIVALS"))
     if not history:
-        lines.append("No completed timers.")
+        lines.extend(
+            (
+                "No arrivals yet".center(width),
+                "Your first run appears here.".center(width),
+            )
+        )
     for item in history[:5]:
         phase = str(item.get("phase", "timer")).replace("_", " ").title()
         if item.get("taskTitle"):

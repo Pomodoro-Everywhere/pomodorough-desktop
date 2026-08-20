@@ -213,6 +213,12 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window._load_state()
         self.window._render()
 
+    def test_completed_focus_clock_displays_next_break_duration(self) -> None:
+        self._queue_completed_timer()
+
+        self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
+        self.assertEqual(self.window.clock.time_text, "05:00")
+
     def test_tray_retains_owned_context_menu(self) -> None:
         with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):
             self.window._build_tray()
@@ -656,9 +662,9 @@ class MainWindowDurationTests(unittest.TestCase):
 
     def test_resolution_confirmations_include_destructive_and_merge_warnings(self) -> None:
         for strategy, expected in (
-            ("replace_remote", "permanently replaces"),
-            ("keep_remote", "permanently discards"),
-            ("merge", "conflicts or sync errors"),
+            ("replace_remote", "will be replaced by this device's data"),
+            ("keep_remote", "will be replaced by account data"),
+            ("merge", "Conflicts or rejected changes are possible"),
         ):
             with self.subTest(strategy=strategy):
                 with patch.object(
@@ -1013,7 +1019,8 @@ class MainWindowDurationTests(unittest.TestCase):
                 (provisional["timerId"], "short_break"),
             )
             self.assertEqual(self.window.timer["status"], "completed")
-            self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
+            self.assertEqual(self.window.clock.phase_text, "FOCUS")
+            self.assertEqual(self.window.clock.time_text, "25:00")
             self.assertEqual(
                 notifications,
                 [("Service arrived", "Short break completed.")],

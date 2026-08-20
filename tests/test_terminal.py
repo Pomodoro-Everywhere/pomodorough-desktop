@@ -41,8 +41,18 @@ class LocalTimerTests(unittest.TestCase):
         self.timer.issue("start", minutes=1, now_ms=1_000)
         state = self.timer.state(now_ms=61_000, auto_finish=True)
         self.assertEqual(state["status"], "completed")
-        self.assertEqual(state["remaining"], "00:00")
+        self.assertEqual((state["phase"], state["remaining"]), ("short_break", "05:00"))
         self.assertEqual(self.timer.selected_phase, "short_break")
+
+    def test_finished_break_displays_next_focus_duration(self) -> None:
+        self.timer.select_phase("short_break")
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+        self.timer.issue("finish", now_ms=61_000)
+
+        state = self.timer.state(now_ms=61_000)
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual((state["phase"], state["remaining"]), ("focus", "25:00"))
 
     def test_live_status_deadline_uses_monotonic_time_across_wall_jump(self) -> None:
         physical_ms = 1_800_000_000_000
@@ -251,7 +261,8 @@ class LocalTimerTests(unittest.TestCase):
         state = self.timer.state(now_ms=31_000)
         lines = build_lines(state, self.timer.completed_history(), 80)
         rendered = "\n".join(lines)
-        self.assertIn("00:00", rendered)
+        self.assertIn("05:00", rendered)
+        self.assertIn("SHORT BREAK", rendered)
         self.assertIn("Focus", rendered)
         self.assertIn("pending sync", rendered)
 

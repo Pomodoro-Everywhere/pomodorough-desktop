@@ -451,6 +451,17 @@ def format_remaining(duration_ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def timer_for_display(
+    timer: dict[str, Any],
+    selected_phase: str,
+    durations_ms: dict[str, int],
+) -> dict[str, Any]:
+    """Show the next interval after completion while retaining terminal state elsewhere."""
+    if timer.get("status") == "completed":
+        return empty_timer(selected_phase, int(durations_ms[selected_phase]))
+    return timer
+
+
 def next_break_phase(
     history: list[dict[str, Any]], now: datetime | str | None = None
 ) -> str:

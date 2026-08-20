@@ -129,7 +129,8 @@ class TuiTests(unittest.TestCase):
         rendered = "\n".join(tui.build_lines(timer_state(status="waiting"), [], 80))
 
         self.assertIn("WAITING", rendered)
-        self.assertIn("No completed timers.", rendered)
+        self.assertIn("No arrivals yet", rendered)
+        self.assertIn("Your first run appears here.", rendered)
         self.assertNotIn("TASK:", rendered)
         self.assertNotIn("pending sync", rendered)
 

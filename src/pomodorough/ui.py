@@ -63,6 +63,7 @@ from .core import (
     rebuild_tasks,
     task_from_title,
     task_summaries_today,
+    timer_for_display,
 )
 from .network import CloudService
 from .iroh_protocol import IrohProtocolError, parse_invite
@@ -409,17 +410,17 @@ class MainWindow(QMainWindow):
         self.task_selector_panel.setObjectName("taskSelector")
         self.task_selector_panel.setMinimumWidth(190)
         self.task_selector_panel.setMaximumHeight(76)
-        task_selector_layout = QVBoxLayout(self.task_selector_panel)
+        task_selector_layout = QHBoxLayout(self.task_selector_panel)
         task_selector_layout.setContentsMargins(8, 5, 8, 7)
-        task_selector_layout.setSpacing(3)
+        task_selector_layout.setSpacing(8)
         task_selector_label = QLabel("FOCUS TASK")
         task_selector_label.setObjectName("microLabel")
         self.task_combo = QComboBox()
         self.task_combo.setAccessibleName("Focus task")
         self.task_combo.currentIndexChanged.connect(self._task_selection_changed)
         task_selector_layout.addWidget(task_selector_label)
-        task_selector_layout.addWidget(self.task_combo)
-        self.primary_button = QPushButton("START")
+        task_selector_layout.addWidget(self.task_combo, 1)
+        self.primary_button = QPushButton("START FOCUS")
         self.primary_button.setObjectName("primaryButton")
         self.primary_button.clicked.connect(self._primary_action)
         self.finish_button = QPushButton("FINISH")
@@ -445,13 +446,16 @@ class MainWindow(QMainWindow):
         service_label = QLabel("SERVICE PATTERN")
         service_label.setObjectName("sectionTitle")
         self.right_layout.addWidget(service_label)
+        service_detail = QLabel("Choose a mode and duration")
+        service_detail.setObjectName("taskSubtitle")
+        self.right_layout.addWidget(service_detail)
         self.phase_group = QButtonGroup(self)
         self.phase_group.setExclusive(True)
         self.phase_buttons: dict[str, QPushButton] = {}
         phase_layout = QHBoxLayout()
         phase_layout.setSpacing(5)
         for phase, definition in PHASES.items():
-            button = QPushButton(definition["label"].replace(" break", "").upper())
+            button = QPushButton(definition["label"].upper())
             button.setToolTip(definition["label"])
             button.setCheckable(True)
             button.setProperty("phase", True)
@@ -479,6 +483,12 @@ class MainWindow(QMainWindow):
         self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
         self.auto_breaks.toggled.connect(self._auto_breaks_changed)
         self.right_layout.addWidget(self.auto_breaks)
+        auto_breaks_detail = QLabel(
+            "Short after focus. Long every fourth completed focus."
+        )
+        auto_breaks_detail.setObjectName("taskSubtitle")
+        auto_breaks_detail.setWordWrap(True)
+        self.right_layout.addWidget(auto_breaks_detail)
         self.right_layout.addStretch()
         self.content_layout.addWidget(self.right_panel, 2)
         self.right_panel.hide()
@@ -527,7 +537,7 @@ class MainWindow(QMainWindow):
 
         form = QHBoxLayout()
         self.task_input = QLineEdit()
-        self.task_input.setPlaceholderText("Add a task")
+        self.task_input.setPlaceholderText("Write release notes")
         self.task_input.setAccessibleName("Task name")
         self.task_input.returnPressed.connect(self._add_task)
         self.add_task_button = QPushButton("ADD TASK")
@@ -539,8 +549,17 @@ class MainWindow(QMainWindow):
 
         self.task_table = QTableWidget(0, 4)
         self.task_table.setHorizontalHeaderLabels(
-            ("Task", "Finished pomodoros today", "Time today spent", "")
+            ("Task", "Finished", "Time", "Action")
         )
+        for column, alignment in enumerate(
+            (
+                Qt.AlignmentFlag.AlignLeft,
+                Qt.AlignmentFlag.AlignCenter,
+                Qt.AlignmentFlag.AlignCenter,
+                Qt.AlignmentFlag.AlignCenter,
+            )
+        ):
+            self.task_table.horizontalHeaderItem(column).setTextAlignment(alignment)
         self.task_table.verticalHeader().hide()
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -550,7 +569,9 @@ class MainWindow(QMainWindow):
         for column in (1, 2, 3):
             table_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.task_table, 1)
-        self.tasks_empty = QLabel("No tasks yet. Add one, then assign it before starting focus.")
+        self.tasks_empty = QLabel(
+            "No tasks yet\nAdd a task, then assign it before starting focus."
+        )
         self.tasks_empty.setObjectName("emptyState")
         self.tasks_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.tasks_empty)
@@ -1131,14 +1152,17 @@ class MainWindow(QMainWindow):
         )
 
     def _render(self) -> None:
-        timer = self._current_timer()
-        now = self.store.effective_timer_now_ms(timer)
+        source_timer = self._current_timer()
+        status = source_timer.get("status", "idle")
+        timer = timer_for_display(
+            source_timer, self._selected_phase(), self.settings["durationsMs"]
+        )
+        now = self.store.effective_timer_now_ms(source_timer)
         elapsed = elapsed_ms(timer, now)
-        if timer.get("status") == "cancelled":
+        if status == "cancelled":
             elapsed = 0
         planned = max(1, int(timer["plannedDurationMs"]))
         remaining = max(0, planned - elapsed)
-        status = timer.get("status", "idle")
         status_labels = {
             "idle": "READY AT PLATFORM",
             "running": "IN TRANSIT",
@@ -1165,7 +1189,13 @@ class MainWindow(QMainWindow):
         active = status in ACTIVE_STATUSES
         self._render_task_selector(timer, active)
         self._update_tray_progress(elapsed / planned, active)
-        self.primary_button.setText("PAUSE" if status == "running" else "RESUME" if status == "paused" else "START")
+        self.primary_button.setText(
+            "PAUSE"
+            if status == "running"
+            else "RESUME"
+            if status == "paused"
+            else f'START {PHASES[self._selected_phase()]["label"].upper()}'
+        )
         mutations_enabled = not self._history_resolution_active
         self.primary_button.setEnabled(
             mutations_enabled
@@ -1183,17 +1213,26 @@ class MainWindow(QMainWindow):
         self.auto_breaks.setEnabled(mutations_enabled)
         if self.tray:
             self.tray.setToolTip(f"Pomodorough • {format_remaining(remaining)} • {status_labels.get(status, status)}")
-            self.tray_primary.setText(self.primary_button.text().title())
+            self.tray_primary.setText(
+                "Pause"
+                if status == "running"
+                else "Resume"
+                if status == "paused"
+                else f'Start {PHASES[self._selected_phase()]["label"].lower()}'
+            )
             self.tray_primary.setEnabled(self.primary_button.isEnabled())
         self._render_history()
         self._render_tasks()
         if (
             status == "completed"
-            and timer.get("id") not in self.provisional_auto_break_timer_ids
-            and timer.get("id") != self._notified_timer_id
+            and source_timer.get("id") not in self.provisional_auto_break_timer_ids
+            and source_timer.get("id") != self._notified_timer_id
         ):
-            self._notified_timer_id = timer.get("id")
-            self._notify("Service arrived", f'{PHASES[timer["phase"]]["label"]} completed.')
+            self._notified_timer_id = source_timer.get("id")
+            self._notify(
+                "Service arrived",
+                f'{PHASES[source_timer["phase"]]["label"]} completed.',
+            )
 
     def _render_history(self) -> None:
         completed = [item for item in self.history if item.get("status") == "completed"]
@@ -1214,7 +1253,10 @@ class MainWindow(QMainWindow):
             marker = "  •" if item.get("pending") else ""
             QListWidgetItem(f"{phase}  {minutes} min\n{time_label}{marker}", self.history_list)
         if not completed:
-            QListWidgetItem("No arrivals yet.\nStart first service.", self.history_list)
+            empty_item = QListWidgetItem(
+                "No arrivals yet\nYour first run appears here.", self.history_list
+            )
+            empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def _render_task_selector(self, timer: dict[str, Any], active: bool) -> None:
         running = timer.get("status") == "running"
@@ -1244,9 +1286,19 @@ class MainWindow(QMainWindow):
         self.task_combo.blockSignals(True)
         self.task_combo.clear()
         self.task_combo.addItem("No task", None)
+        self.task_combo.setItemData(
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            Qt.ItemDataRole.TextAlignmentRole,
+        )
         selected_index = 0
         for task in choices:
             self.task_combo.addItem(task["title"], task["id"])
+            self.task_combo.setItemData(
+                self.task_combo.count() - 1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                Qt.ItemDataRole.TextAlignmentRole,
+            )
             if task["id"] == selected_task_id:
                 selected_index = self.task_combo.count() - 1
         self.task_combo.setCurrentIndex(selected_index)
@@ -1286,7 +1338,8 @@ class MainWindow(QMainWindow):
         total_finished = sum(summary["finished"] for summary in summaries.values())
         total_ms = sum(summary["timeMs"] for summary in summaries.values())
         self.task_totals.setText(
-            f"{total_finished} POMODOROS • {self._format_task_time(total_ms).upper()} TODAY"
+            f"{total_finished} {'POMODORO' if total_finished == 1 else 'POMODOROS'} • "
+            f"{self._format_task_time(total_ms).upper()} TODAY"
         )
         self.task_input.setEnabled(not self._history_resolution_active)
         self.add_task_button.setEnabled(not self._history_resolution_active)
@@ -1727,10 +1780,10 @@ class MainWindow(QMainWindow):
     def _prompt_history_resolution(self) -> str | None:
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("Choose Pomodorough history")
-        dialog.setText("Local and synced state both contain meaningful data.")
+        dialog.setWindowTitle("Choose synchronized state")
+        dialog.setText("This device and your account both contain synchronized data.")
         dialog.setInformativeText(
-            "Choose which timers, history, tasks, and settings should become canonical."
+            "This device and your account both contain synchronized timer, history, task, or settings data. Choose how to continue before making more changes."
         )
         keep_local = dialog.addButton(
             "Keep Local", QMessageBox.ButtonRole.AcceptRole
@@ -1752,16 +1805,16 @@ class MainWindow(QMainWindow):
     def _confirm_history_resolution(self, strategy: str) -> bool:
         messages = {
             "replace_remote": (
-                "Replace synced history?",
-                "Keep Local permanently replaces synced timer history with this device's history.",
+                "Confirm Keep Local",
+                "Account timer, history, tasks, settings, and queued changes will be replaced by this device's data.",
             ),
             "keep_remote": (
-                "Discard local history?",
-                "Keep Remote permanently discards this device's local timer history and pending changes.",
+                "Confirm Keep Remote",
+                "This device's timer, history, tasks, settings, and queued changes will be replaced by account data.",
             ),
             "merge": (
-                "Combine both histories?",
-                "Keep Both can produce timer conflicts or sync errors. Continue only if you accept that risk.",
+                "Confirm Keep Both",
+                "Queued local changes will be merged into account data. Conflicts or rejected changes are possible.",
             ),
         }
         title, message = messages[strategy]
@@ -2023,7 +2076,7 @@ class MainWindow(QMainWindow):
         resume = dialog.addButton(
             "Continue Resolution", QMessageBox.ButtonRole.AcceptRole
         )
-        sign_out = dialog.addButton("Sign Out", QMessageBox.ButtonRole.DestructiveRole)
+        sign_out = dialog.addButton("Sign out", QMessageBox.ButtonRole.DestructiveRole)
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)
@@ -2041,7 +2094,7 @@ class MainWindow(QMainWindow):
         switch = dialog.addButton(
             "Clear Data & Switch", QMessageBox.ButtonRole.DestructiveRole
         )
-        sign_out = dialog.addButton("Sign Out", QMessageBox.ButtonRole.RejectRole)
+        sign_out = dialog.addButton("Sign out", QMessageBox.ButtonRole.RejectRole)
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)

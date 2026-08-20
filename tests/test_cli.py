@@ -76,7 +76,10 @@ class CliTests(unittest.TestCase):
 
     def test_empty_history_text_and_json(self) -> None:
         result, output, error = self.invoke("history")
-        self.assertEqual((result, output, error), (0, "No completed timers.\n", ""))
+        self.assertEqual(
+            (result, output, error),
+            (0, "No arrivals yet\nYour first run appears here.\n", ""),
+        )
 
         result, output, error = self.invoke("history", "--json")
         self.assertEqual(result, 0)
