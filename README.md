@@ -247,9 +247,13 @@ standard local and roaming application-data directories.
 | `ui.py` | Qt desktop interface, rendering, and revision-driven sync |
 | `storage.py` | SQLite schema, migrations, queues, and canonical reconciliation |
 | `network.py` | OAuth, token rotation, HTTP sync, and SSE revision stream |
+| `shared_core.py` | Verified, thread-safe host for the pinned shared-core WASM ABI |
 | `terminal.py` | Shared local timer operations for CLI and TUI clients |
 | `cli.py` | Scriptable command-line interface |
 | `tui.py` | Interactive terminal interface |
+
+Existing Python reducer call sites remain active while shared-core parity is
+validated through the adapter.
 
 ## Testing
 

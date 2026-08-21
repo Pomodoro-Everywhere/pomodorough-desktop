@@ -5,10 +5,75 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+WINDOWS_WORKFLOW = ROOT / ".github" / "workflows" / "build-windows.yml"
+FLATPAK_MANIFEST = ROOT / "deploy" / "flatpak" / "me.egigoka.Pomodorough.yml"
+HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
+FLAKE = ROOT / "flake.nix"
+
+CORE_COMMIT = "a78a312314dd9466557c3dbdd12184b698c3d156"
+CORE_SHA256 = "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_ci_rebuilds_and_verifies_pinned_shared_core(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(f'CORE_COMMIT: "{CORE_COMMIT}"', workflow)
+        self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
+        self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
+        self.assertIn("ref: ${{ env.CORE_COMMIT }}", workflow)
+        self.assertIn(
+            "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
+            workflow,
+        )
+        self.assertIn(
+            'printf \'%s  %s\\n\' "$CORE_SHA256" '
+            "src/pomodorough/resources/pomodorough_core.wasm",
+            workflow,
+        )
+        self.assertIn(
+            "cmp pomodorough-core-source/target/wasm32-unknown-unknown/release/"
+            "pomodorough_core.wasm src/pomodorough/resources/pomodorough_core.wasm",
+            workflow,
+        )
+
+    def test_release_checks_shared_core_in_built_distributions(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(
+            workflow.count(
+                'from pomodorough.shared_core import SharedCore; '
+                'assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+            ),
+            2,
+        )
+        self.assertIn("pomodorough/resources/pomodorough_core.wasm", workflow)
+
+    def test_windows_bundle_collects_shared_core_and_wasmtime(self) -> None:
+        workflow = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("--hidden-import pomodorough.shared_core", workflow)
+        self.assertIn("--collect-all wasmtime", workflow)
+
+    def test_platform_packages_include_wasmtime_runtime(self) -> None:
+        flatpak = FLATPAK_MANIFEST.read_text(encoding="utf-8")
+        homebrew = HOMEBREW_FORMULA.read_text(encoding="utf-8")
+        flake = FLAKE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl", flatpak
+        )
+        self.assertIn(
+            "wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flatpak
+        )
+        self.assertIn('resource "wasmtime" do', homebrew)
+        self.assertIn('venv.pip_install resource("wasmtime")', homebrew)
+        self.assertIn('version = "48.0.0";', flake)
+        self.assertIn("wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl", flake)
+        self.assertIn("wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flake)
+
     def test_draft_is_verified_exactly_before_publication(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         publish_sequence = workflow.split(

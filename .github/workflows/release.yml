@@ -187,6 +187,10 @@ jobs:
         run: |
           test -f "dist/pomodorough_linux-${{ steps.version.outputs.version }}.tar.gz"
           test -f "dist/pomodorough_linux-${{ steps.version.outputs.version }}-py3-none-any.whl"
+          unzip -Z1 dist/*.whl \
+            | grep -Fx "pomodorough/resources/pomodorough_core.wasm"
+          tar -tzf dist/*.tar.gz \
+            | grep -Eq '/src/pomodorough/resources/pomodorough_core\.wasm$'
           python -m twine check dist/*
 
       - name: Install and test wheel
@@ -194,6 +198,7 @@ jobs:
           python -m venv .release-wheel
           .release-wheel/bin/python -m pip install dist/*.whl
           .release-wheel/bin/python -m pip check
+          .release-wheel/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
           QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m unittest discover -s tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
@@ -210,6 +215,7 @@ jobs:
           python -m venv .release-sdist
           .release-sdist/bin/python -m pip install dist/*.tar.gz
           .release-sdist/bin/python -m pip check
+          .release-sdist/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
           QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m unittest discover -s tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
             QT_QPA_PLATFORM=offscreen \

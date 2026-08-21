@@ -55,5 +55,15 @@ modules:
         sha256: abdf089cad4420e2e474a0fe8694aa32f91d7a49f569b559e18edd247a29af03
         only-arches:
           - aarch64
+      - type: file
+        url: https://files.pythonhosted.org/packages/a2/92/e144fcf578fc394678c24b042efe45f3b0614acdb87ea95d8b839b208842/wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl
+        sha256: 58544d539053dff7bd4cf30c40d7a540862d683013c0dfa6ba46a063f5b682f7
+        only-arches:
+          - x86_64
+      - type: file
+        url: https://files.pythonhosted.org/packages/1c/c3/a957b226979daaeb09ec024562e9aac05e475a954537e6f150eb60bca84d/wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl
+        sha256: 26fce3613fefbe29a28e9d659dca3326e800593858e5758cad086eb802b3b766
+        only-arches:
+          - aarch64
       - type: dir
         path: ../..

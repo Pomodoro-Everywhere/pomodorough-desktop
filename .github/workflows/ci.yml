@@ -12,6 +12,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CORE_COMMIT: "a78a312314dd9466557c3dbdd12184b698c3d156"
+  CORE_SHA256: "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
+
 jobs:
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -65,6 +69,32 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check out pinned shared core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Pomodoro-Everywhere/pomodorough-core
+          ref: ${{ env.CORE_COMMIT }}
+          path: pomodorough-core-source
+          persist-credentials: false
+
+      - name: Rebuild and verify pinned shared core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C pomodorough-core-source rev-parse HEAD)" = "$CORE_COMMIT"
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup target add wasm32-unknown-unknown --toolchain 1.97.1
+          (
+            cd pomodorough-core-source
+            cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked
+          )
+          printf '%s  %s\n' "$CORE_SHA256" src/pomodorough/resources/pomodorough_core.wasm \
+            | sha256sum --check --strict
+          grep -Fx "$CORE_COMMIT" src/pomodorough/resources/CORE_COMMIT
+          grep -Fx "$CORE_SHA256  pomodorough_core.wasm" \
+            src/pomodorough/resources/pomodorough_core.wasm.sha256
+          cmp pomodorough-core-source/target/wasm32-unknown-unknown/release/pomodorough_core.wasm src/pomodorough/resources/pomodorough_core.wasm
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5

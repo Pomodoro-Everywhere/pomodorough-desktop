@@ -27,10 +27,22 @@ class Pomodorough < Formula
     sha256 "360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74"
   end
 
+  resource "wasmtime" do
+    on_arm do
+      url "https://files.pythonhosted.org/packages/dc/a6/91c9c19ed7f8e164f4db6405d872c9397be9f53e4f325d0adcd5e67598f4/wasmtime-48.0.0-py3-none-macosx_11_0_arm64.whl"
+      sha256 "ea69889a3c51702e9da5f5f441027ca934f7758f8926a4ed167b0d6877f092e8"
+    end
+    on_intel do
+      url "https://files.pythonhosted.org/packages/89/93/911434c6c4406e6979b6cb67ba889c85633ff8d92eb0cb569fec6e2a43f7/wasmtime-48.0.0-py3-none-macosx_10_13_x86_64.whl"
+      sha256 "50e1ea81a3bec537d00e076722dfdc48978a56ea24619d8153aa1f75b11796b9"
+    end
+  end
+
   def install
     venv = virtualenv_create(libexec, "python3.14")
     venv.pip_install resource("setuptools"), build_isolation: false
     venv.pip_install resource("platformdirs"), build_isolation: false
+    venv.pip_install resource("wasmtime"), build_isolation: false
     if Hardware::CPU.arm?
       iroh = resource("iroh")
       iroh.stage { venv.pip_install Pathname.pwd/iroh.downloader.basename, build_isolation: false }
@@ -44,6 +56,7 @@ class Pomodorough < Formula
     assert_match '"status": "idle"', output
     assert_match "Run Pomodorough", shell_output("#{bin}/pomodorough-tui --help")
     system libexec/"bin/python", "-c", "import PySide6"
+    system libexec/"bin/python", "-c", "from pomodorough.shared_core import SharedCore; SharedCore()"
     system libexec/"bin/python", "-c", "import iroh" if Hardware::CPU.arm?
   end
 end

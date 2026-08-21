@@ -62,6 +62,8 @@ jobs:
             --windowed `
             --name "Pomodorough-$env:VERSION-windows-x86_64" `
             --collect-data pomodorough `
+            --hidden-import pomodorough.shared_core `
+            --collect-all wasmtime `
             deploy/windows/launcher.py
 
       - name: Smoke test executable

@@ -2,4 +2,5 @@ include flake.nix
 include flake.lock
 graft deploy
 graft screenshots
+graft src/pomodorough/resources
 global-exclude __pycache__ *.py[cod]

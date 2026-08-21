@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 dependencies = [
     "platformdirs>=4.3,<5",
     "PySide6-Essentials>=6.8,<7",
+    "wasmtime==48.0.0",
     "windows-curses>=2.4; sys_platform == 'win32'",
 ]
 
@@ -39,4 +40,10 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-pomodorough = ["resources/*.json", "resources/*.svg"]
+pomodorough = [
+    "resources/*.json",
+    "resources/*.svg",
+    "resources/*.wasm",
+    "resources/*.wasm.sha256",
+    "resources/CORE_COMMIT",
+]
