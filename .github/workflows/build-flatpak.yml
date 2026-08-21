@@ -52,6 +52,15 @@ jobs:
           arch: x86_64
           cache-key: flatpak-builder-${{ github.sha }}
 
+      - name: Verify shared core in Flatpak bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak"
+          flatpak install --user --noninteractive "$bundle"
+          flatpak run --user --command=python3 me.egigoka.Pomodorough -c \
+            'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

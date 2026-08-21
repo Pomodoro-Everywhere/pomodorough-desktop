@@ -74,6 +74,14 @@
             '';
 
             pythonImportsCheck = [ "pomodorough" "pomodorough.shared_core" ];
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              PYTHONPATH="$out/${pkgs.python3.sitePackages}:$PYTHONPATH" \
+                ${pkgs.python3.interpreter} -c \
+                'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+              runHook postInstallCheck
+            '';
 
             meta = {
               description = "KDE-first, local-first Pomodoro timer";

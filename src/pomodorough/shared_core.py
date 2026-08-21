@@ -15,7 +15,7 @@ CORE_SHA256: Final = "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b07
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
 _MAX_OPERATION_BYTES: Final = 256
-_MAX_INPUT_BYTES: Final = 64 * 1024 * 1024
+_MAX_INPUT_BYTES: Final = 16 * 1024 * 1024
 _MAX_OUTPUT_BYTES: Final = 16 * 1024 * 1024
 _MAX_MEMORY_BYTES: Final = 256 * 1024 * 1024
 _UINT32_MASK: Final = (1 << 32) - 1
@@ -41,6 +41,19 @@ class SharedCoreOperationError(SharedCoreError):
         self.operation = operation
         self.detail = detail
         super().__init__(f"shared-core operation {operation} failed: {detail}")
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
 
 
 class SharedCore:
@@ -75,6 +88,7 @@ class SharedCore:
         self._store = store
         self._instance = instance
         self._lock = Lock()
+        self._unusable_cause: BaseException | None = None
         self._memory = self._require_memory("memory")
         self._allocate_export = self._require_func(
             "pomodorough_alloc", ("i32",), ("i32",)
@@ -120,6 +134,10 @@ class SharedCore:
             raise ValueError("shared-core input is too large")
 
         with self._lock:
+            if self._unusable_cause is not None:
+                raise SharedCoreABIError(
+                    "shared-core instance is unusable after cleanup failure"
+                ) from self._unusable_cause
             return self._dispatch_locked(operation, operation_bytes, input_bytes)
 
     def _dispatch_locked(
@@ -130,6 +148,8 @@ class SharedCore:
         result_pointer = 0
         result_length = 0
         result_owned = False
+        value: object = None
+        primary: BaseException | None = None
 
         try:
             operation_pointer = self._allocate(operation_bytes)
@@ -147,12 +167,12 @@ class SharedCore:
             packed_bits = packed_result & _UINT64_MASK
             result_pointer = packed_bits & _UINT32_MASK
             result_length = packed_bits >> 32
+            result_owned = result_pointer != 0 and result_length != 0
             if result_length > _MAX_OUTPUT_BYTES:
                 raise SharedCoreABIError(
                     f"dispatch result is too large: {result_length} bytes"
                 )
             self._require_range(result_pointer, result_length, "dispatch result")
-            result_owned = result_pointer != 0 and result_length != 0
             result_bytes = bytes(
                 self._memory.read(
                     self._store,
@@ -164,20 +184,40 @@ class SharedCore:
                 envelope_json = result_bytes.decode("utf-8", errors="strict")
             except UnicodeDecodeError as cause:
                 raise SharedCoreABIError("dispatch result is not UTF-8") from cause
-            return self._parse_envelope(operation, envelope_json)
-        except SharedCoreError:
-            raise
-        except (IndexError, WasmtimeError) as cause:
-            raise SharedCoreABIError("shared-core ABI call failed") from cause
-        finally:
+            value = self._parse_envelope(operation, envelope_json)
+        except BaseException as cause:
+            if isinstance(cause, SharedCoreError):
+                primary = cause
+            elif isinstance(cause, (IndexError, WasmtimeError)):
+                primary = SharedCoreABIError("shared-core ABI call failed")
+                primary.__cause__ = cause
+            else:
+                primary = cause
+
+        cleanup_errors: list[BaseException] = []
+        for pointer, length in (
+            (result_pointer, result_length) if result_owned else (0, 0),
+            (input_pointer, len(input_bytes)),
+            (operation_pointer, len(operation_bytes)),
+        ):
             try:
-                if result_owned:
-                    self._release(result_pointer, result_length)
-            finally:
-                try:
-                    self._release(input_pointer, len(input_bytes))
-                finally:
-                    self._release(operation_pointer, len(operation_bytes))
+                self._release(pointer, length)
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
+
+        if cleanup_errors:
+            self._unusable_cause = cleanup_errors[0]
+            if primary is not None:
+                for cleanup in cleanup_errors:
+                    primary.add_note(f"shared-core cleanup failed: {cleanup!r}")
+                raise primary
+            error = SharedCoreABIError("shared-core cleanup failed")
+            for cleanup in cleanup_errors[1:]:
+                error.add_note(f"additional cleanup failure: {cleanup!r}")
+            raise error from cleanup_errors[0]
+        if primary is not None:
+            raise primary
+        return value
 
     def _allocate(self, value: bytes) -> int:
         raw_pointer = self._allocate_export(self._store, len(value))
@@ -191,8 +231,12 @@ class SharedCore:
             written = self._memory.write(self._store, value, pointer)
             if written != len(value):
                 raise SharedCoreABIError("linear-memory input write was incomplete")
-        except Exception:
-            self._release(pointer, len(value))
+        except BaseException as primary:
+            try:
+                self._release(pointer, len(value))
+            except BaseException as cleanup:
+                self._unusable_cause = cleanup
+                primary.add_note(f"shared-core cleanup failed: {cleanup!r}")
             raise
         return pointer
 
@@ -246,8 +290,12 @@ class SharedCore:
     @staticmethod
     def _parse_envelope(operation: str, envelope_json: str) -> object:
         try:
-            envelope = json.loads(envelope_json)
-        except json.JSONDecodeError as cause:
+            envelope = json.loads(
+                envelope_json,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, ValueError) as cause:
             raise SharedCoreABIError(
                 "dispatch returned an invalid JSON envelope"
             ) from cause

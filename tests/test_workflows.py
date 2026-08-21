@@ -8,7 +8,9 @@ ROOT = Path(__file__).parents[1]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 WINDOWS_WORKFLOW = ROOT / ".github" / "workflows" / "build-windows.yml"
+FLATPAK_WORKFLOW = ROOT / ".github" / "workflows" / "build-flatpak.yml"
 FLATPAK_MANIFEST = ROOT / "deploy" / "flatpak" / "me.egigoka.Pomodorough.yml"
+WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
@@ -56,6 +58,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         self.assertIn("--hidden-import pomodorough.shared_core", workflow)
         self.assertIn("--collect-all wasmtime", workflow)
+
+    def test_final_platform_artifacts_execute_shared_core(self) -> None:
+        windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        flatpak = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+        flake = FLAKE.read_text(encoding="utf-8")
+
+        self.assertIn("POMODOROUGH_SHARED_CORE_SMOKE", windows)
+        self.assertIn("SharedCore().dispatch", launcher)
+        self.assertIn("Verify shared core in Flatpak bundle", flatpak)
+        self.assertIn("flatpak run --user --command=python3", flatpak)
+        self.assertIn("doInstallCheck = true;", flake)
+        self.assertIn('SharedCore().dispatch("core.version", {})', flake)
 
     def test_platform_packages_include_wasmtime_runtime(self) -> None:
         flatpak = FLATPAK_MANIFEST.read_text(encoding="utf-8")

@@ -72,6 +72,12 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
+          $env:POMODOROUGH_SHARED_CORE_SMOKE = "1"
+          $coreProcess = Start-Process -FilePath $executable -PassThru -Wait
+          Remove-Item Env:POMODOROUGH_SHARED_CORE_SMOKE
+          if ($coreProcess.ExitCode -ne 0) {
+            throw "Packaged shared-core smoke test failed"
+          }
           $env:POMODOROUGH_SCREENSHOT = "$PWD/dist/smoke.png"
           $process = Start-Process -FilePath $executable -PassThru
           if (-not $process.WaitForExit(30000)) {

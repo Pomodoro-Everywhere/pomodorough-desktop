@@ -69,12 +69,42 @@ class SharedCoreTests(unittest.TestCase):
             "unsupported shared-core operation: missing.operation",
         )
 
+    def test_oversized_result_is_still_released(self) -> None:
+        core = SharedCore()
+        released: list[tuple[int, int]] = []
+        pointers = iter((100, 200))
+        core._allocate = lambda _value: next(pointers)
+        core._dispatch_export = lambda *_args: (16_777_217 << 32) | 300
+        core._release = lambda pointer, length: released.append((pointer, length))
+
+        with self.assertRaisesRegex(SharedCoreABIError, "result is too large"):
+            core._dispatch_locked("core.version", b"v", b"{}")
+
+        self.assertEqual(released, [(300, 16_777_217), (200, 2), (100, 1)])
+
+    def test_cleanup_failure_preserves_primary_and_invalidates_instance(self) -> None:
+        core = SharedCore()
+
+        def fail_release(pointer: int, length: int) -> None:
+            raise RuntimeError(f"free failed {pointer}/{length}")
+
+        core._release = fail_release
+        with self.assertRaises(SharedCoreOperationError) as raised:
+            core.dispatch("missing.operation", {})
+        self.assertTrue(raised.exception.__notes__)
+
+        with self.assertRaisesRegex(SharedCoreABIError, "unusable after cleanup failure"):
+            core.dispatch("core.version", {})
+
     def test_rejects_noncanonical_result_envelopes(self) -> None:
         invalid = (
             '{"ok":true,"value":{},"extra":true}',
             '{"ok":true,"value":{},"error":"bad"}',
             '{"ok":false,"error":"bad","value":{}}',
             '{"ok":false,"error":""}',
+            '{"ok":false,"error":7}',
+            '{"ok":true,"value":NaN}',
+            '{"ok":false,"ok":true,"value":1}',
         )
         for document in invalid:
             with self.subTest(document=document), self.assertRaises(
