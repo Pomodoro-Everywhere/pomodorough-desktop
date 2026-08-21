@@ -27,8 +27,12 @@ class LocalizationTests(unittest.TestCase):
 
     def test_catalog_resource_files_have_identical_keys(self) -> None:
         resources = files("pomodorough.resources")
-        english = json.loads(resources.joinpath("strings.en.json").read_text())
-        pseudo = json.loads(resources.joinpath("strings.ar-XB.json").read_text())
+        english = json.loads(
+            resources.joinpath("strings.en.json").read_text(encoding="utf-8")
+        )
+        pseudo = json.loads(
+            resources.joinpath("strings.ar-XB.json").read_text(encoding="utf-8")
+        )
 
         self.assertEqual(set(english), set(pseudo))
 
