@@ -44,6 +44,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             2,
         )
         self.assertIn("pomodorough/resources/pomodorough_core.wasm", workflow)
+        self.assertIn('/pname = "pomodorough-linux";/ { found = 1; next }', workflow)
 
     def test_windows_bundle_collects_shared_core_and_wasmtime(self) -> None:
         workflow = WINDOWS_WORKFLOW.read_text(encoding="utf-8")

@@ -64,7 +64,16 @@ jobs:
 
           package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           module_version="$(python -c 'import ast; print(ast.literal_eval(open("src/pomodorough/__init__.py").read().split("=", 1)[1].strip()))')"
-          flake_version="$(sed -nE 's/^[[:space:]]*version = "([^"]+)";.*/\1/p' flake.nix)"
+          flake_version="$(awk '
+            /pname = "pomodorough-linux";/ { found = 1; next }
+            found && /version = "/ {
+              value = $0
+              sub(/^[[:space:]]*version = "/, "", value)
+              sub(/";.*/, "", value)
+              print value
+              exit
+            }
+          ' flake.nix)"
           lock_version="$(python -c 'import tomllib; data=tomllib.load(open("uv.lock", "rb")); print(next(p["version"] for p in data["package"] if p["name"] == "pomodorough-linux"))')"
           metainfo_version="$(sed -nE 's/^[[:space:]]*<release version="([^"]+)".*/\1/p' deploy/flatpak/me.egigoka.Pomodorough.metainfo.xml | head -n 1)"
           for source_version in "$package_version" "$module_version" "$flake_version" "$lock_version" "$metainfo_version"; do
