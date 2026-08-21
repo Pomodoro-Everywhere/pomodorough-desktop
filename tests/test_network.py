@@ -79,8 +79,10 @@ class _FakeRevisionReply:
     def attribute(self, _attribute) -> int | None:
         return self.status
 
-    def rawHeader(self, name: bytes) -> bytes:
-        return self.content_type if bytes(name).lower() == b"content-type" else b""
+    def rawHeader(self, name: str) -> bytes:
+        if not isinstance(name, str):
+            raise TypeError("QNetworkReply.rawHeader requires a string header name")
+        return self.content_type if name.casefold() == "content-type" else b""
 
     def abort(self) -> None:
         self.aborted = True

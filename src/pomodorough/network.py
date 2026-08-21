@@ -901,7 +901,7 @@ class CloudService(QObject):
     @staticmethod
     def _valid_revision_stream_response(reply: QNetworkReply) -> bool:
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        content_type = bytes(reply.rawHeader(b"Content-Type"))
+        content_type = bytes(reply.rawHeader("Content-Type"))
         media_type = content_type.split(b";", 1)[0].strip().lower()
         return status == 200 and media_type == b"text/event-stream"
 
