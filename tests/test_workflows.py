@@ -51,6 +51,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         self.assertIn("--hidden-import pomodorough.shared_core", workflow)
         self.assertIn("--collect-all wasmtime", workflow)
+        self.assertIn("WaitForExit(120000)", workflow)
 
     def test_final_platform_artifacts_execute_shared_core(self) -> None:
         windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")

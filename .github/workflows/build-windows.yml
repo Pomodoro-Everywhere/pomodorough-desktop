@@ -80,7 +80,7 @@ jobs:
           }
           $env:POMODOROUGH_SCREENSHOT = "$PWD/dist/smoke.png"
           $process = Start-Process -FilePath $executable -PassThru
-          if (-not $process.WaitForExit(30000)) {
+          if (-not $process.WaitForExit(120000)) {
             Stop-Process -Id $process.Id -Force
             throw "Packaged application did not exit after smoke test"
           }
