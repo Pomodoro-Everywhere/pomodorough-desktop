@@ -9,11 +9,12 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QSystemTrayIcon
 
 from pomodorough.core import rebuild_optimistic, task_from_title
+from pomodorough.localization import Strings
 from pomodorough.storage import Store, utc_timestamp
 from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
@@ -48,6 +49,8 @@ class FakeCloud(QObject):
     revision_available = Signal(object)
     authorization_stale = Signal()
     failure = Signal(str)
+    account_deleted = Signal()
+    account_deletion_failed = Signal(str)
 
     def __init__(self, authenticated: bool = True, busy: bool = False) -> None:
         super().__init__()
@@ -61,6 +64,8 @@ class FakeCloud(QObject):
         self.restore_calls = 0
         self.revision_stops = 0
         self.revision_starts = 0
+        self.deleting_account = False
+        self.delete_confirmations: list[str] = []
 
     def restore(self) -> None:
         self.restore_calls += 1
@@ -79,6 +84,9 @@ class FakeCloud(QObject):
 
     def logout(self) -> None:
         self.logout_calls += 1
+
+    def delete_account(self, confirmation: str) -> None:
+        self.delete_confirmations.append(confirmation)
 
     def stop_revision_stream(self) -> None:
         self.revision_stops += 1
@@ -219,6 +227,59 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
         self.assertEqual(self.window.clock.time_text, "05:00")
 
+    def test_timer_and_data_views_expose_accessible_context(self) -> None:
+        self.assertEqual(self.window.clock.accessibleName(), "Timer status")
+        self.assertIn("Focus", self.window.clock.accessibleDescription())
+        self.assertIn("25:00 remaining", self.window.clock.accessibleDescription())
+        self.assertEqual(
+            self.window.duration_spins["short_break"].accessibleName(),
+            "Short break duration in minutes",
+        )
+        self.assertEqual(self.window.task_table.accessibleName(), "Task board")
+        self.assertEqual(self.window.history_list.accessibleName(), "Recent arrivals")
+        self.assertEqual(
+            self.window.history_list.focusPolicy(), Qt.FocusPolicy.StrongFocus
+        )
+        self.assertEqual(
+            [button.accessibleName() for button in self.window.screen_buttons],
+            [
+                "Show Timer screen",
+                "Show Tasks screen",
+                "Show Arrivals screen",
+                "Show Network screen",
+            ],
+        )
+
+    def test_active_pattern_and_task_edits_are_explicitly_for_next_timer(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        self.window._load_state()
+        self.window._render()
+
+        self.assertTrue(self.window.duration_spins["focus"].isEnabled())
+        self.assertTrue(self.window.phase_buttons["long_break"].isEnabled())
+        self.assertTrue(self.window.auto_breaks.isEnabled())
+        self.assertEqual(self.window.pattern_scope.text(), "Applies to next timer")
+        self.assertTrue(self.window.task_combo.isEnabled())
+        self.assertEqual(self.window.task_combo.accessibleName(), "Next focus task")
+        self.assertIn("Unassigned", self.window.active_task_context.text())
+
+        self.window.phase_buttons["long_break"].click()
+        self.assertEqual(self.window.timer["id"], start["timerId"])
+        self.assertEqual(self.window.timer["phase"], "focus")
+        self.assertEqual(self.window.settings["selectedPhase"], "long_break")
+
+    def test_completion_alert_limit_is_explicit_in_product(self) -> None:
+        notice = self.window.alert_guarantee
+
+        self.assertEqual(notice.accessibleName(), "Completion alert availability")
+        self.assertIn("while Pomodorough is running", notice.text())
+        self.assertIn("closed", notice.text())
+        self.assertIn("next launch", notice.text())
+        self.assertTrue(notice.wordWrap())
+
     def test_tray_retains_owned_context_menu(self) -> None:
         with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):
             self.window._build_tray()
@@ -227,6 +288,16 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertIsNotNone(self.window.tray_menu)
         self.assertIs(self.window.tray_menu.parent(), self.window)
         self.assertIs(self.window.tray.contextMenu(), self.window.tray_menu)
+
+    def test_tray_actions_use_localized_labels(self) -> None:
+        self.window.strings = Strings("ar-XB")
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):
+            self.window._build_tray()
+
+        labels = [action.text() for action in self.window.tray_menu.actions()]
+        self.assertTrue(labels[0].startswith("⟦"))
+        self.assertTrue(labels[1].startswith("⟦"))
+        self.assertTrue(labels[3].startswith("⟦"))
 
     def test_first_unowned_sign_in_previews_before_any_sync(self) -> None:
         self.store.queue_task_operation("upsert", task_from_title("Local task"))
@@ -614,6 +685,46 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.cloud.resolutions[-1]["strategy"], "merge")
         self.assertIsNotNone(self.store.pending_resolution("user-1"))
 
+    def test_sign_out_warning_reports_zero_queued_changes_and_cancel_is_safe_default(self) -> None:
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            self.window._account_action()
+
+        self.assertEqual(self.cloud.logout_calls, 0)
+        self.assertIn("0 queued changes", question.call_args.args[2])
+        self.assertEqual(
+            question.call_args.args[3],
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        self.assertEqual(
+            question.call_args.args[4], QMessageBox.StandardButton.Cancel
+        )
+
+    def test_sign_out_warning_reports_exact_total_across_all_outboxes(self) -> None:
+        task = task_from_title("Queued task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=2)
+        self.store.set_auto_start_breaks(True, now_ms=3)
+        self.store.set_selected_task_id(task["id"], now_ms=4)
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=5
+        )
+        self.window._load_state()
+
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            self.window._account_action()
+
+        self.assertIn("5 queued changes", question.call_args.args[2])
+        self.assertEqual(self.cloud.logout_calls, 0)
+
     def test_pending_resolution_account_action_can_sign_out(self) -> None:
         self.store.queue_task_operation(
             "upsert", task_from_title("Discarded on sign-out"), now_ms=1
@@ -743,6 +854,38 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.store.pending_resolution("user-1"), pending)
         self.assertEqual(self.store.load()["pending"], local)
         self.assertEqual(self.window._resolution_phase, "resolve")
+
+    def test_close_stops_periodic_timers_before_store_shutdown(self) -> None:
+        self.assertTrue(self.window.tick_timer.isActive())
+        self.assertTrue(self.window.sync_timer.isActive())
+
+        self.window.quitting = True
+        self.window.close()
+
+        self.assertFalse(self.window.tick_timer.isActive())
+        self.assertFalse(self.window.sync_timer.isActive())
+
+    def test_delayed_auto_break_callback_noops_after_window_and_store_shutdown(self) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=1)
+        self.window._load_state()
+        self.window._issue("start")
+        scheduled = []
+        with (
+            patch("pomodorough.ui.time.monotonic", return_value=100.0),
+            patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: scheduled.append((delay, callback)),
+            ),
+        ):
+            self.window._issue("finish")
+
+        self.assertEqual(len(scheduled), 1)
+        self.window.shutdown()
+        self.store.close()
+
+        with patch("pomodorough.ui.time.monotonic", return_value=101.2):
+            scheduled[0][1]()
 
     def test_duration_spin_queues_and_triggers_sync(self) -> None:
         self.window.duration_spins["focus"].setValue(30)
@@ -1113,6 +1256,51 @@ class MainWindowDurationTests(unittest.TestCase):
             ("short_break", "running"),
         )
 
+    def test_relaunch_completes_and_alerts_for_owned_overdue_timer(self) -> None:
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        self._replace_window(FakeCloud(authenticated=False))
+
+        with (
+            patch.object(
+                self.store,
+                "effective_timer_now_ms",
+                return_value=1_000 + settings["durationsMs"]["focus"],
+            ),
+            patch.object(self.window, "_notify") as notify,
+        ):
+            self.window._tick()
+
+        self.assertEqual(self.window.timer["status"], "completed")
+        notify.assert_called_once_with("Service arrived", "Focus completed.")
+
+    def test_tick_does_not_auto_finish_unowned_centralized_timer(self) -> None:
+        remote_timer = {
+            "id": "remote-timer",
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": "1970-01-01T00:00:01.000Z",
+            "taskId": None,
+        }
+        snapshot = self.store.get_meta("snapshot")
+        snapshot["canonicalTimer"] = remote_timer
+        self.store._set_meta("snapshot", snapshot)
+        self.store.connection.commit()
+        self.window._load_state()
+
+        with (
+            patch.object(self.store, "effective_timer_now_ms", return_value=61_000),
+            patch.object(self.window, "_issue") as issue,
+        ):
+            self.window._tick()
+
+        issue.assert_not_called()
+        self.assertEqual(self.store.load()["pending"], [])
+
     def test_tick_uses_monotonic_deadline_across_wall_jumps(self) -> None:
         physical_ms = 1_800_000_000_000
         settings = self.store.load()["settings"]
@@ -1338,6 +1526,58 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertTrue(self.window.screen_buttons[2].isChecked())
         self.assertEqual(len(self.cloud.payloads), before + 1)
 
+    def test_arrivals_include_all_terminal_states_with_honest_count_and_task_context(
+        self,
+    ) -> None:
+        retained = task_from_title("Retained title")
+        self.window.known_tasks[retained["id"]] = retained
+        history = []
+        for index in range(10):
+            item = self._history_item(f"item-{index}")
+            item["status"] = ("completed", "cancelled", "superseded")[index % 3]
+            if index == 0:
+                item["taskId"] = retained["id"]
+            elif index == 1:
+                item["taskId"] = "missing-task"
+            history.append(item)
+        self.window.history = history
+
+        self.window._render_history()
+
+        self.assertEqual(self.window.history_count.text(), "8 of 10")
+        self.assertIn("completed, cancelled, and superseded", self.window.history_scope.text())
+        self.assertIn("Showing 8 of 10", self.window.history_list.accessibleDescription())
+        self.assertEqual(self.window.history_list.count(), 8)
+        rows = [self.window.history_list.item(index).text() for index in range(8)]
+        self.assertIn("Completed", rows[0])
+        self.assertIn("Retained title", rows[0])
+        self.assertIn("Cancelled", rows[1])
+        self.assertIn("Deleted task", rows[1])
+        self.assertIn("Superseded", rows[2])
+        self.assertIn("Unassigned", rows[2])
+
+    def test_arrivals_navigation_moves_keyboard_focus_to_the_list(self) -> None:
+        self.window.show()
+        self.app.processEvents()
+        self.window._show_screen(2)
+        self.app.processEvents()
+
+        self.assertTrue(self.window.history_list.hasFocus())
+
+    def test_rtl_pseudolocale_mirrors_layout_and_uses_externalized_labels(self) -> None:
+        self.window.quitting = True
+        self.window.close()
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(
+                self.store, self.cloud, QIcon(), locale="ar-XB"
+            )
+
+        self.assertEqual(
+            self.window.layoutDirection(), Qt.LayoutDirection.RightToLeft
+        )
+        self.assertTrue(self.window.screen_buttons[2].text().startswith("⟦"))
+        self.assertTrue(self.window.history_scope.text().startswith("⟦"))
+
     def test_network_page_reports_unavailable_transport_without_fake_sync(self) -> None:
         iroh = FakeIroh(available=False)
         self.window.quitting = True
@@ -1368,6 +1608,83 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.window.invite_output.toPlainText(), "pomodorough1.test")
         self.assertTrue(self.window.copy_invite_button.isEnabled())
         self.assertGreaterEqual(self.cloud.revision_stops, 1)
+
+    def test_selecting_first_iroh_route_guides_setup_without_persisting_it(self) -> None:
+        iroh = FakeIroh()
+        self.window.quitting = True
+        self.window.close()
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(self.store, self.cloud, QIcon(), iroh)
+        self.window.show()
+        self.app.processEvents()
+
+        self.window.replication_mode_combo.setCurrentIndex(
+            self.window.replication_mode_combo.findData("iroh")
+        )
+        self.app.processEvents()
+
+        self.assertEqual(self.store.replication_mode, "centralized")
+        self.assertEqual(self.window.replication_mode, "centralized")
+        self.assertEqual(
+            self.window.replication_mode_combo.currentData(), "centralized"
+        )
+        self.assertEqual(self.window.page_stack.currentIndex(), 3)
+        self.assertTrue(self.window.iroh_first_room_guidance.isVisible())
+        self.assertTrue(self.window.create_room_button.hasFocus())
+        self.assertEqual(iroh.started, [])
+
+    def test_signed_out_first_room_creation_activates_iroh_only_after_room_exists(self) -> None:
+        self.cloud.authenticated = False
+        iroh = FakeIroh()
+        self.window.quitting = True
+        self.window.close()
+        with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            self.window = MainWindow(self.store, self.cloud, QIcon(), iroh)
+
+        self.window._create_iroh_room()
+
+        self.assertIsNotNone(self.store.active_iroh_room_id)
+        self.assertEqual(self.store.replication_mode, "iroh")
+        self.assertEqual(iroh.started, [(self.store.active_iroh_room_id, True)])
+
+    def test_account_surface_links_privacy_and_requires_exact_delete_confirmation(self) -> None:
+        self.window._show_screen(3)
+        self.assertEqual(
+            self.window.privacy_policy_button.accessibleDescription(),
+            "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/",
+        )
+        self.assertTrue(self.window.delete_account_button.isEnabled())
+        with patch("pomodorough.ui.QDesktopServices.openUrl") as open_url:
+            self.window._open_privacy_policy()
+        self.assertEqual(
+            open_url.call_args.args[0].toString(),
+            "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/",
+        )
+
+        for confirmation in ("delete", "DELETE "):
+            with patch.object(
+                QInputDialog, "getText", return_value=(confirmation, True)
+            ):
+                self.window._delete_account_action()
+        self.assertEqual(self.cloud.delete_confirmations, [])
+
+        with patch.object(QInputDialog, "getText", return_value=("DELETE", True)):
+            self.window._delete_account_action()
+        self.assertEqual(self.cloud.delete_confirmations, ["DELETE"])
+
+    def test_account_delete_failure_preserves_local_data_and_success_clears_it(self) -> None:
+        task = task_from_title("Account-bound task")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        before = self.store.load()
+
+        self.cloud.account_deletion_failed.emit("offline")
+        self.assertEqual(self.store.load(), before)
+
+        self.cloud.authenticated = False
+        self.cloud.account_deleted.emit()
+        after = self.store.load()
+        self.assertEqual(after["pendingTasks"], [])
+        self.assertIsNone(after["snapshot"]["user"])
 
     def test_synced_task_can_be_selected_while_timer_is_paused(self) -> None:
         task = task_from_title("Remote task")
@@ -1423,7 +1740,12 @@ class MainWindowDurationTests(unittest.TestCase):
             },
             True,
         )
-        self.assertFalse(self.window.task_combo.isEnabled())
+        self.assertTrue(self.window.task_combo.isEnabled())
+        self.assertEqual(self.window.task_combo.accessibleName(), "Next focus task")
+        self.assertIn(
+            "remains assigned to Remote task",
+            self.window.task_combo.accessibleDescription(),
+        )
 
     def test_remote_task_deletion_does_not_queue_clear_and_keeps_history_title(
         self,

@@ -32,6 +32,7 @@ def main() -> int:
     cloud = CloudService(store.device_id)
     iroh = _iroh_service(store)
     window = MainWindow(store, cloud, icon, iroh)
+    app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(cloud.shutdown)
     app.aboutToQuit.connect(iroh.shutdown)
     app.aboutToQuit.connect(store.close)

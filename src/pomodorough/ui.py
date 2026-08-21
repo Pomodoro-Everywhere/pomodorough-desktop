@@ -7,10 +7,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QDesktopServices,
     QFont,
     QIcon,
     QKeySequence,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -67,7 +69,11 @@ from .core import (
 )
 from .network import CloudService
 from .iroh_protocol import IrohProtocolError, parse_invite
+from .localization import Strings
 from .storage import Store
+
+
+PRIVACY_POLICY_URL = "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/"
 
 
 def resource_path(name: str) -> Path:
@@ -75,12 +81,14 @@ def resource_path(name: str) -> Path:
 
 
 class ClockWidget(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, strings: Strings | None = None) -> None:
         super().__init__()
+        self.strings = strings or Strings()
         self.time_text = "25:00"
-        self.phase_text = "FOCUS"
-        self.status_text = "READY AT PLATFORM"
+        self.phase_text = self.strings.text("phase.focus").upper()
+        self.status_text = self.strings.text("status.rail.idle")
         self.progress = 0.0
+        self.setAccessibleName(self.strings.text("status.timer_accessible"))
         self.setMinimumSize(170, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -92,6 +100,10 @@ class ClockWidget(QWidget):
         self.phase_text = phase.upper()
         self.status_text = status.upper()
         self.progress = max(0.0, min(1.0, progress))
+        self.setAccessibleDescription(self.strings.text(
+            "status.timer_description", phase=phase.title(), time=time_text,
+            status=status.lower()
+        ))
         self.update()
 
     def paintEvent(self, _event: Any) -> None:
@@ -185,19 +197,28 @@ class MainWindow(QMainWindow):
         cloud: CloudService,
         app_icon: QIcon,
         iroh: Any | None = None,
+        locale: str | None = None,
     ) -> None:
         super().__init__()
+        self.strings = Strings(locale)
+        self.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft
+            if self.strings.is_rtl
+            else Qt.LayoutDirection.LeftToRight
+        )
         self.store = store
         self.cloud = cloud
+        self.cloud.strings = self.strings
         self.app_icon = app_icon
         self.iroh = iroh
         self.replication_mode = store.replication_mode
-        self._iroh_status = "NOT CONNECTED"
+        self._iroh_status = self.strings.text("network.not_connected")
         self._iroh_details: dict[str, Any] = {}
         self._iroh_invite = ""
         self._cloud_restore_after_iroh_stop = False
         self._iroh_join_pending = False
         self.quitting = False
+        self._closed = False
         self._notified_timer_id: str | None = None
         self._sound_active = False
         self.sound_timer = QTimer(self)
@@ -225,7 +246,7 @@ class MainWindow(QMainWindow):
         self._task_render_signature: tuple[Any, ...] | None = None
         self._load_state()
         self._activate_persisted_resolution()
-        self.setWindowTitle("Pomodorough — Time, in transit")
+        self.setWindowTitle(self.strings.text("window.title"))
         self.setWindowIcon(app_icon)
         self.setMinimumSize(600, 340)
         self.resize(640, 360)
@@ -342,9 +363,9 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         brand = QVBoxLayout()
         brand.setSpacing(0)
-        title = QLabel("POMODOROUGH")
+        title = QLabel(self.strings.text("brand.name"))
         title.setObjectName("brand")
-        tagline = QLabel("TIME, IN TRANSIT")
+        tagline = QLabel(self.strings.text("brand.tagline"))
         tagline.setObjectName("tagline")
         brand.addWidget(title)
         brand.addWidget(tagline)
@@ -352,8 +373,20 @@ class MainWindow(QMainWindow):
         self.screen_group = QButtonGroup(self)
         self.screen_group.setExclusive(True)
         self.screen_buttons: list[QPushButton] = []
-        for index, label in enumerate(("TIMER", "TASKS", "ARRIVALS", "NETWORK")):
+        destinations = (
+            ("timer", self.strings.text("nav.timer")),
+            ("tasks", self.strings.text("nav.tasks")),
+            ("arrivals", self.strings.text("nav.arrivals")),
+            ("network", self.strings.text("nav.network")),
+        )
+        for index, (destination, label) in enumerate(destinations):
             button = QPushButton(label)
+            button.setAccessibleName(
+                self.strings.text(
+                    "nav.show",
+                    destination=self.strings.text(f"destination.{destination}"),
+                )
+            )
             button.setCheckable(True)
             button.setProperty("screen", True)
             button.clicked.connect(
@@ -376,10 +409,10 @@ class MainWindow(QMainWindow):
         else:
             self.settings_button.setIcon(settings_icon)
             self.settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.settings_button.setToolTip("Show settings")
-        self.settings_button.setAccessibleName("Show settings")
+        self.settings_button.setToolTip(self.strings.text("status.settings_show"))
+        self.settings_button.setAccessibleName(self.strings.text("status.settings_show"))
         self.settings_button.toggled.connect(self._settings_toggled)
-        self.account_button = QPushButton("SIGN IN")
+        self.account_button = QPushButton(self.strings.text("account.sign_in"))
         self.account_button.setObjectName("accountButton")
         self.account_button.clicked.connect(self._account_action)
         header.addWidget(self.settings_button)
@@ -396,13 +429,18 @@ class MainWindow(QMainWindow):
         self.content_layout = QHBoxLayout(self.timer_page)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.left_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom)
-        self.clock = ClockWidget()
+        self.clock = ClockWidget(self.strings)
         self.left_layout.addWidget(self.clock, 1)
         self.long_break_progress = QLabel("○○○○")
         self.long_break_progress.setObjectName("microLabel")
         self.long_break_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.long_break_progress.setAccessibleName("Pomodoro progress")
+        self.long_break_progress.setAccessibleName(self.strings.text("status.pomodoro_progress"))
         self.left_layout.addWidget(self.long_break_progress)
+        self.active_task_context = QLabel("")
+        self.active_task_context.setObjectName("taskSubtitle")
+        self.active_task_context.setAccessibleName(self.strings.text("task.active_accessible"))
+        self.active_task_context.setWordWrap(True)
+        self.left_layout.addWidget(self.active_task_context)
 
         self.actions_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self.actions_layout.setSpacing(8)
@@ -413,22 +451,22 @@ class MainWindow(QMainWindow):
         task_selector_layout = QHBoxLayout(self.task_selector_panel)
         task_selector_layout.setContentsMargins(8, 5, 8, 7)
         task_selector_layout.setSpacing(8)
-        task_selector_label = QLabel("FOCUS TASK")
+        task_selector_label = QLabel(self.strings.text("task.focus").upper())
         task_selector_label.setObjectName("microLabel")
         self.task_combo = QComboBox()
-        self.task_combo.setAccessibleName("Focus task")
+        self.task_combo.setAccessibleName(self.strings.text("task.focus"))
         self.task_combo.currentIndexChanged.connect(self._task_selection_changed)
         task_selector_layout.addWidget(task_selector_label)
         task_selector_layout.addWidget(self.task_combo, 1)
-        self.primary_button = QPushButton("START FOCUS")
+        self.primary_button = QPushButton(self.strings.text("status.primary.start", phase=self.strings.text("phase.focus").upper()))
         self.primary_button.setObjectName("primaryButton")
         self.primary_button.clicked.connect(self._primary_action)
-        self.finish_button = QPushButton("FINISH")
+        self.finish_button = QPushButton(self.strings.text("status.finish"))
         self.finish_button.clicked.connect(lambda: self._issue("finish"))
-        self.cancel_button = QPushButton("CANCEL")
+        self.cancel_button = QPushButton(self.strings.text("status.cancel"))
         self.cancel_button.setObjectName("dangerButton")
         self.cancel_button.clicked.connect(lambda: self._issue("cancel"))
-        self.stop_sound_button = QPushButton("STOP SOUND")
+        self.stop_sound_button = QPushButton(self.strings.text("status.stop_sound"))
         self.stop_sound_button.clicked.connect(self._stop_sound_and_clear)
         self.stop_sound_button.setVisible(False)
         self.actions_layout.addWidget(self.task_selector_panel)
@@ -443,20 +481,25 @@ class MainWindow(QMainWindow):
         self.right_panel.setObjectName("ticket")
         self.right_layout = QVBoxLayout(self.right_panel)
 
-        service_label = QLabel("SERVICE PATTERN")
+        service_label = QLabel(self.strings.text("pattern.title"))
         service_label.setObjectName("sectionTitle")
         self.right_layout.addWidget(service_label)
-        service_detail = QLabel("Choose a mode and duration")
+        service_detail = QLabel(self.strings.text("pattern.detail"))
         service_detail.setObjectName("taskSubtitle")
         self.right_layout.addWidget(service_detail)
+        self.pattern_scope = QLabel("")
+        self.pattern_scope.setObjectName("taskSubtitle")
+        self.pattern_scope.setAccessibleName(self.strings.text("pattern.next_scope"))
+        self.right_layout.addWidget(self.pattern_scope)
         self.phase_group = QButtonGroup(self)
         self.phase_group.setExclusive(True)
         self.phase_buttons: dict[str, QPushButton] = {}
         phase_layout = QHBoxLayout()
         phase_layout.setSpacing(5)
         for phase, definition in PHASES.items():
-            button = QPushButton(definition["label"].upper())
-            button.setToolTip(definition["label"])
+            phase_label = self.strings.text(f"phase.{phase}")
+            button = QPushButton(phase_label.upper())
+            button.setToolTip(phase_label)
             button.setCheckable(True)
             button.setProperty("phase", True)
             button.clicked.connect(lambda checked=False, value=phase: self._select_phase(value))
@@ -469,26 +512,31 @@ class MainWindow(QMainWindow):
         duration_grid.setVerticalSpacing(7)
         self.duration_spins: dict[str, QSpinBox] = {}
         for row, (phase, definition) in enumerate(PHASES.items()):
-            label = QLabel(definition["label"])
+            phase_label = self.strings.text(f"phase.{phase}")
+            label = QLabel(phase_label)
             spin = QSpinBox()
+            spin.setAccessibleName(self.strings.text("pattern.duration_accessible", phase=phase_label))
             spin.setRange(1, 180)
-            spin.setSuffix(" min")
+            spin.setSuffix(self.strings.text("pattern.minutes_suffix"))
             spin.setValue(int(self.settings["durations"][phase]))
             spin.valueChanged.connect(lambda value, key=phase: self._duration_changed(key, value))
             duration_grid.addWidget(label, row, 0)
             duration_grid.addWidget(spin, row, 1)
             self.duration_spins[phase] = spin
         self.right_layout.addLayout(duration_grid)
-        self.auto_breaks = QCheckBox("Auto-start breaks")
+        self.auto_breaks = QCheckBox(self.strings.text("pattern.auto_breaks"))
         self.auto_breaks.setChecked(bool(self.settings.get("autoStartBreaks")))
         self.auto_breaks.toggled.connect(self._auto_breaks_changed)
         self.right_layout.addWidget(self.auto_breaks)
-        auto_breaks_detail = QLabel(
-            "Short after focus. Long every fourth completed focus."
-        )
+        auto_breaks_detail = QLabel(self.strings.text("pattern.auto_breaks_detail"))
         auto_breaks_detail.setObjectName("taskSubtitle")
         auto_breaks_detail.setWordWrap(True)
         self.right_layout.addWidget(auto_breaks_detail)
+        self.alert_guarantee = QLabel(self.strings.text("pattern.alert_guarantee"))
+        self.alert_guarantee.setObjectName("privacyNotice")
+        self.alert_guarantee.setWordWrap(True)
+        self.alert_guarantee.setAccessibleName(self.strings.text("pattern.alert_accessible"))
+        self.right_layout.addWidget(self.alert_guarantee)
         self.right_layout.addStretch()
         self.content_layout.addWidget(self.right_panel, 2)
         self.right_panel.hide()
@@ -504,11 +552,14 @@ class MainWindow(QMainWindow):
         self.shortcuts = [
             QShortcut(QKeySequence(Qt.Key.Key_Space), self),
             QShortcut(QKeySequence("Ctrl+Shift+F"), self),
-            QShortcut(QKeySequence("Ctrl+4"), self),
+            *(QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self) for index in range(4)),
         ]
         self.shortcuts[0].activated.connect(self._primary_action)
         self.shortcuts[1].activated.connect(lambda: self._issue("finish"))
-        self.shortcuts[2].activated.connect(lambda: self._show_screen(3))
+        for index, shortcut in enumerate(self.shortcuts[2:]):
+            shortcut.activated.connect(
+                lambda page=index: self._show_screen(page)
+            )
         self.notice.connect(self._show_notice)
         self._refresh_stylesheet()
         self._apply_responsive_layout()
@@ -522,25 +573,25 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         heading = QVBoxLayout()
-        title = QLabel("TASK BOARD")
+        title = QLabel(self.strings.text("task.board"))
         title.setObjectName("sectionTitle")
-        subtitle = QLabel("Completed focus services, grouped for today")
+        subtitle = QLabel(self.strings.text("task.board_detail"))
         subtitle.setObjectName("taskSubtitle")
         heading.addWidget(title)
         heading.addWidget(subtitle)
         header.addLayout(heading)
         header.addStretch()
-        self.task_totals = QLabel("0 POMODOROS • 0 MIN TODAY")
+        self.task_totals = QLabel(self.strings.text("task.totals", count=0, unit=self.strings.text("task.pomodoro.other"), minutes=self.strings.text("duration.minutes", minutes=0).upper()))
         self.task_totals.setObjectName("countBadge")
         header.addWidget(self.task_totals)
         layout.addLayout(header)
 
         form = QHBoxLayout()
         self.task_input = QLineEdit()
-        self.task_input.setPlaceholderText("Write release notes")
-        self.task_input.setAccessibleName("Task name")
+        self.task_input.setPlaceholderText(self.strings.text("task.placeholder"))
+        self.task_input.setAccessibleName(self.strings.text("task.name_accessible"))
         self.task_input.returnPressed.connect(self._add_task)
-        self.add_task_button = QPushButton("ADD TASK")
+        self.add_task_button = QPushButton(self.strings.text("task.add"))
         self.add_task_button.setObjectName("primaryButton")
         self.add_task_button.clicked.connect(self._add_task)
         form.addWidget(self.task_input, 1)
@@ -548,8 +599,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(form)
 
         self.task_table = QTableWidget(0, 4)
+        self.task_table.setAccessibleName(self.strings.text("task.board_accessible"))
         self.task_table.setHorizontalHeaderLabels(
-            ("Task", "Finished", "Time", "Action")
+            tuple(self.strings.text(f"task.column.{key}") for key in ("task", "finished", "time", "action"))
         )
         for column, alignment in enumerate(
             (
@@ -569,9 +621,7 @@ class MainWindow(QMainWindow):
         for column in (1, 2, 3):
             table_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.task_table, 1)
-        self.tasks_empty = QLabel(
-            "No tasks yet\nAdd a task, then assign it before starting focus."
-        )
+        self.tasks_empty = QLabel(self.strings.text("task.empty"))
         self.tasks_empty.setObjectName("emptyState")
         self.tasks_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.tasks_empty)
@@ -585,20 +635,27 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("RECENT ARRIVALS")
+        heading = QVBoxLayout()
+        title = QLabel(self.strings.text("arrivals.title"))
         title.setObjectName("sectionTitle")
+        self.history_scope = QLabel(self.strings.text("arrivals.scope"))
+        self.history_scope.setObjectName("taskSubtitle")
+        self.history_scope.setWordWrap(True)
+        heading.addWidget(title)
+        heading.addWidget(self.history_scope)
         self.history_count = QLabel("0")
         self.history_count.setObjectName("countBadge")
-        header.addWidget(title)
+        header.addLayout(heading)
         header.addStretch()
         header.addWidget(self.history_count)
         layout.addLayout(header)
 
         self.history_list = QListWidget()
+        self.history_list.setAccessibleName(self.strings.text("arrivals.accessible"))
         self.history_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.history_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.history_list, 1)
-        self.device_label = QLabel(f"DEVICE  {self.store.device_id[-8:].upper()}")
+        self.device_label = QLabel(self.strings.text("device.label", device=self.store.device_id[-8:].upper()))
         self.device_label.setObjectName("device")
         layout.addWidget(self.device_label)
         return page
@@ -612,28 +669,28 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         heading = QVBoxLayout()
-        title = QLabel("NETWORK CONTROL")
+        title = QLabel(self.strings.text("network.title"))
         title.setObjectName("sectionTitle")
-        subtitle = QLabel("Choose one route for remote replication")
+        subtitle = QLabel(self.strings.text("network.detail"))
         subtitle.setObjectName("taskSubtitle")
         heading.addWidget(title)
         heading.addWidget(subtitle)
         header.addLayout(heading)
         header.addStretch()
-        self.network_status = QLabel("NOT CONNECTED")
+        self.network_status = QLabel(self.strings.text("network.not_connected"))
         self.network_status.setObjectName("countBadge")
-        self.network_status.setAccessibleName("Replication status")
+        self.network_status.setAccessibleName(self.strings.text("network.status_accessible"))
         header.addWidget(self.network_status)
         layout.addLayout(header)
 
         mode_row = QHBoxLayout()
-        mode_label = QLabel("ROUTE")
+        mode_label = QLabel(self.strings.text("network.route"))
         mode_label.setObjectName("microLabel")
         self.replication_mode_combo = QComboBox()
-        self.replication_mode_combo.setAccessibleName("Replication mode")
-        self.replication_mode_combo.addItem("ON DEVICE · OFFLINE", "offline")
-        self.replication_mode_combo.addItem("IROH ROOM · EQUAL PEERS", "iroh")
-        self.replication_mode_combo.addItem("POMODOROUGH CLOUD · CENTRAL", "centralized")
+        self.replication_mode_combo.setAccessibleName(self.strings.text("network.mode_accessible"))
+        self.replication_mode_combo.addItem(self.strings.text("network.mode.offline"), "offline")
+        self.replication_mode_combo.addItem(self.strings.text("network.mode.iroh"), "iroh")
+        self.replication_mode_combo.addItem(self.strings.text("network.mode.centralized"), "centralized")
         self.replication_mode_combo.setCurrentIndex(
             max(0, self.replication_mode_combo.findData(self.replication_mode))
         )
@@ -644,11 +701,38 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.replication_mode_combo, 1)
         layout.addLayout(mode_row)
 
+        account_row = QHBoxLayout()
+        account_label = QLabel(self.strings.text("account.heading"))
+        account_label.setObjectName("microLabel")
+        self.privacy_policy_button = QPushButton(
+            self.strings.text("account.privacy_policy")
+        )
+        self.privacy_policy_button.setAccessibleDescription(PRIVACY_POLICY_URL)
+        self.privacy_policy_button.clicked.connect(self._open_privacy_policy)
+        self.delete_account_button = QPushButton(self.strings.text("account.delete"))
+        self.delete_account_button.setObjectName("dangerButton")
+        self.delete_account_button.clicked.connect(self._delete_account_action)
+        account_row.addWidget(account_label)
+        account_row.addStretch()
+        account_row.addWidget(self.privacy_policy_button)
+        account_row.addWidget(self.delete_account_button)
+        layout.addLayout(account_row)
+
         self.network_unavailable = QLabel("")
         self.network_unavailable.setObjectName("privacyNotice")
         self.network_unavailable.setWordWrap(True)
-        self.network_unavailable.setAccessibleName("Iroh availability")
+        self.network_unavailable.setAccessibleName(self.strings.text("network.iroh_unavailable_accessible"))
         layout.addWidget(self.network_unavailable)
+
+        self.iroh_first_room_guidance = QLabel(
+            self.strings.text("iroh.first_room_guidance")
+        )
+        self.iroh_first_room_guidance.setObjectName("privacyNotice")
+        self.iroh_first_room_guidance.setWordWrap(True)
+        self.iroh_first_room_guidance.setAccessibleName(
+            self.strings.text("iroh.first_room_accessible")
+        )
+        layout.addWidget(self.iroh_first_room_guidance)
 
         self.iroh_panel = QFrame()
         self.iroh_panel.setObjectName("networkPanel")
@@ -658,43 +742,43 @@ class MainWindow(QMainWindow):
         iroh_layout.setVerticalSpacing(8)
 
         self.room_name_input = QLineEdit()
-        self.room_name_input.setPlaceholderText("Optional room name")
+        self.room_name_input.setPlaceholderText(self.strings.text("network.room_name_placeholder"))
         self.room_name_input.setMaxLength(64)
-        self.room_name_input.setAccessibleName("Iroh room name")
-        self.create_room_button = QPushButton("OPEN NEW ROOM")
+        self.room_name_input.setAccessibleName(self.strings.text("network.room_name_accessible"))
+        self.create_room_button = QPushButton(self.strings.text("network.create_room"))
         self.create_room_button.setObjectName("primaryButton")
-        self.create_room_button.setAccessibleName("Create Iroh room")
+        self.create_room_button.setAccessibleName(self.strings.text("network.create_room_accessible"))
         self.create_room_button.clicked.connect(self._create_iroh_room)
         iroh_layout.addWidget(self.room_name_input, 0, 0)
         iroh_layout.addWidget(self.create_room_button, 0, 1)
 
         self.invite_input = QPlainTextEdit()
-        self.invite_input.setPlaceholderText("Paste pomodorough1. invite code")
-        self.invite_input.setAccessibleName("Iroh room invite code")
+        self.invite_input.setPlaceholderText(self.strings.text("network.invite_placeholder"))
+        self.invite_input.setAccessibleName(self.strings.text("network.invite_accessible"))
         self.invite_input.setMaximumHeight(70)
-        self.join_room_button = QPushButton("JOIN ROOM")
-        self.join_room_button.setAccessibleName("Join Iroh room")
+        self.join_room_button = QPushButton(self.strings.text("network.join_room"))
+        self.join_room_button.setAccessibleName(self.strings.text("network.join_room_accessible"))
         self.join_room_button.clicked.connect(self._join_iroh_room)
         iroh_layout.addWidget(self.invite_input, 1, 0)
         iroh_layout.addWidget(self.join_room_button, 1, 1)
 
         self.invite_output = QPlainTextEdit()
         self.invite_output.setReadOnly(True)
-        self.invite_output.setPlaceholderText("Room invite appears here after endpoint starts")
-        self.invite_output.setAccessibleName("Shareable Iroh room invite")
+        self.invite_output.setPlaceholderText(self.strings.text("network.invite_output_placeholder"))
+        self.invite_output.setAccessibleName(self.strings.text("network.invite_output_accessible"))
         self.invite_output.setMaximumHeight(70)
-        self.copy_invite_button = QPushButton("COPY INVITE")
-        self.copy_invite_button.setAccessibleName("Copy Iroh room invite")
+        self.copy_invite_button = QPushButton(self.strings.text("network.copy_invite"))
+        self.copy_invite_button.setAccessibleName(self.strings.text("network.copy_invite_accessible"))
         self.copy_invite_button.clicked.connect(self._copy_iroh_invite)
         iroh_layout.addWidget(self.invite_output, 2, 0)
         iroh_layout.addWidget(self.copy_invite_button, 2, 1)
 
         action_row = QHBoxLayout()
-        self.refresh_invite_button = QPushButton("REFRESH TICKET")
+        self.refresh_invite_button = QPushButton(self.strings.text("network.refresh_ticket"))
         self.refresh_invite_button.clicked.connect(self._refresh_iroh_invite)
-        self.sync_iroh_button = QPushButton("SYNC NOW")
+        self.sync_iroh_button = QPushButton(self.strings.text("network.sync_now"))
         self.sync_iroh_button.clicked.connect(self._sync_iroh_now)
-        self.leave_room_button = QPushButton("LEAVE ROOM")
+        self.leave_room_button = QPushButton(self.strings.text("network.leave_room"))
         self.leave_room_button.setObjectName("dangerButton")
         self.leave_room_button.clicked.connect(self._leave_iroh_room)
         action_row.addWidget(self.refresh_invite_button)
@@ -704,24 +788,19 @@ class MainWindow(QMainWindow):
         iroh_layout.addLayout(action_row, 3, 0, 1, 2)
         layout.addWidget(self.iroh_panel)
 
-        self.network_details = QLabel("NO ROOM ASSIGNED")
+        self.network_details = QLabel(self.strings.text("network.no_room"))
         self.network_details.setObjectName("device")
         self.network_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByKeyboard
             | Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.network_details.setAccessibleName("Iroh room and peer details")
+        self.network_details.setAccessibleName(self.strings.text("network.details_accessible"))
         layout.addWidget(self.network_details)
 
-        privacy = QLabel(
-            "PRIVACY NOTICE · Direct peers learn each other's IP addresses. Relay traffic is "
-            "end-to-end encrypted, but relay operators can observe endpoint IDs, IP addresses, "
-            "timing, and volume. Invite codes grant full room read/write access and can contain "
-            "network addresses. Iroh v1 has no member revocation; rotate into a new room to remove a member."
-        )
+        privacy = QLabel(self.strings.text("network.privacy"))
         privacy.setObjectName("privacyNotice")
         privacy.setWordWrap(True)
-        privacy.setAccessibleName("Iroh privacy disclosure")
+        privacy.setAccessibleName(self.strings.text("network.privacy_accessible"))
         layout.addWidget(privacy)
         layout.addStretch()
         return page
@@ -735,16 +814,19 @@ class MainWindow(QMainWindow):
 
     def _settings_toggled(self, visible: bool) -> None:
         self.right_panel.setVisible(visible)
-        label = "Hide settings" if visible else "Show settings"
+        label = self.strings.text("status.settings_hide" if visible else "status.settings_show")
         self.settings_button.setToolTip(label)
         self.settings_button.setAccessibleName(label)
 
-    def _show_screen(self, index: int) -> None:
+    def _show_screen(self, index: int, *, sync: bool = True) -> None:
         self.page_stack.setCurrentIndex(index)
         self.screen_buttons[index].setChecked(True)
         self.settings_button.setVisible(index == 0)
         self._render()
-        if index and self.replication_mode == "centralized":
+        focus_targets = (self.primary_button, self.task_input, self.history_list)
+        if index < len(focus_targets):
+            focus_targets[index].setFocus(Qt.FocusReason.ShortcutFocusReason)
+        if sync and index and self.replication_mode == "centralized":
             self._sync()
 
     def _apply_responsive_layout(self) -> None:
@@ -803,11 +885,17 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(self.app_icon, self)
         self.tray.setToolTip("Pomodorough")
         self.tray_menu = QMenu(self)
-        show_action = QAction("Show Pomodorough", self)
+        show_action = QAction(self.strings.text("tray.show"), self)
         show_action.triggered.connect(self._show_window)
-        self.tray_primary = QAction("Start", self)
+        self.tray_primary = QAction(
+            self.strings.text(
+                "tray.primary.start",
+                phase=self.strings.text(f"phase.{self._selected_phase()}"),
+            ),
+            self,
+        )
         self.tray_primary.triggered.connect(self._primary_action)
-        quit_action = QAction("Quit", self)
+        quit_action = QAction(self.strings.text("tray.quit"), self)
         quit_action.triggered.connect(self._quit)
         self.tray_menu.addAction(show_action)
         self.tray_menu.addAction(self.tray_primary)
@@ -855,6 +943,8 @@ class MainWindow(QMainWindow):
         self.cloud.revision_available.connect(self._remote_revision_available)
         self.cloud.authorization_stale.connect(self._sync)
         self.cloud.failure.connect(self._cloud_failure)
+        self.cloud.account_deleted.connect(self._account_deleted)
+        self.cloud.account_deletion_failed.connect(self._account_deletion_failed)
 
     def _connect_iroh(self) -> None:
         if self.iroh is None:
@@ -867,6 +957,8 @@ class MainWindow(QMainWindow):
         self.iroh.failure.connect(self._iroh_failure)
 
     def _restore_replication(self) -> None:
+        if self._closed:
+            return
         if self.replication_mode == "centralized":
             self.cloud.restore()
             return
@@ -875,14 +967,14 @@ class MainWindow(QMainWindow):
             return
         room_id = self.store.active_iroh_room_id
         if self.iroh is None or room_id is None:
-            self._iroh_status = "UNAVAILABLE"
+            self._iroh_status = self.strings.text("network.unavailable")
             self._iroh_failure(
-                "Iroh mode is saved, but optional Iroh service or active room metadata is unavailable."
+                self.strings.text("network.iroh_saved_unavailable")
             )
             return
         available, reason = self.iroh.availability()
         if not available:
-            self._iroh_status = "UNAVAILABLE"
+            self._iroh_status = self.strings.text("network.unavailable")
             self.statusBar().showMessage(reason)
             self._render_network()
             return
@@ -892,28 +984,39 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "network_status"):
             return
         status = {
-            "offline": "ON DEVICE",
-            "centralized": "CLOUD ROUTE",
+            "offline": self.strings.text("network.status.on_device"),
+            "centralized": self.strings.text("network.status.cloud_route"),
         }.get(self.replication_mode, self._iroh_status)
         self.network_status.setText(status)
         self.account_button.setEnabled(self.replication_mode == "centralized")
+        self.delete_account_button.setEnabled(
+            self.cloud.authenticated and not self.cloud.deleting_account
+        )
         if self.replication_mode != "centralized":
             self.account_button.setToolTip(
-                "Cloud account controls are available in Pomodorough Cloud mode."
+                self.strings.text("network.account_inactive")
             )
-            self.account_button.setAccessibleName("Cloud account controls inactive")
+            self.account_button.setAccessibleName(
+                self.strings.text("network.account_inactive_accessible")
+            )
         room = self.store.iroh_room()
         active = self.replication_mode == "iroh" and room is not None
         available = self.iroh is not None and self.iroh.availability()[0]
         unavailable_reason = (
             self.iroh.availability()[1]
             if self.iroh is not None and not available
-            else "Iroh support is not packaged in this build. Offline and centralized modes remain available."
+            else self.strings.text("network.iroh_not_packaged")
             if self.iroh is None
             else ""
         )
         self.network_unavailable.setText(unavailable_reason)
         self.network_unavailable.setVisible(bool(unavailable_reason))
+        self.iroh_first_room_guidance.setVisible(available and room is None)
+        self.replication_mode_combo.setAccessibleDescription(
+            self.strings.text("iroh.first_room_guidance")
+            if available and room is None
+            else ""
+        )
         self.iroh_panel.setEnabled(available)
         self.create_room_button.setEnabled(available and not active)
         self.join_room_button.setEnabled(available and not active)
@@ -925,7 +1028,11 @@ class MainWindow(QMainWindow):
             self.invite_output.setPlainText(self._iroh_invite)
         if room is None:
             self.network_details.setText(
-                "NO ROOM ASSIGNED" if available else self.iroh.availability()[1] if self.iroh else "IROH SERVICE NOT PACKAGED"
+                self.strings.text("network.no_room")
+                if available
+                else self.iroh.availability()[1]
+                if self.iroh
+                else self.strings.text("network.service_not_packaged")
             )
             return
         peer_count = int(self._iroh_details.get("peerCount", room["peerCount"]))
@@ -934,20 +1041,25 @@ class MainWindow(QMainWindow):
         )
         conflict = self._iroh_details.get("conflict", room.get("conflict"))
         self.leave_room_button.setText(
-            "LEAVE / ROTATE ROOM" if conflict else "LEAVE ROOM"
+            self.strings.text(
+                "network.leave_rotate_room" if conflict else "network.leave_room"
+            )
         )
         self.leave_room_button.setAccessibleName(
-            "Leave conflicted Iroh room and prepare rotation"
+            self.strings.text("network.leave_conflicted_accessible")
             if conflict
-            else "Leave Iroh room"
+            else self.strings.text("network.leave_accessible")
         )
-        name = room.get("roomName") or "UNNAMED ROOM"
-        details = (
-            f"ROOM  {name.upper()}  ·  ID {room['roomId'][:10].upper()}…  ·  "
-            f"PEERS {peer_count}  ·  RECORDS {operation_count}"
+        name = room.get("roomName") or self.strings.text("network.unnamed_room")
+        details = self.strings.text(
+            "network.room_details",
+            name=name.upper(),
+            room_id=room["roomId"][:10].upper(),
+            peers=peer_count,
+            records=operation_count,
         )
         if conflict:
-            details += "  ·  REPAIR REQUIRED"
+            details += self.strings.text("network.repair_required")
         self.network_details.setText(details)
 
     def _replication_mode_changed(self, index: int) -> None:
@@ -956,7 +1068,7 @@ class MainWindow(QMainWindow):
             return
         if mode == "iroh":
             if self.iroh is None:
-                self.notice.emit("Iroh support is not packaged in this build.")
+                self.notice.emit(self.strings.text("network.iroh_not_packaged"))
                 self._reset_replication_mode_combo()
                 return
             available, reason = self.iroh.availability()
@@ -964,8 +1076,18 @@ class MainWindow(QMainWindow):
                 self.notice.emit(reason)
                 self._reset_replication_mode_combo()
                 return
+            if self.store.active_iroh_room_id is None:
+                self._reset_replication_mode_combo()
+                self._show_screen(3, sync=False)
+                self.create_room_button.setFocus(
+                    Qt.FocusReason.ShortcutFocusReason
+                )
+                self.statusBar().showMessage(
+                    self.strings.text("iroh.first_room_guidance"), 10_000
+                )
+                return
         if self.replication_mode == "centralized" and self.cloud.busy:
-            self.notice.emit("Wait for the active Cloud request before changing replication mode.")
+            self.notice.emit(self.strings.text("network.wait_cloud"))
             self._reset_replication_mode_combo()
             return
         try:
@@ -1000,14 +1122,14 @@ class MainWindow(QMainWindow):
 
     def _create_iroh_room(self) -> None:
         if self.iroh is None:
-            self.notice.emit("Iroh support is not packaged in this build.")
+            self.notice.emit(self.strings.text("network.iroh_not_packaged"))
             return
         available, reason = self.iroh.availability()
         if not available:
             self.notice.emit(reason)
             return
         if self.replication_mode == "centralized" and self.cloud.busy:
-            self.notice.emit("Wait for the active Cloud request before opening an Iroh room.")
+            self.notice.emit(self.strings.text("network.wait_cloud_open"))
             return
         name = self.room_name_input.text().strip() or None
         try:
@@ -1024,14 +1146,14 @@ class MainWindow(QMainWindow):
 
     def _join_iroh_room(self) -> None:
         if self.iroh is None:
-            self.notice.emit("Iroh support is not packaged in this build.")
+            self.notice.emit(self.strings.text("network.iroh_not_packaged"))
             return
         available, reason = self.iroh.availability()
         if not available:
             self.notice.emit(reason)
             return
         if self.replication_mode == "centralized" and self.cloud.busy:
-            self.notice.emit("Wait for the active Cloud request before joining an Iroh room.")
+            self.notice.emit(self.strings.text("network.wait_cloud_join"))
             return
         try:
             invite = parse_invite(self.invite_input.toPlainText().strip())
@@ -1045,7 +1167,7 @@ class MainWindow(QMainWindow):
         except (IrohProtocolError, OSError, ValueError) as error:
             self.notice.emit(str(error))
             return
-        self._iroh_status = "JOINING ROOM"
+        self._iroh_status = self.strings.text("network.status.joining_room")
         self._iroh_join_pending = True
         self.cloud.stop_revision_stream()
         self._render_network()
@@ -1054,8 +1176,8 @@ class MainWindow(QMainWindow):
     def _leave_iroh_room(self) -> None:
         answer = QMessageBox.warning(
             self,
-            "Leave Iroh room?",
-            "Leaving restores state from before room activation. Room log remains saved for later reactivation.",
+            self.strings.text("network.leave_title"),
+            self.strings.text("network.leave_detail"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1090,7 +1212,9 @@ class MainWindow(QMainWindow):
     def _copy_iroh_invite(self) -> None:
         if self._iroh_invite:
             QApplication.clipboard().setText(self._iroh_invite)
-            self.statusBar().showMessage("Invite copied. Treat it as a full-access secret.", 5000)
+            self.statusBar().showMessage(
+                self.strings.text("network.invite_copied"), 5000
+            )
 
     def _iroh_status_changed(self, status: str) -> None:
         self._iroh_status = status
@@ -1164,16 +1288,20 @@ class MainWindow(QMainWindow):
         planned = max(1, int(timer["plannedDurationMs"]))
         remaining = max(0, planned - elapsed)
         status_labels = {
-            "idle": "READY AT PLATFORM",
-            "running": "IN TRANSIT",
-            "paused": "HELD AT SIGNAL",
-            "completed": "ARRIVED",
-            "cancelled": "SERVICE CANCELLED",
-            "superseded": "ROUTE CHANGED",
+            value: self.strings.text(f"status.rail.{value}")
+            for value in (
+                "idle",
+                "running",
+                "paused",
+                "completed",
+                "cancelled",
+                "superseded",
+            )
         }
+        phase_label = self.strings.text(f"phase.{timer['phase']}")
         self.clock.set_state(
             format_remaining(remaining),
-            PHASES[timer["phase"]]["label"],
+            phase_label,
             status_labels.get(status, status),
             elapsed / planned,
         )
@@ -1183,18 +1311,23 @@ class MainWindow(QMainWindow):
             "●" * break_progress + "○" * (4 - break_progress)
         )
         self.long_break_progress.setAccessibleDescription(
-            f"{break_progress} of 4 pomodoros completed today"
+            self.strings.text(
+                "status.pomodoro_progress_value", count=break_progress
+            )
         )
         self._render_network()
         active = status in ACTIVE_STATUSES
         self._render_task_selector(timer, active)
         self._update_tray_progress(elapsed / planned, active)
         self.primary_button.setText(
-            "PAUSE"
+            self.strings.text("status.primary.pause")
             if status == "running"
-            else "RESUME"
+            else self.strings.text("status.primary.resume")
             if status == "paused"
-            else f'START {PHASES[self._selected_phase()]["label"].upper()}'
+            else self.strings.text(
+                "status.primary.start",
+                phase=self.strings.text(f"phase.{self._selected_phase()}").upper(),
+            )
         )
         mutations_enabled = not self._history_resolution_active
         self.primary_button.setEnabled(
@@ -1209,16 +1342,30 @@ class MainWindow(QMainWindow):
             spin.setEnabled(mutations_enabled)
         for phase, button in self.phase_buttons.items():
             button.setChecked(phase == self._selected_phase())
-            button.setEnabled(mutations_enabled and not active)
+            button.setEnabled(mutations_enabled)
         self.auto_breaks.setEnabled(mutations_enabled)
+        self.pattern_scope.setText(
+            self.strings.text("pattern.next_scope") if active else ""
+        )
         if self.tray:
-            self.tray.setToolTip(f"Pomodorough • {format_remaining(remaining)} • {status_labels.get(status, status)}")
+            self.tray.setToolTip(
+                self.strings.text(
+                    "tray.tooltip",
+                    remaining=format_remaining(remaining),
+                    status=status_labels.get(status, status),
+                )
+            )
             self.tray_primary.setText(
-                "Pause"
+                self.strings.text("tray.primary.pause")
                 if status == "running"
-                else "Resume"
+                else self.strings.text("tray.primary.resume")
                 if status == "paused"
-                else f'Start {PHASES[self._selected_phase()]["label"].lower()}'
+                else self.strings.text(
+                    "tray.primary.start",
+                    phase=self.strings.text(
+                        f"phase.{self._selected_phase()}"
+                    ).lower(),
+                )
             )
             self.tray_primary.setEnabled(self.primary_button.isEnabled())
         self._render_history()
@@ -1230,47 +1377,109 @@ class MainWindow(QMainWindow):
         ):
             self._notified_timer_id = source_timer.get("id")
             self._notify(
-                "Service arrived",
-                f'{PHASES[source_timer["phase"]]["label"]} completed.',
+                self.strings.text("status.service_arrived"),
+                self.strings.text(
+                    "status.service_completed",
+                    phase=self.strings.text(f"phase.{source_timer['phase']}"),
+                ),
             )
 
     def _render_history(self) -> None:
-        completed = [item for item in self.history if item.get("status") == "completed"]
-        self.history_count.setText(str(len(completed)))
+        retained = [
+            item for item in self.history if item.get("status") in TERMINAL_STATUSES
+        ]
+        displayed = min(8, len(retained))
+        self.history_count.setText(
+            self.strings.text(
+                "arrivals.count", displayed=displayed, total=len(retained)
+            )
+        )
+        self.history_list.setAccessibleDescription(
+            self.strings.text(
+                "arrivals.description", displayed=displayed, total=len(retained)
+            )
+        )
         self.history_list.clear()
-        for item in completed[:8]:
-            phase = PHASES.get(item.get("phase"), {"label": item.get("phase", "Timer")})["label"]
-            task = self.known_tasks.get(item.get("taskId"))
-            if task:
-                phase = f'{phase} · {task["title"]}'
+        for item in retained[:8]:
+            phase_value = str(item.get("phase", "timer"))
+            phase = (
+                self.strings.text(f"phase.{phase_value}")
+                if f"phase.{phase_value}" in self.strings.messages
+                else phase_value
+            )
+            task_id = item.get("taskId")
+            task = self.known_tasks.get(task_id) if task_id else None
+            task_label = (
+                task["title"]
+                if task
+                else self.strings.text("task.deleted")
+                if task_id
+                else self.strings.text("task.unassigned")
+            )
+            status = str(item.get("status"))
+            status_label = self.strings.text(f"arrivals.status.{status}")
             minutes = int(item.get("plannedDurationMs", 0)) // 60_000
             when = item.get("completedAt") or item.get("endedAt")
             try:
-                local_time = datetime.fromisoformat(when.replace("Z", "+00:00")).astimezone()
+                local_time = datetime.fromisoformat(
+                    when.replace("Z", "+00:00")
+                ).astimezone()
                 time_label = local_time.strftime("%a %H:%M")
             except (AttributeError, ValueError):
-                time_label = "Pending"
-            marker = "  •" if item.get("pending") else ""
-            QListWidgetItem(f"{phase}  {minutes} min\n{time_label}{marker}", self.history_list)
-        if not completed:
-            empty_item = QListWidgetItem(
-                "No arrivals yet\nYour first run appears here.", self.history_list
+                time_label = self.strings.text("arrivals.time_pending")
+            pending = (
+                self.strings.text("arrivals.pending") if item.get("pending") else ""
+            )
+            text = self.strings.text(
+                "arrivals.row",
+                phase=phase,
+                status=status_label,
+                task=task_label,
+                minutes=minutes,
+                when=time_label,
+                pending=pending,
+            )
+            row = QListWidgetItem(text, self.history_list)
+            row.setData(Qt.ItemDataRole.AccessibleTextRole, text.replace("\n", ", "))
+        if not retained:
+            empty_text = self.strings.text("arrivals.empty")
+            empty_item = QListWidgetItem(empty_text, self.history_list)
+            empty_item.setData(
+                Qt.ItemDataRole.AccessibleTextRole, empty_text.replace("\n", ", ")
             )
             empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def _render_task_selector(self, timer: dict[str, Any], active: bool) -> None:
-        running = timer.get("status") == "running"
         selected_task_id = (
-            timer.get("taskId")
-            if running
-            else self.settings.get("selectedTaskId")
+            self.settings.get("selectedTaskId")
             if self._selected_phase() == "focus"
             else None
         )
+        active_task_id = timer.get("taskId") if active else None
+        active_task = self.known_tasks.get(active_task_id) if active_task_id else None
+        active_task_label = (
+            active_task["title"]
+            if active_task
+            else self.strings.text("task.deleted")
+            if active_task_id
+            else self.strings.text("task.unassigned")
+        )
+        self.active_task_context.setText(
+            self.strings.text("task.active_context", task=active_task_label)
+            if active
+            else ""
+        )
+        self.active_task_context.setVisible(active)
         choices = list(self.tasks)
         if selected_task_id and not any(task["id"] == selected_task_id for task in choices):
             task = self.known_tasks.get(selected_task_id)
-            choices.append(task or {"id": selected_task_id, "title": "Deleted task"})
+            choices.append(
+                task
+                or {
+                    "id": selected_task_id,
+                    "title": self.strings.text("task.deleted"),
+                }
+            )
 
         signature = (
             timer.get("status"),
@@ -1285,7 +1494,7 @@ class MainWindow(QMainWindow):
 
         self.task_combo.blockSignals(True)
         self.task_combo.clear()
-        self.task_combo.addItem("No task", None)
+        self.task_combo.addItem(self.strings.text("task.unassigned"), None)
         self.task_combo.setItemData(
             0,
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -1305,14 +1514,22 @@ class MainWindow(QMainWindow):
         self.task_combo.blockSignals(False)
         self.task_combo.setEnabled(
             not self._history_resolution_active
-            and not running
             and self._selected_phase() == "focus"
         )
-        self.task_combo.setToolTip(
-            "Select task for next focus session; paused session keeps its current task."
+        self.task_combo.setAccessibleName(
+            self.strings.text("task.next_focus")
             if active
-            else "Select task for next focus session."
+            else self.strings.text("task.focus")
         )
+        description = (
+            self.strings.text(
+                "task.next_description", task=active_task_label
+            )
+            if active
+            else ""
+        )
+        self.task_combo.setAccessibleDescription(description)
+        self.task_combo.setToolTip(description)
 
     def _render_tasks(self) -> None:
         signature = (
@@ -1338,8 +1555,12 @@ class MainWindow(QMainWindow):
         total_finished = sum(summary["finished"] for summary in summaries.values())
         total_ms = sum(summary["timeMs"] for summary in summaries.values())
         self.task_totals.setText(
-            f"{total_finished} {'POMODORO' if total_finished == 1 else 'POMODOROS'} • "
-            f"{self._format_task_time(total_ms).upper()} TODAY"
+            self.strings.text(
+                "task.totals",
+                count=total_finished,
+                unit=self.strings.plural("task.pomodoro", total_finished),
+                minutes=self._format_task_time(total_ms).upper(),
+            )
         )
         self.task_input.setEnabled(not self._history_resolution_active)
         self.add_task_button.setEnabled(not self._history_resolution_active)
@@ -1353,9 +1574,11 @@ class MainWindow(QMainWindow):
             spent = QTableWidgetItem(self._format_task_time(summary["timeMs"]))
             spent.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.task_table.setItem(row, 2, spent)
-            delete = QPushButton("DELETE")
+            delete = QPushButton(self.strings.text("task.delete"))
             delete.setObjectName("dangerButton")
-            delete.setAccessibleName(f'Delete {task["title"]}')
+            delete.setAccessibleName(
+                self.strings.text("task.delete_accessible", task=task["title"])
+            )
             delete.setEnabled(not self._history_resolution_active)
             delete.clicked.connect(
                 lambda checked=False, task_id=task["id"]: self._delete_task(task_id)
@@ -1364,17 +1587,20 @@ class MainWindow(QMainWindow):
         self.task_table.setVisible(bool(self.tasks))
         self.tasks_empty.setVisible(not self.tasks)
 
-    @staticmethod
-    def _format_task_time(milliseconds: int) -> str:
+    def _format_task_time(self, milliseconds: int) -> str:
         minutes = max(0, milliseconds) // 60_000
         hours, remaining = divmod(minutes, 60)
         if hours and remaining:
-            return f"{hours} hr {remaining} min"
+            return self.strings.text(
+                "duration.hours_minutes", hours=hours, minutes=remaining
+            )
         if hours:
-            return f"{hours} hr"
-        return f"{remaining} min"
+            return self.strings.text("duration.hours", hours=hours)
+        return self.strings.text("duration.minutes", minutes=remaining)
 
     def _tick(self) -> None:
+        if self._closed:
+            return
         if (
             (self.user is None or not self.cloud.authenticated)
             and not self.cloud.busy
@@ -1401,13 +1627,17 @@ class MainWindow(QMainWindow):
                         self._render()
                         self._sync()
                     else:
-                        self._issue("finish", automatic=True)
+                        if self.store.owns_timer(timer):
+                            self._issue("finish", automatic=True)
+                        else:
+                            self._auto_finish_in_progress = False
+                            self._render()
             else:
                 self._render()
 
     def _mutation_blocked(self) -> bool:
         if self._iroh_join_pending:
-            self.notice.emit("Wait for Iroh room join to finish before changing local state.")
+            self.notice.emit(self.strings.text("network.wait_join"))
             return True
         if (
             not self._history_resolution_active
@@ -1419,7 +1649,7 @@ class MainWindow(QMainWindow):
         if not self._history_resolution_active:
             return False
         self.notice.emit(
-            "Resolve local and synced history before changing timers, tasks, or durations."
+            self.strings.text("resolution.blocked")
         )
         return True
 
@@ -1504,7 +1734,8 @@ class MainWindow(QMainWindow):
         require_canonical: bool | None = None,
     ) -> bool:
         if (
-            time.monotonic() < self._auto_break_not_before
+            self._closed
+            or time.monotonic() < self._auto_break_not_before
             or self._history_resolution_active
             or (self.cloud.busy and not allow_busy)
         ):
@@ -1532,12 +1763,10 @@ class MainWindow(QMainWindow):
         if self._mutation_blocked():
             self._render()
             return
-        if self._current_timer().get("status") in ACTIVE_STATUSES:
-            return
         self.settings["selectedPhase"] = phase
         self.store.set_selected_phase(phase)
-        if not self.timer:
-            self._render()
+        self._task_selector_signature = None
+        self._render()
 
     def _task_selection_changed(self, index: int) -> None:
         if self._mutation_blocked():
@@ -1546,8 +1775,6 @@ class MainWindow(QMainWindow):
                 self._current_timer(),
                 self._current_timer().get("status") in ACTIVE_STATUSES,
             )
-            return
-        if self._current_timer().get("status") == "running":
             return
         task_id = self.task_combo.itemData(index)
         if task_id and not any(task["id"] == task_id for task in self.tasks):
@@ -1640,6 +1867,8 @@ class MainWindow(QMainWindow):
         self._sync()
 
     def _sync(self) -> None:
+        if self._closed:
+            return
         if self._iroh_join_pending:
             return
         if self.replication_mode == "iroh":
@@ -1780,18 +2009,23 @@ class MainWindow(QMainWindow):
     def _prompt_history_resolution(self) -> str | None:
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("Choose synchronized state")
-        dialog.setText("This device and your account both contain synchronized data.")
+        dialog.setWindowTitle(self.strings.text("resolution.title"))
+        dialog.setText(self.strings.text("resolution.question"))
         dialog.setInformativeText(
-            "This device and your account both contain synchronized timer, history, task, or settings data. Choose how to continue before making more changes."
+            self.strings.text("resolution.detail")
         )
         keep_local = dialog.addButton(
-            "Keep Local", QMessageBox.ButtonRole.AcceptRole
+            self.strings.text("resolution.keep_local"),
+            QMessageBox.ButtonRole.AcceptRole,
         )
         keep_remote = dialog.addButton(
-            "Keep Remote", QMessageBox.ButtonRole.AcceptRole
+            self.strings.text("resolution.keep_remote"),
+            QMessageBox.ButtonRole.AcceptRole,
         )
-        keep_both = dialog.addButton("Keep Both", QMessageBox.ButtonRole.AcceptRole)
+        keep_both = dialog.addButton(
+            self.strings.text("resolution.keep_both"),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)
@@ -1805,16 +2039,16 @@ class MainWindow(QMainWindow):
     def _confirm_history_resolution(self, strategy: str) -> bool:
         messages = {
             "replace_remote": (
-                "Confirm Keep Local",
-                "Account timer, history, tasks, settings, and queued changes will be replaced by this device's data.",
+                self.strings.text("resolution.confirm_local"),
+                self.strings.text("resolution.confirm_local_detail"),
             ),
             "keep_remote": (
-                "Confirm Keep Remote",
-                "This device's timer, history, tasks, settings, and queued changes will be replaced by account data.",
+                self.strings.text("resolution.confirm_remote"),
+                self.strings.text("resolution.confirm_remote_detail"),
             ),
             "merge": (
-                "Confirm Keep Both",
-                "Queued local changes will be merged into account data. Conflicts or rejected changes are possible.",
+                self.strings.text("resolution.confirm_both"),
+                self.strings.text("resolution.confirm_both_detail"),
             ),
         }
         title, message = messages[strategy]
@@ -1836,7 +2070,7 @@ class MainWindow(QMainWindow):
         self._sync_request = None
         if request is None:
             self._set_account_state(False)
-            self.notice.emit("Sync response did not match an active request.")
+            self.notice.emit(self.strings.text("resolution.stale_response"))
             return
         try:
             notices = self.store.apply_sync(
@@ -1856,7 +2090,11 @@ class MainWindow(QMainWindow):
         if has_pending:
             self._sync()
         if notices:
-            self.notice.emit("Server resolved a sync conflict: " + "; ".join(notices))
+            self.notice.emit(
+                self.strings.text(
+                    "resolution.sync_conflict", detail="; ".join(notices)
+                )
+            )
 
     def _apply_resolution(self, response: dict[str, Any]) -> None:
         if not self._history_resolution_active or self._resolution_user is None:
@@ -1887,7 +2125,9 @@ class MainWindow(QMainWindow):
             self._sync()
         if notices:
             self.notice.emit(
-                "Server resolved a history conflict: " + "; ".join(notices)
+                self.strings.text(
+                    "resolution.history_conflict", detail="; ".join(notices)
+                )
             )
 
     def _bootstrap_conflict(self, details: dict[str, Any]) -> None:
@@ -1901,7 +2141,7 @@ class MainWindow(QMainWindow):
             or not self.store.discard_pending_resolution(user_id, request_id)
         ):
             self._resolution_retry_paused = True
-            self.notice.emit("Could not discard stale history resolution request.")
+            self.notice.emit(self.strings.text("resolution.discard_failed"))
             return
         self._resolution_phase = "preview"
         self._resolution_preview = None
@@ -1909,8 +2149,8 @@ class MainWindow(QMainWindow):
         self._resolution_retry_paused = False
         message = details.get("message") if isinstance(details, dict) else None
         self.statusBar().showMessage(
-            (message or "History changed before resolution could be applied.")
-            + " Refreshing synced history; local data is preserved.",
+            (message or self.strings.text("resolution.changed"))
+            + self.strings.text("resolution.refreshing"),
             10_000,
         )
         self._continue_history_resolution()
@@ -2011,29 +2251,82 @@ class MainWindow(QMainWindow):
             self.account_button.style().polish(self.account_button)
             self.account_button.updateGeometry()
         if not authenticated:
-            self.account_button.setText("SIGN IN")
-            self.account_button.setToolTip("Sign in with Google")
-            self.account_button.setAccessibleName("Sign in with Google")
+            self.account_button.setText(self.strings.text("account.sign_in"))
+            self.account_button.setToolTip(
+                self.strings.text("account.sign_in_google")
+            )
+            self.account_button.setAccessibleName(
+                self.strings.text("account.sign_in_google")
+            )
         elif self._account_switch_user is not None:
             self.account_button.setText("!")
             self.account_button.setToolTip(
-                "Signed-in account differs from local data owner. Click to switch or sign out."
+                self.strings.text("account.switch_tooltip")
             )
-            self.account_button.setAccessibleName("Account switch required")
+            self.account_button.setAccessibleName(
+                self.strings.text("account.switch_required")
+            )
         elif self._history_resolution_active:
             self.account_button.setText("!")
             self.account_button.setToolTip(
-                "Signed in; local and synced history must be resolved. Click to continue."
+                self.strings.text("account.resolution_tooltip")
             )
-            self.account_button.setAccessibleName("History resolution required")
+            self.account_button.setAccessibleName(
+                self.strings.text("account.resolution_required")
+            )
         elif self._account_synced:
             self.account_button.setText("✓")
-            self.account_button.setToolTip("Signed in and synced. Click to sign out.")
-            self.account_button.setAccessibleName("Signed in and synced")
+            self.account_button.setToolTip(
+                self.strings.text("account.synced_tooltip")
+            )
+            self.account_button.setAccessibleName(
+                self.strings.text("account.synced")
+            )
         else:
             self.account_button.setText("…")
-            self.account_button.setToolTip("Signed in; sync pending. Click to sign out.")
-            self.account_button.setAccessibleName("Signed in; sync pending")
+            self.account_button.setToolTip(
+                self.strings.text("account.pending_tooltip")
+            )
+            self.account_button.setAccessibleName(
+                self.strings.text("account.pending")
+            )
+
+    def _open_privacy_policy(self) -> None:
+        QDesktopServices.openUrl(QUrl(PRIVACY_POLICY_URL))
+
+    def _delete_account_action(self) -> None:
+        if not self.cloud.authenticated or self.cloud.deleting_account:
+            return
+        confirmation, accepted = QInputDialog.getText(
+            self,
+            self.strings.text("account.delete_prompt_title"),
+            self.strings.text("account.delete_prompt"),
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not accepted:
+            return
+        if confirmation != "DELETE":
+            self.statusBar().showMessage(
+                self.strings.text("account.delete_mismatch"), 10_000
+            )
+            return
+        self.cloud.delete_account(confirmation)
+        self._render_network()
+
+    def _account_deleted(self) -> None:
+        self._signed_out()
+        self.statusBar().showMessage(
+            self.strings.text("account.delete_succeeded"), 10_000
+        )
+
+    def _account_deletion_failed(self, error: str) -> None:
+        # The server did not confirm deletion; account-bound local state must
+        # remain untouched and the authenticated controls become usable again.
+        self._render()
+        self.statusBar().showMessage(
+            self.strings.text("account.delete_failed", error=error), 15_000
+        )
 
     def _account_action(self) -> None:
         if self.cloud.authenticated:
@@ -2055,10 +2348,24 @@ class MainWindow(QMainWindow):
                 elif action == "sign_out":
                     self.cloud.logout()
                 return
+            state = self.store.load()
+            queued_changes = sum(
+                len(state[key])
+                for key in (
+                    "pending",
+                    "pendingTasks",
+                    "pendingDurations",
+                    "pendingAutoStarts",
+                    "pendingSelectedTasks",
+                )
+            )
+            queue_label = self.strings.plural("queue.changes", queued_changes)
             answer = QMessageBox.question(
                 self,
-                "Sign out of Pomodorough?",
-                "Signing out clears this account's timer, history, and tasks from this device.",
+                self.strings.text("account.signout_title"),
+                self.strings.text("account.signout_detail", queue=queue_label),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
             )
             if answer == QMessageBox.StandardButton.Yes:
                 self.cloud.logout()
@@ -2068,15 +2375,19 @@ class MainWindow(QMainWindow):
     def _choose_resolution_account_action(self) -> str | None:
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("History resolution required")
-        dialog.setText("Continue resolving history or sign out?")
+        dialog.setWindowTitle(self.strings.text("account.resolve_title"))
+        dialog.setText(self.strings.text("account.resolve_question"))
         dialog.setInformativeText(
-            "Signing out clears this account's timer, history, tasks, and pending resolution from this device."
+            self.strings.text("account.resolve_detail")
         )
         resume = dialog.addButton(
-            "Continue Resolution", QMessageBox.ButtonRole.AcceptRole
+            self.strings.text("account.continue_resolution"),
+            QMessageBox.ButtonRole.AcceptRole,
         )
-        sign_out = dialog.addButton("Sign out", QMessageBox.ButtonRole.DestructiveRole)
+        sign_out = dialog.addButton(
+            self.strings.text("account.sign_out"),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)
@@ -2086,15 +2397,18 @@ class MainWindow(QMainWindow):
     def _choose_account_switch_action(self) -> str | None:
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("Different account detected")
-        dialog.setText("Signed-in account does not own this device's local data.")
+        dialog.setWindowTitle(self.strings.text("account.different_title"))
+        dialog.setText(self.strings.text("account.different_question"))
         dialog.setInformativeText(
-            "Clear the previous account's local timer, history, tasks, and pending resolution to switch, or sign out without changing that data."
+            self.strings.text("account.different_detail")
         )
         switch = dialog.addButton(
-            "Clear Data & Switch", QMessageBox.ButtonRole.DestructiveRole
+            self.strings.text("account.clear_switch"),
+            QMessageBox.ButtonRole.DestructiveRole,
         )
-        sign_out = dialog.addButton("Sign out", QMessageBox.ButtonRole.RejectRole)
+        sign_out = dialog.addButton(
+            self.strings.text("account.sign_out"), QMessageBox.ButtonRole.RejectRole
+        )
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)
@@ -2160,18 +2474,26 @@ class MainWindow(QMainWindow):
         self.quitting = True
         QApplication.quit()
 
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.tick_timer.stop()
+        self.sync_timer.stop()
+        self._stop_sound()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.tray and not self.quitting:
             event.ignore()
             self.hide()
             self.tray.showMessage(
-                "Pomodorough is still running",
-                "Timer remains available in system tray.",
+                self.strings.text("tray.running_title"),
+                self.strings.text("tray.running_detail"),
                 self.app_icon,
                 3500,
             )
         else:
-            self._stop_sound()
+            self.shutdown()
             event.accept()
 
     @staticmethod

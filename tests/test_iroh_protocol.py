@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 from pomodorough.iroh_protocol import (
     INVITE_PREFIX,
@@ -15,11 +16,38 @@ from pomodorough.iroh_protocol import (
     parse_invite,
     record_digest,
     room_id_for_secret,
+    validate_record,
 )
 from pomodorough.storage import utc_timestamp
 
 
 class IrohProtocolTests(unittest.TestCase):
+    def test_canonical_fixture_selected_task_records_are_strictly_valid(self) -> None:
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "protocol-fixtures-v1.json").read_text()
+        )
+
+        genesis = fixture["irohGenesisRecord"]
+        selected = fixture["irohSelectedTaskRecord"]
+        self.assertIsNone(validate_record(genesis)["operation"]["selectedTaskId"])
+        self.assertIsNone(validate_record(selected)["operation"]["taskId"])
+        self.assertEqual(
+            set(selected["operation"]),
+            {"id", "taskId", "occurredAt", "hlcWallMs", "hlcCounter"},
+        )
+
+        for record, key in ((genesis, "selectedTaskId"), (selected, "taskId")):
+            with self.subTest(domain=record["domain"], mutation="omitted"):
+                changed = json.loads(json.dumps(record))
+                changed["operation"].pop(key)
+                with self.assertRaises(IrohProtocolError):
+                    validate_record(changed)
+            with self.subTest(domain=record["domain"], mutation="unknown"):
+                changed = json.loads(json.dumps(record))
+                changed["operation"]["unknown"] = True
+                with self.assertRaises(IrohProtocolError):
+                    validate_record(changed)
+
     def test_room_id_vector(self) -> None:
         self.assertEqual(
             room_id_for_secret(bytes(range(32))),

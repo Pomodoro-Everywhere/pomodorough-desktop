@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://pomodorough.egigoka.me">Web app</a> |
+  <a href="https://pomodoro-everywhere.github.io/pomodorough-server/privacy/">Privacy policy</a> |
   <a href="https://github.com/Pomodoro-Everywhere/pomodorough-server">Server</a> |
   <a href="https://pomodorough.egigoka.me/openapi.yaml">API specification</a>
 </p>
@@ -65,6 +66,18 @@ py -3.11 -m venv .venv
 The desktop application can run entirely offline. Google sign-in enables
 cross-device synchronization with the production service.
 
+## Completion alert guarantee
+
+Pomodorough sounds a completion alert while its process is running, including
+when the window is hidden in the system tray. After sleep, it detects an overdue
+owned timer and completes it when the process resumes.
+
+Pomodorough does **not** install an operating-system alarm. If the process is
+quit, killed, or unavailable during a reboot, no background completion alert is
+guaranteed. The running timer remains durable: on the next launch, the owning
+client deterministically completes an overdue timer and presents its alert.
+Observer devices never finish a timer owned by another centralized-sync device.
+
 ## Install
 
 ### Windows
@@ -98,9 +111,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.2.4/pomodorough_linux-0.2.4.tar.gz
-tar -xzf pomodorough_linux-0.2.4.tar.gz
-cd pomodorough_linux-0.2.4
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.3.0/pomodorough_linux-0.3.0.tar.gz
+tar -xzf pomodorough_linux-0.3.0.tar.gz
+cd pomodorough_linux-0.3.0
 ./deploy/install.sh
 ```
 
@@ -123,7 +136,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.2.4
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.3.0
 ```
 
 ### Flatpak
@@ -131,8 +144,8 @@ nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.2.4
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.2.4/Pomodorough-0.2.4-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.2.4-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.3.0/Pomodorough-0.3.0-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.3.0-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 
@@ -246,6 +259,12 @@ python3 -m compileall -q src tests
 uvx ruff check .
 sh -n deploy/install.sh
 ```
+
+## Shared experience contract
+
+Navigation, timer-state language, account safety, completion guarantees,
+accessibility, and localization semantics are defined in the
+[cross-client experience contract](https://github.com/Pomodoro-Everywhere/pomodorough-server/blob/master/docs/client-experience-contract.md).
 
 ## Pomodorough projects
 

@@ -134,6 +134,14 @@ class TuiTests(unittest.TestCase):
         self.assertNotIn("TASK:", rendered)
         self.assertNotIn("pending sync", rendered)
 
+    def test_build_lines_supports_rtl_pseudolocale(self) -> None:
+        rendered = "\n".join(
+            tui.build_lines(timer_state(), [], 80, strings=tui.Strings("ar-XB"))
+        )
+
+        self.assertIn("⟦", rendered)
+        self.assertNotIn("RECENT ARRIVALS", rendered)
+
     def test_draw_warns_on_small_screen(self) -> None:
         screen = FakeScreen(5, 8)
         timer = Mock()

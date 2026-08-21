@@ -892,6 +892,18 @@ class Store:
     def device_id(self) -> str:
         return str(self.get_meta("deviceId"))
 
+    def owns_timer(self, timer: dict[str, Any] | None) -> bool:
+        if not isinstance(timer, dict) or not timer.get("id"):
+            return False
+        if self.replication_mode == "iroh":
+            return timer.get("startedByDeviceId") == self.device_id
+        ownership = self.get_meta("centralizedTimerOwnership")
+        return (
+            isinstance(ownership, dict)
+            and ownership.get("timerId") == timer["id"]
+            and ownership.get("deviceId") == self.device_id
+        )
+
     def load(self, *, projection: bool = False) -> dict[str, Any]:
         owns_transaction = not self.connection.in_transaction
         if owns_transaction:
@@ -1352,17 +1364,13 @@ class Store:
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
             settings = self._normalize_settings(self.get_meta("settings", {}))
-            if self.get_meta("replicationMode", "centralized") == "iroh":
-                settings["selectedTaskId"] = task_id
-                self._set_meta("settings", settings)
-                self._capture_iroh_after_mutation_locked()
-                return None
             operation = self._queue_selected_task_operation(
                 task_id,
                 settings,
                 now_ms,
                 use_server_clock=use_server_clock,
             )
+            self._capture_iroh_after_mutation_locked()
         return operation
 
     def queue_command(
@@ -1690,6 +1698,15 @@ class Store:
             ),
         )
         self._record_command_physical_time(command["id"], timer_now_ms)
+        if starting and self.replication_mode != "iroh":
+            self._set_meta(
+                "centralizedTimerOwnership",
+                {
+                    "timerId": timer_id,
+                    "deviceId": self.device_id,
+                    "startCommandId": command["id"],
+                },
+            )
         if command_type == "finish":
             settings = self._normalize_settings(self.get_meta("settings", {}))
             snapshot = self.get_meta("snapshot", {})
@@ -2432,15 +2449,22 @@ class Store:
             for item in request_items
         ]
         acknowledged_ids: list[str] = []
+        normalized_response_items: list[dict[str, Any]] = []
         for acknowledgement in response_items:
+            if not isinstance(acknowledgement, dict):
+                raise ValueError(f"Sync returned invalid {label} acknowledgements.")
+            normalized_acknowledgement = {
+                **acknowledgement,
+                "reason": acknowledgement.get("reason", ""),
+            }
             if (
-                not isinstance(acknowledgement, dict)
-                or not isinstance(acknowledgement.get(acknowledgement_id_key), str)
-                or acknowledgement.get("outcome") not in ACKNOWLEDGEMENT_OUTCOMES
-                or not isinstance(acknowledgement.get("reason"), str)
+                not isinstance(normalized_acknowledgement.get(acknowledgement_id_key), str)
+                or normalized_acknowledgement.get("outcome") not in ACKNOWLEDGEMENT_OUTCOMES
+                or not isinstance(normalized_acknowledgement["reason"], str)
             ):
                 raise ValueError(f"Sync returned invalid {label} acknowledgements.")
-            acknowledged_ids.append(acknowledgement[acknowledgement_id_key])
+            acknowledged_ids.append(normalized_acknowledgement[acknowledgement_id_key])
+            normalized_response_items.append(normalized_acknowledgement)
         if (
             any(not isinstance(item_id, str) for item_id in sent_ids)
             or len(sent_ids) != len(set(sent_ids))
@@ -2450,7 +2474,7 @@ class Store:
             raise ValueError(
                 f"Sync returned an invalid {label} acknowledgement set."
             )
-        return response_items
+        return normalized_response_items
 
     def _validated_sync_response(
         self,
@@ -2464,12 +2488,14 @@ class Store:
             "taskAcknowledgements",
             "durationAcknowledgements",
             "autoStartAcknowledgements",
+            "selectedTaskAcknowledgements",
             "revision",
             "canonicalTimer",
             "history",
             "tasks",
             "durationsMs",
             "autoStartBreaks",
+            "selectedTaskId",
             "serverTime",
             "serverHlcWallMs",
             "serverHlcCounter",
@@ -2503,20 +2529,9 @@ class Store:
             "auto-start",
         )
         selected_task_operations = request.get("selectedTaskOperations", [])
-        has_selected_task_response = (
-            "selectedTaskAcknowledgements" in response and "selectedTaskId" in response
-        )
-        if (
-            ("selectedTaskAcknowledgements" in response)
-            != ("selectedTaskId" in response)
-            or selected_task_operations and not has_selected_task_response
-        ):
-            raise ValueError(
-                "Server response omitted canonical fields: selected-task state."
-            )
         selected_task_acknowledgements = self._validate_acknowledgements(
             selected_task_operations,
-            response.get("selectedTaskAcknowledgements", []),
+            response["selectedTaskAcknowledgements"],
             "operationId",
             "selected-task",
         )
@@ -2559,17 +2574,7 @@ class Store:
             task_ids.append(task_id)
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("Server returned duplicate tasks.")
-        if has_selected_task_response:
-            selected_task_id = response["selectedTaskId"]
-        else:
-            previous_selected_task_id = self.get_meta("snapshot", {}).get(
-                "selectedTaskId"
-            )
-            selected_task_id = (
-                previous_selected_task_id
-                if previous_selected_task_id in task_ids
-                else None
-            )
+        selected_task_id = response["selectedTaskId"]
         if (
             selected_task_id is not None
             and (
@@ -3251,6 +3256,21 @@ class Store:
         )
         local_clock = (local_wall, local_counter)
         pending = self._preflight_pending_queues(require_clock_coverage=False)
+        ownership = self.get_meta("centralizedTimerOwnership")
+        owned_timer_id = (
+            ownership.get("timerId") if isinstance(ownership, dict) else None
+        )
+        canonical_timer = canonical["canonicalTimer"]
+        retained_timer_ids = {
+            operation.get("timerId")
+            for operation in pending["commands"]
+            if operation.get("type") == "start"
+        }
+        if owned_timer_id is not None and (
+            not isinstance(canonical_timer, dict)
+            or canonical_timer.get("id") != owned_timer_id
+        ) and owned_timer_id not in retained_timer_ids:
+            self._set_meta("centralizedTimerOwnership", None)
         retained_clocks = [
             (operation["hlcWallMs"], operation["hlcCounter"])
             for operations in (
@@ -3604,6 +3624,51 @@ class Store:
             }:
                 self._set_meta(key, value)
 
+    def _workspace_without_account(
+        self, workspace: dict[str, Any], *, preserve_domain: bool
+    ) -> dict[str, Any]:
+        cleared = deepcopy(workspace)
+        metadata = cleared["metadata"]
+        settings = self._normalize_settings(metadata.get("settings", {}))
+        snapshot = deepcopy(metadata.get("snapshot", {}))
+        snapshot["revision"] = 0
+        snapshot["user"] = None
+        metadata.update(
+            pendingSync=None,
+            pendingResolution=None,
+            serverClockSample=None,
+            commandPhysicalTimes={},
+        )
+        if preserve_domain:
+            metadata["snapshot"] = snapshot
+            return cleared
+
+        settings["durations"] = {
+            phase: int(definition["default_minutes"])
+            for phase, definition in PHASES.items()
+        }
+        settings["durationsMs"] = {
+            phase: int(definition["default_minutes"]) * 60_000
+            for phase, definition in PHASES.items()
+        }
+        settings["selectedTaskId"] = None
+        settings["autoStartBreaks"] = False
+        metadata["settings"] = settings
+        metadata["snapshot"] = {
+            "revision": 0,
+            "canonicalTimer": None,
+            "history": [],
+            "tasks": [],
+            "knownTasks": [],
+            "autoStartBreaks": False,
+            "selectedTaskId": None,
+            "user": None,
+        }
+        metadata["autoStartLegacyDefaultUnknown"] = False
+        for table in cleared["tables"]:
+            cleared["tables"][table] = []
+        return cleared
+
     def _projected_local_genesis(self) -> dict[str, Any]:
         state = self.load()
         snapshot = state["snapshot"]
@@ -3620,6 +3685,7 @@ class Store:
         auto_start = project_auto_start_breaks(
             bool(snapshot.get("autoStartBreaks", False)), state["pendingAutoStarts"]
         )
+        selected_task_id = state["settings"].get("selectedTaskId")
         clocks = [
             (int(operation.get("hlcWallMs", 0)), int(operation.get("hlcCounter", 0)))
             for operations in (
@@ -3627,6 +3693,7 @@ class Store:
                 state["pendingTasks"],
                 state["pendingDurations"],
                 state["pendingAutoStarts"],
+                state["pendingSelectedTasks"],
             )
             for operation in operations
         ]
@@ -3661,6 +3728,7 @@ class Store:
             "tasks": tasks,
             "durationsMs": durations,
             "autoStartBreaks": auto_start,
+            "selectedTaskId": selected_task_id,
             "hlcWallMs": wall,
             "hlcCounter": counter,
         }
@@ -3680,10 +3748,7 @@ class Store:
             for phase, duration in genesis["durationsMs"].items()
         }
         settings["autoStartBreaks"] = genesis["autoStartBreaks"]
-        if settings.get("selectedTaskId") not in {
-            task["id"] for task in genesis["tasks"]
-        }:
-            settings["selectedTaskId"] = None
+        settings["selectedTaskId"] = genesis["selectedTaskId"]
         workspace["metadata"].update(
             settings=settings,
             snapshot={
@@ -3811,6 +3876,7 @@ class Store:
                     return_workspace["metadata"]["settings"]
                 )["durationsMs"],
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "hlcWallMs": 0,
                 "hlcCounter": 0,
             }
@@ -4033,10 +4099,11 @@ class Store:
             ("task", pending["taskOperations"]),
             ("duration", pending["durationOperations"]),
             ("autoStart", pending["autoStartOperations"]),
+            ("selectedTask", pending["selectedTaskOperations"]),
         ):
             for operation in operations:
                 wire_operation = deepcopy(operation)
-                if domain == "autoStart":
+                if domain in {"autoStart", "selectedTask"}:
                     wire_operation.pop("deviceId", None)
                 records.append(
                     {
@@ -4057,6 +4124,7 @@ class Store:
         self.connection.execute("DELETE FROM pending_task_operations")
         self.connection.execute("DELETE FROM pending_duration_operations")
         self.connection.execute("DELETE FROM pending_auto_start_operations")
+        self.connection.execute("DELETE FROM pending_selected_task_operations")
         self.connection.executemany(
             "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
             ((identifier,) for identifier in command_ids),
@@ -4090,10 +4158,7 @@ class Store:
             for phase, duration in projection["durationsMs"].items()
         }
         settings["autoStartBreaks"] = projection["autoStartBreaks"]
-        if settings.get("selectedTaskId") not in {
-            task["id"] for task in projection["tasks"]
-        }:
-            settings["selectedTaskId"] = None
+        settings["selectedTaskId"] = projection["selectedTaskId"]
         previous = workspace["metadata"].get("snapshot", {})
         known = {
             item["id"]: item
@@ -4160,6 +4225,7 @@ class Store:
         tasks = genesis["tasks"]
         durations = genesis["durationsMs"]
         auto_start = genesis["autoStartBreaks"]
+        selected_task_id = genesis["selectedTaskId"]
         clocks = [(genesis["hlcWallMs"], genesis["hlcCounter"])]
         known_tasks = {task["id"]: task for task in genesis["tasks"]}
         timer_starters = {
@@ -4208,6 +4274,8 @@ class Store:
             elif record["domain"] == "autoStart":
                 projected_operation = {**operation, "deviceId": record["deviceId"]}
                 auto_start = project_auto_start_breaks(auto_start, [projected_operation])
+            elif record["domain"] == "selectedTask":
+                selected_task_id = operation["taskId"]
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         if (
             timer is not None
@@ -4266,6 +4334,7 @@ class Store:
             ),
             "durationsMs": durations,
             "autoStartBreaks": auto_start,
+            "selectedTaskId": selected_task_id,
             "hlcWallMs": wall,
             "hlcCounter": counter,
         }
@@ -4286,6 +4355,19 @@ class Store:
                 and projection["canonicalTimer"].get("id") == before.get("id")
                 and projection["canonicalTimer"].get("status") == "completed"
             )
+            timer = projection.get("canonicalTimer")
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            if (
+                expired
+                and isinstance(timer, dict)
+                and settings["selectedPhase"] == timer.get("phase")
+            ):
+                settings["selectedPhase"] = (
+                    next_break_phase(projection["history"], timer.get("anchorAt"))
+                    if timer.get("phase") == "focus"
+                    else "focus"
+                )
+                self._set_meta("settings", settings)
             workspace = self._workspace_with_iroh_projection(
                 self._capture_workspace(), projection
             )
@@ -4885,6 +4967,38 @@ class Store:
 
     def reset_account_data(self) -> None:
         with self._immediate_transaction():
+            room_id = self.active_iroh_room_id
+            if self.replication_mode == "iroh" and room_id is not None:
+                self._capture_local_iroh_records_locked(room_id)
+                room = self.connection.execute(
+                    "SELECT return_workspace FROM iroh_rooms WHERE room_id = ?",
+                    (room_id,),
+                ).fetchone()
+                if room is None:
+                    raise ValueError("Active Iroh room workspace is missing.")
+                returned = json.loads(room["return_workspace"])
+                return_snapshot = returned.get("metadata", {}).get("snapshot", {})
+                preserve_return_domain = (
+                    isinstance(return_snapshot, dict)
+                    and return_snapshot.get("user") is None
+                )
+                cleared_current = self._workspace_without_account(
+                    self._capture_workspace(), preserve_domain=True
+                )
+                cleared_return = self._workspace_without_account(
+                    returned, preserve_domain=preserve_return_domain
+                )
+                self.connection.execute(
+                    "UPDATE iroh_rooms SET return_workspace = ?, workspace = ? "
+                    "WHERE room_id = ?",
+                    (
+                        json.dumps(cleared_return, separators=(",", ":")),
+                        json.dumps(cleared_current, separators=(",", ":")),
+                        room_id,
+                    ),
+                )
+                self._restore_workspace(cleared_current)
+                return
             self.connection.execute("DELETE FROM pending_commands")
             self.connection.execute("DELETE FROM pending_task_operations")
             self.connection.execute("DELETE FROM pending_duration_operations")
@@ -4894,6 +5008,7 @@ class Store:
             self.connection.execute("DELETE FROM pending_auto_break_starts")
             self.connection.execute("DELETE FROM pending_phase_advances")
             self._set_meta("commandPhysicalTimes", {})
+            self._set_meta("centralizedTimerOwnership", None)
             self._set_meta("pendingSync", None)
             self._set_meta("pendingResolution", None)
             settings = self._normalize_settings(self.get_meta("settings", {}))

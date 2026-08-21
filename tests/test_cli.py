@@ -23,10 +23,14 @@ class CliTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def invoke(self, *arguments: str) -> tuple[int, str, str]:
+    def invoke(
+        self, *arguments: str, locale: str | None = None
+    ) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        result = main(arguments, store=self.store, stdout=stdout, stderr=stderr)
+        result = main(
+            arguments, store=self.store, stdout=stdout, stderr=stderr, locale=locale
+        )
         return result, stdout.getvalue(), stderr.getvalue()
 
     def test_start_and_json_status(self) -> None:
@@ -100,6 +104,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output), [])
         self.assertEqual(error, "")
+
+    def test_rtl_pseudolocale_localizes_human_output_but_not_json(self) -> None:
+        result, output, error = self.invoke("history", locale="ar-XB")
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("⟦", output)
+
+        result, output, error = self.invoke("status", "--json", locale="ar-XB")
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(json.loads(output)["status"], "idle")
 
     def test_history_rejects_limit_below_one(self) -> None:
         result, output, error = self.invoke("history", "--limit", "0")

@@ -51,6 +51,27 @@ class LocalTimerTests(unittest.TestCase):
         )
         self.assertEqual(self.timer.selected_phase, "short_break")
 
+    def test_elapsed_observer_timer_is_not_auto_finished(self) -> None:
+        remote_timer = {
+            "id": "remote-timer",
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": "1970-01-01T00:00:01.000Z",
+            "taskId": None,
+        }
+        snapshot = self.store.get_meta("snapshot")
+        snapshot["canonicalTimer"] = remote_timer
+        self.store._set_meta("snapshot", snapshot)
+        self.store.connection.commit()
+
+        state = self.timer.state(now_ms=61_000, auto_finish=True)
+
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["remainingMs"], 0)
+        self.assertEqual(self.store.load()["pending"], [])
+
     def test_finished_break_displays_next_focus_duration(self) -> None:
         self.timer.select_phase("short_break")
         self.timer.issue("start", minutes=1, now_ms=1_000)

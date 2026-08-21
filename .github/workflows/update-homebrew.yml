@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download release source
         id: release
@@ -40,7 +40,7 @@ jobs:
           printf 'version=%s\nurl=%s\nsha256=%s\n' "$version" "$url" "$sha256" >> "$GITHUB_OUTPUT"
 
       - name: Check out tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: egigoka/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}

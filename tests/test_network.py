@@ -19,7 +19,7 @@ from unittest.mock import Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
 
 from pomodorough.network import (
@@ -58,9 +58,15 @@ class _FakeSignal:
 
 
 class _FakeRevisionReply:
-    def __init__(self, body: bytes = b"", status: int | None = 200) -> None:
+    def __init__(
+        self,
+        body: bytes = b"",
+        status: int | None = 200,
+        content_type: bytes = b"text/event-stream; charset=utf-8",
+    ) -> None:
         self.body = body
         self.status = status
+        self.content_type = content_type
         self.readyRead = _FakeSignal()
         self.finished = _FakeSignal()
         self.aborted = False
@@ -72,6 +78,9 @@ class _FakeRevisionReply:
 
     def attribute(self, _attribute) -> int | None:
         return self.status
+
+    def rawHeader(self, name: bytes) -> bytes:
+        return self.content_type if bytes(name).lower() == b"content-type" else b""
 
     def abort(self) -> None:
         self.aborted = True
@@ -933,6 +942,122 @@ class AuthenticationNetworkTests(unittest.TestCase):
         )
         self.assertIsNotNone(cloud.access_expires_at.tzinfo)
 
+    def test_stale_refresh_cannot_reinstall_tokens_after_logout(self) -> None:
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        cloud.authenticated = True
+        response = {
+            "accessToken": "stale-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "stale-rotated-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+
+        def refresh_then_logout(*_args: object, **_kwargs: object) -> dict[str, str]:
+            cloud.logout()
+            return response
+
+        with (
+            patch.object(cloud.token_store, "load", return_value={"refreshToken": "old-refresh"}),
+            patch.object(cloud.token_store, "clear"),
+            patch.object(cloud.token_store, "save") as save,
+            patch.object(cloud, "_start_revocation"),
+            patch("pomodorough.network._request", side_effect=refresh_then_logout),
+        ):
+            with self.assertRaisesRegex(ApiError, "cancelled"):
+                cloud._ensure_access()
+
+        save.assert_not_called()
+        self.assertFalse(cloud.authenticated)
+        self.assertIsNone(cloud.access_token)
+
+    def test_stale_refresh_cannot_overwrite_switched_account(self) -> None:
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        cloud.authenticated = True
+        response = {
+            "accessToken": "account-a-stale-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "account-a-stale-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+
+        def refresh_then_switch(*_args: object, **_kwargs: object) -> dict[str, str]:
+            cloud.logout()
+            cloud.authenticated = True
+            cloud.access_token = "account-b-access"
+            cloud.refresh_token = "account-b-refresh"
+            cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+            return response
+
+        with (
+            patch.object(cloud.token_store, "load", return_value={"refreshToken": "account-a-refresh"}),
+            patch.object(cloud.token_store, "clear"),
+            patch.object(cloud.token_store, "save") as save,
+            patch.object(cloud, "_start_revocation"),
+            patch("pomodorough.network._request", side_effect=refresh_then_switch),
+        ):
+            with self.assertRaisesRegex(ApiError, "cancelled"):
+                cloud._ensure_access()
+
+        save.assert_not_called()
+        self.assertTrue(cloud.authenticated)
+        self.assertEqual(cloud.access_token, "account-b-access")
+        self.assertEqual(cloud.refresh_token, "account-b-refresh")
+
+    def test_stale_refresh_cannot_persist_after_account_deletion_starts(self) -> None:
+        cloud = CloudService("device-1", "https://example.test")
+        self.addCleanup(cloud.shutdown)
+        cloud.authenticated = True
+        cloud.refresh_token = "account-refresh"
+        response = {
+            "accessToken": "stale-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "stale-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+
+        def refresh_then_delete(*_args: object, **_kwargs: object) -> dict[str, str]:
+            cloud.delete_account("DELETE")
+            return response
+
+        with (
+            patch.object(cloud.token_store, "load", return_value={"refreshToken": "account-refresh"}),
+            patch.object(cloud.token_store, "save") as save,
+            patch.object(cloud, "stop_revision_stream"),
+            patch.object(QThreadPool.globalInstance(), "start"),
+            patch("pomodorough.network._request", side_effect=refresh_then_delete),
+        ):
+            with self.assertRaisesRegex(ApiError, "cancelled"):
+                cloud._ensure_access()
+
+        save.assert_not_called()
+        self.assertTrue(cloud.deleting_account)
+
+    def test_stale_refresh_cannot_persist_after_shutdown(self) -> None:
+        cloud = CloudService("device-1", "https://example.test")
+        response = {
+            "accessToken": "stale-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "stale-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+
+        def refresh_then_shutdown(*_args: object, **_kwargs: object) -> dict[str, str]:
+            cloud.shutdown()
+            return response
+
+        with (
+            patch.object(cloud.token_store, "load", return_value={"refreshToken": "account-refresh"}),
+            patch.object(cloud.token_store, "save") as save,
+            patch("pomodorough.network._request", side_effect=refresh_then_shutdown),
+        ):
+            with self.assertRaisesRegex(ApiError, "cancelled"):
+                cloud._ensure_access()
+
+        save.assert_not_called()
+        self.assertIsNone(cloud.access_token)
+
     def test_ensure_access_clears_store_and_reraises_refresh_401(self) -> None:
         cloud = CloudService("device-1", "https://example.test")
         self.addCleanup(cloud.shutdown)
@@ -1609,6 +1734,57 @@ class RevisionStreamTests(unittest.TestCase):
 
         self.assertEqual(revisions, [17, 18])
 
+    def test_204_and_non_sse_responses_never_emit_revisions(self) -> None:
+        for reply in (
+            _FakeRevisionReply(b"data: 21\n\n", status=204),
+            _FakeRevisionReply(
+                b"data: 22\n\n", content_type=b"application/json"
+            ),
+            _FakeRevisionReply(b"data: 23\n\n", content_type=b""),
+        ):
+            with self.subTest(status=reply.status, content_type=reply.content_type):
+                cloud, _manager = self.cloud_with_reply(reply)
+                revisions = []
+                cloud.revision_available.connect(revisions.append)
+                cloud.start_revision_stream()
+
+                reply.readyRead.callbacks[0]()
+                reply.finished.callbacks[0]()
+
+                self.assertEqual(revisions, [])
+                self.assertTrue(cloud._revision_reconnect.isActive())
+                cloud._revision_reconnect.stop()
+
+    def test_reconnect_backoff_is_jittered_bounded_and_resets_after_valid_data(self) -> None:
+        reply = _FakeRevisionReply(status=503)
+        cloud, _manager = self.cloud_with_reply(reply)
+        cloud.start_revision_stream()
+
+        with patch("pomodorough.network.secrets.randbelow", return_value=250):
+            reply.finished.callbacks[0]()
+        self.assertEqual(cloud._revision_reconnect.interval(), 1_250)
+
+        cloud._revision_reconnect.stop()
+        second = _FakeRevisionReply(status=503)
+        cloud._network = _FakeNetworkManager(second)
+        cloud.start_revision_stream()
+        with patch("pomodorough.network.secrets.randbelow", return_value=500):
+            second.finished.callbacks[0]()
+        self.assertEqual(cloud._revision_reconnect.interval(), 2_500)
+
+        cloud._revision_reconnect.stop()
+        valid = _FakeRevisionReply(b"data: 30\n\n")
+        cloud._network = _FakeNetworkManager(valid)
+        cloud.start_revision_stream()
+        valid.readyRead.callbacks[0]()
+        self.assertEqual(cloud._revision_reconnect_attempt, 0)
+
+        cloud._revision_reply = None
+        cloud._revision_reconnect_attempt = 20
+        with patch("pomodorough.network.secrets.randbelow", return_value=10_000):
+            cloud._schedule_revision_reconnect()
+        self.assertLessEqual(cloud._revision_reconnect.interval(), 30_000)
+
     def test_unauthorized_finish_clears_access_and_does_not_reconnect(self) -> None:
         reply = _FakeRevisionReply(status=401)
         cloud, _manager = self.cloud_with_reply(reply)
@@ -1856,17 +2032,84 @@ class CloudOrchestrationTests(unittest.TestCase):
         self.assertEqual(failures, [str(error)])
         self.assertEqual(statuses[-2:], ["RESOLVING HISTORY", "OFFLINE • HISTORY PRESERVED"])
 
-    def test_logout_busy_guard_and_revoke_failure_still_clear_locally(self) -> None:
-        busy = self.cloud()
-        busy.busy = True
-        with (
-            patch.object(busy, "stop_revision_stream") as stop,
-            patch.object(busy, "_start") as start,
-        ):
-            busy.logout()
-        stop.assert_not_called()
-        start.assert_not_called()
+    def test_logout_during_busy_work_clears_local_session_immediately(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "logout-access"
+        cloud.busy = True
+        cloud._sync_queued = {"lastRevision": 9}
+        signed_out = []
+        cloud.signed_out.connect(lambda: signed_out.append(True))
 
+        with (
+            patch.object(cloud, "stop_revision_stream") as stop,
+            patch.object(cloud.token_store, "clear") as clear,
+            patch.object(cloud, "_start_revocation") as revoke,
+        ):
+            cloud.logout()
+
+        stop.assert_called_once_with()
+        clear.assert_called_once_with()
+        revoke.assert_called_once_with(
+            "logout-access",
+            refresh_token=None,
+            access_token_is_fresh=False,
+        )
+        self.assertFalse(cloud.authenticated)
+        self.assertFalse(cloud.busy)
+        self.assertIsNone(cloud.access_token)
+        self.assertIsNone(cloud._sync_queued)
+        self.assertEqual(signed_out, [True])
+
+    def test_shutdown_invalidates_in_flight_worker_callbacks(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "shutdown-access"
+        sync_results = []
+        failures = []
+        cloud.sync_ready.connect(sync_results.append)
+        cloud.failure.connect(failures.append)
+
+        with patch.object(QThreadPool.globalInstance(), "start"):
+            cloud.sync({"lastRevision": 1})
+            worker = next(iter(cloud._workers))
+            cloud.shutdown()
+            worker.signals.result.emit({"revision": 2})
+            worker.signals.error.emit(ApiError("late failure"))
+            worker.signals.finished.emit()
+
+        self.assertEqual(sync_results, [])
+        self.assertEqual(failures, [])
+        self.assertFalse(cloud.busy)
+        self.assertIsNone(cloud._sync_queued)
+
+    def test_logout_generation_ignores_old_sync_and_allows_immediate_new_login(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "old-access"
+        sync_results = []
+        cloud.sync_ready.connect(sync_results.append)
+
+        with patch.object(QThreadPool.globalInstance(), "start") as start:
+            cloud.sync({"lastRevision": 1})
+            old_worker = next(iter(cloud._workers))
+            with (
+                patch.object(cloud.token_store, "clear"),
+                patch.object(cloud, "_start_revocation"),
+            ):
+                cloud.logout()
+            cloud.login()
+            self.assertEqual(start.call_count, 2)
+            self.assertTrue(cloud.busy)
+
+            old_worker.signals.result.emit({"revision": 99})
+            old_worker.signals.finished.emit()
+
+        self.assertEqual(sync_results, [])
+        self.assertTrue(cloud.busy)
+        self.assertFalse(cloud.authenticated)
+
+    def test_offline_logout_clears_locally_before_best_effort_revocation(self) -> None:
         cloud = self.cloud()
         cloud.authenticated = True
         cloud.access_token = "logout-access"
@@ -1876,19 +2119,205 @@ class CloudOrchestrationTests(unittest.TestCase):
         cloud.status_changed.connect(statuses.append)
         with (
             patch.object(cloud, "stop_revision_stream") as stop,
-            patch.object(cloud, "_start", side_effect=_run_immediately),
-            patch.object(cloud, "_ensure_access", return_value="logout-access"),
-            patch("pomodorough.network._request", side_effect=ApiError("down", 503)),
+            patch.object(cloud, "_start_revocation") as revoke,
             patch.object(cloud.token_store, "clear") as clear,
         ):
             cloud.logout()
 
         stop.assert_called_once_with()
         clear.assert_called_once_with()
+        revoke.assert_called_once_with(
+            "logout-access",
+            refresh_token=None,
+            access_token_is_fresh=False,
+        )
         self.assertFalse(cloud.authenticated)
         self.assertIsNone(cloud.access_token)
         self.assertEqual(signed_out, [True])
         self.assertEqual(statuses, ["LOCAL • SIGN IN TO SYNC"])
+
+    def test_logout_refreshes_expired_captured_session_then_revokes_without_persisting(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "expired-access"
+        cloud.refresh_token = "captured-refresh"
+        cloud.access_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        refreshed = {
+            "accessToken": "revocation-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "rotated-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+
+        with (
+            patch.object(QThreadPool.globalInstance(), "start") as start,
+            patch.object(cloud.token_store, "clear"),
+            patch.object(cloud.token_store, "save") as save,
+            patch("pomodorough.network._request", side_effect=[refreshed, {}]) as request,
+        ):
+            cloud.logout()
+            worker = start.call_args.args[0]
+            cloud.authenticated = True
+            cloud.access_token = "new-account-access"
+            cloud.refresh_token = "new-account-refresh"
+            worker.function()
+
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call(
+                    "POST",
+                    "https://example.test/api/v1/auth/refresh",
+                    {"refreshToken": "captured-refresh"},
+                ),
+                call(
+                    "POST",
+                    "https://example.test/api/v1/auth/logout",
+                    {},
+                    access_token="revocation-access",
+                ),
+            ],
+        )
+        save.assert_not_called()
+        self.assertTrue(cloud.authenticated)
+        self.assertEqual(cloud.access_token, "new-account-access")
+        self.assertEqual(cloud.refresh_token, "new-account-refresh")
+
+    def test_logout_refresh_failure_is_contained_and_cannot_touch_new_session(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "expired-access"
+        cloud.refresh_token = "captured-refresh"
+        cloud.access_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        retries = []
+
+        with (
+            patch.object(QThreadPool.globalInstance(), "start") as start,
+            patch.object(cloud.token_store, "clear"),
+            patch.object(cloud.token_store, "save") as save,
+            patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: retries.append((delay, callback)),
+            ),
+            patch(
+                "pomodorough.network._request",
+                side_effect=ApiError("refresh unavailable", 503),
+            ) as request,
+        ):
+            cloud.logout()
+            worker = start.call_args.args[0]
+            cloud.authenticated = True
+            cloud.access_token = "new-account-access"
+            cloud.refresh_token = "new-account-refresh"
+            worker.run()
+
+        request.assert_called_once_with(
+            "POST",
+            "https://example.test/api/v1/auth/refresh",
+            {"refreshToken": "captured-refresh"},
+        )
+        self.assertEqual(len(retries), 1)
+        save.assert_not_called()
+        self.assertTrue(cloud.authenticated)
+        self.assertEqual(cloud.access_token, "new-account-access")
+        self.assertEqual(cloud.refresh_token, "new-account-refresh")
+
+    def test_delete_account_requires_exact_confirmation_and_success_clears_session(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "delete-access"
+        cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        deleted = []
+        cloud.account_deleted.connect(lambda: deleted.append(True))
+
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud, "stop_revision_stream") as stop,
+            patch.object(cloud.token_store, "clear") as clear,
+            patch("pomodorough.network._request", return_value={}) as request,
+        ):
+            for confirmation in ("", "delete", "DELETE "):
+                cloud.delete_account(confirmation)
+            request.assert_not_called()
+            cloud.delete_account("DELETE")
+
+        request.assert_called_once_with(
+            "DELETE",
+            "https://example.test/api/v1/account",
+            {"confirmation": "DELETE"},
+            access_token="delete-access",
+        )
+        stop.assert_called_once_with()
+        clear.assert_called_once_with()
+        self.assertEqual(deleted, [True])
+        self.assertFalse(cloud.authenticated)
+        self.assertFalse(cloud.deleting_account)
+        self.assertIsNone(cloud.access_token)
+
+    def test_delete_account_failure_preserves_session_and_resumes_stream(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "preserved-access"
+        cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        failures = []
+        cloud.account_deletion_failed.connect(failures.append)
+
+        with (
+            patch.object(cloud, "_start", side_effect=_run_immediately),
+            patch.object(cloud, "stop_revision_stream"),
+            patch.object(cloud, "start_revision_stream") as start_stream,
+            patch.object(cloud.token_store, "clear") as clear,
+            patch("pomodorough.network._request", side_effect=ApiError("offline")),
+        ):
+            cloud.delete_account("DELETE")
+
+        clear.assert_not_called()
+        start_stream.assert_called_once_with()
+        self.assertEqual(failures, ["offline"])
+        self.assertTrue(cloud.authenticated)
+        self.assertFalse(cloud.deleting_account)
+        self.assertEqual(cloud.access_token, "preserved-access")
+
+    def test_stale_account_a_delete_success_cannot_clear_account_b(self) -> None:
+        cloud = self.cloud()
+        cloud.authenticated = True
+        cloud.access_token = "account-a"
+        cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        deleted = []
+        cloud.account_deleted.connect(lambda: deleted.append(True))
+
+        with (
+            patch.object(QThreadPool.globalInstance(), "start"),
+            patch("pomodorough.network._request", return_value={}) as request,
+        ):
+            cloud.busy = True  # Simulate an in-flight account-A sync.
+            cloud.delete_account("DELETE")
+            deletion_worker = next(
+                worker
+                for worker, generation in cloud._worker_generations.items()
+                if generation == cloud._account_generation
+            )
+            with (
+                patch.object(cloud.token_store, "clear"),
+                patch.object(cloud, "_start_revocation"),
+            ):
+                cloud.logout()
+            cloud.authenticated = True
+            cloud.access_token = "account-b"
+            response = deletion_worker.function()
+            deletion_worker.signals.result.emit(response)
+            deletion_worker.signals.finished.emit()
+
+        request.assert_called_once_with(
+            "DELETE",
+            "https://example.test/api/v1/account",
+            {"confirmation": "DELETE"},
+            access_token="account-a",
+        )
+        self.assertEqual(deleted, [])
+        self.assertTrue(cloud.authenticated)
+        self.assertEqual(cloud.access_token, "account-b")
 
 
 class BootstrapNetworkTests(unittest.TestCase):

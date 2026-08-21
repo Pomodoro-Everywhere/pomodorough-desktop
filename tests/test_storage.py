@@ -46,6 +46,73 @@ class StorageTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
+    def test_canonical_shipping_fixture_uses_production_sync_decoder(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures/protocol-fixtures-v1.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        decoded = self.store._validated_sync_response(
+            fixture["syncResponse"], fixture["syncRequest"]
+        )
+
+        self.assertEqual(decoded["revision"], 5)
+        self.assertEqual(
+            decoded["canonicalTimer"]["id"],
+            "01a0219e-0800-7002-8000-000000000002",
+        )
+        self.assertEqual([task["title"] for task in decoded["tasks"]], ["Ship release"])
+        self.assertEqual(decoded["selectedTaskId"], None)
+        for key in (
+            "acknowledgements",
+            "taskAcknowledgements",
+            "durationAcknowledgements",
+            "autoStartAcknowledgements",
+            "selectedTaskAcknowledgements",
+        ):
+            self.assertEqual(len(decoded[key]), 1)
+
+    def test_centralized_timer_ownership_survives_restart(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(None, [], [start])
+
+        self.assertTrue(self.store.owns_timer(running))
+        self.store.close()
+        self.store = Store(self.path)
+
+        self.assertTrue(self.store.owns_timer(running))
+        self.store.reset_account_data()
+        self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
+
+    def test_canonical_replacement_clears_centralized_timer_ownership(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        local_timer, _history = rebuild_optimistic(None, [], [start])
+        self.assertTrue(self.store.owns_timer(local_timer))
+        request = self.store.sync_payload()
+        remote_timer = {
+            "id": "remote-timer",
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": 25 * 60_000,
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": utc_timestamp(2_000),
+            "taskId": None,
+        }
+        response = self._canonical_response(request, revision=1)
+        response["canonicalTimer"] = remote_timer
+
+        self.store.apply_sync(response, request)
+
+        self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
+        self.assertFalse(self.store.owns_timer(remote_timer))
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertFalse(self.store.owns_timer(remote_timer))
+
     @staticmethod
     def _history_item(
         item_id: str, completed_at: str = "2026-07-22T10:00:00.000Z"
@@ -925,12 +992,14 @@ class StorageTests(unittest.TestCase):
             "taskAcknowledgements",
             "durationAcknowledgements",
             "autoStartAcknowledgements",
+            "selectedTaskAcknowledgements",
             "revision",
             "canonicalTimer",
             "history",
             "tasks",
             "durationsMs",
             "autoStartBreaks",
+            "selectedTaskId",
             "serverTime",
             "serverHlcWallMs",
             "serverHlcCounter",
@@ -946,6 +1015,19 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(before["pending"], [command])
         self.assertEqual(before["pendingTasks"], [task_operation])
         self.assertEqual(before["pendingDurations"], [duration])
+
+    def test_sync_requires_selected_task_fields_even_without_selected_task_operations(self) -> None:
+        request = self.store.sync_payload()
+        response = self._canonical_response(request, revision=1)
+        response.pop("selectedTaskAcknowledgements")
+        response.pop("selectedTaskId")
+        before = self.store.load()
+
+        with self.assertRaisesRegex(ValueError, "canonical fields"):
+            self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.store.pending_sync(), request)
 
     def test_sync_revision_guard_rejects_lower_and_applies_equal_or_higher(self) -> None:
         for response_revision, accepted in ((4, False), (5, True), (6, True)):
@@ -1136,12 +1218,14 @@ class StorageTests(unittest.TestCase):
                 "tasks": [],
                 "durationAcknowledgements": [],
                 "autoStartAcknowledgements": [],
+                "selectedTaskAcknowledgements": [],
                 "durationsMs": {
                     "focus": 25 * 60_000,
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "serverTime": queued["occurredAt"],
                 "serverHlcWallMs": queued["hlcWallMs"],
                 "serverHlcCounter": queued["hlcCounter"],
@@ -1177,12 +1261,14 @@ class StorageTests(unittest.TestCase):
                 "tasks": [task],
                 "durationAcknowledgements": [],
                 "autoStartAcknowledgements": [],
+                "selectedTaskAcknowledgements": [],
                 "durationsMs": {
                     "focus": 25 * 60_000,
                     "short_break": 5 * 60_000,
                     "long_break": 15 * 60_000,
                 },
                 "autoStartBreaks": False,
+                "selectedTaskId": None,
                 "serverTime": operation["occurredAt"],
                 "serverHlcWallMs": operation["hlcWallMs"],
                 "serverHlcCounter": operation["hlcCounter"],
@@ -1621,6 +1707,7 @@ class StorageTests(unittest.TestCase):
                 {"operationId": sent["id"], "outcome": "applied", "reason": ""}
             ],
             "autoStartAcknowledgements": [],
+            "selectedTaskAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -1631,6 +1718,7 @@ class StorageTests(unittest.TestCase):
                 "long_break": 16 * 60_000,
             },
             "autoStartBreaks": False,
+            "selectedTaskId": None,
             "serverTime": utc_timestamp(1_000),
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
@@ -1672,6 +1760,7 @@ class StorageTests(unittest.TestCase):
                 {"operationId": sent["id"], "outcome": "applied", "reason": ""}
             ],
             "autoStartAcknowledgements": [],
+            "selectedTaskAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -1682,6 +1771,7 @@ class StorageTests(unittest.TestCase):
                 "long_break": 16 * 60_000,
             },
             "autoStartBreaks": False,
+            "selectedTaskId": None,
             "serverTime": utc_timestamp(server_wall),
             "serverHlcWallMs": server_wall,
             "serverHlcCounter": 0,
@@ -2759,6 +2849,7 @@ class StorageTests(unittest.TestCase):
                     "reason": "",
                 }
             ],
+            "selectedTaskAcknowledgements": [],
             "revision": 1,
             "canonicalTimer": None,
             "history": [],
@@ -2769,6 +2860,7 @@ class StorageTests(unittest.TestCase):
                 "long_break": 16 * 60_000,
             },
             "autoStartBreaks": False,
+            "selectedTaskId": None,
             "serverTime": utc_timestamp(1_000),
             "serverHlcWallMs": 1_000,
             "serverHlcCounter": 0,
@@ -2956,6 +3048,7 @@ class StorageTests(unittest.TestCase):
                     }
                     for item in request["autoStartOperations"]
                 ],
+                "selectedTaskAcknowledgements": [],
                 "revision": 1,
                 "canonicalTimer": None,
                 "history": [],
@@ -2966,6 +3059,7 @@ class StorageTests(unittest.TestCase):
                     "long_break": 10_800_000,
                 },
                 "autoStartBreaks": True,
+                "selectedTaskId": None,
                 "serverTime": utc_timestamp(server_hlc_wall_ms),
                 "serverHlcWallMs": server_hlc_wall_ms,
                 "serverHlcCounter": 7,

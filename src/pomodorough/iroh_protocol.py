@@ -24,7 +24,7 @@ MAX_INVENTORY = 1024
 MAX_OPERATION_REFS = 255
 MAX_PEERS = 64
 LEGACY_EPOCH = "1970-01-01T00:00:00.000Z"
-DOMAINS = {"genesis", "timer", "task", "duration", "autoStart"}
+DOMAINS = {"genesis", "timer", "task", "duration", "autoStart", "selectedTask"}
 ERROR_CODES = {
     "bad_frame",
     "unauthorized",
@@ -343,7 +343,7 @@ def _valid_peer_timer(operation: dict[str, Any]) -> None:
 
 def _validate_genesis(operation: dict[str, Any]) -> None:
     _exact_keys(operation, {
-        "canonicalTimer", "history", "tasks", "durationsMs", "autoStartBreaks", "hlcWallMs", "hlcCounter"
+        "canonicalTimer", "history", "tasks", "durationsMs", "autoStartBreaks", "selectedTaskId", "hlcWallMs", "hlcCounter"
     })
     timer = operation["canonicalTimer"]
     if timer is not None and not Store._valid_canonical_timer(timer):
@@ -414,6 +414,9 @@ def _validate_genesis(operation: dict[str, Any]) -> None:
         )
     except ValueError as error:
         raise IrohProtocolError("Genesis durations or logical clock are invalid.") from error
+    selected_task_id = operation["selectedTaskId"]
+    if selected_task_id is not None and not valid_identifier(selected_task_id):
+        raise IrohProtocolError("Genesis selected task is invalid.")
     if wall == 0 and counter != 0 or not isinstance(operation["autoStartBreaks"], bool):
         raise IrohProtocolError("Genesis settings or logical clock are invalid.")
 
@@ -461,7 +464,7 @@ def validate_record(record: Any) -> dict[str, Any]:
             Store._validate_pending_duration_operation(Store.__new__(Store), operation, row)  # type: ignore[arg-type]
         except (KeyError, TypeError, ValueError) as error:
             raise IrohProtocolError("Duration operation is invalid.") from error
-    else:
+    elif domain == "autoStart":
         _exact_keys(operation, {"id", "enabled", "occurredAt", "hlcWallMs", "hlcCounter"})
         try:
             _valid_peer_clock(operation, allow_zero=True)
@@ -469,6 +472,14 @@ def validate_record(record: Any) -> dict[str, Any]:
             raise IrohProtocolError("Auto-start operation is invalid.") from error
         if not isinstance(operation.get("enabled"), bool):
             raise IrohProtocolError("Auto-start operation is invalid.")
+    else:
+        _exact_keys(operation, {"id", "taskId", "occurredAt", "hlcWallMs", "hlcCounter"})
+        if operation.get("taskId") is not None and not valid_identifier(operation["taskId"]):
+            raise IrohProtocolError("Selected-task operation is invalid.")
+        try:
+            _valid_peer_clock(operation)
+        except IrohProtocolError as error:
+            raise IrohProtocolError("Selected-task operation is invalid.") from error
     return record
 
 

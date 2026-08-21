@@ -16,6 +16,7 @@ from .core import (
     rebuild_tasks,
     timer_for_display,
 )
+from .localization import Strings
 from .storage import Store
 
 PHASE_ALIASES = {
@@ -33,19 +34,20 @@ class InvalidAction(ValueError):
     pass
 
 
-def normalize_phase(value: str) -> str:
+def normalize_phase(value: str, strings: Strings | None = None) -> str:
     try:
         return PHASE_ALIASES[value.lower()]
     except KeyError as error:
-        choices = ", ".join(("focus", "short-break", "long-break"))
-        raise InvalidAction(f"Unknown phase {value!r}. Choose {choices}.") from error
+        strings = strings or Strings()
+        raise InvalidAction(strings.text("error.unknown_phase", value=value)) from error
 
 
 class LocalTimer:
     """Terminal-facing timer operations backed by the shared local store."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, *, strings: Strings | None = None) -> None:
         self.store = store
+        self.strings = strings or Strings()
         self.settings: dict[str, Any] = {}
         self.timer: dict[str, Any] | None = None
         self.history: list[dict[str, Any]] = []
@@ -129,6 +131,10 @@ class LocalTimer:
             and not self.resolution_pending
             and status == "running"
             and elapsed >= planned
+            and (
+                self.store.replication_mode == "iroh"
+                or self.store.owns_timer(timer)
+            )
         ):
             if self.store.replication_mode == "iroh":
                 self._store_action(
@@ -207,15 +213,23 @@ class LocalTimer:
             "clear": status in TERMINAL_STATUSES,
         }
         if command_type not in valid:
-            raise InvalidAction(f"Unknown timer action {command_type!r}.")
+            raise InvalidAction(
+                self.strings.text("error.unknown_action", action=command_type)
+            )
         if not valid[command_type]:
-            raise InvalidAction(f"Cannot {command_type} timer while it is {status}.")
+            raise InvalidAction(
+                self.strings.text(
+                    "error.invalid_transition", action=command_type, status=status
+                )
+            )
 
-        selected_phase = normalize_phase(phase) if phase else self.selected_phase
+        selected_phase = (
+            normalize_phase(phase, self.strings) if phase else self.selected_phase
+        )
         durations_ms = deepcopy(self.settings["durationsMs"])
         if minutes is not None:
             if not 1 <= minutes <= 180:
-                raise InvalidAction("Duration must be between 1 and 180 minutes.")
+                raise InvalidAction(self.strings.text("error.duration_range"))
             durations_ms[selected_phase] = minutes * 60_000
 
         if command_type == "start" and selected_phase != self.selected_phase:
@@ -275,8 +289,8 @@ class LocalTimer:
     def select_phase(self, phase: str) -> None:
         self.reload()
         if self.current_timer().get("status") in ACTIVE_STATUSES:
-            raise InvalidAction("Cannot change phase while timer is active.")
-        selected_phase = normalize_phase(phase)
+            raise InvalidAction(self.strings.text("error.phase_active"))
+        selected_phase = normalize_phase(phase, self.strings)
         self._store_action(lambda: self.store.set_selected_phase(selected_phase))
         self.reload()
 

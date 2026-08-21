@@ -6,17 +6,14 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from .localization import Strings
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
-STATUS_LABELS = {
-    "idle": "READY AT PLATFORM",
-    "running": "IN TRANSIT",
-    "paused": "HELD AT SIGNAL",
-    "completed": "ARRIVED",
-    "cancelled": "SERVICE CANCELLED",
-    "superseded": "ROUTE CHANGED",
-}
+
+def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings:
+    candidate = strings or getattr(timer, "strings", None)
+    return candidate if isinstance(candidate, Strings) else Strings()
 
 
 def build_lines(
@@ -24,54 +21,60 @@ def build_lines(
     history: list[dict[str, Any]],
     width: int,
     message: str = "",
+    *,
+    strings: Strings | None = None,
 ) -> list[str]:
+    strings = strings or Strings()
     display = state.get("display", state)
     bar_width = max(10, min(48, width - 12))
     filled = round(display["progress"] * bar_width)
     progress = "#" * filled + "-" * (bar_width - filled)
     lines = [
-        "POMODOROUGH",
-        "TIME, IN TRANSIT",
+        strings.text("brand.name"),
+        strings.text("brand.tagline"),
         "",
-        display["phaseLabel"].upper(),
+        strings.text(f"phase.{display.get('phase', 'focus')}").upper(),
         display["remaining"],
-        STATUS_LABELS.get(state["status"], state["status"].upper()),
+        strings.messages.get(
+            f"status.rail.{state['status']}", str(state["status"]).upper()
+        ),
         f"[{progress}]",
         "",
-        "space start/pause/resume  f finish  x cancel  c clear",
-        "1 focus  2 short break  3 long break  +/- duration  q quit",
+        strings.text("tui.keys_primary"),
+        strings.text("tui.keys_secondary"),
     ]
     if display["taskTitle"]:
-        lines.insert(6, f"TASK: {display['taskTitle']}")
-    if state["pendingCommands"]:
-        lines.append(f"{state['pendingCommands']} command(s) pending sync")
-    if state["pendingDurationOperations"]:
-        lines.append(
-            f"{state['pendingDurationOperations']} duration preference(s) pending sync"
-        )
-    if state["pendingAutoStartOperations"]:
-        lines.append(
-            f"{state['pendingAutoStartOperations']} auto-start preference operation(s) pending sync"
-        )
+        lines.insert(6, strings.text("terminal.task_upper", task=display["taskTitle"]))
+    for key, count in (
+        ("terminal.pending_commands", state["pendingCommands"]),
+        ("terminal.pending_durations", state["pendingDurationOperations"]),
+        ("terminal.pending_auto_start", state["pendingAutoStartOperations"]),
+    ):
+        if count:
+            lines.append(strings.plural(key, count))
     if state["historyResolutionPending"]:
-        lines.append("Account history resolution pending; timer changes are blocked.")
+        lines.append(strings.text("terminal.history_resolution_pending"))
     if message:
         lines.extend(("", message))
-    lines.extend(("", "RECENT ARRIVALS"))
+    lines.extend(("", strings.text("arrivals.title")))
     if not history:
-        lines.extend(
-            (
-                "No arrivals yet".center(width),
-                "Your first run appears here.".center(width),
+        empty_title, empty_detail = strings.text("terminal.history_empty").split("\n", 1)
+        lines.extend((empty_title.center(width), empty_detail.center(width)))
+    for item in history[:5]:
+        phase = strings.text(f"phase.{item.get('phase', 'timer')}").title()
+        if item.get("taskTitle"):
+            phase = strings.text(
+                "tui.phase_task", phase=phase, task=item["taskTitle"]
+            )
+        minutes = int(item.get("plannedDurationMs", 0)) // 60_000
+        lines.append(
+            strings.text(
+                "tui.history_row",
+                phase=phase,
+                minutes=minutes,
+                pending=(strings.text("tui.pending_mark") if item.get("pending") else ""),
             )
         )
-    for item in history[:5]:
-        phase = str(item.get("phase", "timer")).replace("_", " ").title()
-        if item.get("taskTitle"):
-            phase = f"{phase}: {item['taskTitle']}"
-        minutes = int(item.get("plannedDurationMs", 0)) // 60_000
-        pending = " *" if item.get("pending") else ""
-        lines.append(f"{phase:<12} {minutes:>3} min{pending}")
     return lines
 
 
@@ -99,13 +102,20 @@ def handle_key(timer: LocalTimer, key: int) -> bool:
     return True
 
 
-def _draw(screen: Any, timer: LocalTimer, message: str) -> None:
+def _draw(
+    screen: Any, timer: LocalTimer, message: str, strings: Strings | None = None
+) -> None:
+    strings = _timer_strings(timer, strings)
     height, width = screen.getmaxyx()
     state = timer.state(auto_finish=True)
-    lines = build_lines(state, timer.completed_history(5), width, message)
+    lines = build_lines(
+        state, timer.completed_history(5), width, message, strings=strings
+    )
     screen.erase()
     if height < 12 or width < 40:
-        screen.addnstr(0, 0, "Terminal too small (minimum 40x12).", max(1, width - 1))
+        screen.addnstr(
+            0, 0, strings.text("tui.too_small"), max(1, width - 1)
+        )
     else:
         for row, line in enumerate(lines[: height - 1]):
             attribute = curses.A_BOLD if row in (0, 3, 4) else curses.A_NORMAL
@@ -113,7 +123,8 @@ def _draw(screen: Any, timer: LocalTimer, message: str) -> None:
     screen.refresh()
 
 
-def _run(screen: Any, timer: LocalTimer) -> None:
+def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None:
+    strings = _timer_strings(timer, strings)
     try:
         curses.curs_set(0)
     except curses.error:
@@ -133,21 +144,24 @@ def _run(screen: Any, timer: LocalTimer) -> None:
             message = str(error)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int:
+    strings = Strings(locale)
     parser = argparse.ArgumentParser(
         prog="pomodorough-tui",
-        description="Run Pomodorough in a terminal.",
+        description=strings.text("tui.description"),
     )
-    parser.add_argument("--data", type=Path, help="use a custom SQLite database")
+    parser.add_argument("--data", type=Path, help=strings.text("terminal.data_help"))
     args = parser.parse_args(argv)
     store = Store(args.data.expanduser() if args.data else None)
     try:
-        curses.wrapper(_run, LocalTimer(store))
+        timer = LocalTimer(store)
+        timer.strings = strings
+        curses.wrapper(_run, timer)
         return 0
     except KeyboardInterrupt:
         return 130
     except curses.error as error:
-        print(f"pomodorough-tui: terminal unavailable: {error}", file=sys.stderr)
+        print(strings.text("tui.error", error=error), file=sys.stderr)
         return 2
     finally:
         store.close()
