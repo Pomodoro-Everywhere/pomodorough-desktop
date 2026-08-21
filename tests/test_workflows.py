@@ -44,6 +44,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
             verification,
         )
 
+    def test_installed_python_artifacts_run_gui_smoke_without_tracebacks(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(workflow.count("POMODOROUGH_SCREENSHOT="), 2)
+        self.assertGreaterEqual(workflow.count("grep -q 'Traceback (most recent call last)'"), 2)
+        self.assertIn("test -s .release-wheel-smoke.png", workflow)
+        self.assertIn("test -s .release-sdist-smoke.png", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

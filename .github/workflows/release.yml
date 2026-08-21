@@ -195,6 +195,15 @@ jobs:
           .release-wheel/bin/python -m pip install dist/*.whl
           .release-wheel/bin/python -m pip check
           QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m unittest discover -s tests -v
+          POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
+            QT_QPA_PLATFORM=offscreen \
+            timeout 30s .release-wheel/bin/pomodorough \
+            2>.release-wheel-smoke.stderr
+          test -s .release-wheel-smoke.png
+          if grep -q 'Traceback (most recent call last)' .release-wheel-smoke.stderr; then
+            cat .release-wheel-smoke.stderr
+            exit 1
+          fi
 
       - name: Install and test source distribution
         run: |
@@ -202,6 +211,15 @@ jobs:
           .release-sdist/bin/python -m pip install dist/*.tar.gz
           .release-sdist/bin/python -m pip check
           QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m unittest discover -s tests -v
+          POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
+            QT_QPA_PLATFORM=offscreen \
+            timeout 30s .release-sdist/bin/pomodorough \
+            2>.release-sdist-smoke.stderr
+          test -s .release-sdist-smoke.png
+          if grep -q 'Traceback (most recent call last)' .release-sdist-smoke.stderr; then
+            cat .release-sdist-smoke.stderr
+            exit 1
+          fi
 
       - name: Upload Python package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
