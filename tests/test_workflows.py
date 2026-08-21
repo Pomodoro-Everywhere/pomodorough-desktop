@@ -14,7 +14,7 @@ WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
-CORE_COMMIT = "a78a312314dd9466557c3dbdd12184b698c3d156"
+CORE_COMMIT = "9a01dc8da0f1612e7a301c19cf42f3b522e61684"
 CORE_SHA256 = "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
 
 
@@ -30,16 +30,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
             workflow,
         )
-        self.assertIn(
-            'printf \'%s  %s\\n\' "$CORE_SHA256" '
-            "src/pomodorough/resources/pomodorough_core.wasm",
-            workflow,
-        )
-        self.assertIn(
-            "cmp pomodorough-core-source/target/wasm32-unknown-unknown/release/"
-            "pomodorough_core.wasm src/pomodorough/resources/pomodorough_core.wasm",
-            workflow,
-        )
+        self.assertIn("verify_wasm_artifact.py", workflow)
+        self.assertIn('--sha256 "$CORE_SHA256"', workflow)
 
     def test_release_checks_shared_core_in_built_distributions(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

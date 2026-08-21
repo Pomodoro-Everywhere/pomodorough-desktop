@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CORE_COMMIT: "a78a312314dd9466557c3dbdd12184b698c3d156"
+  CORE_COMMIT: "9a01dc8da0f1612e7a301c19cf42f3b522e61684"
   CORE_SHA256: "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
 
 jobs:
@@ -89,12 +89,14 @@ jobs:
             cd pomodorough-core-source
             cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked
           )
-          printf '%s  %s\n' "$CORE_SHA256" src/pomodorough/resources/pomodorough_core.wasm \
-            | sha256sum --check --strict
+          python3 pomodorough-core-source/scripts/verify_wasm_artifact.py \
+            pomodorough-core-source/target/wasm32-unknown-unknown/release/pomodorough_core.wasm
+          python3 pomodorough-core-source/scripts/verify_wasm_artifact.py \
+            src/pomodorough/resources/pomodorough_core.wasm \
+            --sha256 "$CORE_SHA256"
           grep -Fx "$CORE_COMMIT" src/pomodorough/resources/CORE_COMMIT
           grep -Fx "$CORE_SHA256  pomodorough_core.wasm" \
             src/pomodorough/resources/pomodorough_core.wasm.sha256
-          cmp pomodorough-core-source/target/wasm32-unknown-unknown/release/pomodorough_core.wasm src/pomodorough/resources/pomodorough_core.wasm
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5

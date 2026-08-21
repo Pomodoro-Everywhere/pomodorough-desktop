@@ -10,7 +10,7 @@ from typing import Final, Self
 from wasmtime import Engine, Func, Instance, Memory, Module, Store, WasmtimeError
 
 
-CORE_COMMIT: Final = "a78a312314dd9466557c3dbdd12184b698c3d156"
+CORE_COMMIT: Final = "9a01dc8da0f1612e7a301c19cf42f3b522e61684"
 CORE_SHA256: Final = "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
