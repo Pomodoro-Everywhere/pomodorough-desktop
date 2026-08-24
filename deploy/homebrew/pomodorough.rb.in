@@ -42,7 +42,8 @@ class Pomodorough < Formula
     venv = virtualenv_create(libexec, "python3.14")
     venv.pip_install resource("setuptools"), build_isolation: false
     venv.pip_install resource("platformdirs"), build_isolation: false
-    venv.pip_install resource("wasmtime"), build_isolation: false
+    wasmtime = resource("wasmtime")
+    wasmtime.stage { venv.pip_install Pathname.pwd/wasmtime.downloader.basename, build_isolation: false }
     if Hardware::CPU.arm?
       iroh = resource("iroh")
       iroh.stage { venv.pip_install Pathname.pwd/iroh.downloader.basename, build_isolation: false }
