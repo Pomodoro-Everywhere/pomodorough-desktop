@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind a pinned shared-core rebuild to every embedded copy."""
+"""Verify a pinned rebuild and canonical embedded shared-core copies."""
 
 from __future__ import annotations
 
@@ -10,15 +10,22 @@ from pathlib import Path
 
 def verify(rebuilt: Path, embedded: list[Path], expected_sha256: str) -> None:
     rebuilt_bytes = rebuilt.read_bytes()
-    rebuilt_sha256 = hashlib.sha256(rebuilt_bytes).hexdigest()
-    if rebuilt_sha256 != expected_sha256.lower():
-        raise ValueError(
-            f"rebuilt shared core SHA-256 is {rebuilt_sha256}, expected {expected_sha256}"
-        )
+    if not rebuilt_bytes.startswith(b"\0asm\x01\0\0\0"):
+        raise ValueError("rebuilt shared core is not a WebAssembly module")
 
+    canonical_bytes: bytes | None = None
     for candidate in embedded:
-        if candidate.read_bytes() != rebuilt_bytes:
-            raise ValueError(f"embedded shared core differs from rebuild: {candidate}")
+        candidate_bytes = candidate.read_bytes()
+        candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+        if candidate_sha256 != expected_sha256.lower():
+            raise ValueError(
+                f"embedded shared core SHA-256 is {candidate_sha256}, "
+                f"expected {expected_sha256}: {candidate}"
+            )
+        if canonical_bytes is None:
+            canonical_bytes = candidate_bytes
+        elif candidate_bytes != canonical_bytes:
+            raise ValueError(f"embedded shared core copies differ: {candidate}")
 
 
 def main() -> int:
