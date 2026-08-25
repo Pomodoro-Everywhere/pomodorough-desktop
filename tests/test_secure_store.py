@@ -29,6 +29,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "", ""),
         ]
         with (
+            patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", side_effect=responses) as run,
@@ -47,6 +48,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_malformed_platform_value_fails_closed(self) -> None:
         response = subprocess.CompletedProcess([], 0, "not base64!", "")
         with (
+            patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
         ):
@@ -56,6 +58,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_rejected_save_preserves_platform_error(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
         with (
+            patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
@@ -65,6 +68,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
     def test_unavailable_store_rejects_save_without_spawning_process(self) -> None:
         with (
+            patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.shutil.which", return_value=None),
             patch("pomodorough.secure_store.subprocess.run") as run,
@@ -108,6 +112,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_macos_save_passes_secret_as_keychain_argument_not_stdin(self) -> None:
         response = subprocess.CompletedProcess([], 0, "", "")
         with (
+            patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="darwin"),
             patch("pomodorough.secure_store.shutil.which", return_value="/usr/bin/security"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response) as run,

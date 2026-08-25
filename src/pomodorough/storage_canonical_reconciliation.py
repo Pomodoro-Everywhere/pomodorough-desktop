@@ -214,7 +214,7 @@ class CanonicalReconciliationHooks(Protocol):
 
 def generated_break_day_bounds(source_ms: int) -> tuple[str, str]:
     source_day = (
-        datetime.fromtimestamp(source_ms / 1000)
+        datetime.fromtimestamp(source_ms / 1000, UTC)
         .astimezone()
         .replace(hour=0, minute=0, second=0, microsecond=0)
     )
