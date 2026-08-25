@@ -56,20 +56,24 @@ class SharedCoreProvenanceTests(unittest.TestCase):
                 text=True,
             )
 
-    def test_accepts_matching_embedded_modules(self) -> None:
-        result = self.run_provenance(VALID_WASM, [VALID_WASM, VALID_WASM])
+    def test_accepts_host_specific_rebuild_with_pinned_embedded_modules(self) -> None:
+        result = self.run_provenance(
+            DIFFERENT_VALID_WASM,
+            [VALID_WASM, VALID_WASM],
+            expected_sha256=hashlib.sha256(VALID_WASM).hexdigest(),
+        )
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_rejects_rebuilt_hash_mismatch(self) -> None:
+    def test_rejects_embedded_hash_mismatch(self) -> None:
         result = self.run_provenance(
             VALID_WASM,
-            [VALID_WASM],
-            expected_sha256=hashlib.sha256(DIFFERENT_VALID_WASM).hexdigest(),
+            [DIFFERENT_VALID_WASM],
+            expected_sha256=hashlib.sha256(VALID_WASM).hexdigest(),
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("rebuilt shared core SHA-256 is", result.stderr)
+        self.assertIn("embedded shared core SHA-256 is", result.stderr)
 
     def test_rejects_different_valid_embedded_module(self) -> None:
         result = self.run_provenance(
@@ -78,7 +82,7 @@ class SharedCoreProvenanceTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("differs from rebuild", result.stderr)
+        self.assertIn("embedded shared core SHA-256 is", result.stderr)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -92,6 +96,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
         self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
         self.assertIn("ref: ${{ env.CORE_COMMIT }}", workflow)
+        self.assertIn(
+            "cargo +1.97.1 test --all-targets --locked",
+            workflow,
+        )
         self.assertIn(
             "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
             workflow,

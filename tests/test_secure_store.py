@@ -97,7 +97,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
         PlatformSecretStore._write_private(path, b"second")
 
         self.assertEqual(path.read_bytes(), b"second")
-        if hasattr(os, "fchmod"):
+        if os.name != "nt" and hasattr(os, "fchmod"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(list(path.parent.glob(f".{path.name}.*")), [])
 

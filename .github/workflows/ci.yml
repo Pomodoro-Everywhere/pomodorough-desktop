@@ -87,6 +87,7 @@ jobs:
           rustup target add wasm32-unknown-unknown --toolchain 1.97.1
           (
             cd pomodorough-core-source
+            cargo +1.97.1 test --all-targets --locked
             cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked
           )
           rebuilt=pomodorough-core-source/target/wasm32-unknown-unknown/release/pomodorough_core.wasm

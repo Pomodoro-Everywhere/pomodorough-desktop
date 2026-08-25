@@ -41,6 +41,8 @@ class AppLifecycleTests(unittest.TestCase):
     def test_main_wires_application_lifecycle(self) -> None:
         application = MagicMock()
         application.exec.return_value = 17
+        lock = MagicMock()
+        lock.tryLock.return_value = True
         icon = MagicMock()
         store = MagicMock(device_id="device-42")
         cloud = MagicMock()
@@ -55,6 +57,7 @@ class AppLifecycleTests(unittest.TestCase):
             patch.object(app_module.sys, "argv", ["pomodorough"]),
             patch.object(app_module, "QApplication", return_value=application) as application_type,
             patch.object(app_module, "QIcon", return_value=icon) as icon_type,
+            patch.object(app_module, "_instance_lock", return_value=lock),
             patch.object(app_module, "Store", return_value=store) as store_type,
             patch.object(app_module, "CloudService", return_value=cloud) as cloud_type,
             patch.object(app_module, "_iroh_service", return_value=iroh) as iroh_factory,
@@ -74,6 +77,7 @@ class AppLifecycleTests(unittest.TestCase):
         icon_type.assert_called_once_with(str(icon_path))
         application.setWindowIcon.assert_called_once_with(icon)
         application.setQuitOnLastWindowClosed.assert_called_once_with(True)
+        lock.tryLock.assert_called_once_with(0)
         store_type.assert_called_once_with()
         cloud_type.assert_called_once_with("device-42")
         iroh_factory.assert_called_once_with(store)
@@ -99,6 +103,8 @@ class AppLifecycleTests(unittest.TestCase):
     def test_screenshot_mode_captures_then_quits(self) -> None:
         application = MagicMock()
         application.exec.return_value = 0
+        lock = MagicMock()
+        lock.tryLock.return_value = True
         icon = MagicMock()
         store = MagicMock(device_id="device-42")
         cloud = MagicMock()
@@ -118,6 +124,7 @@ class AppLifecycleTests(unittest.TestCase):
             ),
             patch.object(app_module, "QApplication", return_value=application),
             patch.object(app_module, "QIcon", return_value=icon),
+            patch.object(app_module, "_instance_lock", return_value=lock),
             patch.object(app_module, "Store", return_value=store),
             patch.object(app_module, "CloudService", return_value=cloud),
             patch.object(app_module, "_iroh_service", return_value=iroh),
