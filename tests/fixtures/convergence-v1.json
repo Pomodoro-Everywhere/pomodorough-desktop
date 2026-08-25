@@ -37,12 +37,12 @@
         {"id":"c2","sequence":2,"deviceId":"device-a","timerId":"timer-a","type":"finish","phase":"long_break","durationMs":900000,"atMs":70000,"wallMs":200,"counter":0,"elapsedMs":60000}
       ],
       "expected": {
-        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":60000,"lastCommandId":"c2","taskId":"task-source"},
-        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"commandId":"c2","endedMs":60000,"taskId":"task-source"}]
+        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":70000,"lastCommandId":"c2","taskId":"task-source"},
+        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"commandId":"c2","endedMs":70000,"taskId":"task-source"}]
       }
     },
     {
-      "name": "deadline-rejects-late-cancel-and-duplicate-start",
+      "name": "deadline-latest-start-wins-after-late-cancel",
       "nowMs": 80000,
       "commands": [
         {"id":"c1","sequence":1,"deviceId":"device-a","timerId":"timer-a","type":"start","phase":"focus","durationMs":60000,"atMs":0,"wallMs":100,"counter":0,"elapsedMs":0},
@@ -50,8 +50,8 @@
         {"id":"c3","sequence":3,"deviceId":"device-b","timerId":"timer-a","type":"start","phase":"long_break","durationMs":900000,"atMs":80000,"wallMs":300,"counter":0,"elapsedMs":0}
       ],
       "expected": {
-        "timer": {"id":"timer-a","status":"completed","phase":"focus","durationMs":60000,"elapsedMs":60000,"anchorMs":60000,"lastCommandId":"c1"},
-        "history": [{"timerId":"timer-a","status":"completed","phase":"focus","durationMs":60000,"endedMs":60000}]
+        "timer": {"id":"timer-a","status":"running","phase":"long_break","durationMs":900000,"elapsedMs":0,"anchorMs":80000,"lastCommandId":"c3"},
+        "history": []
       }
     },
     {

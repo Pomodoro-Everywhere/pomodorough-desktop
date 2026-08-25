@@ -51,7 +51,37 @@ class LocalTimerTests(unittest.TestCase):
         )
         self.assertEqual(self.timer.selected_phase, "short_break")
 
-    def test_elapsed_observer_timer_is_not_auto_finished(self) -> None:
+    def test_terminal_projection_completes_overdue_pause_then_resume(self) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        running = self.store.projected_state(now_ms=1_000).canonical_timer
+        self.store.queue_command(
+            "pause", running, "focus", durations_ms, now_ms=70_000
+        )
+        paused = self.store.projected_state(now_ms=70_000).canonical_timer
+        self.store.queue_command(
+            "resume", paused, "focus", durations_ms, now_ms=80_000
+        )
+
+        state = self.timer.state(now_ms=90_000)
+        history = self.timer.completed_history()
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(self.timer.timer["lastIntent"]["type"], "resume")
+        self.assertEqual(
+            (history[0]["id"], history[0]["timerId"]),
+            (state["timerId"], state["timerId"]),
+        )
+        self.assertIn(
+            self.timer.strings.text("status.rail.completed"),
+            build_lines(state, history, 80, strings=self.timer.strings),
+        )
+
+    def test_elapsed_observer_timer_is_projected_completed_but_not_claimed(self) -> None:
         remote_timer = {
             "id": "remote-timer",
             "phase": "focus",
@@ -68,7 +98,7 @@ class LocalTimerTests(unittest.TestCase):
 
         state = self.timer.state(now_ms=61_000, auto_finish=True)
 
-        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["status"], "completed")
         self.assertEqual(state["remainingMs"], 0)
         self.assertEqual(self.store.load()["pending"], [])
 
@@ -188,6 +218,50 @@ class LocalTimerTests(unittest.TestCase):
             ["start", "pause", "cancel", "clear"],
         )
 
+    def test_retained_history_includes_every_status_and_task_context(self) -> None:
+        retained = task_from_title("Retained title")
+        self.timer.known_tasks = {retained["id"]: retained}
+        self.timer.history = [
+            {
+                "id": "completed",
+                "status": "completed",
+                "taskId": retained["id"],
+            },
+            {"id": "cancelled", "status": "cancelled", "taskId": "missing"},
+            {"id": "superseded", "status": "superseded", "taskId": None},
+            {"id": "running", "status": "running", "taskId": None},
+        ]
+
+        with patch.object(self.timer, "reload"):
+            retained_history = self.timer.retained_history()
+            compatibility_history = self.timer.completed_history()
+
+        self.assertEqual(
+            [item["status"] for item in retained_history],
+            ["completed", "cancelled", "superseded"],
+        )
+        self.assertEqual(
+            [item["taskContext"] for item in retained_history],
+            ["retained", "deleted", "unassigned"],
+        )
+        self.assertEqual(
+            [item["taskTitle"] for item in retained_history],
+            ["Retained title", "Deleted task", "Unassigned"],
+        )
+        self.assertEqual(compatibility_history, retained_history)
+
+    def test_dismiss_clears_terminal_timer(self) -> None:
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+        self.timer.issue("finish", now_ms=31_000)
+
+        self.timer.issue("dismiss", now_ms=31_001)
+
+        self.assertEqual(self.timer.state(now_ms=31_001)["status"], "idle")
+        self.assertEqual(
+            [command["type"] for command in self.store.load()["pending"]],
+            ["start", "finish", "clear"],
+        )
+
     def test_focus_start_keeps_selected_task(self) -> None:
         task = task_from_title("Write release notes")
         self.store.queue_task_operation("upsert", task, now_ms=500)
@@ -227,7 +301,7 @@ class LocalTimerTests(unittest.TestCase):
                     action()
                 self.assertEqual(self.store.load(), before)
 
-    def test_pending_resolution_status_does_not_auto_finish_elapsed_timer(
+    def test_pending_resolution_projects_deadline_but_does_not_claim_finish(
         self,
     ) -> None:
         self.timer.issue("start", minutes=1, now_ms=1_000)
@@ -235,12 +309,12 @@ class LocalTimerTests(unittest.TestCase):
 
         state = self.timer.state(now_ms=61_000, auto_finish=True)
 
-        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["status"], "completed")
         self.assertEqual(state["remainingMs"], 0)
         self.assertTrue(state["historyResolutionPending"])
         self.assertEqual(len(self.store.load()["pending"]), 1)
 
-    def test_pending_resolution_status_preserves_unavailable_selection(self) -> None:
+    def test_pending_resolution_status_uses_projected_selection(self) -> None:
         task = task_from_title("Pending selection")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"], now_ms=2)
@@ -250,7 +324,7 @@ class LocalTimerTests(unittest.TestCase):
         state = self.timer.state()
 
         self.assertTrue(state["historyResolutionPending"])
-        self.assertEqual(self.timer.settings["selectedTaskId"], task["id"])
+        self.assertIsNone(self.timer.settings["selectedTaskId"])
         self.assertEqual(
             self.store.load()["settings"]["selectedTaskId"], task["id"]
         )
@@ -291,7 +365,7 @@ class LocalTimerTests(unittest.TestCase):
         self.timer.issue("start", minutes=1, now_ms=1_000)
         self.timer.issue("finish", now_ms=31_000)
         state = self.timer.state(now_ms=31_000)
-        lines = build_lines(state, self.timer.completed_history(), 80)
+        lines = build_lines(state, self.timer.retained_history(), 80)
         rendered = "\n".join(lines)
         self.assertIn("05:00", rendered)
         self.assertIn("SHORT BREAK", rendered)

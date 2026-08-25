@@ -17,48 +17,42 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from platformdirs import user_config_path
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtNetwork import QNetworkReply
 
 from .localization import Strings
+from .network_account import (
+    AccountLifecycle,
+    RevocationState,
+)
+from .network_revision import (
+    RevisionEventParser as _RevisionEventParser,
+    RevisionStream,
+)
+from .network_session import (
+    ApiError,
+    AuthenticatedSession,
+    SessionState,
+    TimedDocument as TimedDocument,
+)
 
 API_BASE = "https://pomodorough.egigoka.me"
+RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS = frozenset(
+    {
+        "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com",
+    }
+)
 
 
 def _text(key: str, **values: Any) -> str:
     return Strings().text(key, **values)
-
-
-class ApiError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        status: int | None = None,
-        document: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status = status
-        self.document = document
-
-    def details(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "message": str(self),
-            "document": self.document,
-        }
-
-
-class TimedDocument(dict[str, Any]):
-    def __init__(self, document: dict[str, Any], timing: dict[str, int]) -> None:
-        super().__init__(document)
-        self.timing = timing
 
 
 def _request(
@@ -256,60 +250,7 @@ class Worker(QRunnable):
             self.signals.finished.emit()
 
 
-class _RevisionEventParser:
-    def __init__(self) -> None:
-        self.buffer = b""
-        self.data_lines: list[bytes] = []
-
-    def feed(self, chunk: bytes) -> list[int]:
-        self.buffer += chunk
-        revisions: list[int] = []
-        while b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
-            line = line.rstrip(b"\r")
-            if not line:
-                revision = self._dispatch()
-                if revision is not None:
-                    revisions.append(revision)
-            elif line.startswith(b"data:"):
-                data = line[5:]
-                if data.startswith(b" "):
-                    data = data[1:]
-                self.data_lines.append(data)
-        return revisions
-
-    def _dispatch(self) -> int | None:
-        if not self.data_lines:
-            return None
-        raw = b"\n".join(self.data_lines)
-        self.data_lines = []
-        try:
-            document = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            try:
-                document = raw.decode()
-            except UnicodeDecodeError:
-                return None
-        value = document.get("revision") if isinstance(document, dict) else document
-        if isinstance(value, bool):
-            return None
-        try:
-            revision = int(value)
-        except (TypeError, ValueError):
-            return None
-        return revision if revision >= 0 else None
-
-
-def _read_oauth_credentials() -> dict[str, str]:
-    override = os.environ.get("POMODOROUGH_GOOGLE_OAUTH_JSON")
-    user_path = _config_root() / "google-oauth.json"
-    source = (
-        Path(override)
-        if override
-        else user_path
-        if user_path.is_file()
-        else files("pomodorough").joinpath("resources/oauth-client.json")
-    )
+def _parse_oauth_credentials(source: Any) -> dict[str, str]:
     try:
         document = json.loads(source.read_text(encoding="utf-8"))
         config = document.get("installed") or document.get("web") or document
@@ -321,6 +262,25 @@ def _read_oauth_credentials() -> dict[str, str]:
         }
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise ApiError(_text("network.error.oauth_config", path=source)) from error
+
+
+def _read_oauth_credentials() -> dict[str, str]:
+    override = os.environ.get("POMODOROUGH_GOOGLE_OAUTH_JSON")
+    if override:
+        return _parse_oauth_credentials(Path(override))
+
+    bundled = files("pomodorough").joinpath("resources/oauth-client.json")
+    user_path = _config_root() / "google-oauth.json"
+    if not user_path.is_file():
+        return _parse_oauth_credentials(bundled)
+
+    implicit = _parse_oauth_credentials(user_path)
+    if (
+        implicit["client_id"] in RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS
+        or implicit["client_secret"]
+    ):
+        return _parse_oauth_credentials(bundled)
+    return implicit
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -483,11 +443,122 @@ class CloudService(QObject):
     failure = Signal(str)
     account_deleted = Signal()
     account_deletion_failed = Signal(str)
+    _valid_revision_stream_response = staticmethod(RevisionStream.valid_response)
+
+    @property
+    def access_token(self) -> str | None:
+        return self._state.access_token
+
+    @access_token.setter
+    def access_token(self, value: str | None) -> None:
+        self._state.access_token = value
+
+    @property
+    def refresh_token(self) -> str | None:
+        return self._state.refresh_token
+
+    @refresh_token.setter
+    def refresh_token(self, value: str | None) -> None:
+        self._state.refresh_token = value
+
+    @property
+    def access_expires_at(self) -> datetime:
+        return self._state.access_expires_at
+
+    @access_expires_at.setter
+    def access_expires_at(self, value: datetime) -> None:
+        self._state.access_expires_at = value
+
+    @property
+    def authenticated(self) -> bool:
+        return self._state.authenticated
+
+    @authenticated.setter
+    def authenticated(self, value: bool) -> None:
+        self._state.authenticated = value
+
+    @property
+    def busy(self) -> bool:
+        return self._state.busy
+
+    @busy.setter
+    def busy(self, value: bool) -> None:
+        self._state.busy = value
+
+    @property
+    def deleting_account(self) -> bool:
+        return self._state.deleting_account
+
+    @deleting_account.setter
+    def deleting_account(self, value: bool) -> None:
+        self._state.deleting_account = value
+
+    @property
+    def _sync_queued(self) -> dict[str, Any] | None:
+        return self._state.sync_queued
+
+    @_sync_queued.setter
+    def _sync_queued(self, value: dict[str, Any] | None) -> None:
+        self._state.sync_queued = value
+
+    @property
+    def _account_generation(self) -> int:
+        return self._state.account_generation
+
+    @_account_generation.setter
+    def _account_generation(self, value: int) -> None:
+        self._state.account_generation = value
+
+    @property
+    def _shutting_down(self) -> bool:
+        return self._state.shutting_down
+
+    @_shutting_down.setter
+    def _shutting_down(self, value: bool) -> None:
+        self._state.shutting_down = value
+
+    @property
+    def _lifecycle_lock(self) -> threading.Lock:
+        return self._state.lock
+
+    @property
+    def _network(self) -> Any:
+        return self._revisions.network
+
+    @_network.setter
+    def _network(self, value: Any) -> None:
+        self._revisions.network = value
+
+    @property
+    def _revision_reply(self) -> QNetworkReply | None:
+        return self._revisions.state.reply
+
+    @_revision_reply.setter
+    def _revision_reply(self, value: QNetworkReply | None) -> None:
+        self._revisions.state.reply = value
+
+    @property
+    def _revision_parser(self) -> _RevisionEventParser:
+        return self._revisions.state.parser
+
+    @_revision_parser.setter
+    def _revision_parser(self, value: _RevisionEventParser) -> None:
+        self._revisions.state.parser = value
+
+    @property
+    def _revision_reconnect(self) -> QTimer:
+        return self._revisions.reconnect_timer
+
+    @property
+    def _revision_reconnect_attempt(self) -> int:
+        return self._revisions.state.reconnect_attempt
+
+    @_revision_reconnect_attempt.setter
+    def _revision_reconnect_attempt(self, value: int) -> None:
+        self._revisions.state.reconnect_attempt = value
 
     def __init__(
-        self,
-        device_id: str,
-        api_base: str = API_BASE,
+        self, device_id: str, api_base: str = API_BASE,
         oauth_browser: OAuthBrowserTransport | None = None,
         token_urlsafe: Callable[[int], str] = secrets.token_urlsafe,
         strings: Strings | None = None,
@@ -496,27 +567,44 @@ class CloudService(QObject):
         self.strings = strings or Strings()
         self.device_id = device_id
         self.api_base = api_base.rstrip("/")
+        self._state = SessionState()
         self.token_store = TokenStore(device_id)
-        self.access_token: str | None = None
-        self.refresh_token: str | None = None
-        self.access_expires_at = datetime.min.replace(tzinfo=timezone.utc)
-        self.authenticated = False
-        self.busy = False
-        self.deleting_account = False
-        self._sync_queued: dict[str, Any] | None = None
+        self._session = AuthenticatedSession(
+            self.api_base,
+            self._state,
+            self.token_store,
+            lambda *args, **kwargs: _request(*args, **kwargs),
+            _text,
+            lambda: datetime.now(timezone.utc),
+            lambda: time.time(), lambda: time.monotonic_ns(),
+        )
+        self._accept_tokens = self._session.accept_tokens
+        self._accept_login_tokens = self._session.accept_login_tokens
+        self._ensure_access = self._session.ensure_access
+        self._authorized_request = self._session.authorized_request
+        self._timed_request = self._session.timed_request
+        self._accounts = AccountLifecycle(
+            self.api_base,
+            self._state,
+            self.token_store,
+            lambda *args, **kwargs: _request(*args, **kwargs),
+            _text,
+            lambda: datetime.now(timezone.utc),
+        )
+        self._begin_account_deletion = self._accounts.begin_deletion
+        self._delete_captured_account = self._accounts.delete_account
+        self._refresh_deletion_access = self._accounts.refresh_deletion_access
+        self._revoke_credentials = self._accounts.revoke
+        self._refresh_revocation_access = self._accounts.refresh_revocation_access
         self._workers: set[Worker] = set()
         self._worker_generations: dict[Worker, int] = {}
-        self._account_generation = 0
         self._revocation_workers: set[Worker] = set()
-        self._network = QNetworkAccessManager(self)
-        self._revision_reply: QNetworkReply | None = None
-        self._revision_parser = _RevisionEventParser()
-        self._revision_reconnect = QTimer(self)
-        self._revision_reconnect.setSingleShot(True)
-        self._revision_reconnect.timeout.connect(self.start_revision_stream)
-        self._revision_reconnect_attempt = 0
-        self._shutting_down = False
-        self._lifecycle_lock = threading.Lock()
+        self._revisions = RevisionStream(
+            self,
+            self.api_base,
+            lambda: self.start_revision_stream(), lambda upper: secrets.randbelow(upper),
+            lambda reply: self._valid_revision_stream_response(reply),
+        )
         self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
         self._token_urlsafe = token_urlsafe
 
@@ -564,140 +652,6 @@ class CloudService(QObject):
             self._sync_queued = None
             self.sync(payload)
 
-    def _accept_tokens(self, response: dict[str, Any]) -> None:
-        try:
-            access_token = response["accessToken"]
-            access_expires_value = response["accessTokenExpiresAt"]
-            refresh_token = response["refreshToken"]
-            refresh_expires_value = response["refreshTokenExpiresAt"]
-            if not all(
-                isinstance(value, str)
-                for value in (
-                    access_token,
-                    access_expires_value,
-                    refresh_token,
-                    refresh_expires_value,
-                )
-            ):
-                raise TypeError("token fields must be strings")
-            access_expires_at = datetime.fromisoformat(
-                access_expires_value.replace("Z", "+00:00")
-            )
-            refresh_expires_at = datetime.fromisoformat(
-                refresh_expires_value.replace("Z", "+00:00")
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise ApiError(_text("network.error.invalid_token")) from error
-        if (
-            not access_token.strip()
-            or not refresh_token.strip()
-            or access_expires_at.tzinfo is None
-            or refresh_expires_at.tzinfo is None
-        ):
-            raise ApiError(_text("network.error.invalid_token"))
-        self.token_store.save(response)
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self.access_expires_at = access_expires_at
-
-    def _accept_login_tokens(self, response: dict[str, Any]) -> None:
-        with self._lifecycle_lock:
-            if self._shutting_down:
-                raise ApiError(_text("network.error.sign_in_cancelled"))
-            self._accept_tokens(response)
-
-    def _ensure_access(self, generation: int | None = None) -> str:
-        with self._lifecycle_lock:
-            refresh_generation = (
-                self._account_generation if generation is None else generation
-            )
-            if self._shutting_down or refresh_generation != self._account_generation:
-                raise ApiError(_text("network.error.sign_in_cancelled"))
-            if (
-                self.access_token
-                and self.access_expires_at
-                > datetime.now(timezone.utc) + timedelta(seconds=30)
-            ):
-                return self.access_token
-            stored = self.token_store.load()
-        if not stored or not stored.get("refreshToken"):
-            raise ApiError(_text("network.error.sign_in_required"))
-        try:
-            response = _request(
-                "POST",
-                f"{self.api_base}/api/v1/auth/refresh",
-                {"refreshToken": stored["refreshToken"]},
-            )
-        except ApiError as error:
-            with self._lifecycle_lock:
-                if self._shutting_down or refresh_generation != self._account_generation:
-                    raise ApiError(
-                        _text("network.error.sign_in_cancelled")
-                    ) from error
-                if error.status == 401:
-                    self.token_store.clear()
-            raise
-        with self._lifecycle_lock:
-            if self._shutting_down or refresh_generation != self._account_generation:
-                raise ApiError(_text("network.error.sign_in_cancelled"))
-            self._accept_tokens(response)
-            return self.access_token or ""
-
-    def _authorized_request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        with self._lifecycle_lock:
-            generation = self._account_generation
-        token = self._ensure_access(generation)
-        try:
-            return self._timed_request(
-                method, path, payload, access_token=token
-            )
-        except ApiError as error:
-            if error.status != 401:
-                raise
-            with self._lifecycle_lock:
-                if self._shutting_down or generation != self._account_generation:
-                    raise ApiError(
-                        _text("network.error.sign_in_cancelled")
-                    ) from error
-                self.access_token = None
-            token = self._ensure_access(generation)
-            return self._timed_request(
-                method, path, payload, access_token=token
-            )
-
-    def _timed_request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None,
-        *,
-        access_token: str,
-    ) -> TimedDocument:
-        request_physical_ms = int(time.time() * 1000)
-        request_monotonic_ms = time.monotonic_ns() // 1_000_000
-        document = _request(
-            method,
-            f"{self.api_base}{path}",
-            payload,
-            access_token=access_token,
-        )
-        received_physical_ms = int(time.time() * 1000)
-        received_monotonic_ms = time.monotonic_ns() // 1_000_000
-        return TimedDocument(
-            document,
-            {
-                "requestPhysicalMs": request_physical_ms,
-                "receivedPhysicalMs": received_physical_ms,
-                "requestMonotonicMs": request_monotonic_ms,
-                "receivedMonotonicMs": received_monotonic_ms,
-            },
-        )
-
     def restore(self) -> None:
         self.status_changed.emit(self.strings.text("cloud.status.connecting"))
 
@@ -742,13 +696,57 @@ class CloudService(QObject):
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
             self.failure.emit(str(error))
 
-        self._start(self._authorize_google, authorized, failed)
+        with self._lifecycle_lock:
+            generation = self._account_generation
+        self._start(
+            lambda: self._authorize_google(expected_generation=generation),
+            authorized,
+            failed,
+        )
 
-    def _authorize_google(self) -> dict[str, Any]:
+    def _authorize_google(
+        self,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        generation = self._authorization_generation(expected_generation)
         credentials = _read_oauth_credentials()
         challenge = _request(
             "POST", f"{self.api_base}/api/v1/auth/google/challenge", {}
         )
+        identity_token = self._google_identity_token(credentials, challenge)
+        response = self._exchange_google_identity(identity_token, challenge)
+        access_token = self._access_token_after_login(response, generation)
+        user = _request(
+            "GET",
+            f"{self.api_base}/api/v1/me",
+            access_token=access_token,
+        )["user"]
+        self._assert_authorization_generation(generation)
+        return user
+
+    def _authorization_generation(
+        self, expected_generation: int | None
+    ) -> int:
+        with self._lifecycle_lock:
+            generation = (
+                self._account_generation
+                if expected_generation is None
+                else expected_generation
+            )
+            if self._shutting_down or generation != self._account_generation:
+                raise ApiError(_text("network.error.sign_in_cancelled"))
+            return generation
+
+    def _assert_authorization_generation(self, generation: int) -> None:
+        with self._lifecycle_lock:
+            if self._shutting_down or generation != self._account_generation:
+                raise ApiError(_text("network.error.sign_in_cancelled"))
+
+    def _google_identity_token(
+        self,
+        credentials: dict[str, str],
+        challenge: dict[str, Any],
+    ) -> str:
         state = self._token_urlsafe(32)
         verifier = self._token_urlsafe(64)
         redirect_uri, callback = self._oauth_browser.authorize(
@@ -770,25 +768,37 @@ class CloudService(QObject):
         google_tokens = _request(
             "POST", credentials["token_uri"], token_payload, form=True
         )
-        if not google_tokens.get("id_token"):
+        identity_token = google_tokens.get("id_token")
+        if not identity_token:
             raise ApiError(_text("network.error.missing_identity"))
-        response = _request(
+        return identity_token
+
+    def _exchange_google_identity(
+        self,
+        identity_token: str,
+        challenge: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _request(
             "POST",
             f"{self.api_base}/api/v1/auth/google/exchange",
             {
-                "idToken": google_tokens["id_token"],
+                "idToken": identity_token,
                 "challenge": challenge["challenge"],
                 "deviceId": self.device_id,
                 "platform": "windows" if sys.platform == "win32" else "linux",
             },
         )
-        self._accept_login_tokens(response)
-        user = _request(
-            "GET",
-            f"{self.api_base}/api/v1/me",
-            access_token=self.access_token,
-        )["user"]
-        return user
+
+    def _access_token_after_login(
+        self,
+        response: dict[str, Any],
+        generation: int,
+    ) -> str | None:
+        self._accept_login_tokens(response, expected_generation=generation)
+        with self._lifecycle_lock:
+            if self._shutting_down or generation != self._account_generation:
+                raise ApiError(_text("network.error.sign_in_cancelled"))
+            return self.access_token
 
     def sync(self, payload: dict[str, Any]) -> None:
         if self.busy:
@@ -872,81 +882,39 @@ class CloudService(QObject):
             or self._revision_reply is not None
         ):
             return
-        self._revision_reconnect.stop()
-        request = QNetworkRequest(QUrl(f"{self.api_base}/api/v1/stream"))
-        request.setRawHeader(b"Accept", b"text/event-stream")
-        request.setRawHeader(
-            b"Authorization", f"Bearer {self.access_token}".encode()
-        )
-        reply = self._network.get(request)
-        self._revision_reply = reply
-        self._revision_parser = _RevisionEventParser()
-        reply.readyRead.connect(lambda reply=reply: self._read_revision_stream(reply))
-        reply.finished.connect(
-            lambda reply=reply: self._revision_stream_finished(reply)
+        self._revisions.start(
+            self.access_token,
+            self._read_revision_stream,
+            self._revision_stream_finished,
         )
 
     def _read_revision_stream(self, reply: QNetworkReply) -> None:
-        if reply is not self._revision_reply:
-            return
-        if not self._valid_revision_stream_response(reply):
-            reply.readAll()
-            return
-        revisions = self._revision_parser.feed(bytes(reply.readAll()))
-        if revisions:
-            self._revision_reconnect_attempt = 0
-        for revision in revisions:
+        for revision in self._revisions.read(reply):
             self.revision_available.emit(revision)
 
-    @staticmethod
-    def _valid_revision_stream_response(reply: QNetworkReply) -> bool:
-        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        content_type = bytes(reply.rawHeader("Content-Type"))
-        media_type = content_type.split(b";", 1)[0].strip().lower()
-        return status == 200 and media_type == b"text/event-stream"
-
     def _schedule_revision_reconnect(self) -> None:
-        base_ms = min(20_000, 1_000 * (2 ** min(self._revision_reconnect_attempt, 5)))
-        jitter_ms = secrets.randbelow(min(10_000, base_ms // 2) + 1)
-        self._revision_reconnect_attempt += 1
-        self._revision_reconnect.start(min(30_000, base_ms + jitter_ms))
+        self._revisions.schedule_reconnect()
 
     def _revision_stream_finished(self, reply: QNetworkReply) -> None:
-        if reply is not self._revision_reply:
-            reply.deleteLater()
+        finished = self._revisions.finish(reply)
+        if not finished.was_active:
             return
-        self._read_revision_stream(reply)
-        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        self._revision_reply = None
-        reply.deleteLater()
+        for revision in finished.revisions:
+            self.revision_available.emit(revision)
         if self._shutting_down or not self.authenticated:
             return
-        if status == 401:
+        if finished.status == 401:
             self.access_token = None
             self.authorization_stale.emit()
             return
         self._schedule_revision_reconnect()
 
     def stop_revision_stream(self) -> None:
-        self._revision_reconnect.stop()
-        self._revision_reconnect_attempt = 0
-        reply = self._revision_reply
-        self._revision_reply = None
-        self._revision_parser = _RevisionEventParser()
-        if reply is not None:
-            reply.abort()
-            reply.deleteLater()
+        self._revisions.stop()
 
     def _expire_session(self) -> None:
         self.stop_revision_stream()
-        try:
-            self.token_store.clear()
-        except (OSError, subprocess.SubprocessError):
-            pass
-        self.access_token = None
-        self.refresh_token = None
-        self.access_expires_at = datetime.min.replace(tzinfo=timezone.utc)
-        self.authenticated = False
+        self._accounts.expire_session()
         self.session_expired.emit()
         self.status_changed.emit(self.strings.text("cloud.status.session_expired"))
 
@@ -963,112 +931,40 @@ class CloudService(QObject):
         self.stop_revision_stream()
 
     def logout(self) -> None:
-        with self._lifecycle_lock:
-            token = self.access_token
-            refresh_token = self.refresh_token
-            token_is_fresh = bool(
-                token
-                and self.access_expires_at
-                > datetime.now(timezone.utc) + timedelta(seconds=30)
-            )
-            self._account_generation += 1
-            self.busy = False
-            self.deleting_account = False
-            self._sync_queued = None
-            self.token_store.clear()
-            self.access_token = None
-            self.refresh_token = None
-            self.access_expires_at = datetime.min.replace(tzinfo=timezone.utc)
-            self.authenticated = False
+        credentials = self._accounts.sign_out()
         self.stop_revision_stream()
         self.signed_out.emit()
         self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
-        if token or refresh_token:
+        if credentials.access_token or credentials.refresh_token:
             self._start_revocation(
-                token,
-                refresh_token=refresh_token,
-                access_token_is_fresh=token_is_fresh,
+                credentials.access_token,
+                refresh_token=credentials.refresh_token,
+                access_token_is_fresh=credentials.access_token_is_fresh,
             )
 
     def delete_account(self, confirmation: str) -> None:
-        with self._lifecycle_lock:
-            if (
-                confirmation != "DELETE"
-                or not self.authenticated
-                or self.deleting_account
-            ):
-                return
-            access_token = self.access_token
-            access_expires_at = self.access_expires_at
-            refresh_token = self.refresh_token
-            self._account_generation += 1
-            self.deleting_account = True
+        credentials = self._begin_account_deletion(confirmation)
+        if credentials is None:
+            return
         self.stop_revision_stream()
         self.status_changed.emit(self.strings.text("cloud.status.syncing"))
+        self._start(
+            lambda: self._delete_captured_account(credentials),
+            self._account_deleted,
+            self._account_deletion_failed,
+        )
 
-        def refresh_access() -> str:
-            if not refresh_token:
-                raise ApiError(_text("network.error.sign_in_required"))
-            response = _request(
-                "POST",
-                f"{self.api_base}/api/v1/auth/refresh",
-                {"refreshToken": refresh_token},
-            )
-            refreshed = response.get("accessToken")
-            if not isinstance(refreshed, str) or not refreshed.strip():
-                raise ApiError(_text("network.error.invalid_token"))
-            return refreshed
+    def _account_deleted(self, _response: dict[str, Any]) -> None:
+        # Invalidate every callback tied to deleted account before notifying UI.
+        self._accounts.complete_deletion()
+        self.account_deleted.emit()
+        self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
 
-        def delete() -> dict[str, Any]:
-            token = (
-                access_token
-                if access_token
-                and access_expires_at
-                > datetime.now(timezone.utc) + timedelta(seconds=30)
-                else refresh_access()
-            )
-            try:
-                return _request(
-                    "DELETE",
-                    f"{self.api_base}/api/v1/account",
-                    {"confirmation": "DELETE"},
-                    access_token=token,
-                )
-            except ApiError as error:
-                if error.status != 401 or token != access_token:
-                    raise
-                return _request(
-                    "DELETE",
-                    f"{self.api_base}/api/v1/account",
-                    {"confirmation": "DELETE"},
-                    access_token=refresh_access(),
-                )
-
-        def deleted(_response: dict[str, Any]) -> None:
-            # Invalidate every callback tied to the deleted account before
-            # notifying the UI to clear account-bound local state.
-            self._account_generation += 1
-            self.busy = False
-            self.deleting_account = False
-            self._sync_queued = None
-            try:
-                self.token_store.clear()
-            except (OSError, subprocess.SubprocessError):
-                pass
-            self.access_token = None
-            self.refresh_token = None
-            self.access_expires_at = datetime.min.replace(tzinfo=timezone.utc)
-            self.authenticated = False
-            self.account_deleted.emit()
-            self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
-
-        def failed(error: Exception) -> None:
-            self.deleting_account = False
-            self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
-            self.account_deletion_failed.emit(str(error))
-            self.start_revision_stream()
-
-        self._start(delete, deleted, failed)
+    def _account_deletion_failed(self, error: Exception) -> None:
+        self._accounts.fail_deletion()
+        self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
+        self.account_deletion_failed.emit(str(error))
+        self.start_revision_stream()
 
     def _start_revocation(
         self,
@@ -1077,63 +973,21 @@ class CloudService(QObject):
         refresh_token: str | None = None,
         access_token_is_fresh: bool = True,
         attempt: int = 0,
-        state: dict[str, Any] | None = None,
+        state: RevocationState | None = None,
     ) -> None:
         # Revocation owns a detached copy of the signed-out account's credentials.
         # It must never use or persist credentials from the current account generation.
-        revocation = state or {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "access_token_is_fresh": access_token_is_fresh,
-        }
+        revocation = state or self._accounts.revocation(
+            access_token,
+            refresh_token,
+            access_token_is_fresh,
+        )
+        self._launch_revocation(revocation, attempt)
 
-        def refresh_access() -> str:
-            captured_refresh = revocation.get("refresh_token")
-            if not isinstance(captured_refresh, str) or not captured_refresh:
-                raise ApiError(_text("network.error.sign_in_required"))
-            response = _request(
-                "POST",
-                f"{self.api_base}/api/v1/auth/refresh",
-                {"refreshToken": captured_refresh},
-            )
-            refreshed_access = response.get("accessToken")
-            if not isinstance(refreshed_access, str) or not refreshed_access.strip():
-                raise ApiError(_text("network.error.invalid_token"))
-            rotated_refresh = response.get("refreshToken")
-            if isinstance(rotated_refresh, str) and rotated_refresh.strip():
-                revocation["refresh_token"] = rotated_refresh
-            revocation["access_token"] = refreshed_access
-            revocation["access_token_is_fresh"] = True
-            return refreshed_access
-
-        def revoke() -> None:
-            captured_access = revocation.get("access_token")
-            token = (
-                captured_access
-                if revocation.get("access_token_is_fresh")
-                and isinstance(captured_access, str)
-                and captured_access
-                else refresh_access()
-            )
-            try:
-                _request(
-                    "POST",
-                    f"{self.api_base}/api/v1/auth/logout",
-                    {},
-                    access_token=token,
-                )
-            except ApiError as error:
-                if error.status != 401 or not revocation.get("refresh_token"):
-                    raise
-                revocation["access_token_is_fresh"] = False
-                _request(
-                    "POST",
-                    f"{self.api_base}/api/v1/auth/logout",
-                    {},
-                    access_token=refresh_access(),
-                )
-
-        worker = Worker(revoke)
+    def _launch_revocation(
+        self, revocation: RevocationState, attempt: int
+    ) -> None:
+        worker = Worker(lambda: self._revoke_credentials(revocation))
         self._revocation_workers.add(worker)
         worker.signals.error.connect(
             lambda _error: self._retry_revocation(revocation, attempt + 1)
@@ -1143,7 +997,7 @@ class CloudService(QObject):
         )
         QThreadPool.globalInstance().start(worker)
 
-    def _retry_revocation(self, state: dict[str, Any], attempt: int) -> None:
+    def _retry_revocation(self, state: RevocationState, attempt: int) -> None:
         if self._shutting_down or attempt >= 3:
             return
         delay_ms = min(30_000, 1_000 * (2 ** (attempt - 1)))

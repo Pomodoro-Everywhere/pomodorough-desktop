@@ -341,37 +341,47 @@ def _valid_peer_timer(operation: dict[str, Any]) -> None:
     _valid_peer_clock(operation)
 
 
-def _validate_genesis(operation: dict[str, Any]) -> None:
-    _exact_keys(operation, {
-        "canonicalTimer", "history", "tasks", "durationsMs", "autoStartBreaks", "selectedTaskId", "hlcWallMs", "hlcCounter"
-    })
-    timer = operation["canonicalTimer"]
+def _validate_genesis_timer(timer: Any) -> None:
     if timer is not None and not Store._valid_canonical_timer(timer):
         raise IrohProtocolError("Genesis canonical timer is invalid.")
-    if timer is not None:
-        _exact_keys(
-            timer,
-            {"id", "phase", "status", "plannedDurationMs", "elapsedAtAnchorMs", "anchorAt"},
-            {"taskId", "lastIntent", "startedByDeviceId"},
-        )
-        if not valid_identifier(timer["id"]):
+    if timer is None:
+        return
+    _exact_keys(
+        timer,
+        {
+            "id",
+            "phase",
+            "status",
+            "plannedDurationMs",
+            "elapsedAtAnchorMs",
+            "anchorAt",
+        },
+        {"taskId", "lastIntent", "startedByDeviceId"},
+    )
+    if not valid_identifier(timer["id"]):
+        raise IrohProtocolError("Genesis timer identity is invalid.")
+    for key in ("taskId", "startedByDeviceId"):
+        if timer.get(key) is not None and not valid_identifier(timer[key]):
             raise IrohProtocolError("Genesis timer identity is invalid.")
-        for key in ("taskId", "startedByDeviceId"):
-            if timer.get(key) is not None and not valid_identifier(timer[key]):
-                raise IrohProtocolError("Genesis timer identity is invalid.")
-        intent = timer.get("lastIntent")
-        if intent is not None:
-            if not isinstance(intent, dict):
-                raise IrohProtocolError("Genesis timer intent is invalid.")
-            _exact_keys(intent, {"type", "commandId", "occurredAt"}, {"deviceId"})
-            if "deviceId" in intent:
-                raise IrohProtocolError("Genesis timer intent contains a local origin field.")
-            if not valid_identifier(intent["commandId"]) or (
-                intent.get("deviceId") is not None
-                and not valid_identifier(intent["deviceId"])
-            ):
-                raise IrohProtocolError("Genesis timer intent identity is invalid.")
-    history = operation["history"]
+    _validate_genesis_intent(timer.get("lastIntent"))
+
+
+def _validate_genesis_intent(intent: Any) -> None:
+    if intent is None:
+        return
+    if not isinstance(intent, dict):
+        raise IrohProtocolError("Genesis timer intent is invalid.")
+    _exact_keys(intent, {"type", "commandId", "occurredAt"}, {"deviceId"})
+    if "deviceId" in intent:
+        raise IrohProtocolError("Genesis timer intent contains a local origin field.")
+    if not valid_identifier(intent["commandId"]) or (
+        intent.get("deviceId") is not None
+        and not valid_identifier(intent["deviceId"])
+    ):
+        raise IrohProtocolError("Genesis timer intent identity is invalid.")
+
+
+def _validate_genesis_history(history: Any) -> None:
     if not isinstance(history, list) or any(not Store._valid_history_item(item) for item in history):
         raise IrohProtocolError("Genesis history is invalid.")
     for item in history:
@@ -383,14 +393,16 @@ def _validate_genesis(operation: dict[str, Any]) -> None:
         for key in ("id", "timerId", "commandId", "taskId"):
             if item.get(key) is not None and not valid_identifier(item[key]):
                 raise IrohProtocolError("Genesis history identity is invalid.")
-        if item["id"] != item["timerId"] or any(
+        if any(
             key in item and item[key] is None
             for key in ("commandId", "taskId", "completedAt", "endedAt")
         ):
             raise IrohProtocolError("Genesis history is not canonical.")
     if len({item["id"] for item in history}) != len(history):
         raise IrohProtocolError("Genesis history contains duplicate IDs.")
-    tasks = operation["tasks"]
+
+
+def _validate_genesis_tasks(tasks: Any) -> None:
     if not isinstance(tasks, list):
         raise IrohProtocolError("Genesis tasks are invalid.")
     task_ids = []
@@ -406,6 +418,9 @@ def _validate_genesis(operation: dict[str, Any]) -> None:
         task_ids.append(task["id"])
     if len(task_ids) != len(set(task_ids)):
         raise IrohProtocolError("Genesis tasks contain duplicate IDs.")
+
+
+def _validate_genesis_settings(operation: dict[str, Any]) -> None:
     try:
         Store._canonical_durations(operation["durationsMs"])
         wall, counter = Store._logical_clock(
@@ -419,6 +434,110 @@ def _validate_genesis(operation: dict[str, Any]) -> None:
         raise IrohProtocolError("Genesis selected task is invalid.")
     if wall == 0 and counter != 0 or not isinstance(operation["autoStartBreaks"], bool):
         raise IrohProtocolError("Genesis settings or logical clock are invalid.")
+
+
+def _validate_genesis(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {
+            "canonicalTimer",
+            "history",
+            "tasks",
+            "durationsMs",
+            "autoStartBreaks",
+            "selectedTaskId",
+            "hlcWallMs",
+            "hlcCounter",
+        },
+    )
+    _validate_genesis_timer(operation["canonicalTimer"])
+    _validate_genesis_history(operation["history"])
+    _validate_genesis_tasks(operation["tasks"])
+    _validate_genesis_settings(operation)
+
+
+def _validate_timer_operation(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {
+            "id",
+            "deviceSequence",
+            "timerId",
+            "type",
+            "phase",
+            "plannedDurationMs",
+            "occurredAt",
+            "hlcWallMs",
+            "hlcCounter",
+            "observedElapsedMs",
+        },
+        {"taskId"},
+    )
+    if not valid_identifier(operation.get("timerId")) or (
+        operation.get("taskId") is not None
+        and not valid_identifier(operation["taskId"])
+    ):
+        raise IrohProtocolError("Timer operation identity is invalid.")
+    _valid_peer_timer(operation)
+
+
+def _validate_task_operation(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {"id", "taskId", "type", "occurredAt", "hlcWallMs", "hlcCounter"},
+        {"title"},
+    )
+    if not valid_identifier(operation.get("taskId")):
+        raise IrohProtocolError("Task operation identity is invalid.")
+    row = {"id": operation["id"]}
+    try:
+        Store._validate_pending_task_operation(  # type: ignore[arg-type]
+            Store.__new__(Store), operation, row
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise IrohProtocolError("Task operation is invalid.") from error
+
+
+def _validate_duration_operation(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {"id", "phase", "durationMs", "occurredAt", "hlcWallMs", "hlcCounter"},
+    )
+    row = {"id": operation["id"], "phase": operation.get("phase")}
+    try:
+        Store._validate_pending_duration_operation(  # type: ignore[arg-type]
+            Store.__new__(Store), operation, row
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise IrohProtocolError("Duration operation is invalid.") from error
+
+
+def _validate_auto_start_operation(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {"id", "enabled", "occurredAt", "hlcWallMs", "hlcCounter"},
+    )
+    try:
+        _valid_peer_clock(operation, allow_zero=True)
+    except IrohProtocolError as error:
+        raise IrohProtocolError("Auto-start operation is invalid.") from error
+    if not isinstance(operation.get("enabled"), bool):
+        raise IrohProtocolError("Auto-start operation is invalid.")
+
+
+def _validate_selected_task_operation(operation: dict[str, Any]) -> None:
+    _exact_keys(
+        operation,
+        {"id", "taskId", "occurredAt", "hlcWallMs", "hlcCounter"},
+    )
+    if operation.get("taskId") is not None and not valid_identifier(
+        operation["taskId"]
+    ):
+        raise IrohProtocolError("Selected-task operation is invalid.")
+    try:
+        _valid_peer_clock(operation)
+    except IrohProtocolError as error:
+        raise IrohProtocolError("Selected-task operation is invalid.") from error
 
 
 def validate_record(record: Any) -> dict[str, Any]:
@@ -438,48 +557,15 @@ def validate_record(record: Any) -> dict[str, Any]:
     if not valid_identifier(operation.get("id")):
         raise IrohProtocolError("Operation ID is invalid.")
     if domain == "timer":
-        _exact_keys(operation, {
-            "id", "deviceSequence", "timerId", "type", "phase", "plannedDurationMs", "occurredAt",
-            "hlcWallMs", "hlcCounter", "observedElapsedMs"
-        }, {"taskId"})
-        if not valid_identifier(operation.get("timerId")) or (
-            operation.get("taskId") is not None
-            and not valid_identifier(operation["taskId"])
-        ):
-            raise IrohProtocolError("Timer operation identity is invalid.")
-        _valid_peer_timer(operation)
+        _validate_timer_operation(operation)
     elif domain == "task":
-        _exact_keys(operation, {"id", "taskId", "type", "occurredAt", "hlcWallMs", "hlcCounter"}, {"title"})
-        if not valid_identifier(operation.get("taskId")):
-            raise IrohProtocolError("Task operation identity is invalid.")
-        row = {"id": operation["id"]}
-        try:
-            Store._validate_pending_task_operation(Store.__new__(Store), operation, row)  # type: ignore[arg-type]
-        except (KeyError, TypeError, ValueError) as error:
-            raise IrohProtocolError("Task operation is invalid.") from error
+        _validate_task_operation(operation)
     elif domain == "duration":
-        _exact_keys(operation, {"id", "phase", "durationMs", "occurredAt", "hlcWallMs", "hlcCounter"})
-        row = {"id": operation["id"], "phase": operation.get("phase")}
-        try:
-            Store._validate_pending_duration_operation(Store.__new__(Store), operation, row)  # type: ignore[arg-type]
-        except (KeyError, TypeError, ValueError) as error:
-            raise IrohProtocolError("Duration operation is invalid.") from error
+        _validate_duration_operation(operation)
     elif domain == "autoStart":
-        _exact_keys(operation, {"id", "enabled", "occurredAt", "hlcWallMs", "hlcCounter"})
-        try:
-            _valid_peer_clock(operation, allow_zero=True)
-        except IrohProtocolError as error:
-            raise IrohProtocolError("Auto-start operation is invalid.") from error
-        if not isinstance(operation.get("enabled"), bool):
-            raise IrohProtocolError("Auto-start operation is invalid.")
+        _validate_auto_start_operation(operation)
     else:
-        _exact_keys(operation, {"id", "taskId", "occurredAt", "hlcWallMs", "hlcCounter"})
-        if operation.get("taskId") is not None and not valid_identifier(operation["taskId"]):
-            raise IrohProtocolError("Selected-task operation is invalid.")
-        try:
-            _valid_peer_clock(operation)
-        except IrohProtocolError as error:
-            raise IrohProtocolError("Selected-task operation is invalid.") from error
+        _validate_selected_task_operation(operation)
     return record
 
 
@@ -530,81 +616,152 @@ def _valid_cursor(cursor: Any) -> bool:
     return _valid_reference({"domain": domain, "id": identifier})
 
 
+def _validate_hello_message(message: dict[str, Any], base: set[str]) -> None:
+    required = base | {"deviceId", "endpointTicket", "platform"}
+    _exact_keys(message, required, {"displayName"})
+    display_name = message.get("displayName")
+    if (
+        not valid_identifier(message["deviceId"])
+        or not isinstance(message["endpointTicket"], str)
+        or not message["endpointTicket"]
+        or (_utf8_length(message["endpointTicket"]) or MAX_ENDPOINT_TICKET + 1)
+        > MAX_ENDPOINT_TICKET
+        or message["platform"]
+        not in {"ios", "macos", "android", "linux", "windows"}
+        or display_name is not None
+        and not _valid_room_name(display_name)
+    ):
+        raise IrohProtocolError("Hello fields are invalid.")
+
+
+def _validate_inventory_message(message: dict[str, Any], base: set[str]) -> None:
+    _exact_keys(message, base | {"after", "limit"})
+    if (
+        isinstance(message["limit"], bool)
+        or not isinstance(message["limit"], int)
+        or not 1 <= message["limit"] <= MAX_INVENTORY
+        or not _valid_cursor(message["after"])
+    ):
+        raise IrohProtocolError("Inventory request is invalid.")
+
+
+def _inventory_entry_key(
+    entry: Any,
+    previous: tuple[bytes, bytes] | None,
+    seen: set[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"domain", "id", "digest"}
+        or not _valid_reference(
+            {"domain": entry.get("domain"), "id": entry.get("id")}
+        )
+    ):
+        raise IrohProtocolError("Inventory entry is invalid.")
+    try:
+        digest = b64url_decode(entry["digest"], label="record digest")
+    except (IrohProtocolError, TypeError) as error:
+        raise IrohProtocolError("Inventory digest is invalid.") from error
+    key = (entry["domain"].encode(), entry["id"].encode())
+    if len(digest) != 32 or key in seen or previous is not None and key <= previous:
+        raise IrohProtocolError("Inventory entries are duplicate or out of order.")
+    return key
+
+
+def _validate_inventory_result(
+    message: dict[str, Any], base: set[str]
+) -> None:
+    _exact_keys(message, base | {"entries", "next"})
+    entries = message["entries"]
+    if (
+        not isinstance(entries, list)
+        or len(entries) > MAX_INVENTORY
+        or not _valid_cursor(message["next"])
+    ):
+        raise IrohProtocolError("Inventory result is invalid.")
+    previous: tuple[bytes, bytes] | None = None
+    seen: set[tuple[bytes, bytes]] = set()
+    for entry in entries:
+        previous = _inventory_entry_key(entry, previous, seen)
+        seen.add(previous)
+
+
+def _validate_operations_message(
+    message: dict[str, Any], base: set[str]
+) -> None:
+    _exact_keys(message, base | {"refs"})
+    refs = message["refs"]
+    keys = (
+        []
+        if not isinstance(refs, list)
+        else [
+            (item.get("domain"), item.get("id"))
+            for item in refs
+            if isinstance(item, dict)
+        ]
+    )
+    if (
+        not isinstance(refs, list)
+        or not 1 <= len(refs) <= MAX_OPERATION_REFS
+        or any(not _valid_reference(item) for item in refs)
+        or len(set(keys)) != len(refs)
+    ):
+        raise IrohProtocolError("Operation references are invalid.")
+
+
+def _validate_operations_result(
+    message: dict[str, Any], base: set[str]
+) -> None:
+    _exact_keys(message, base | {"records"})
+    records = message["records"]
+    if not isinstance(records, list) or len(records) > MAX_OPERATION_REFS:
+        raise IrohProtocolError("Operation result is invalid.")
+    keys = []
+    for record in records:
+        validate_record(record)
+        keys.append((record["domain"], record_id(record)))
+    if len(keys) != len(set(keys)):
+        raise IrohProtocolError("Operation result contains duplicate records.")
+
+
+def _validate_error_message(message: dict[str, Any], base: set[str]) -> None:
+    _exact_keys(message, base | {"code", "message", "retryable"})
+    message_size = _utf8_length(message["message"])
+    if (
+        message["code"] not in ERROR_CODES
+        or message_size is None
+        or message_size > 1024
+        or not isinstance(message["retryable"], bool)
+    ):
+        raise IrohProtocolError("Error response is invalid.")
+
+
 def validate_message(message: Any) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise IrohProtocolError("Message must be an object.")
     base = {"protocolVersion", "roomId", "requestId", "kind"}
     if not base <= set(message):
         raise IrohProtocolError("Message envelope is incomplete.")
-    if isinstance(message["protocolVersion"], bool) or message["protocolVersion"] != PROTOCOL_VERSION:
+    if (
+        isinstance(message["protocolVersion"], bool)
+        or message["protocolVersion"] != PROTOCOL_VERSION
+    ):
         raise IrohProtocolError("Protocol version is unsupported.")
-    if not valid_room_id(message["roomId"]) or not valid_request_id(message["requestId"]):
+    if not valid_room_id(message["roomId"]) or not valid_request_id(
+        message["requestId"]
+    ):
         raise IrohProtocolError("Message room or request ID is invalid.")
     kind = message["kind"]
-    if kind == "hello":
-        required = base | {"deviceId", "endpointTicket", "platform"}
-        _exact_keys(message, required, {"displayName"})
-        display_name = message.get("displayName")
-        if (
-            not valid_identifier(message["deviceId"])
-            or not isinstance(message["endpointTicket"], str)
-            or not message["endpointTicket"]
-            or (_utf8_length(message["endpointTicket"]) or MAX_ENDPOINT_TICKET + 1)
-            > MAX_ENDPOINT_TICKET
-            or message["platform"] not in {"ios", "macos", "android", "linux", "windows"}
-            or display_name is not None and not _valid_room_name(display_name)
-        ):
-            raise IrohProtocolError("Hello fields are invalid.")
-    elif kind == "inventory":
-        _exact_keys(message, base | {"after", "limit"})
-        if (
-            isinstance(message["limit"], bool)
-            or not isinstance(message["limit"], int)
-            or not 1 <= message["limit"] <= MAX_INVENTORY
-            or not _valid_cursor(message["after"])
-        ):
-            raise IrohProtocolError("Inventory request is invalid.")
-    elif kind == "inventoryResult":
-        _exact_keys(message, base | {"entries", "next"})
-        entries = message["entries"]
-        if not isinstance(entries, list) or len(entries) > MAX_INVENTORY or not _valid_cursor(message["next"]):
-            raise IrohProtocolError("Inventory result is invalid.")
-        previous: tuple[bytes, bytes] | None = None
-        seen = set()
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"domain", "id", "digest"} or not _valid_reference({"domain": entry.get("domain"), "id": entry.get("id")}):
-                raise IrohProtocolError("Inventory entry is invalid.")
-            try:
-                digest = b64url_decode(entry["digest"], label="record digest")
-            except (IrohProtocolError, TypeError) as error:
-                raise IrohProtocolError("Inventory digest is invalid.") from error
-            key = (entry["domain"].encode(), entry["id"].encode())
-            if len(digest) != 32 or key in seen or previous is not None and key <= previous:
-                raise IrohProtocolError("Inventory entries are duplicate or out of order.")
-            previous = key
-            seen.add(key)
-    elif kind == "operations":
-        _exact_keys(message, base | {"refs"})
-        refs = message["refs"]
-        keys = [] if not isinstance(refs, list) else [(item.get("domain"), item.get("id")) for item in refs if isinstance(item, dict)]
-        if not isinstance(refs, list) or not 1 <= len(refs) <= MAX_OPERATION_REFS or any(not _valid_reference(item) for item in refs) or len(set(keys)) != len(refs):
-            raise IrohProtocolError("Operation references are invalid.")
-    elif kind == "operationsResult":
-        _exact_keys(message, base | {"records"})
-        records = message["records"]
-        if not isinstance(records, list) or len(records) > MAX_OPERATION_REFS:
-            raise IrohProtocolError("Operation result is invalid.")
-        keys = []
-        for record in records:
-            validate_record(record)
-            keys.append((record["domain"], record_id(record)))
-        if len(keys) != len(set(keys)):
-            raise IrohProtocolError("Operation result contains duplicate records.")
-    elif kind == "error":
-        _exact_keys(message, base | {"code", "message", "retryable"})
-        message_size = _utf8_length(message["message"])
-        if message["code"] not in ERROR_CODES or message_size is None or message_size > 1024 or not isinstance(message["retryable"], bool):
-            raise IrohProtocolError("Error response is invalid.")
-    else:
+    validators = {
+        "hello": _validate_hello_message,
+        "inventory": _validate_inventory_message,
+        "inventoryResult": _validate_inventory_result,
+        "operations": _validate_operations_message,
+        "operationsResult": _validate_operations_result,
+        "error": _validate_error_message,
+    }
+    validator = validators.get(kind) if isinstance(kind, str) else None
+    if validator is None:
         raise IrohProtocolError("Message kind is unknown.")
+    validator(message, base)
     return message

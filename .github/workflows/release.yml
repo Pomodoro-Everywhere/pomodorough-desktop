@@ -255,6 +255,8 @@ jobs:
     uses: ./.github/workflows/build-flatpak.yml
     with:
       tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
 
   windows:
     name: Build Windows executable
@@ -264,6 +266,8 @@ jobs:
     uses: ./.github/workflows/build-windows.yml
     with:
       tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
 
   release:
     name: Create GitHub release
@@ -289,6 +293,21 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Reject compromised credential in final artifacts
+        shell: bash
+        env:
+          COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
+          version="${RELEASE_TAG#v}"
+          scan_root="$RUNNER_TEMP/release-secret-scan"
+          mkdir -p "$scan_root/wheel" "$scan_root/sdist"
+          python -m zipfile -e "dist/pomodorough_linux-${version}-py3-none-any.whl" "$scan_root/wheel"
+          python -m tarfile -e "dist/pomodorough_linux-${version}.tar.gz" "$scan_root/sdist"
+          python scripts/scan_secret.py "$scan_root"
+          python scripts/scan_secret.py dist
 
       - name: Export SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0

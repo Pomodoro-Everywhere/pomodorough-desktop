@@ -12,6 +12,32 @@ from pomodorough import app as app_module
 
 
 class AppLifecycleTests(unittest.TestCase):
+    def test_second_instance_exits_before_opening_shared_store(self) -> None:
+        application = MagicMock()
+        application.exec.return_value = 17
+        lock = MagicMock()
+        lock.tryLock.return_value = False
+
+        with (
+            patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}, clear=True),
+            patch.object(app_module.sys, "argv", ["pomodorough"]),
+            patch.object(app_module, "QApplication", return_value=application),
+            patch.object(app_module, "QIcon"),
+            patch.object(app_module, "_instance_lock", return_value=lock, create=True),
+            patch.object(app_module, "Store") as store_type,
+            patch.object(app_module, "CloudService"),
+            patch.object(app_module, "_iroh_service"),
+            patch.object(app_module, "MainWindow"),
+            patch.object(app_module, "QTimer"),
+            patch.object(app_module.signal, "signal"),
+        ):
+            result = app_module.main()
+
+        self.assertEqual(result, 0)
+        lock.tryLock.assert_called_once_with(0)
+        store_type.assert_not_called()
+        application.exec.assert_not_called()
+
     def test_main_wires_application_lifecycle(self) -> None:
         application = MagicMock()
         application.exec.return_value = 17

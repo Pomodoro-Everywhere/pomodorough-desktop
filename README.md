@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://pomodorough.egigoka.me">Web app</a> |
-  <a href="https://pomodoro-everywhere.github.io/pomodorough-server/privacy/">Privacy policy</a> |
+  <a href="https://pomodorough.egigoka.me/privacy">Privacy policy</a> |
   <a href="https://github.com/Pomodoro-Everywhere/pomodorough-server">Server</a> |
   <a href="https://pomodorough.egigoka.me/openapi.yaml">API specification</a>
 </p>
@@ -111,9 +111,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.4.0/pomodorough_linux-0.4.0.tar.gz
-tar -xzf pomodorough_linux-0.4.0.tar.gz
-cd pomodorough_linux-0.4.0
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.4.1/pomodorough_linux-0.4.1.tar.gz
+tar -xzf pomodorough_linux-0.4.1.tar.gz
+cd pomodorough_linux-0.4.1
 ./deploy/install.sh
 ```
 
@@ -136,7 +136,7 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.4.0
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.4.1
 ```
 
 ### Flatpak
@@ -144,8 +144,8 @@ nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.4.0
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.4.0/Pomodorough-0.4.0-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.4.0-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.4.1/Pomodorough-0.4.1-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.4.1-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 
@@ -179,6 +179,10 @@ pomodorough-cli history --limit 10
 Use `focus`, `short-break`, or `long-break` as the optional `start` phase. Add
 `--json` to status, history, or timer actions for machine-readable output. Pass
 `--data PATH` to use a separate SQLite database.
+
+JSON failures exit with status 2, leave stdout empty, and write one object to
+stderr with `version`, `code`, `type`, and `message` fields. Version 1 codes are
+`invalid_arguments`, `invalid_action`, and `storage_error`.
 
 ## Terminal UI
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,11 +67,123 @@ class CliTests(unittest.TestCase):
         self.assertEqual(state["display"]["phase"], "short_break")
         self.assertEqual(state["display"]["remaining"], "05:00")
 
+    def test_status_completes_overdue_pause_then_resume_projection(self) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        running = self.store.projected_state(now_ms=1_000).canonical_timer
+        self.store.queue_command(
+            "pause", running, "focus", durations_ms, now_ms=70_000
+        )
+        paused = self.store.projected_state(now_ms=70_000).canonical_timer
+        self.store.queue_command(
+            "resume", paused, "focus", durations_ms, now_ms=80_000
+        )
+
+        result, output, error = self.invoke("status", "--json")
+        state = json.loads(output)
+        history_result, history_output, history_error = self.invoke(
+            "history", "--json"
+        )
+        history = json.loads(history_output)
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual((history_result, history_error), (0, ""))
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(
+            (history[0]["id"], history[0]["timerId"]),
+            (state["timerId"], state["timerId"]),
+        )
+
     def test_invalid_transition_returns_error(self) -> None:
         result, output, error = self.invoke("finish")
         self.assertEqual(result, 2)
         self.assertEqual(output, "")
         self.assertIn("Cannot finish timer while it is idle", error)
+
+    def test_invalid_transition_json_returns_versioned_error_only(self) -> None:
+        result, output, error = self.invoke("pause", "--json")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertEqual(
+            json.loads(error),
+            {
+                "version": 1,
+                "code": "invalid_action",
+                "type": "InvalidAction",
+                "message": "Cannot pause timer while it is idle.",
+            },
+        )
+        self.assertEqual(error.count("\n"), 1)
+
+    def test_argument_validation_json_returns_versioned_error_only(self) -> None:
+        result, output, error = self.invoke(
+            "start", "focus", "--minutes", "many", "--json"
+        )
+
+        payload = json.loads(error)
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["code"], "invalid_arguments")
+        self.assertEqual(payload["type"], "ArgumentError")
+        self.assertIn("invalid int value", payload["message"])
+        self.assertEqual(error.count("\n"), 1)
+
+    def test_storage_failure_json_returns_versioned_error_only(self) -> None:
+        with patch.object(
+            self.store, "load", side_effect=sqlite3.OperationalError("disk unavailable")
+        ):
+            result, output, error = self.invoke("status", "--json")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertEqual(
+            json.loads(error),
+            {
+                "version": 1,
+                "code": "storage_error",
+                "type": "StorageError",
+                "message": "disk unavailable",
+            },
+        )
+        self.assertEqual(error.count("\n"), 1)
+
+    def test_corrupt_persisted_json_returns_versioned_storage_error_only(self) -> None:
+        error = json.JSONDecodeError("invalid persisted JSON", "{", 1)
+        with patch.object(self.store, "load", side_effect=error):
+            result, output, stderr = self.invoke("status", "--json")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["code"], "storage_error")
+        self.assertEqual(payload["type"], "StorageError")
+        self.assertIn("invalid persisted JSON", payload["message"])
+        self.assertEqual(stderr.count("\n"), 1)
+
+    def test_store_open_failure_json_returns_versioned_error_only(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("pomodorough.cli.Store", side_effect=OSError("cannot open store")):
+            result = main(("status", "--json"), stdout=stdout, stderr=stderr)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "version": 1,
+                "code": "storage_error",
+                "type": "StorageError",
+                "message": "cannot open store",
+            },
+        )
 
     def test_cancel_resets_timer_and_preserves_cancelled_history(self) -> None:
         self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
@@ -97,7 +210,12 @@ class CliTests(unittest.TestCase):
         result, output, error = self.invoke("history")
         self.assertEqual(
             (result, output, error),
-            (0, "No arrivals yet\nYour first run appears here.\n", ""),
+            (
+                0,
+                "No arrivals yet\n"
+                "Completed, cancelled, and superseded timers appear here.\n",
+                "",
+            ),
         )
 
         result, output, error = self.invoke("history", "--json")
@@ -140,7 +258,10 @@ class CliTests(unittest.TestCase):
 
         result, output, error = self.invoke("history")
         self.assertEqual(result, 0)
-        self.assertIn("Focus | Write CLI coverage | 2 min | pending sync", output)
+        self.assertIn(
+            "Focus | Write CLI coverage | Completed | 2 min | pending sync",
+            output,
+        )
         self.assertEqual(error, "")
 
         result, output, error = self.invoke("history", "--json")
@@ -149,6 +270,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual([item["phase"] for item in history], ["short_break", "focus"])
         focus = history[1]
         self.assertEqual(focus["taskTitle"], "Write CLI coverage")
+        self.assertEqual(focus["taskContext"], "retained")
         self.assertEqual(focus["plannedDurationMs"], 120_000)
         self.assertTrue(focus["pending"])
         self.assertTrue(
@@ -162,9 +284,12 @@ class CliTests(unittest.TestCase):
                 "completedAt",
                 "pending",
                 "taskId",
+                "taskContext",
                 "taskTitle",
             }.issubset(focus)
         )
+        self.assertEqual(history[0]["taskContext"], "unassigned")
+        self.assertEqual(history[0]["taskTitle"], "Unassigned")
         self.assertEqual(error, "")
 
         result, output, error = self.invoke("history", "--limit", "1", "--json")
@@ -173,6 +298,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(limited), 1)
         self.assertEqual(limited[0]["phase"], "short_break")
         self.assertEqual(error, "")
+
+    def test_cancelled_arrival_and_dismiss_command_use_terminal_semantics(self) -> None:
+        self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
+        self.assertEqual(self.invoke("cancel")[0], 0)
+
+        result, output, error = self.invoke("history")
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("Focus | Unassigned | Cancelled | 1 min", output)
+
+        result, output, error = self.invoke("history", "--json")
+        history = json.loads(output)
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(history[0]["status"], "cancelled")
+        self.assertEqual(history[0]["taskContext"], "unassigned")
+
+        self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
+        self.assertEqual(self.invoke("finish")[0], 0)
+        result, output, error = self.invoke("dismiss")
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("Short break | idle", output)
 
     def test_history_time_handles_missing_invalid_and_iso_values(self) -> None:
         self.assertEqual(_history_time(None), "unknown time")
@@ -210,12 +356,19 @@ class CliTests(unittest.TestCase):
 
     def test_owned_store_receives_expanded_path_and_closes(self) -> None:
         stored_state = self.store.load()
+        projection = self.store.projected_state(now_ms=1, state=stored_state)
         raw_path = "~/owned-state.sqlite3"
         stdout = io.StringIO()
         stderr = io.StringIO()
         with patch("pomodorough.cli.Store", autospec=True) as store_type:
             owned_store = store_type.return_value
             owned_store.load.return_value = stored_state
+            owned_store.effective_timer_now_ms.return_value = 1
+            owned_store.projected_state.return_value = projection
+            owned_store.projected_settings.return_value = (
+                self.store.projected_settings(stored_state, projection)
+            )
+            owned_store.projected_history.return_value = projection.history
             owned_store.has_pending_auto_break.return_value = False
 
             result = main(

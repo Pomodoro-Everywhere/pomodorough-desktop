@@ -6,6 +6,9 @@ on:
       tag:
         required: true
         type: string
+    secrets:
+      COMPROMISED_GOOGLE_CLIENT_SECRET:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -54,12 +57,27 @@ jobs:
 
       - name: Verify shared core in Flatpak bundle
         shell: bash
+        env:
+          COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
+          test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
           bundle="Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak"
           flatpak install --user --noninteractive "$bundle"
           flatpak run --user --command=python3 me.egigoka.Pomodorough -c \
-            'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+            'from pomodorough.shared_core import SharedCore; raise SystemExit(0 if SharedCore().dispatch("core.version", {}).get("schemaVersion") == 1 else "invalid packaged shared core")'
+          expected_client_id="$(python3 -c 'import json; print(json.load(open("src/pomodorough/resources/oauth-client.json"))["installed"]["client_id"])')"
+          flatpak run --user \
+            --env=POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID="$expected_client_id" \
+            --env=COMPROMISED_GOOGLE_CLIENT_SECRET="$COMPROMISED_GOOGLE_CLIENT_SECRET" \
+            --command=python3 \
+            me.egigoka.Pomodorough \
+            -c 'import json, os; from importlib.resources import files; document=json.loads(files("pomodorough").joinpath("resources/oauth-client.json").read_text(encoding="utf-8")); config=document.get("installed") or document; valid=config.get("client_id") == os.environ["POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID"] and not config.get("client_secret"); raise SystemExit(0 if valid else "invalid packaged OAuth resource")'
+          flatpak run --user \
+            --env=COMPROMISED_GOOGLE_CLIENT_SECRET="$COMPROMISED_GOOGLE_CLIENT_SECRET" \
+            --command=python3 \
+            me.egigoka.Pomodorough \
+            -c 'import os; from pathlib import Path; secret=os.environ["COMPROMISED_GOOGLE_CLIENT_SECRET"].encode(); found=any(secret in path.read_bytes() for path in Path("/app").rglob("*") if path.is_file() and not path.is_symlink()); raise SystemExit("compromised secret found in unpacked Flatpak" if found else 0)'
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

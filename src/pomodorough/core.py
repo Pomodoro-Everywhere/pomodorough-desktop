@@ -5,7 +5,8 @@ import re
 import unicodedata
 import uuid
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime
+from functools import lru_cache
 from math import ceil
 from typing import Any
 
@@ -235,200 +236,110 @@ def elapsed_ms(timer: dict[str, Any] | None, now_ms: int) -> int:
     return min(planned, max(0, elapsed))
 
 
+@lru_cache(maxsize=1)
+def _compatibility_shared_core() -> Any:
+    from .shared_core import SharedCore
+
+    return SharedCore()
+
+
+def _shared_core_projection(
+    base_timer: dict[str, Any] | None,
+    base_history: list[dict[str, Any]],
+    pending: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Compatibility reader backed by production SharedCore projection."""
+    commands = _compatibility_commands(pending)
+    base = _compatibility_projection_base(base_timer, base_history)
+    now = _compatibility_projection_now(commands, base["canonicalTimer"])
+    projection = _compatibility_shared_core().apply_projection_v2(
+        _compatibility_projection_input(base, commands, now)
+    )
+    return projection.canonical_timer, projection.history
+
+
+def _compatibility_commands(
+    pending: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    for index, raw_command in enumerate(pending, start=1):
+        command = {key: value for key, value in raw_command.items() if value is not None}
+        command.setdefault("deviceId", "desktop-compat")
+        command.setdefault("deviceSequence", index)
+        commands.append(command)
+    return commands
+
+
+def _compatibility_projection_base(
+    base_timer: dict[str, Any] | None,
+    base_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    timer = deepcopy(base_timer)
+    if timer is not None:
+        timer.pop("_historyId", None)
+        timer = {key: value for key, value in timer.items() if value is not None}
+    history = [
+        {key: value for key, value in item.items() if value is not None and key != "pending"}
+        for item in deepcopy(base_history)
+    ]
+    if timer is not None and any(
+        item.get("timerId") == timer.get("id") for item in history
+    ):
+        timer = None
+    return {
+        "canonicalTimer": timer,
+        "history": history,
+        "tasks": [],
+        "durationsMs": {
+            phase: definition["default_minutes"] * 60_000
+            for phase, definition in PHASES.items()
+        },
+        "autoStartBreaks": False,
+        "selectedTaskId": None,
+    }
+
+
+def _compatibility_projection_now(
+    commands: list[dict[str, Any]], timer: dict[str, Any] | None
+) -> str:
+    timestamps = [
+        str(command["occurredAt"])
+        for command in commands
+        if isinstance(command.get("occurredAt"), str)
+    ]
+    if timestamps:
+        now = max(timestamps)
+    elif timer is not None and isinstance(timer.get("anchorAt"), str):
+        now = str(timer["anchorAt"])
+    else:
+        now = "1970-01-01T00:00:00.000Z"
+    return now
+
+
+def _compatibility_projection_input(
+    base: dict[str, Any], commands: list[dict[str, Any]], now: str
+) -> dict[str, Any]:
+    return {
+        "base": base,
+        "pending": {
+            "commands": commands,
+            "taskOperations": [],
+            "durationOperations": [],
+            "autoStartOperations": [],
+            "selectedTaskOperations": [],
+        },
+        "now": now,
+    }
+
+
 def reduce_command(
     timer: dict[str, Any] | None,
     history: list[dict[str, Any]],
     command: dict[str, Any],
+    sessions: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    next_timer = deepcopy(timer)
-    next_history = deepcopy(history)
-    command_type = command["type"]
-    intent = {
-        "type": command_type,
-        "commandId": command["id"],
-        "occurredAt": command["occurredAt"],
-    }
-
-    def add_terminal_history(source: dict[str, Any], status: str) -> None:
-        if any(item.get("commandId") == command["id"] for item in next_history):
-            return
-        item = {
-            "id": f'{source["id"]}:{command["id"]}',
-            "timerId": source["id"],
-            "commandId": command["id"],
-            "phase": source["phase"],
-            "status": status,
-            "plannedDurationMs": source["plannedDurationMs"],
-            "endedAt": command["occurredAt"],
-            "pending": True,
-            "taskId": source.get("taskId"),
-        }
-        if status == "completed":
-            item["completedAt"] = command["occurredAt"]
-        next_history.insert(0, item)
-
-    if next_timer is not None and next_timer.get("status") == "running":
-        occurred_ms = parse_timestamp_ms(command.get("occurredAt"))
-        anchor_ms = parse_timestamp_ms(next_timer.get("anchorAt"))
-        planned = max(0, int(next_timer.get("plannedDurationMs") or 0))
-        stored_elapsed = min(
-            planned, max(0, int(next_timer.get("elapsedAtAnchorMs") or 0))
-        )
-        if (
-            occurred_ms is not None
-            and anchor_ms is not None
-            and stored_elapsed + max(0, occurred_ms - anchor_ms) >= planned
-        ):
-            completed_ms = anchor_ms + planned - stored_elapsed
-            completed_at = (
-                datetime.fromtimestamp(completed_ms / 1000, tz=timezone.utc)
-                .isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z")
-            )
-            next_timer.update(
-                status="completed",
-                elapsedAtAnchorMs=planned,
-                anchorAt=completed_at,
-            )
-            if not any(
-                item.get("timerId") == next_timer["id"] for item in next_history
-            ):
-                next_history.insert(
-                    0,
-                    {
-                        "id": next_timer["id"],
-                        "timerId": next_timer["id"],
-                        "phase": next_timer["phase"],
-                        "status": "completed",
-                        "plannedDurationMs": planned,
-                        "completedAt": completed_at,
-                        "endedAt": completed_at,
-                        "taskId": next_timer.get("taskId"),
-                    },
-                )
-
-    if command_type == "start":
-        timer_id = command["timerId"]
-        if (
-            (next_timer is not None and next_timer.get("id") == timer_id)
-            or any(item.get("timerId") == timer_id for item in next_history)
-        ):
-            return next_timer, next_history
-        if next_timer is not None and next_timer.get("status") in ACTIVE_STATUSES:
-            add_terminal_history(next_timer, "superseded")
-        return (
-            {
-                "id": timer_id,
-                "phase": command["phase"],
-                "status": "running",
-                "plannedDurationMs": command["plannedDurationMs"],
-                "elapsedAtAnchorMs": 0,
-                "anchorAt": command["occurredAt"],
-                "lastIntent": intent,
-                "taskId": command.get("taskId"),
-            },
-            next_history,
-        )
-
-    if command_type == "resume" and (
-        not next_timer or command.get("timerId") != next_timer.get("id")
-    ):
-        superseded = next(
-            (
-                item
-                for item in next_history
-                if item.get("timerId") == command.get("timerId")
-                and item.get("status") == "superseded"
-            ),
-            None,
-        )
-        if superseded is not None:
-            if next_timer is not None and next_timer.get("status") in ACTIVE_STATUSES:
-                add_terminal_history(next_timer, "superseded")
-            next_history = [item for item in next_history if item is not superseded]
-            planned = int(superseded["plannedDurationMs"])
-            return (
-                {
-                    "id": superseded["timerId"],
-                    "phase": superseded["phase"],
-                    "status": "running",
-                    "plannedDurationMs": planned,
-                    "elapsedAtAnchorMs": min(
-                        planned,
-                        max(0, int(command.get("observedElapsedMs") or 0)),
-                    ),
-                    "anchorAt": command["occurredAt"],
-                    "lastIntent": intent,
-                    "taskId": superseded.get("taskId"),
-                },
-                next_history,
-            )
-
-    if not next_timer or command.get("timerId") != next_timer.get("id"):
-        return next_timer, next_history
-
-    planned = int(next_timer.get("plannedDurationMs") or 0)
-    observed = min(planned, max(0, int(command.get("observedElapsedMs") or 0)))
-    status = next_timer.get("status")
-
-    if command_type == "pause" and status == "running":
-        next_timer.update(
-            status="paused",
-            elapsedAtAnchorMs=observed,
-            anchorAt=command["occurredAt"],
-            lastIntent=intent,
-        )
-    elif command_type == "resume" and status in {"paused", "superseded"}:
-        if status == "superseded":
-            next_history = [
-                item
-                for item in next_history
-                if not (
-                    item.get("timerId") == next_timer["id"]
-                    and item.get("status") == "superseded"
-                )
-            ]
-        next_timer.update(
-            status="running",
-            elapsedAtAnchorMs=observed,
-            anchorAt=command["occurredAt"],
-            lastIntent=intent,
-        )
-    elif command_type == "finish" and status in ACTIVE_STATUSES:
-        next_timer.update(
-            status="completed",
-            elapsedAtAnchorMs=planned,
-            anchorAt=command["occurredAt"],
-            lastIntent=intent,
-        )
-        add_terminal_history(next_timer, "completed")
-    elif command_type == "finish" and status == "completed":
-        completion = next(
-            (
-                item
-                for item in next_history
-                if item.get("timerId") == next_timer["id"]
-                and item.get("status") == "completed"
-                and not item.get("commandId")
-            ),
-            None,
-        )
-        if completion is not None:
-            next_timer["lastIntent"] = intent
-            completion["commandId"] = command["id"]
-            completion["pending"] = True
-    elif command_type == "cancel" and status in ACTIVE_STATUSES:
-        next_timer.update(
-            status="cancelled",
-            elapsedAtAnchorMs=observed,
-            anchorAt=command["occurredAt"],
-            lastIntent=intent,
-        )
-        add_terminal_history(next_timer, "cancelled")
-    elif command_type == "clear" and status in {"completed", "cancelled"}:
-        return None, next_history
-
-    return next_timer, next_history
+    del sessions
+    return _shared_core_projection(timer, history, [command])
 
 
 def rebuild_optimistic(
@@ -436,13 +347,7 @@ def rebuild_optimistic(
     base_history: list[dict[str, Any]],
     pending: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    timer = deepcopy(base_timer)
-    history = deepcopy(base_history)
-    for command in sorted(
-        pending, key=lambda item: (int(item["deviceSequence"]), str(item["id"]))
-    ):
-        timer, history = reduce_command(timer, history, command)
-    return timer, history
+    return _shared_core_projection(base_timer, base_history, pending)
 
 
 def format_remaining(duration_ms: int) -> str:

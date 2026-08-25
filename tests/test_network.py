@@ -187,7 +187,7 @@ class OAuthResourceTests(unittest.TestCase):
         config = json.loads(resource.read_text(encoding="utf-8"))["installed"]
         self.assertEqual(
             config["client_id"],
-            "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com",
+            "614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com",
         )
         self.assertNotIn("client_secret", config)
 
@@ -232,6 +232,31 @@ class OAuthResourceTests(unittest.TestCase):
                 credentials = _read_oauth_credentials()
 
         self.assertEqual(credentials["client_id"], "user-client")
+
+    def test_retired_or_secret_bearing_implicit_user_credentials_use_bundle(self) -> None:
+        retired_client_id = (
+            "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com"
+        )
+        variants = (
+            {"installed": {"client_id": retired_client_id}},
+            {"installed": {"client_id": "custom-client", "client_secret": "secret"}},
+        )
+        for document in variants:
+            with self.subTest(document=document), TemporaryDirectory() as directory:
+                source = Path(directory) / "google-oauth.json"
+                source.write_text(json.dumps(document))
+                with (
+                    patch.dict(os.environ, {}, clear=False),
+                    patch("pomodorough.network._config_root", return_value=Path(directory)),
+                ):
+                    os.environ.pop("POMODOROUGH_GOOGLE_OAUTH_JSON", None)
+                    credentials = _read_oauth_credentials()
+
+                self.assertEqual(
+                    credentials["client_id"],
+                    "614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com",
+                )
+                self.assertEqual(credentials["client_secret"], "")
 
     def test_invalid_credentials_report_source_path(self) -> None:
         with TemporaryDirectory() as directory:
@@ -588,6 +613,61 @@ class DesktopOAuthTransactionTests(unittest.TestCase):
         )
         save.assert_called_once_with(self.token_response)
         self.assertEqual(cloud.access_token, "native-access")
+
+    def test_stale_authorization_cannot_persist_tokens_or_fetch_profile(self) -> None:
+        browser = _FakeOAuthBrowser({"state": "state-value", "code": "code-value"})
+        cloud = self.cloud(browser, ["state-value", "verifier-value"])
+        calls = []
+
+        def request(method, url, payload=None, access_token=None, form=False):
+            calls.append(url)
+            if url.endswith("/challenge"):
+                return {"nonce": "nonce-value", "challenge": "native-challenge"}
+            if url == self.credentials["token_uri"]:
+                return {"id_token": "google-id-token"}
+            if url.endswith("/exchange"):
+                with cloud._lifecycle_lock:
+                    cloud._account_generation += 1
+                return dict(self.token_response)
+            self.fail(f"stale authorization continued to {url}")
+
+        with (
+            patch("pomodorough.network._read_oauth_credentials", return_value=self.credentials),
+            patch("pomodorough.network._request", side_effect=request),
+            patch.object(cloud.token_store, "save") as save,
+            self.assertRaisesRegex(ApiError, "cancelled"),
+        ):
+            cloud._authorize_google(expected_generation=0)
+
+        save.assert_not_called()
+        self.assertIsNone(cloud.access_token)
+        self.assertFalse(any(url.endswith("/me") for url in calls))
+
+    def test_login_generations_prevent_account_a_from_overwriting_account_b(self) -> None:
+        account_a = dict(self.token_response, accessToken="account-a", refreshToken="refresh-a")
+        account_b = dict(self.token_response, accessToken="account-b", refreshToken="refresh-b")
+
+        for stale_finishes_last in (False, True):
+            with self.subTest(stale_finishes_last=stale_finishes_last):
+                cloud = self.cloud(
+                    _FakeOAuthBrowser({"state": "state", "code": "code"}),
+                    ["state", "verifier"],
+                )
+                with patch.object(cloud.token_store, "save") as save:
+                    if not stale_finishes_last:
+                        cloud._accept_login_tokens(account_a, expected_generation=0)
+                    with cloud._lifecycle_lock:
+                        cloud._account_generation = 1
+                        cloud.access_token = None
+                        cloud.refresh_token = None
+                    cloud._accept_login_tokens(account_b, expected_generation=1)
+                    if stale_finishes_last:
+                        with self.assertRaisesRegex(ApiError, "cancelled"):
+                            cloud._accept_login_tokens(account_a, expected_generation=0)
+
+                self.assertEqual(cloud.access_token, "account-b")
+                self.assertEqual(cloud.refresh_token, "refresh-b")
+                self.assertEqual(save.call_args_list[-1].args[0], account_b)
 
     def test_callback_and_google_token_failures_stop_before_native_exchange(self) -> None:
         cases = (

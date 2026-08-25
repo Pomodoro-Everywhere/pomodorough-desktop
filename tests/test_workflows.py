@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,13 +18,75 @@ WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
-CORE_COMMIT = "9a01dc8da0f1612e7a301c19cf42f3b522e61684"
-CORE_SHA256 = "89fb6300324042b61d62070242cccad10e30f125885bb1b7a05af67b077bac83"
+CORE_COMMIT = "0c2068a128c51e95aef580a916df7778c927e748"
+CORE_SHA256 = "2f259ce1ab446fae665e8ed78bd198201b7aa594df297293c86b8406d7699525"
+PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
+VALID_WASM = b"\0asm\x01\0\0\0"
+DIFFERENT_VALID_WASM = VALID_WASM + b"\0\x01\0"
+
+
+class SharedCoreProvenanceTests(unittest.TestCase):
+    def run_provenance(
+        self,
+        rebuilt_bytes: bytes,
+        embedded_bytes: list[bytes],
+        expected_sha256: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt = root / "rebuilt.wasm"
+            rebuilt.write_bytes(rebuilt_bytes)
+            embedded = []
+            for index, candidate_bytes in enumerate(embedded_bytes):
+                candidate = root / f"embedded-{index}.wasm"
+                candidate.write_bytes(candidate_bytes)
+                embedded.append(candidate)
+
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(PROVENANCE_SCRIPT),
+                    "--sha256",
+                    expected_sha256 or hashlib.sha256(rebuilt_bytes).hexdigest(),
+                    str(rebuilt),
+                    *(str(candidate) for candidate in embedded),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+    def test_accepts_matching_embedded_modules(self) -> None:
+        result = self.run_provenance(VALID_WASM, [VALID_WASM, VALID_WASM])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_rebuilt_hash_mismatch(self) -> None:
+        result = self.run_provenance(
+            VALID_WASM,
+            [VALID_WASM],
+            expected_sha256=hashlib.sha256(DIFFERENT_VALID_WASM).hexdigest(),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rebuilt shared core SHA-256 is", result.stderr)
+
+    def test_rejects_different_valid_embedded_module(self) -> None:
+        result = self.run_provenance(
+            VALID_WASM,
+            [VALID_WASM, DIFFERENT_VALID_WASM],
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differs from rebuild", result.stderr)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_ci_rebuilds_and_verifies_pinned_shared_core(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        rebuild_step = workflow.split(
+            "      - name: Rebuild and verify pinned shared core\n", 1
+        )[1].split("      - name:", 1)[0]
 
         self.assertIn(f'CORE_COMMIT: "{CORE_COMMIT}"', workflow)
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
@@ -30,8 +96,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
             workflow,
         )
-        self.assertIn("verify_wasm_artifact.py", workflow)
-        self.assertIn('--sha256 "$CORE_SHA256"', workflow)
+        self.assertIn("verify_wasm_artifact.py", rebuild_step)
+        self.assertIn('--sha256 "$CORE_SHA256"', rebuild_step)
+        self.assertIn(
+            "rebuilt=pomodorough-core-source/target/wasm32-unknown-unknown/"
+            "release/pomodorough_core.wasm",
+            rebuild_step,
+        )
+        invocation = """          python3 scripts/verify_shared_core_provenance.py \\
+            --sha256 "$CORE_SHA256" \\
+            "$rebuilt" \\
+            src/pomodorough/resources/pomodorough_core.wasm
+"""
+        self.assertEqual(rebuild_step.count(invocation), 1)
+        self.assertLess(
+            rebuild_step.index("verify_wasm_artifact.py"),
+            rebuild_step.index("verify_shared_core_provenance.py"),
+        )
+        self.assertLess(
+            rebuild_step.index("verify_shared_core_provenance.py"),
+            rebuild_step.index("grep -Fx"),
+        )
 
     def test_release_checks_shared_core_in_built_distributions(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -66,6 +151,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("doInstallCheck = true;", flake)
         self.assertIn('SharedCore().dispatch("core.version", {})', flake)
 
+    def test_final_platform_artifacts_validate_exact_oauth_resource(self) -> None:
+        windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        flatpak = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+
+        for workflow in (windows, flatpak):
+            self.assertIn("POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID", workflow)
+        self.assertIn("oauth-client.json", launcher)
+        self.assertIn("client_secret", launcher)
+        self.assertIn("oauth-client.json", flatpak)
+        self.assertIn("client_secret", flatpak)
+        self.assertNotIn("assert config.get", flatpak)
+        self.assertIn("invalid packaged OAuth resource", flatpak)
+
+    def test_compromised_secret_scan_gates_release_publication(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        publication = workflow.split("  release:", 1)[1]
+        scan_index = publication.index("scripts/scan_secret.py")
+        publish_index = publication.index("--draft=false")
+
+        self.assertLess(scan_index, publish_index)
+        self.assertIn("COMPROMISED_GOOGLE_CLIENT_SECRET", publication)
+        self.assertIn("python -m zipfile -e", publication)
+        self.assertIn("python -m tarfile -e", publication)
+
     def test_platform_packages_include_wasmtime_runtime(self) -> None:
         flatpak = FLATPAK_MANIFEST.read_text(encoding="utf-8")
         homebrew = HOMEBREW_FORMULA.read_text(encoding="utf-8")
@@ -78,7 +188,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flatpak
         )
         self.assertIn('resource "wasmtime" do', homebrew)
-        self.assertIn('venv.pip_install resource("wasmtime")', homebrew)
+        self.assertIn(
+            "wasmtime.stage { venv.pip_install Pathname.pwd/wasmtime.downloader.basename",
+            homebrew,
+        )
         self.assertIn('version = "48.0.0";', flake)
         self.assertIn("wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl", flake)
         self.assertIn("wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flake)

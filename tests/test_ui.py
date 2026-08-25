@@ -252,8 +252,9 @@ class MainWindowDurationTests(unittest.TestCase):
 
     def test_active_pattern_and_task_edits_are_explicitly_for_next_timer(self) -> None:
         settings = self.store.load()["settings"]
+        now_ms = int(time.time() * 1_000)
         start = self.store.queue_command(
-            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+            "start", None, "focus", settings["durationsMs"], now_ms=now_ms
         )
         self.window._load_state()
         self.window._render()
@@ -859,11 +860,13 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertTrue(self.window.tick_timer.isActive())
         self.assertTrue(self.window.sync_timer.isActive())
 
-        self.window.quitting = True
-        self.window.close()
+        with patch.object(self.window.completion_sound, "stop") as stop_sound:
+            self.window.quitting = True
+            self.window.close()
 
         self.assertFalse(self.window.tick_timer.isActive())
         self.assertFalse(self.window.sync_timer.isActive())
+        stop_sound.assert_called_once_with()
 
     def test_delayed_auto_break_callback_noops_after_window_and_store_shutdown(self) -> None:
         self.store.set_auto_start_breaks(True, now_ms=1)
@@ -1177,18 +1180,23 @@ class MainWindowDurationTests(unittest.TestCase):
     def test_unsigned_offline_provisional_break_notifies_once_on_completion(
         self,
     ) -> None:
-        self.store.set_auto_start_breaks(True, now_ms=100)
+        now_ms = int(time.time() * 1_000)
+        self.store.set_auto_start_breaks(True, now_ms=now_ms - 4_000)
         settings = self.store.load()["settings"]
         self.store.queue_command(
-            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+            "start", None, "focus", settings["durationsMs"], now_ms=now_ms - 3_000
         )
         running, _history = rebuild_optimistic(
             None, [], self.store.load()["pending"]
         )
         self.store.queue_command(
-            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+            "finish",
+            running,
+            "focus",
+            settings["durationsMs"],
+            now_ms=now_ms - 2_000,
         )
-        self.store.process_auto_break(require_canonical=False, now_ms=3_000)
+        self.store.process_auto_break(require_canonical=False, now_ms=now_ms - 1_000)
         self.window._load_state()
         self.window._render()
         notifications = []
@@ -1210,7 +1218,8 @@ class MainWindowDurationTests(unittest.TestCase):
         self,
     ) -> None:
         with (
-            patch.object(QApplication, "beep") as beep,
+            patch.object(self.window.completion_sound, "play") as beep,
+            patch.object(self.window.completion_sound, "stop") as stop_sound,
             patch.object(self.window, "_issue") as issue,
         ):
             self._queue_completed_timer()
@@ -1224,10 +1233,46 @@ class MainWindowDurationTests(unittest.TestCase):
 
         self.assertFalse(self.window.sound_timer.isActive())
         self.assertTrue(self.window.stop_sound_button.isHidden())
+        stop_sound.assert_called_once_with()
         issue.assert_called_once_with("clear")
 
+    def test_pending_clear_hides_synced_terminal_timer(self) -> None:
+        self._queue_completed_timer()
+        request = self.store.sync_payload()
+        canonical_timer = dict(self.window.timer)
+        canonical_history = []
+        for item in self.window.history:
+            canonical_item = dict(item)
+            canonical_item.pop("pending", None)
+            canonical_history.append(canonical_item)
+        response = self._bootstrap_response(revision=1, history=canonical_history)
+        response["acknowledgements"] = [
+            {"commandId": command["id"], "outcome": "applied", "reason": ""}
+            for command in request["commands"]
+        ]
+        response["canonicalTimer"] = canonical_timer
+        self.window._sync_request = request
+        self.window._apply_sync(response)
+        self.assertEqual(self.window.timer["status"], "completed")
+
+        self.window._issue("clear")
+
+        clear = self.store.load()["pending"][-1]
+        projection = self.store.projected_state(
+            now_ms=self.window._projection_now_ms
+        )
+        self.assertEqual(clear["type"], "clear")
+        self.assertEqual(
+            projection.timer_outcomes[clear["id"]]["outcome"], "applied"
+        )
+        self.assertIsNone(projection.canonical_timer)
+        self.assertIsNone(self.window.timer)
+
     def test_starting_next_timer_stops_completion_sound(self) -> None:
-        with patch.object(QApplication, "beep"):
+        with (
+            patch.object(self.window.completion_sound, "play"),
+            patch.object(self.window.completion_sound, "stop") as stop,
+        ):
             self._queue_completed_timer()
             self.assertTrue(self.window.sound_timer.isActive())
             completed_timer_id = self.window.timer["id"]
@@ -1238,6 +1283,7 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertNotEqual(self.window.timer["id"], completed_timer_id)
         self.assertFalse(self.window.sound_timer.isActive())
         self.assertTrue(self.window.stop_sound_button.isHidden())
+        stop.assert_called_once_with()
 
     def test_local_focus_completion_waits_before_auto_starting_break(self) -> None:
         self.window.auto_breaks.setChecked(True)
@@ -1261,20 +1307,37 @@ class MainWindowDurationTests(unittest.TestCase):
         self.store.queue_command(
             "start", None, "focus", settings["durationsMs"], now_ms=1_000
         )
-        self._replace_window(FakeCloud(authenticated=False))
-
-        with (
-            patch.object(
-                self.store,
-                "effective_timer_now_ms",
-                return_value=1_000 + settings["durationsMs"]["focus"],
-            ),
-            patch.object(self.window, "_notify") as notify,
-        ):
+        with patch.object(MainWindow, "_notify") as notify:
+            self._replace_window(FakeCloud(authenticated=False))
             self.window._tick()
 
         self.assertEqual(self.window.timer["status"], "completed")
         notify.assert_called_once_with("Service arrived", "Focus completed.")
+
+    def test_gui_projection_completes_overdue_pause_then_resume(self) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        running = self.store.projected_state(now_ms=1_000).canonical_timer
+        self.store.queue_command(
+            "pause", running, "focus", durations_ms, now_ms=70_000
+        )
+        paused = self.store.projected_state(now_ms=70_000).canonical_timer
+        self.store.queue_command(
+            "resume", paused, "focus", durations_ms, now_ms=80_000
+        )
+
+        self.window._load_state()
+
+        self.assertEqual(self.window.timer["status"], "completed")
+        self.assertEqual(self.window.timer["lastIntent"]["type"], "resume")
+        self.assertEqual(
+            (self.window.history[0]["id"], self.window.history[0]["timerId"]),
+            (self.window.timer["id"], self.window.timer["id"]),
+        )
 
     def test_tick_does_not_auto_finish_unowned_centralized_timer(self) -> None:
         remote_timer = {
@@ -1651,14 +1714,14 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window._show_screen(3)
         self.assertEqual(
             self.window.privacy_policy_button.accessibleDescription(),
-            "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/",
+            "https://pomodorough.egigoka.me/privacy",
         )
         self.assertTrue(self.window.delete_account_button.isEnabled())
         with patch("pomodorough.ui.QDesktopServices.openUrl") as open_url:
             self.window._open_privacy_policy()
         self.assertEqual(
             open_url.call_args.args[0].toString(),
-            "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/",
+            "https://pomodorough.egigoka.me/privacy",
         )
 
         for confirmation in ("delete", "DELETE "):

@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,34 +20,170 @@ from .core import (
     next_break_phase,
     parse_timestamp_ms,
     project_auto_start_breaks,
-    project_durations,
-    rebuild_tasks,
-    rebuild_optimistic,
-    reduce_command,
     task_from_title,
 )
-from .uuid7 import reserve_uuid7, uuid7_parts
 from .secure_store import PlatformSecretStore
+from .shared_core import (
+    ProjectionApplyV2,
+    SharedCore as SharedCore,
+    SharedCoreDispatcher,
+    SharedCoreError,
+    apply_projection_v2,
+)
+from .storage_canonical import (
+    CanonicalResponseStorage,
+    valid_canonical_timer,
+    valid_history_item,
+)
+from .storage_iroh_records import IrohRecordPersistence
+from .storage_model import (
+    ACKNOWLEDGEMENT_OUTCOMES as ACKNOWLEDGEMENT_OUTCOMES,
+    CANONICAL_DURATION_MAX_MS as CANONICAL_DURATION_MAX_MS,
+    COMMAND_TYPES as COMMAND_TYPES,
+    DURATION_MIN_MS as DURATION_MIN_MS,
+    MAX_CLOCK_CONTINUITY_DRIFT_MS as MAX_CLOCK_CONTINUITY_DRIFT_MS,
+    MAX_CLOCK_SKEW_MS as MAX_CLOCK_SKEW_MS,
+    MAX_SAFE_INTEGER as MAX_SAFE_INTEGER,
+    MAX_SERVER_TIME_UNCERTAINTY_MS as MAX_SERVER_TIME_UNCERTAINTY_MS,
+    PREFERENCE_DURATION_MAX_MS as PREFERENCE_DURATION_MAX_MS,
+    RESOLUTION_OPERATION_MAX as RESOLUTION_OPERATION_MAX,
+    _default_shared_core as _default_shared_core,
+    utc_timestamp as utc_timestamp,
+)
+from .storage_replication import ReplicationStorage, _iroh_conflict_time_ms
+from .storage_sync import SyncStorage
+from .storage_workspace import WorkspacePersistence
+from .uuid7 import reserve_uuid7, uuid7_parts
 
-DURATION_MIN_MS = 60_000
-PREFERENCE_DURATION_MAX_MS = 10_800_000
-CANONICAL_DURATION_MAX_MS = 14_400_000
-RESOLUTION_OPERATION_MAX = 4_096
-ACKNOWLEDGEMENT_OUTCOMES = {"applied", "ignored", "rejected"}
-MAX_SAFE_INTEGER = 9_007_199_254_740_991
-MAX_CLOCK_SKEW_MS = 300_000
-MAX_SERVER_TIME_UNCERTAINTY_MS = 30_000
-MAX_CLOCK_CONTINUITY_DRIFT_MS = 1_000
-COMMAND_TYPES = {"start", "pause", "resume", "finish", "cancel", "clear"}
+_LOCAL_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_commands (
+    id TEXT PRIMARY KEY,
+    device_sequence INTEGER NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    depends_on_command_id TEXT
+);
+CREATE TABLE IF NOT EXISTS pending_task_operations (
+    id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_duration_operations (
+    id TEXT PRIMARY KEY,
+    phase TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_auto_start_operations (
+    id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_selected_task_operations (
+    id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_auto_breaks (
+    finish_command_id TEXT PRIMARY KEY,
+    timer_id TEXT NOT NULL,
+    finish_device_sequence INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_auto_break_starts (
+    source_finish_command_id TEXT PRIMARY KEY,
+    source_timer_id TEXT NOT NULL,
+    start_command_id TEXT NOT NULL UNIQUE,
+    selected_phase_version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pending_phase_advances (
+    finish_command_id TEXT PRIMARY KEY,
+    timer_id TEXT NOT NULL,
+    source_phase TEXT NOT NULL,
+    advanced_phase TEXT NOT NULL,
+    selected_phase_version INTEGER NOT NULL
+);
+"""
+
+_IROH_SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS iroh_rooms (
+        room_id TEXT PRIMARY KEY,
+        room_secret BLOB NOT NULL,
+        room_name TEXT,
+        return_workspace TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        conflict TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS iroh_records (
+        room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+        domain TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        record TEXT NOT NULL,
+        PRIMARY KEY(room_id, domain, operation_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS iroh_peers (
+        room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+        endpoint_id TEXT NOT NULL,
+        endpoint_ticket TEXT NOT NULL,
+        device_id TEXT,
+        display_name TEXT,
+        last_seen_at_ms INTEGER,
+        PRIMARY KEY(room_id, endpoint_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS iroh_conflicts (
+        room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
+        domain TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        local_digest TEXT NOT NULL,
+        received_digest TEXT NOT NULL,
+        received_record TEXT,
+        detected_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(room_id, domain, operation_id, received_digest)
+    )""",
+    """CREATE INDEX IF NOT EXISTS iroh_records_inventory
+        ON iroh_records(room_id, domain, operation_id)""",
+    """CREATE INDEX IF NOT EXISTS iroh_peers_recent
+        ON iroh_peers(room_id, last_seen_at_ms DESC)""",
+)
+
+
+@dataclass(frozen=True)
+class _ResponseTiming:
+    server_ms: int
+    request_physical_ms: int
+    received_physical_ms: int
+    request_monotonic_ms: int
+    received_monotonic_ms: int
+    round_trip_ms: int
+    clock_disagreement_ms: int
+
+
+@dataclass(frozen=True)
+class _CommandQueueContext:
+    effective_now_ms: int
+    timer: dict[str, Any] | None
+    selected_task_id: str | None
+    generates_break: bool
+
+
+@dataclass(frozen=True)
+class _AutoBreakTrigger:
+    finish_command_id: str
+    timer_id: str
+    finish_sequence: int
+
+
+@dataclass(frozen=True)
+class _AutoBreakContext:
+    settings: dict[str, Any]
+    history: list[dict[str, Any]]
+    completion: dict[str, Any] | None
+    source_already_accepted: bool
 
 
 def default_data_path() -> Path:
     return user_data_path("pomodorough", appauthor=False) / "pomodorough.sqlite3"
-
-
-def utc_timestamp(milliseconds: int) -> str:
-    value = datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
-    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class Store:
@@ -56,11 +192,43 @@ class Store:
         path: Path | None = None,
         *,
         iroh_secret_store: PlatformSecretStore | None = None,
+        shared_core: SharedCoreDispatcher | None = None,
     ) -> None:
         self._trusted_time_anchor: dict[str, int] | None = None
         self._timer_time_anchor: dict[str, Any] | None = None
         self.path = path or default_data_path()
         self._iroh_secret_store = iroh_secret_store or PlatformSecretStore()
+        self._shared_core = shared_core
+        self._open_database()
+        self._create_local_schema()
+        self._migrate_local_schema()
+        if self._migrated_iroh_capabilities:
+            self.connection.execute("VACUUM")
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._configure_storage_responsibilities()
+        self._initialize()
+        self._restore_trusted_time_anchor()
+
+    def _configure_storage_responsibilities(self) -> None:
+        self._workspace_storage = WorkspacePersistence(
+            self.connection,
+            self.get_meta,
+            self._set_meta,
+            self._normalize_settings,
+        )
+        self._iroh_record_storage = IrohRecordPersistence(
+            self.connection,
+            _iroh_conflict_time_ms,
+        )
+        self._sync_storage = SyncStorage(self)
+        self._canonical_storage = CanonicalResponseStorage(self)
+        self._replication_storage = ReplicationStorage(
+            self,
+            self._workspace_storage,
+            self._iroh_record_storage,
+        )
+
+    def _open_database(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.path.parent.chmod(0o700)
@@ -70,134 +238,306 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_commands (
-                id TEXT PRIMARY KEY,
-                device_sequence INTEGER NOT NULL UNIQUE,
-                payload TEXT NOT NULL,
-                depends_on_command_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS pending_task_operations (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_duration_operations (
-                id TEXT PRIMARY KEY,
-                phase TEXT NOT NULL UNIQUE,
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_auto_start_operations (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_selected_task_operations (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_auto_breaks (
-                finish_command_id TEXT PRIMARY KEY,
-                timer_id TEXT NOT NULL,
-                finish_device_sequence INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_auto_break_starts (
-                source_finish_command_id TEXT PRIMARY KEY,
-                source_timer_id TEXT NOT NULL,
-                start_command_id TEXT NOT NULL UNIQUE,
-                selected_phase_version INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS pending_phase_advances (
-                finish_command_id TEXT PRIMARY KEY,
-                timer_id TEXT NOT NULL,
-                source_phase TEXT NOT NULL,
-                advanced_phase TEXT NOT NULL,
-                selected_phase_version INTEGER NOT NULL
-            );
-            """
-        )
+
+    def _create_local_schema(self) -> None:
+        self.connection.executescript(_LOCAL_SCHEMA_SQL)
         self.connection.commit()
+
+    def _migrate_local_schema(self) -> None:
         with self._immediate_transaction():
-            command_columns = {
-                str(row["name"])
-                for row in self.connection.execute("PRAGMA table_info(pending_commands)")
-            }
-            if "depends_on_command_id" not in command_columns:
-                self.connection.execute(
-                    "ALTER TABLE pending_commands ADD COLUMN depends_on_command_id TEXT"
-                )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS pending_commands_dependency "
-                "ON pending_commands(depends_on_command_id)"
-            )
-            auto_break_columns = {
-                str(row["name"])
-                for row in self.connection.execute(
-                    "PRAGMA table_info(pending_auto_break_starts)"
-                )
-            }
-            if "selected_phase_version" not in auto_break_columns:
-                self.connection.execute(
-                    "ALTER TABLE pending_auto_break_starts ADD COLUMN "
-                    "selected_phase_version INTEGER NOT NULL DEFAULT 0"
-                )
-            for statement in (
-                """CREATE TABLE IF NOT EXISTS iroh_rooms (
-                    room_id TEXT PRIMARY KEY,
-                    room_secret BLOB NOT NULL,
-                    room_name TEXT,
-                    return_workspace TEXT NOT NULL,
-                    workspace TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    conflict TEXT
-                )""",
-                """CREATE TABLE IF NOT EXISTS iroh_records (
-                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
-                    domain TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    device_id TEXT NOT NULL,
-                    digest TEXT NOT NULL,
-                    record TEXT NOT NULL,
-                    PRIMARY KEY(room_id, domain, operation_id)
-                )""",
-                """CREATE TABLE IF NOT EXISTS iroh_peers (
-                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
-                    endpoint_id TEXT NOT NULL,
-                    endpoint_ticket TEXT NOT NULL,
-                    device_id TEXT,
-                    display_name TEXT,
-                    last_seen_at_ms INTEGER,
-                    PRIMARY KEY(room_id, endpoint_id)
-                )""",
-                """CREATE TABLE IF NOT EXISTS iroh_conflicts (
-                    room_id TEXT NOT NULL REFERENCES iroh_rooms(room_id) ON DELETE CASCADE,
-                    domain TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    local_digest TEXT NOT NULL,
-                    received_digest TEXT NOT NULL,
-                    received_record TEXT,
-                    detected_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(room_id, domain, operation_id, received_digest)
-                )""",
-                """CREATE INDEX IF NOT EXISTS iroh_records_inventory
-                    ON iroh_records(room_id, domain, operation_id)""",
-                """CREATE INDEX IF NOT EXISTS iroh_peers_recent
-                    ON iroh_peers(room_id, last_seen_at_ms DESC)""",
-            ):
+            self._migrate_pending_command_dependency()
+            self._migrate_auto_break_phase_version()
+            for statement in _IROH_SCHEMA_STATEMENTS:
                 self.connection.execute(statement)
-            self._migrated_iroh_capabilities = self._migrate_plaintext_iroh_capabilities()
+            self._migrated_iroh_capabilities = (
+                self._migrate_plaintext_iroh_capabilities()
+            )
             self._set_meta("irohSchemaVersion", 1)
-        if self._migrated_iroh_capabilities:
-            self.connection.execute("VACUUM")
-            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        self._initialize()
-        self._restore_trusted_time_anchor()
+
+    def _migrate_pending_command_dependency(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(pending_commands)")
+        }
+        if "depends_on_command_id" not in columns:
+            self.connection.execute(
+                "ALTER TABLE pending_commands ADD COLUMN depends_on_command_id TEXT"
+            )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS pending_commands_dependency "
+            "ON pending_commands(depends_on_command_id)"
+        )
+
+    def _migrate_auto_break_phase_version(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA table_info(pending_auto_break_starts)"
+            )
+        }
+        if "selected_phase_version" not in columns:
+            self.connection.execute(
+                "ALTER TABLE pending_auto_break_starts ADD COLUMN "
+                "selected_phase_version INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self.connection.close()
+
+    def sync_payload(self) -> dict[str, Any]:
+        return self._sync_storage.sync_payload()
+
+    def pending_sync(self) -> dict[str, Any] | None:
+        return self._sync_storage.pending_sync()
+
+    def has_sendable_sync_operations(self) -> bool:
+        return self._sync_storage.has_sendable_sync_operations()
+
+    def pending_resolution(
+        self, user_id: str | None = None
+    ) -> dict[str, Any] | None:
+        return self._sync_storage.pending_resolution(user_id)
+
+    def clear_pending_resolution(self) -> None:
+        self._sync_storage.clear_pending_resolution()
+
+    def _ensure_no_pending_resolution(self) -> None:
+        self._sync_storage._ensure_no_pending_resolution()
+
+    def discard_pending_resolution(self, user_id: str, request_id: str) -> bool:
+        return self._sync_storage.discard_pending_resolution(user_id, request_id)
+
+    def bootstrap_resolution_plan(
+        self,
+        response: dict[str, Any],
+        *,
+        request_physical_ms: int | None = None,
+        received_physical_ms: int | None = None,
+        request_monotonic_ms: int | None = None,
+        received_monotonic_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return self._sync_storage.bootstrap_resolution_plan(
+            response,
+            request_physical_ms=request_physical_ms,
+            received_physical_ms=received_physical_ms,
+            request_monotonic_ms=request_monotonic_ms,
+            received_monotonic_ms=received_monotonic_ms,
+        )
+
+    def prepare_resolution(
+        self,
+        user: dict[str, Any],
+        expected_revision: int,
+        strategy: str,
+    ) -> dict[str, Any]:
+        return self._sync_storage.prepare_resolution(
+            user, expected_revision, strategy
+        )
+
+    def _validated_sync_response(
+        self,
+        response: dict[str, Any],
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._canonical_storage._validated_sync_response(response, request)
+
+    @classmethod
+    def _valid_canonical_timer(cls, timer: Any) -> bool:
+        return valid_canonical_timer(timer, cls._duration_ms)
+
+    @classmethod
+    def _valid_history_item(cls, item: Any) -> bool:
+        return valid_history_item(item, cls._duration_ms)
+
+    def apply_sync(
+        self,
+        response: dict[str, Any],
+        request: dict[str, Any],
+        *,
+        request_physical_ms: int | None = None,
+        received_physical_ms: int | None = None,
+        request_monotonic_ms: int | None = None,
+        received_monotonic_ms: int | None = None,
+    ) -> list[str]:
+        return self._canonical_storage.apply_sync(
+            response,
+            request,
+            request_physical_ms=request_physical_ms,
+            received_physical_ms=received_physical_ms,
+            request_monotonic_ms=request_monotonic_ms,
+            received_monotonic_ms=received_monotonic_ms,
+        )
+
+    def apply_resolution(
+        self,
+        response: dict[str, Any],
+        user: dict[str, Any],
+        request_id: str | None = None,
+        *,
+        request_physical_ms: int | None = None,
+        received_physical_ms: int | None = None,
+        request_monotonic_ms: int | None = None,
+        received_monotonic_ms: int | None = None,
+    ) -> list[str]:
+        return self._canonical_storage.apply_resolution(
+            response,
+            user,
+            request_id,
+            request_physical_ms=request_physical_ms,
+            received_physical_ms=received_physical_ms,
+            request_monotonic_ms=request_monotonic_ms,
+            received_monotonic_ms=received_monotonic_ms,
+        )
+
+    @property
+    def replication_mode(self) -> str:
+        return self._replication_storage.replication_mode
+
+    @property
+    def active_iroh_room_id(self) -> str | None:
+        return self._replication_storage.active_iroh_room_id
+
+    def create_iroh_room(
+        self,
+        room_secret: bytes,
+        room_name: str | None = None,
+        *,
+        now_ms: int | None = None,
+    ) -> str:
+        return self._replication_storage.create_iroh_room(
+            room_secret, room_name, now_ms=now_ms
+        )
+
+    def prepare_iroh_join(
+        self,
+        room_id: str,
+        room_secret: bytes,
+        room_name: str | None,
+        endpoint_id: str,
+        endpoint_ticket: str,
+        *,
+        now_ms: int | None = None,
+    ) -> None:
+        self._replication_storage.prepare_iroh_join(
+            room_id,
+            room_secret,
+            room_name,
+            endpoint_id,
+            endpoint_ticket,
+            now_ms=now_ms,
+        )
+
+    def discard_inactive_iroh_room(self, room_id: str) -> None:
+        self._replication_storage.discard_inactive_iroh_room(room_id)
+
+    def activate_joined_iroh_room(self, room_id: str) -> None:
+        self._replication_storage.activate_joined_iroh_room(room_id)
+
+    def set_replication_mode(self, mode: str) -> None:
+        self._replication_storage.set_replication_mode(mode)
+
+    def leave_iroh_room(self) -> None:
+        self._replication_storage.leave_iroh_room()
+
+    def iroh_room(self, room_id: str | None = None) -> dict[str, Any] | None:
+        return self._replication_storage.iroh_room(room_id)
+
+    def iroh_room_secret(self, room_id: str) -> bytes:
+        return self._replication_storage.iroh_room_secret(room_id)
+
+    def capture_local_iroh_records(self) -> bool:
+        return self._replication_storage.capture_local_iroh_records()
+
+    def _capture_iroh_after_mutation(self) -> None:
+        self._replication_storage._capture_iroh_after_mutation()
+
+    def _capture_iroh_after_mutation_locked(self) -> None:
+        self._replication_storage._capture_iroh_after_mutation_locked()
+
+    def _capture_local_iroh_records_locked(self, room_id: str) -> bool:
+        return self._replication_storage._capture_local_iroh_records_locked(room_id)
+
+    def project_iroh_expiry(self, now_ms: int | None = None) -> bool:
+        return self._replication_storage.project_iroh_expiry(now_ms)
+
+    def insert_remote_iroh_records(
+        self,
+        room_id: str,
+        records: list[dict[str, Any]],
+        advertised_digests: dict[tuple[str, str], str] | None = None,
+    ) -> bool:
+        return self._replication_storage.insert_remote_iroh_records(
+            room_id, records, advertised_digests
+        )
+
+    def iroh_inventory(
+        self, room_id: str, after: str | None, limit: int
+    ) -> tuple[list[dict[str, str]], str | None]:
+        return self._iroh_record_storage.inventory(room_id, after, limit)
+
+    def iroh_operations(
+        self, room_id: str, references: list[dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        return self._iroh_record_storage.operations(room_id, references)
+
+    def missing_iroh_references(
+        self, room_id: str, remote_entries: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        return self._replication_storage.missing_iroh_references(
+            room_id, remote_entries
+        )
+
+    def upsert_iroh_peer(
+        self,
+        room_id: str,
+        endpoint_id: str,
+        endpoint_ticket: str,
+        device_id: str | None,
+        display_name: str | None,
+        last_seen_at_ms: int | None = None,
+    ) -> None:
+        self._replication_storage.upsert_iroh_peer(
+            room_id,
+            endpoint_id,
+            endpoint_ticket,
+            device_id,
+            display_name,
+            last_seen_at_ms,
+        )
+
+    def iroh_peers(self, room_id: str) -> list[dict[str, Any]]:
+        return self._replication_storage.iroh_peers(room_id)
+
+    def has_pending_auto_break(self) -> bool:
+        return self._replication_storage.has_pending_auto_break()
+
+    def _projected_local_genesis(self) -> dict[str, Any]:
+        return self._replication_storage._projected_local_genesis()
+
+    @staticmethod
+    def _workspace_table_columns() -> dict[str, tuple[str, ...]]:
+        return WorkspacePersistence.table_columns()
+
+    def _capture_workspace(self) -> dict[str, Any]:
+        return self._workspace_storage.capture()
+
+    def _restore_workspace(self, workspace: dict[str, Any]) -> None:
+        self._workspace_storage.restore(workspace)
+
+    def _restore_workspace_metadata(self, metadata: dict[str, Any]) -> None:
+        self._workspace_storage.restore_metadata(metadata)
+
+    def _workspace_without_account(
+        self, workspace: dict[str, Any], *, preserve_domain: bool
+    ) -> dict[str, Any]:
+        return self._workspace_storage.without_account(
+            workspace, preserve_domain=preserve_domain
+        )
+
+    def _save_iroh_workspace(
+        self, room_id: str, workspace: dict[str, Any]
+    ) -> None:
+        self._workspace_storage.save_room(room_id, workspace)
 
     @staticmethod
     def _room_secret_key(room_id: str) -> str:
@@ -248,7 +588,22 @@ class Store:
         return migrated
 
     def _initialize(self) -> None:
-        defaults: dict[str, Any] = {
+        with self._immediate_transaction():
+            for key, value in self._initial_meta_defaults().items():
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                    (key, json.dumps(value, separators=(",", ":"))),
+                )
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            self._set_meta("settings", settings)
+            snapshot, snapshot_had_auto_start = self._initialize_snapshot()
+            self._migrate_legacy_preferences(settings, snapshot, snapshot_had_auto_start)
+            self._reconcile_auto_start_setting(settings, snapshot)
+            self._repair_command_physical_times()
+
+    @staticmethod
+    def _initial_meta_defaults() -> dict[str, Any]:
+        return {
             "deviceId": f"desktop-{uuid.uuid4()}",
             "deviceSequence": 0,
             "hlc": {"wallMs": 0, "counter": 0},
@@ -259,7 +614,8 @@ class Store:
             "settings": {
                 "selectedPhase": "focus",
                 "durations": {
-                    phase: definition["default_minutes"] for phase, definition in PHASES.items()
+                    phase: definition["default_minutes"]
+                    for phase, definition in PHASES.items()
                 },
                 "durationsMs": {
                     phase: definition["default_minutes"] * 60_000
@@ -283,17 +639,24 @@ class Store:
             "replicationMode": "centralized",
             "activeIrohRoomId": None,
         }
-        with self._immediate_transaction():
-            for key, value in defaults.items():
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
-                    (key, json.dumps(value, separators=(",", ":"))),
-                )
-            settings = self.get_meta("settings", {})
-            normalized_settings = self._normalize_settings(settings)
-            if normalized_settings != settings:
-                settings = normalized_settings
-                self._set_meta("settings", settings)
+
+    def _initialize_snapshot(self) -> tuple[dict[str, Any], bool]:
+        snapshot = self.get_meta("snapshot", {})
+        had_auto_start = "autoStartBreaks" in snapshot
+        changed = False
+        for key, value in (("tasks", []), ("knownTasks", []),
+                           ("autoStartBreaks", False), ("selectedTaskId", None)):
+            if key not in snapshot:
+                snapshot[key] = value
+                changed = True
+        if changed:
+            self._set_meta("snapshot", snapshot)
+        return snapshot, had_auto_start
+
+    def _migrate_legacy_preferences(
+        self, settings: dict[str, Any], snapshot: dict[str, Any],
+        snapshot_had_auto_start: bool,
+    ) -> None:
             if not self.get_meta("durationMigrationComplete", False):
                 for phase, definition in PHASES.items():
                     duration_ms = int(settings["durationsMs"][phase])
@@ -302,25 +665,9 @@ class Store:
                             phase, duration_ms, settings, 0, bootstrap=True
                         )
                 self._set_meta("durationMigrationComplete", True)
-            snapshot = self.get_meta("snapshot", {})
-            snapshot_had_auto_start = "autoStartBreaks" in snapshot
-            changed = False
-            for key, value in (
-                ("tasks", []),
-                ("knownTasks", []),
-                ("autoStartBreaks", False),
-                ("selectedTaskId", None),
-            ):
-                if key not in snapshot:
-                    snapshot[key] = value
-                    changed = True
-            if changed:
-                self._set_meta("snapshot", snapshot)
             if not self.get_meta("autoStartMigrationComplete", False):
                 if settings["autoStartBreaks"]:
-                    self._queue_auto_start_operation(
-                        True, settings, 0, bootstrap=True
-                    )
+                    self._queue_auto_start_operation(True, settings, 0, bootstrap=True)
                 self._set_meta(
                     "autoStartLegacyDefaultUnknown",
                     not settings["autoStartBreaks"]
@@ -340,6 +687,10 @@ class Store:
                         selected_task_id, settings, 0, bootstrap=True
                     )
                     self._set_meta("selectedTaskMigrationComplete", True)
+
+    def _reconcile_auto_start_setting(
+        self, settings: dict[str, Any], snapshot: dict[str, Any]
+    ) -> None:
             pending_auto_starts = self._pending_auto_start_operations()
             projected = project_auto_start_breaks(
                 bool(snapshot["autoStartBreaks"]), pending_auto_starts
@@ -347,6 +698,8 @@ class Store:
             if settings["autoStartBreaks"] != projected:
                 settings["autoStartBreaks"] = projected
                 self._set_meta("settings", settings)
+
+    def _repair_command_physical_times(self) -> None:
             physical_times = self.get_meta("commandPhysicalTimes", {})
             if not isinstance(physical_times, dict):
                 physical_times = {}
@@ -388,9 +741,7 @@ class Store:
             except (TypeError, ValueError):
                 duration_ms = 0
             if (
-                not DURATION_MIN_MS
-                <= duration_ms
-                <= PREFERENCE_DURATION_MAX_MS
+                not DURATION_MIN_MS <= duration_ms <= PREFERENCE_DURATION_MAX_MS
                 or duration_ms % 60_000
             ):
                 legacy_value = durations.get(phase, default_minutes)
@@ -413,9 +764,7 @@ class Store:
         }
         if normalized.get("selectedPhase") not in PHASES:
             normalized["selectedPhase"] = "focus"
-        normalized["autoStartBreaks"] = bool(
-            normalized.get("autoStartBreaks", False)
-        )
+        normalized["autoStartBreaks"] = bool(normalized.get("autoStartBreaks", False))
         normalized.setdefault("selectedTaskId", None)
         return normalized
 
@@ -424,9 +773,7 @@ class Store:
         return duration_ms // 60_000
 
     @staticmethod
-    def _duration_ms(
-        value: Any, *, maximum: int = PREFERENCE_DURATION_MAX_MS
-    ) -> int:
+    def _duration_ms(value: Any, *, maximum: int = PREFERENCE_DURATION_MAX_MS) -> int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("Duration must be an integer number of milliseconds.")
         if not DURATION_MIN_MS <= value <= maximum:
@@ -438,9 +785,7 @@ class Store:
         return value
 
     @staticmethod
-    def _bounded_integer(
-        value: Any, label: str, *, minimum: int = 0
-    ) -> int:
+    def _bounded_integer(value: Any, label: str, *, minimum: int = 0) -> int:
         if (
             isinstance(value, bool)
             or not isinstance(value, int)
@@ -485,16 +830,12 @@ class Store:
         offset_ms = cls._signed_safe_integer(
             value.get("offsetMs"), "Persisted server clock offset"
         )
-        acquired_physical_ms = cls._physical_time_ms(
-            value.get("acquiredPhysicalMs")
-        )
+        acquired_physical_ms = cls._physical_time_ms(value.get("acquiredPhysicalMs"))
         acquired_monotonic_ms = cls._bounded_integer(
             value.get("acquiredMonotonicMs"),
             "Persisted server clock monotonic acquisition",
         )
-        acquired_trusted_ms = cls._physical_time_ms(
-            value.get("acquiredTrustedMs")
-        )
+        acquired_trusted_ms = cls._physical_time_ms(value.get("acquiredTrustedMs"))
         return {
             "offsetMs": offset_ms,
             "uncertaintyMs": uncertainty_ms,
@@ -523,9 +864,7 @@ class Store:
     def _restore_trusted_time_anchor(self) -> None:
         with self._immediate_transaction():
             try:
-                sample = self._server_clock_sample(
-                    self.get_meta("serverClockSample")
-                )
+                sample = self._server_clock_sample(self.get_meta("serverClockSample"))
             except ValueError:
                 self._set_meta("serverClockSample", None)
                 return
@@ -535,12 +874,7 @@ class Store:
             monotonic_ms = self._bounded_integer(
                 time.monotonic_ns() // 1_000_000, "Monotonic clock"
             )
-            if (
-                self._projected_trusted_time(
-                    sample, physical_ms, monotonic_ms
-                )
-                is None
-            ):
+            if self._projected_trusted_time(sample, physical_ms, monotonic_ms) is None:
                 self._set_meta("serverClockSample", None)
                 return
             self._trusted_time_anchor = sample
@@ -563,8 +897,37 @@ class Store:
             return None, None
         if any(value is None for value in timings):
             raise ValueError("Local response timing is incomplete.")
+        timing = self._validated_response_timing(server_time_ms, timings)
+        midpoint_elapsed_ms = timing.round_trip_ms // 2
+        uncertainty_ms = (
+            timing.round_trip_ms + 1
+        ) // 2 + timing.clock_disagreement_ms
+        if uncertainty_ms > MAX_SERVER_TIME_UNCERTAINTY_MS:
+            raise ValueError("Server time sample uncertainty is too large.")
+        midpoint_ms = self._physical_time_ms(
+            timing.request_physical_ms + midpoint_elapsed_ms
+        )
+        offset_ms = self._signed_safe_integer(
+            timing.server_ms - midpoint_ms, "Server clock offset"
+        )
+        acquired_trusted_ms = self._physical_time_ms(
+            timing.server_ms + timing.round_trip_ms - midpoint_elapsed_ms
+        )
+        sample = {
+            "offsetMs": offset_ms,
+            "uncertaintyMs": uncertainty_ms,
+            "acquiredPhysicalMs": timing.received_physical_ms,
+            "acquiredMonotonicMs": timing.received_monotonic_ms,
+            "acquiredTrustedMs": acquired_trusted_ms,
+        }
+        return sample, sample
 
-        server_time_ms = self._physical_time_ms(server_time_ms)
+    def _validated_response_timing(
+        self,
+        server_time_ms: int,
+        timings: tuple[int | None, int | None, int | None, int | None],
+    ) -> _ResponseTiming:
+        server_ms = self._physical_time_ms(server_time_ms)
         request_physical_ms = self._physical_time_ms(timings[0])
         received_physical_ms = self._physical_time_ms(timings[1])
         request_monotonic_ms = self._bounded_integer(
@@ -583,27 +946,15 @@ class Store:
             or clock_disagreement_ms > MAX_CLOCK_CONTINUITY_DRIFT_MS
         ):
             raise ValueError("Local response clocks disagree.")
-        midpoint_elapsed_ms = round_trip_ms // 2
-        uncertainty_ms = (round_trip_ms + 1) // 2 + clock_disagreement_ms
-        if uncertainty_ms > MAX_SERVER_TIME_UNCERTAINTY_MS:
-            raise ValueError("Server time sample uncertainty is too large.")
-        midpoint_ms = self._physical_time_ms(
-            request_physical_ms + midpoint_elapsed_ms
+        return _ResponseTiming(
+            server_ms,
+            request_physical_ms,
+            received_physical_ms,
+            request_monotonic_ms,
+            received_monotonic_ms,
+            round_trip_ms,
+            clock_disagreement_ms,
         )
-        offset_ms = self._signed_safe_integer(
-            server_time_ms - midpoint_ms, "Server clock offset"
-        )
-        acquired_trusted_ms = self._physical_time_ms(
-            server_time_ms + round_trip_ms - midpoint_elapsed_ms
-        )
-        sample = {
-            "offsetMs": offset_ms,
-            "uncertaintyMs": uncertainty_ms,
-            "acquiredPhysicalMs": received_physical_ms,
-            "acquiredMonotonicMs": received_monotonic_ms,
-            "acquiredTrustedMs": acquired_trusted_ms,
-        }
-        return sample, sample
 
     def _set_trusted_time_anchor(self, anchor: dict[str, int]) -> None:
         self._trusted_time_anchor = dict(anchor)
@@ -649,9 +1000,7 @@ class Store:
             self._timer_time_anchor = None
             return physical_ms
         monotonic_ms = self._bounded_integer(
-            time.monotonic_ns() // 1_000_000
-            if monotonic_ms is None
-            else monotonic_ms,
+            time.monotonic_ns() // 1_000_000 if monotonic_ms is None else monotonic_ms,
             "Monotonic clock",
         )
         identity = self._timer_continuity_identity(timer)
@@ -669,17 +1018,13 @@ class Store:
             self._timer_time_anchor = timer_anchor
         projected_elapsed_ms = min(
             int(timer["plannedDurationMs"]),
-            timer_anchor["elapsedMs"]
-            + monotonic_ms
-            - timer_anchor["monotonicMs"],
+            timer_anchor["elapsedMs"] + monotonic_ms - timer_anchor["monotonicMs"],
         )
         anchor_ms = parse_timestamp_ms(timer.get("anchorAt"))
         if anchor_ms is None:
             return physical_ms
         return self._physical_time_ms(
-            anchor_ms
-            + projected_elapsed_ms
-            - int(timer.get("elapsedAtAnchorMs") or 0)
+            anchor_ms + projected_elapsed_ms - int(timer.get("elapsedAtAnchorMs") or 0)
         )
 
     def _trusted_now_ms(
@@ -724,9 +1069,7 @@ class Store:
         if monotonic_ms < anchor["acquiredMonotonicMs"]:
             return physical_ms
         return self._physical_time_ms(
-            anchor["acquiredTrustedMs"]
-            + monotonic_ms
-            - anchor["acquiredMonotonicMs"]
+            anchor["acquiredTrustedMs"] + monotonic_ms - anchor["acquiredMonotonicMs"]
         )
 
     @classmethod
@@ -735,12 +1078,8 @@ class Store:
     ) -> tuple[int, int]:
         if not isinstance(value, dict):
             raise ValueError("Persisted logical clock is invalid.")
-        wall_ms = cls._bounded_integer(
-            value.get("wallMs"), "Logical clock wall time"
-        )
-        counter = cls._bounded_integer(
-            value.get("counter"), "Logical clock counter"
-        )
+        wall_ms = cls._bounded_integer(value.get("wallMs"), "Logical clock wall time")
+        counter = cls._bounded_integer(value.get("counter"), "Logical clock counter")
         if wall_ms == 0 and (not allow_legacy_zero or counter != 0):
             raise ValueError("Logical clock wall time must be positive.")
         return wall_ms, counter
@@ -808,9 +1147,7 @@ class Store:
             raise ValueError("Logical clock counter has no safe integer headroom.")
 
         sequences = [sequence + offset for offset in range(1, sequence_count + 1)]
-        clocks = [
-            (wall_ms, first_counter + offset) for offset in range(clock_count)
-        ]
+        clocks = [(wall_ms, first_counter + offset) for offset in range(clock_count)]
         return now_ms, sequences, clocks
 
     def _pending_uuid7_ids(self) -> list[str]:
@@ -863,7 +1200,9 @@ class Store:
         return {phase: cls._duration_ms(durations_ms[phase]) for phase in PHASES}
 
     def get_meta(self, key: str, default: Any = None) -> Any:
-        row = self.connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
         return json.loads(row["value"]) if row else default
 
     @contextmanager
@@ -912,31 +1251,13 @@ class Store:
             settings = self.get_meta("settings")
             snapshot = self.get_meta("snapshot")
             pending = self._pending_commands()
-            pending_tasks = [
-                json.loads(row["payload"])
-                for row in self.connection.execute(
-                    "SELECT payload FROM pending_task_operations ORDER BY rowid"
-                )
-            ]
-            pending_durations = [
-                json.loads(row["payload"])
-                for row in self.connection.execute(
-                    "SELECT payload FROM pending_duration_operations ORDER BY rowid"
-                )
-            ]
-            pending_durations.sort(
-                key=lambda operation: (
-                    int(operation.get("hlcWallMs", 0)),
-                    int(operation.get("hlcCounter", 0)),
-                    str(operation.get("id", "")),
-                )
+            pending_tasks = self._pending_operation_payloads(
+                "pending_task_operations"
             )
+            pending_durations = self._pending_durations_for_load()
             pending_auto_starts = self._pending_auto_start_operations()
             pending_selected_tasks = self._pending_selected_task_operations()
-            try:
-                pending_resolution = self.get_meta("pendingResolution")
-            except (TypeError, json.JSONDecodeError):
-                pending_resolution = {"corrupted": True}
+            pending_resolution = self._pending_resolution_for_load()
             state = {
                 "settings": settings,
                 "snapshot": snapshot,
@@ -958,13 +1279,37 @@ class Store:
             self.connection.commit()
         return state
 
+    def _pending_operation_payloads(self, table: str) -> list[dict[str, Any]]:
+        return [
+            json.loads(row["payload"])
+            for row in self.connection.execute(
+                f"SELECT payload FROM {table} ORDER BY rowid"
+            )
+        ]
+
+    def _pending_durations_for_load(self) -> list[dict[str, Any]]:
+        operations = self._pending_operation_payloads("pending_duration_operations")
+        operations.sort(
+            key=lambda operation: (
+                int(operation.get("hlcWallMs", 0)),
+                int(operation.get("hlcCounter", 0)),
+                str(operation.get("id", "")),
+            )
+        )
+        return operations
+
+    def _pending_resolution_for_load(self) -> Any:
+        try:
+            return self.get_meta("pendingResolution")
+        except (TypeError, json.JSONDecodeError):
+            return {"corrupted": True}
+
     def _pending_commands(self, *, sendable_only: bool = False) -> list[dict[str, Any]]:
         where = "WHERE depends_on_command_id IS NULL" if sendable_only else ""
         return [
             json.loads(row["payload"])
             for row in self.connection.execute(
-                f"SELECT payload FROM pending_commands {where} "
-                "ORDER BY device_sequence"
+                f"SELECT payload FROM pending_commands {where} ORDER BY device_sequence"
             )
         ]
 
@@ -1026,9 +1371,7 @@ class Store:
                     item[key] = self._physical_timestamp(item.get(key))
         return projected
 
-    def _record_command_physical_time(
-        self, command_id: str, physical_ms: int
-    ) -> None:
+    def _record_command_physical_time(self, command_id: str, physical_ms: int) -> None:
         physical_times = self._command_physical_times()
         physical_times[command_id] = self._physical_time_ms(physical_ms)
         self._set_meta("commandPhysicalTimes", physical_times)
@@ -1126,10 +1469,7 @@ class Store:
             or isinstance(task_id, str)
             and not task_id
             or task_id is not None
-            and (
-                command.get("type") != "start"
-                or command.get("phase") != "focus"
-            )
+            and (command.get("type") != "start" or command.get("phase") != "focus")
         ):
             raise ValueError("Pending timer command is invalid.")
         self._operation_clock(command)
@@ -1213,87 +1553,32 @@ class Store:
             allow_legacy_zero=True,
         )
         self._server_clock_sample(self.get_meta("serverClockSample"))
-
-        commands: list[dict[str, Any]] = []
-        sendable_commands: list[dict[str, Any]] = []
-        for row in self.connection.execute(
+        command_rows = self.connection.execute(
             "SELECT id, device_sequence, payload, depends_on_command_id "
             "FROM pending_commands ORDER BY device_sequence"
-        ):
-            command = self._pending_object(row["payload"], "timer command")
-            self._validate_pending_command(command, row)
-            commands.append(command)
-            if row["depends_on_command_id"] is None:
-                sendable_commands.append(command)
+        ).fetchall()
+        commands = self._validated_pending_rows(
+            command_rows, "timer command", self._validate_pending_command
+        )
+        sendable_commands = [command for command, row in zip(commands, command_rows)
+                             if row["depends_on_command_id"] is None]
         if commands and commands[-1]["deviceSequence"] > persisted_sequence:
             raise ValueError("Pending timer command exceeds persisted device sequence.")
-
-        task_operations = []
-        for row in self.connection.execute(
-            "SELECT id, payload FROM pending_task_operations ORDER BY rowid"
-        ):
-            operation = self._pending_object(row["payload"], "task operation")
-            self._validate_pending_task_operation(operation, row)
-            task_operations.append(operation)
-
-        duration_operations = []
-        for row in self.connection.execute(
-            "SELECT id, phase, payload FROM pending_duration_operations ORDER BY rowid"
-        ):
-            operation = self._pending_object(row["payload"], "duration operation")
-            self._validate_pending_duration_operation(operation, row)
-            duration_operations.append(operation)
-        duration_operations.sort(
-            key=lambda operation: (
-                operation["hlcWallMs"],
-                operation["hlcCounter"],
-                operation["id"],
-            )
-        )
-
-        auto_start_operations = []
-        for row in self.connection.execute(
-            "SELECT id, payload FROM pending_auto_start_operations ORDER BY rowid"
-        ):
-            operation = self._pending_object(row["payload"], "auto-start operation")
-            self._validate_pending_auto_start_operation(operation, row, device_id)
-            auto_start_operations.append(operation)
-        auto_start_operations.sort(
-            key=lambda operation: (
-                operation["hlcWallMs"],
-                operation["hlcCounter"],
-                operation["deviceId"],
-                operation["id"],
-            )
-        )
-        selected_task_operations = []
-        for row in self.connection.execute(
-            "SELECT id, payload FROM pending_selected_task_operations ORDER BY rowid"
-        ):
-            operation = self._pending_object(row["payload"], "selected-task operation")
-            self._validate_pending_selected_task_operation(operation, row, device_id)
-            selected_task_operations.append(operation)
-        selected_task_operations.sort(
-            key=lambda operation: (
-                operation["hlcWallMs"],
-                operation["hlcCounter"],
-                operation["deviceId"],
-                operation["id"],
-            )
-        )
-        clocks = [
-            (operation["hlcWallMs"], operation["hlcCounter"])
-            for operations in (
-                commands,
-                task_operations,
-                duration_operations,
-                auto_start_operations,
-                selected_task_operations,
-            )
-            for operation in operations
-        ]
-        if require_clock_coverage and clocks and max(clocks) > persisted_clock:
-            raise ValueError("Pending operation exceeds persisted logical clock.")
+        task_operations = self._preflight_operation_queue(
+            "pending_task_operations", "task operation", self._validate_pending_task_operation,
+            sort_by_clock=False)
+        duration_operations = self._preflight_operation_queue(
+            "pending_duration_operations", "duration operation",
+            self._validate_pending_duration_operation, extra_column="phase")
+        auto_start_operations = self._preflight_device_operation_queue(
+            "pending_auto_start_operations", "auto-start operation",
+            self._validate_pending_auto_start_operation, device_id)
+        selected_task_operations = self._preflight_device_operation_queue(
+            "pending_selected_task_operations", "selected-task operation",
+            self._validate_pending_selected_task_operation, device_id)
+        self._validate_pending_clock_coverage(
+            (commands, task_operations, duration_operations, auto_start_operations,
+             selected_task_operations), persisted_clock, require_clock_coverage)
         return {
             "commands": commands,
             "sendableCommands": sendable_commands,
@@ -1302,6 +1587,42 @@ class Store:
             "autoStartOperations": auto_start_operations,
             "selectedTaskOperations": selected_task_operations,
         }
+
+    @staticmethod
+    def _validate_pending_clock_coverage(
+        queues: tuple[list[dict[str, Any]], ...], persisted_clock: tuple[int, int],
+        required: bool,
+    ) -> None:
+        clocks = [(item["hlcWallMs"], item["hlcCounter"])
+                  for queue in queues for item in queue]
+        if required and clocks and max(clocks) > persisted_clock:
+            raise ValueError("Pending operation exceeds persisted logical clock.")
+
+    def _validated_pending_rows(self, rows: list[sqlite3.Row], label: str, validator: Any,
+                                *validator_args: Any) -> list[dict[str, Any]]:
+        operations = []
+        for row in rows:
+            operation = self._pending_object(row["payload"], label)
+            validator(operation, row, *validator_args)
+            operations.append(operation)
+        return operations
+
+    def _preflight_operation_queue(self, table: str, label: str, validator: Any,
+                                   *, extra_column: str | None = None,
+                                   sort_by_clock: bool = True) -> list[dict[str, Any]]:
+        columns = f"id, {extra_column}, payload" if extra_column else "id, payload"
+        rows = self.connection.execute(f"SELECT {columns} FROM {table} ORDER BY rowid").fetchall()
+        operations = self._validated_pending_rows(rows, label, validator)
+        if sort_by_clock:
+            operations.sort(key=lambda item: (item["hlcWallMs"], item["hlcCounter"], item["id"]))
+        return operations
+
+    def _preflight_device_operation_queue(self, table: str, label: str, validator: Any,
+                                          device_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(f"SELECT id, payload FROM {table} ORDER BY rowid").fetchall()
+        operations = self._validated_pending_rows(rows, label, validator, device_id)
+        return sorted(operations, key=lambda item: (
+            item["hlcWallMs"], item["hlcCounter"], item["deviceId"], item["id"]))
 
     def save_settings(self, settings: dict[str, Any]) -> None:
         candidate = self._normalize_settings(settings)
@@ -1357,7 +1678,11 @@ class Store:
     def set_selected_task_id(
         self, task_id: str | None, now_ms: int | None = None
     ) -> dict[str, Any] | None:
-        if not isinstance(task_id, (str, type(None))) or isinstance(task_id, str) and not task_id:
+        if (
+            not isinstance(task_id, (str, type(None)))
+            or isinstance(task_id, str)
+            and not task_id
+        ):
             raise ValueError("Selected task identity must be non-empty or null.")
         use_server_clock = now_ms is None
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
@@ -1374,97 +1699,153 @@ class Store:
         return operation
 
     def queue_command(
+        self, command_type: str, timer: dict[str, Any] | None, selected_phase: str,
+        durations_ms: dict[str, int], selected_task_id: str | None = None,
+        now_ms: int | None = None, generate_auto_break: bool = False,
+        automatic: bool = False,
+    ) -> dict[str, Any] | None:
+        use_server_clock = now_ms is None
+        physical_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        with self._immediate_transaction():
+            return self._queue_command_transaction(
+                command_type, timer, selected_phase, durations_ms, selected_task_id,
+                physical_ms, generate_auto_break, automatic, use_server_clock)
+
+    def _queue_command_transaction(
         self,
         command_type: str,
         timer: dict[str, Any] | None,
         selected_phase: str,
         durations_ms: dict[str, int],
-        selected_task_id: str | None = None,
-        now_ms: int | None = None,
+        selected_task_id: str | None,
+        now_ms: int,
         generate_auto_break: bool = False,
-    ) -> dict[str, Any]:
-        use_server_clock = now_ms is None
-        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-        with self._immediate_transaction():
-            self._ensure_no_pending_resolution()
-            effective_now_ms = (
-                now_ms
-                if not use_server_clock
-                else self.effective_timer_now_ms(timer, physical_ms=now_ms)
-            )
-            state = self.load()
-            settings = self._normalize_settings(state["settings"])
-            if command_type == "start":
-                selected_task_id = settings.get("selectedTaskId")
-                tasks = rebuild_tasks(
-                    state["snapshot"].get("tasks", []), state["pendingTasks"]
-                )
-                if not any(
-                    task.get("id") == selected_task_id for task in tasks
-                ):
-                    selected_task_id = None
-            generates_break = bool(
-                generate_auto_break
-                and command_type == "finish"
-                and isinstance(timer, dict)
-                and timer.get("phase") == "focus"
-                and settings["autoStartBreaks"]
-                and (
-                    self.replication_mode != "iroh"
-                    or timer.get("startedByDeviceId") == self.device_id
-                )
-            )
-            trusted_ms, sequences, clocks = self._reserve_generation(
-                effective_now_ms,
-                sequence_count=2 if generates_break else 1,
-                clock_count=2 if generates_break else 1,
-                use_server_clock=use_server_clock,
-                use_monotonic=use_server_clock,
-            )
-            command_ids = self._reserve_uuid7_ids(
-                clocks[0][0], 2 if generates_break else 1
-            )
-            command = self._queue_command(
-                command_type,
-                timer,
-                selected_phase,
-                durations_ms,
-                selected_task_id,
-                now_ms,
-                timer_now_ms=effective_now_ms,
-                trusted_ms=trusted_ms,
-                sequence=sequences[0],
-                clock=clocks[0],
-                command_id=command_ids[0],
-            )
-            if generates_break:
-                self._queue_generated_auto_break(
-                    command,
-                    now_ms,
-                    timer_now_ms=effective_now_ms,
-                    trusted_ms=trusted_ms,
-                    sequence=sequences[1],
-                    clock=clocks[1],
-                    command_id=command_ids[1],
-                )
-            state = self.load(projection=True)
-            projection_snapshot = state.get("projectionSnapshot", state["snapshot"])
-            projected_timer, _history = rebuild_optimistic(
-                projection_snapshot.get("canonicalTimer"),
-                projection_snapshot.get("history", []),
-                state.get("projectionPending", state["pending"]),
-            )
-            if (
-                use_server_clock
-                and projected_timer
-                and projected_timer.get("status") == "running"
-            ):
-                self.effective_timer_now_ms(
-                    projected_timer,
-                    physical_ms=effective_now_ms,
-                )
-            self._capture_iroh_after_mutation_locked()
+        automatic: bool = False,
+        use_server_clock: bool = False,
+    ) -> dict[str, Any] | None:
+        context = self._prepare_command_queue(
+            command_type,
+            timer,
+            selected_task_id,
+            now_ms,
+            generate_auto_break,
+            automatic,
+            use_server_clock,
+        )
+        if context is None:
+            return None
+        command = self._queue_prepared_timer_command(
+            command_type,
+            context,
+            selected_phase,
+            durations_ms,
+            now_ms,
+            use_server_clock,
+        )
+        self._refresh_timer_after_queue(context.effective_now_ms, use_server_clock)
         return command
+
+    def _prepare_command_queue(
+        self, command_type: str, timer: dict[str, Any] | None,
+        selected_task_id: str | None, now_ms: int, generate_auto_break: bool,
+        automatic: bool, use_server_clock: bool,
+    ) -> _CommandQueueContext | None:
+        self._ensure_no_pending_resolution()
+        effective_now_ms = (
+            now_ms
+            if not use_server_clock
+            else self.effective_timer_now_ms(timer, physical_ms=now_ms)
+        )
+        state = self.load(projection=True)
+        projection = self.projected_state(now_ms=effective_now_ms, state=state)
+        settings = self.projected_settings(state, projection)
+        if automatic:
+            if command_type != "finish":
+                raise ValueError("Only Finish can be queued automatically.")
+            current_timer = projection.canonical_timer
+            if (
+                not isinstance(timer, dict)
+                or not isinstance(current_timer, dict)
+                or current_timer.get("id") != timer.get("id")
+                or current_timer.get("status") != "completed"
+                or current_timer.get("lastIntent", {}).get("type") == "finish"
+                or not self.owns_timer(current_timer)
+            ):
+                return None
+            timer = current_timer
+        if command_type == "start":
+            selected_task_id = projection.selected_task_id
+            if not any(
+                task.get("id") == selected_task_id for task in projection.tasks
+            ):
+                selected_task_id = None
+        generates_break = self._command_generates_auto_break(
+            command_type, timer, settings, generate_auto_break
+        )
+        return _CommandQueueContext(
+            effective_now_ms, timer, selected_task_id, generates_break
+        )
+
+    def _command_generates_auto_break(
+        self, command_type: str, timer: dict[str, Any] | None,
+        settings: dict[str, Any], requested: bool,
+    ) -> bool:
+        return bool(
+            requested
+            and command_type == "finish"
+            and isinstance(timer, dict)
+            and timer.get("phase") == "focus"
+            and settings["autoStartBreaks"]
+            and (
+                self.replication_mode != "iroh"
+                or timer.get("startedByDeviceId") == self.device_id
+            )
+        )
+
+    def _queue_prepared_timer_command(
+        self, command_type: str, context: _CommandQueueContext,
+        selected_phase: str, durations_ms: dict[str, int], now_ms: int,
+        use_server_clock: bool,
+    ) -> dict[str, Any]:
+        count = 2 if context.generates_break else 1
+        trusted_ms, sequences, clocks = self._reserve_generation(
+            context.effective_now_ms,
+            sequence_count=count,
+            clock_count=count,
+            use_server_clock=use_server_clock,
+            use_monotonic=use_server_clock,
+        )
+        command_ids = self._reserve_uuid7_ids(clocks[0][0], count)
+        command = self._queue_command(
+            command_type, context.timer, selected_phase, durations_ms,
+            context.selected_task_id, now_ms,
+            timer_now_ms=context.effective_now_ms, trusted_ms=trusted_ms,
+            sequence=sequences[0], clock=clocks[0], command_id=command_ids[0],
+        )
+        if context.generates_break:
+            self._queue_generated_auto_break(
+                command, now_ms, timer_now_ms=context.effective_now_ms,
+                trusted_ms=trusted_ms, sequence=sequences[1], clock=clocks[1],
+                command_id=command_ids[1],
+            )
+        return command
+
+    def _refresh_timer_after_queue(
+        self, effective_now_ms: int, use_server_clock: bool
+    ) -> None:
+        state = self.load(projection=True)
+        projected_timer = self.projected_state(
+            now_ms=effective_now_ms, state=state
+        ).canonical_timer
+        if (
+            use_server_clock
+            and projected_timer
+            and projected_timer.get("status") == "running"
+        ):
+            self.effective_timer_now_ms(
+                projected_timer, physical_ms=effective_now_ms
+            )
+        self._capture_iroh_after_mutation_locked()
 
     def queue_restart(
         self,
@@ -1478,33 +1859,10 @@ class Store:
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
-            state = self.load(projection=True)
-            projection_snapshot = state.get("projectionSnapshot", state["snapshot"])
-            current_timer, _history = rebuild_optimistic(
-                projection_snapshot.get("canonicalTimer"),
-                projection_snapshot.get("history", []),
-                state.get("projectionPending", state["pending"]),
-            )
-            if (
-                not isinstance(current_timer, dict)
-                or current_timer.get("status") not in {
-                    "completed",
-                    "cancelled",
-                    "superseded",
-                }
-                or self._timer_fingerprint(current_timer)
-                != self._timer_fingerprint(timer)
-            ):
-                raise ValueError("Timer changed before restart could be saved.")
-            settings = self._normalize_settings(state["settings"])
-            selected_phase = settings["selectedPhase"]
-            durations_ms = settings["durationsMs"]
-            selected_task_id = settings.get("selectedTaskId")
-            tasks = rebuild_tasks(
-                state["snapshot"].get("tasks", []), state["pendingTasks"]
-            )
-            if not any(task.get("id") == selected_task_id for task in tasks):
-                selected_task_id = None
+            current_timer, selected_phase, durations_ms, selected_task_id = (
+                self._terminal_action_context(
+                    timer, now_ms, {"completed", "cancelled", "superseded"},
+                    "Timer changed before restart could be saved.", validate_task=True))
             effective_now_ms = (
                 now_ms
                 if not use_server_clock
@@ -1518,32 +1876,10 @@ class Store:
                 use_monotonic=use_server_clock,
             )
             command_ids = self._reserve_uuid7_ids(clocks[0][0], 2)
-            cleared = self._queue_command(
-                "clear",
-                current_timer,
-                selected_phase,
-                durations_ms,
-                selected_task_id,
-                now_ms,
-                timer_now_ms=effective_now_ms,
-                trusted_ms=trusted_ms,
-                sequence=sequences[0],
-                clock=clocks[0],
-                command_id=command_ids[0],
-            )
-            started = self._queue_command(
-                "start",
-                None,
-                selected_phase,
-                durations_ms,
-                selected_task_id,
-                now_ms,
-                timer_now_ms=effective_now_ms,
-                trusted_ms=trusted_ms,
-                sequence=sequences[1],
-                clock=clocks[1],
-                command_id=command_ids[1],
-            )
+            cleared, started = self._queue_reserved_pair(
+                ("clear", current_timer), ("start", None), selected_phase,
+                durations_ms, selected_task_id, now_ms, effective_now_ms, trusted_ms,
+                sequences, clocks, command_ids)
             self._capture_iroh_after_mutation_locked()
         return [cleared, started]
 
@@ -1559,24 +1895,10 @@ class Store:
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
-            state = self.load(projection=True)
-            projection_snapshot = state.get("projectionSnapshot", state["snapshot"])
-            current_timer, _history = rebuild_optimistic(
-                projection_snapshot.get("canonicalTimer"),
-                projection_snapshot.get("history", []),
-                state.get("projectionPending", state["pending"]),
-            )
-            if (
-                not isinstance(current_timer, dict)
-                or current_timer.get("status") not in ACTIVE_STATUSES
-                or self._timer_fingerprint(current_timer)
-                != self._timer_fingerprint(timer)
-            ):
-                raise ValueError("Timer changed before cancel could be saved.")
-            settings = self._normalize_settings(state["settings"])
-            selected_phase = settings["selectedPhase"]
-            durations_ms = settings["durationsMs"]
-            selected_task_id = settings.get("selectedTaskId")
+            current_timer, selected_phase, durations_ms, selected_task_id = (
+                self._terminal_action_context(
+                    timer, now_ms, ACTIVE_STATUSES,
+                    "Timer changed before cancel could be saved."))
             effective_now_ms = (
                 now_ms
                 if not use_server_clock
@@ -1590,36 +1912,55 @@ class Store:
                 use_monotonic=use_server_clock,
             )
             command_ids = self._reserve_uuid7_ids(clocks[0][0], 2)
-            cancelled = self._queue_command(
-                "cancel",
-                current_timer,
-                selected_phase,
-                durations_ms,
-                selected_task_id,
-                now_ms,
-                timer_now_ms=effective_now_ms,
-                trusted_ms=trusted_ms,
-                sequence=sequences[0],
-                clock=clocks[0],
-                command_id=command_ids[0],
-            )
-            cleared = self._queue_command(
-                "clear",
-                current_timer,
-                selected_phase,
-                durations_ms,
-                selected_task_id,
-                now_ms,
-                timer_now_ms=effective_now_ms,
-                trusted_ms=trusted_ms,
-                sequence=sequences[1],
-                clock=clocks[1],
-                command_id=command_ids[1],
-            )
+            cancelled, cleared = self._queue_reserved_pair(
+                ("cancel", current_timer), ("clear", current_timer), selected_phase,
+                durations_ms, selected_task_id, now_ms, effective_now_ms, trusted_ms,
+                sequences, clocks, command_ids)
             self._capture_iroh_after_mutation_locked()
         return [cancelled, cleared]
 
+    def _terminal_action_context(self, timer: dict[str, Any], now_ms: int,
+                                 statuses: set[str], error: str, *, validate_task: bool = False
+                                 ) -> tuple[dict[str, Any], str, dict[str, int], str | None]:
+        state = self.load(projection=True)
+        projection = self.projected_state(now_ms=now_ms, state=state)
+        current = projection.canonical_timer
+        if (not isinstance(current, dict) or current.get("status") not in statuses
+                or self._timer_fingerprint(current) != self._timer_fingerprint(timer)):
+            raise ValueError(error)
+        settings = self.projected_settings(state, projection)
+        task_id = settings.get("selectedTaskId")
+        if validate_task and not any(task.get("id") == task_id for task in projection.tasks):
+            task_id = None
+        return current, settings["selectedPhase"], settings["durationsMs"], task_id
+
+    def _queue_reserved_pair(self, first: tuple[str, dict[str, Any] | None],
+                             second: tuple[str, dict[str, Any] | None], phase: str,
+                             durations: dict[str, int], task_id: str | None, now_ms: int,
+                             timer_now_ms: int, trusted_ms: int, sequences: list[int],
+                             clocks: list[tuple[int, int]], ids: list[str]
+                             ) -> tuple[dict[str, Any], dict[str, Any]]:
+        commands = [self._queue_command(
+            kind, timer, phase, durations, task_id, now_ms, timer_now_ms=timer_now_ms,
+            trusted_ms=trusted_ms, sequence=sequences[index], clock=clocks[index],
+            command_id=ids[index])
+            for index, (kind, timer) in enumerate((first, second))]
+        return commands[0], commands[1]
+
     def _queue_command(
+        self, command_type: str, timer: dict[str, Any] | None, selected_phase: str,
+        durations_ms: dict[str, int], selected_task_id: str | None, now_ms: int,
+        depends_on_command_id: str | None = None, *, timer_now_ms: int | None = None,
+        trusted_ms: int | None = None, sequence: int | None = None,
+        clock: tuple[int, int] | None = None, command_id: str | None = None,
+    ) -> dict[str, Any]:
+        generation = self._command_generation(
+            now_ms, timer_now_ms, trusted_ms, sequence, clock, command_id)
+        return self._persist_timer_command(
+            command_type, timer, selected_phase, durations_ms, selected_task_id,
+            now_ms, depends_on_command_id, *generation)
+
+    def _persist_timer_command(
         self,
         command_type: str,
         timer: dict[str, Any] | None,
@@ -1627,30 +1968,46 @@ class Store:
         durations_ms: dict[str, int],
         selected_task_id: str | None,
         now_ms: int,
-        depends_on_command_id: str | None = None,
-        *,
-        timer_now_ms: int | None = None,
-        trusted_ms: int | None = None,
-        sequence: int | None = None,
-        clock: tuple[int, int] | None = None,
-        command_id: str | None = None,
+        depends_on_command_id: str | None,
+        timer_now_ms: int, trusted_ms: int, sequence: int,
+        clock: tuple[int, int], command_id: str,
     ) -> dict[str, Any]:
+        command, depends_on_command_id = self._prepare_timer_command(
+            command_type, timer, selected_phase, durations_ms, selected_task_id,
+            timer_now_ms, trusted_ms, sequence, clock, command_id,
+            depends_on_command_id,
+        )
+        projection_settings = self._normalize_settings(self.get_meta("settings", {}))
+        self._project_timer_command(command, projection_settings)
+        self.connection.execute(
+            "INSERT INTO pending_commands("
+            "id, device_sequence, payload, depends_on_command_id) VALUES (?, ?, ?, ?)",
+            (
+                command["id"],
+                sequence,
+                json.dumps(command, separators=(",", ":")),
+                depends_on_command_id,
+            ),
+        )
+        self._record_command_physical_time(command["id"], timer_now_ms)
+        self._apply_timer_command_side_effects(command, timer)
+        self._set_meta("deviceSequence", sequence)
+        self._set_meta(
+            "hlc", {"wallMs": command["hlcWallMs"], "counter": command["hlcCounter"]}
+        )
+        return command
+
+    def _prepare_timer_command(
+        self, command_type: str, timer: dict[str, Any] | None,
+        selected_phase: str, durations_ms: dict[str, int],
+        selected_task_id: str | None, timer_now_ms: int, trusted_ms: int,
+        sequence: int, clock: tuple[int, int], command_id: str,
+        dependency: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
         if command_type not in COMMAND_TYPES:
             raise ValueError("Unsupported timer command.")
-        if sequence is None or clock is None:
-            trusted_ms, sequences, clocks = self._reserve_generation(
-                now_ms, sequence_count=1, clock_count=1
-            )
-            sequence = sequences[0]
-            clock = clocks[0]
-        if trusted_ms is None:
-            trusted_ms = self._trusted_now_ms(now_ms, use_monotonic=False)
-        timer_now_ms = now_ms if timer_now_ms is None else timer_now_ms
         wall_ms, counter = clock
-        if command_id is None:
-            command_id = self._reserve_uuid7_ids(wall_ms, 1)[0]
         starting = command_type == "start"
-
         if starting:
             phase = selected_phase if selected_phase in PHASES else "focus"
             timer_id = str(uuid.uuid4())
@@ -1663,16 +2020,15 @@ class Store:
             timer_id = str(timer["id"])
             planned_ms = int(timer["plannedDurationMs"])
             observed_ms = round(elapsed_ms(timer, timer_now_ms))
-            if depends_on_command_id is None:
+            if dependency is None:
                 for row in self.connection.execute(
                     "SELECT depends_on_command_id, payload FROM pending_commands "
                     "WHERE depends_on_command_id IS NOT NULL"
                 ):
                     pending_command = json.loads(row["payload"])
                     if pending_command.get("timerId") == timer_id:
-                        depends_on_command_id = str(row["depends_on_command_id"])
+                        dependency = str(row["depends_on_command_id"])
                         break
-
         command = {
             "id": command_id,
             "deviceSequence": sequence,
@@ -1687,71 +2043,77 @@ class Store:
         }
         if starting and phase == "focus" and selected_task_id:
             command["taskId"] = selected_task_id
-        self.connection.execute(
-            "INSERT INTO pending_commands("
-            "id, device_sequence, payload, depends_on_command_id) VALUES (?, ?, ?, ?)",
-            (
-                command["id"],
-                sequence,
-                json.dumps(command, separators=(",", ":")),
-                depends_on_command_id,
-            ),
-        )
-        self._record_command_physical_time(command["id"], timer_now_ms)
-        if starting and self.replication_mode != "iroh":
+        return command, dependency
+
+    def _apply_timer_command_side_effects(
+        self, command: dict[str, Any], timer: dict[str, Any] | None
+    ) -> None:
+        if command["type"] == "start" and self.replication_mode != "iroh":
             self._set_meta(
                 "centralizedTimerOwnership",
                 {
-                    "timerId": timer_id,
+                    "timerId": command["timerId"],
                     "deviceId": self.device_id,
                     "startCommandId": command["id"],
                 },
             )
-        if command_type == "finish":
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            snapshot = self.get_meta("snapshot", {})
-            _, history = rebuild_optimistic(
-                snapshot.get("canonicalTimer"),
-                snapshot.get("history", []),
-                self._pending_commands(),
+        if command["type"] == "finish":
+            self._apply_finish_command(command, timer)
+
+    def _apply_finish_command(
+        self, command: dict[str, Any], timer: dict[str, Any] | None
+    ) -> None:
+        settings = self._normalize_settings(self.get_meta("settings", {}))
+        history = self._project_operation(
+            settings, now=command["occurredAt"]
+        ).history
+        phase = command["phase"]
+        advanced_phase = (
+            next_break_phase(history, command["occurredAt"])
+            if phase == "focus"
+            else "focus"
+        )
+        settings["selectedPhase"] = advanced_phase
+        self._set_meta("settings", settings)
+        self.connection.execute(
+            "INSERT INTO pending_phase_advances("
+            "finish_command_id, timer_id, source_phase, advanced_phase, "
+            "selected_phase_version) VALUES (?, ?, ?, ?, ?)",
+            (
+                command["id"], command["timerId"], phase, advanced_phase,
+                int(self.get_meta("selectedPhaseVersion", 0)),
+            ),
+        )
+        if (
+            phase == "focus"
+            and settings["autoStartBreaks"]
+            and (
+                self.replication_mode != "iroh"
+                or timer is not None
+                and timer.get("startedByDeviceId") == self.device_id
             )
-            advanced_phase = (
-                next_break_phase(history, command["occurredAt"])
-                if phase == "focus"
-                else "focus"
-            )
-            settings["selectedPhase"] = advanced_phase
-            self._set_meta("settings", settings)
+        ):
             self.connection.execute(
-                "INSERT INTO pending_phase_advances("
-                "finish_command_id, timer_id, source_phase, advanced_phase, "
-                "selected_phase_version) VALUES (?, ?, ?, ?, ?)",
-                (
-                    command["id"],
-                    timer_id,
-                    phase,
-                    advanced_phase,
-                    int(self.get_meta("selectedPhaseVersion", 0)),
-                ),
+                "INSERT OR IGNORE INTO pending_auto_breaks("
+                "finish_command_id, timer_id, finish_device_sequence) "
+                "VALUES (?, ?, ?)",
+                (command["id"], command["timerId"], command["deviceSequence"]),
             )
-            if (
-                phase == "focus"
-                and settings["autoStartBreaks"]
-                and (
-                    self.replication_mode != "iroh"
-                    or timer is not None
-                    and timer.get("startedByDeviceId") == self.device_id
-                )
-            ):
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO pending_auto_breaks("
-                    "finish_command_id, timer_id, finish_device_sequence) "
-                    "VALUES (?, ?, ?)",
-                    (command["id"], timer_id, sequence),
-                )
-        self._set_meta("deviceSequence", sequence)
-        self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
-        return command
+
+    def _command_generation(self, now_ms: int, timer_now_ms: int | None,
+                            trusted_ms: int | None, sequence: int | None,
+                            clock: tuple[int, int] | None, command_id: str | None
+                            ) -> tuple[int, int, int, tuple[int, int], str]:
+        if sequence is None or clock is None:
+            trusted_ms, sequences, clocks = self._reserve_generation(
+                now_ms, sequence_count=1, clock_count=1)
+            sequence, clock = sequences[0], clocks[0]
+        if trusted_ms is None:
+            trusted_ms = self._trusted_now_ms(now_ms, use_monotonic=False)
+        timer_now_ms = now_ms if timer_now_ms is None else timer_now_ms
+        if command_id is None:
+            command_id = self._reserve_uuid7_ids(clock[0], 1)[0]
+        return timer_now_ms, trusted_ms, sequence, clock, command_id
 
     def _queue_generated_auto_break(
         self,
@@ -1764,26 +2126,13 @@ class Store:
         clock: tuple[int, int],
         command_id: str,
     ) -> dict[str, Any]:
-        snapshot = self.get_meta("snapshot", {})
-        _timer, history = rebuild_optimistic(
-            snapshot.get("canonicalTimer"),
-            snapshot.get("history", []),
-            self._pending_commands(),
-        )
-        completion = next(
-            (
-                item
-                for item in history
-                if item.get("phase") == "focus"
-                and item.get("status") == "completed"
-                and item.get("timerId") == finish["timerId"]
-                and item.get("commandId") == finish["id"]
-            ),
-            None,
-        )
-        if completion is None:
-            raise ValueError("Automatic break generation requires an accepted focus finish.")
         settings = self._normalize_settings(self.get_meta("settings", {}))
+        history = self._project_operation(settings, now=finish["occurredAt"]).history
+        completion = self._focus_completion(history, finish["timerId"], finish["id"])
+        if completion is None:
+            raise ValueError(
+                "Automatic break generation requires an accepted focus finish."
+            )
         phase = next_break_phase(
             history, completion.get("completedAt") or completion.get("endedAt")
         )
@@ -1807,18 +2156,23 @@ class Store:
             clock=clock,
             command_id=command_id,
         )
+        self._record_auto_break_start(finish["id"], finish["timerId"], command["id"])
+        return command
+
+    @staticmethod
+    def _focus_completion(history: list[dict[str, Any]], timer_id: str,
+                          command_id: str) -> dict[str, Any] | None:
+        return next((item for item in history if item.get("phase") == "focus"
+                     and item.get("status") == "completed"
+                     and item.get("timerId") == timer_id
+                     and item.get("commandId") == command_id), None)
+
+    def _record_auto_break_start(self, finish_id: str, timer_id: str, start_id: str) -> None:
         self.connection.execute(
             "INSERT INTO pending_auto_break_starts("
             "source_finish_command_id, source_timer_id, start_command_id, "
             "selected_phase_version) VALUES (?, ?, ?, ?)",
-            (
-                finish["id"],
-                finish["timerId"],
-                command["id"],
-                int(self.get_meta("selectedPhaseVersion", 0)),
-            ),
-        )
-        return command
+            (finish_id, timer_id, start_id, int(self.get_meta("selectedPhaseVersion", 0))))
 
     def queue_task_operation(
         self,
@@ -1828,51 +2182,81 @@ class Store:
     ) -> dict[str, Any]:
         if operation_type not in {"upsert", "delete"}:
             raise ValueError("Unsupported task operation.")
-        normalized = task_from_title(task.get("title", ""))
-        if normalized["id"] != task.get("id"):
-            raise ValueError("Task identity does not match its name.")
-
+        normalized = self._normalized_task_identity(task)
         use_server_clock = now_ms is None
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
-            trusted_ms, _sequences, clocks = self._reserve_generation(
-                now_ms,
-                use_server_clock=use_server_clock,
-                use_monotonic=use_server_clock,
-            )
-            wall_ms, counter = clocks[0]
-            operation_id = self._reserve_uuid7_ids(wall_ms, 1)[0]
-            operation: dict[str, Any] = {
-                "id": operation_id,
-                "taskId": normalized["id"],
-                "type": operation_type,
-                "occurredAt": utc_timestamp(trusted_ms),
-                "hlcWallMs": wall_ms,
-                "hlcCounter": counter,
-            }
-            if operation_type == "upsert":
-                operation["title"] = normalized["title"]
-
+            operation = self._create_task_operation(
+                operation_type, normalized, now_ms, use_server_clock)
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            self._project_task_operation(operation, settings)
             self.connection.execute(
                 "INSERT INTO pending_task_operations(id, payload) VALUES (?, ?)",
                 (operation["id"], json.dumps(operation, separators=(",", ":"))),
             )
-            snapshot = self.get_meta("snapshot", {})
-            known = {
+            self._remember_known_task(normalized)
+            self._set_meta("hlc", {"wallMs": operation["hlcWallMs"],
+                                   "counter": operation["hlcCounter"]})
+            self._capture_iroh_after_mutation_locked()
+        return operation
+
+    def _normalized_task_identity(self, task: dict[str, str]) -> dict[str, str]:
+        core = (
+            self._shared_core
+            if self._shared_core is not None
+            else _default_shared_core()
+        )
+        try:
+            normalized_value = core.dispatch(
+                "task.identity.v1", {"title": task.get("title", "")}
+            )
+        except SharedCoreError as error:
+            raise ValueError(str(error)) from error
+        if not isinstance(normalized_value, dict):
+            raise ValueError("Shared core returned an invalid task identity.")
+        task_id = normalized_value.get("id")
+        title = normalized_value.get("title")
+        utf8_bytes = normalized_value.get("utf8Bytes")
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(title, str)
+            or not title
+            or isinstance(utf8_bytes, bool)
+            or not isinstance(utf8_bytes, int)
+            or utf8_bytes != len(title.encode("utf-8"))
+            or utf8_bytes > 512
+        ):
+            raise ValueError("Shared core returned an invalid task identity.")
+        normalized = {"id": task_id, "title": title}
+        if normalized["id"] != task.get("id"):
+            raise ValueError("Task identity does not match its name.")
+        return normalized
+
+    def _create_task_operation(self, operation_type: str, task: dict[str, str],
+                               now_ms: int, use_server_clock: bool) -> dict[str, Any]:
+        trusted_ms, _sequences, clocks = self._reserve_generation(
+            now_ms, use_server_clock=use_server_clock, use_monotonic=use_server_clock)
+        wall_ms, counter = clocks[0]
+        operation = {"id": self._reserve_uuid7_ids(wall_ms, 1)[0], "taskId": task["id"],
+                     "type": operation_type, "occurredAt": utc_timestamp(trusted_ms),
+                     "hlcWallMs": wall_ms, "hlcCounter": counter}
+        if operation_type == "upsert":
+            operation["title"] = task["title"]
+        return operation
+
+    def _remember_known_task(self, normalized: dict[str, str]) -> None:
+        snapshot = self.get_meta("snapshot", {})
+        known = {
                 item["id"]: item
                 for item in snapshot.get("knownTasks", [])
                 if item.get("id") and item.get("title")
             }
-            known[normalized["id"]] = normalized
-            snapshot["knownTasks"] = sorted(
-                known.values(),
-                key=lambda item: (item["title"].encode(), item["id"].encode()),
-            )
-            self._set_meta("snapshot", snapshot)
-            self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
-            self._capture_iroh_after_mutation_locked()
-        return operation
+        known[normalized["id"]] = normalized
+        snapshot["knownTasks"] = sorted(
+            known.values(), key=lambda item: (item["title"].encode(), item["id"].encode()))
+        self._set_meta("snapshot", snapshot)
 
     def queue_duration_operation(
         self,
@@ -1897,6 +2281,284 @@ class Store:
             self._capture_iroh_after_mutation_locked()
         return operation
 
+    def _project_operation(
+        self,
+        settings: dict[str, Any],
+        *,
+        duration_operation: dict[str, Any] | None = None,
+        auto_start_operation: dict[str, Any] | None = None,
+        selected_task_operation: dict[str, Any] | None = None,
+        command_operation: dict[str, Any] | None = None,
+        task_operation: dict[str, Any] | None = None,
+        now: str | None = None,
+        base: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+        pending_commands: list[dict[str, Any]] | None = None,
+    ) -> ProjectionApplyV2:
+        state = self.load() if state is None else state
+        snapshot = state["snapshot"]
+        projection_base = snapshot if base is None else base
+        pending = self._projection_pending(
+            state, duration_operation, auto_start_operation, selected_task_operation,
+            command_operation, task_operation, pending_commands)
+        prospective = (
+            duration_operation
+            or auto_start_operation
+            or selected_task_operation
+            or command_operation
+            or task_operation
+        )
+        if prospective is None and now is None:
+            raise ValueError(
+                "Shared-core projection requires a prospective operation or projection time."
+            )
+        projection_now = prospective["occurredAt"] if prospective is not None else now
+        projection_input = self._projection_input(
+            projection_base, settings, pending, projection_now)
+        core = (
+            self._shared_core
+            if self._shared_core is not None
+            else _default_shared_core()
+        )
+        try:
+            return apply_projection_v2(core, projection_input)
+        except SharedCoreError as error:
+            raise ValueError(str(error)) from error
+
+    def _with_device_id(self, item: dict[str, Any]) -> dict[str, Any]:
+        projected = dict(item)
+        projected.setdefault("deviceId", self.device_id)
+        return projected
+
+    def _projection_pending(self, state: dict[str, Any], duration: dict[str, Any] | None,
+                            auto_start: dict[str, Any] | None, selected_task: dict[str, Any] | None,
+                            command: dict[str, Any] | None, task: dict[str, Any] | None,
+                            commands: list[dict[str, Any]] | None) -> dict[str, list[dict[str, Any]]]:
+        durations = [self._with_device_id(item) for item in state["pendingDurations"]
+                     if duration is None or item.get("phase") != duration["phase"]]
+        sources = {"commands": state["pending"] if commands is None else commands,
+                   "taskOperations": state["pendingTasks"],
+                   "autoStartOperations": state["pendingAutoStarts"],
+                   "selectedTaskOperations": state["pendingSelectedTasks"]}
+        pending = {key: [self._with_device_id(item) for item in value]
+                   for key, value in sources.items()}
+        pending["durationOperations"] = durations
+        for key, operation in (("durationOperations", duration), ("autoStartOperations", auto_start),
+                               ("selectedTaskOperations", selected_task), ("commands", command),
+                               ("taskOperations", task)):
+            if operation is not None:
+                pending[key].append(self._with_device_id(operation))
+        return pending
+
+    @staticmethod
+    def _projection_input(base: dict[str, Any], settings: dict[str, Any],
+                          pending: dict[str, list[dict[str, Any]]], now: str | None
+                          ) -> dict[str, Any]:
+        history = base.get("history", [])
+        timer = base.get("canonicalTimer")
+        if isinstance(timer, dict) and any(
+                isinstance(item, dict) and item.get("timerId") == timer.get("id")
+                for item in history):
+            timer = None
+        return {"base": {"canonicalTimer": timer, "history": history,
+                         "tasks": base.get("tasks", []), "durationsMs": settings["durationsMs"],
+                         "autoStartBreaks": bool(base.get("autoStartBreaks", False)),
+                         "selectedTaskId": base.get("selectedTaskId")},
+                "pending": pending, "now": now}
+
+    def projected_state(
+        self,
+        *,
+        now_ms: int | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> ProjectionApplyV2:
+        """Return fail-closed synchronized state from production SharedCore."""
+        state = self.load(projection=True) if state is None else state
+        projection_base = state.get("projectionSnapshot", state["snapshot"])
+        pending_commands = state.get("projectionPending", state["pending"])
+        projection_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        return self._project_operation(
+            self._normalize_settings(state["settings"]),
+            now=utc_timestamp(projection_now_ms),
+            base=projection_base,
+            state=state,
+            pending_commands=pending_commands,
+        )
+
+    def projected_settings(
+        self,
+        state: dict[str, Any],
+        projection: ProjectionApplyV2,
+    ) -> dict[str, Any]:
+        settings = self._normalize_settings(state["settings"])
+        settings["durationsMs"] = dict(projection.durations_ms)
+        settings["durations"] = {
+            phase: self._display_minutes(duration_ms)
+            for phase, duration_ms in projection.durations_ms.items()
+        }
+        settings["autoStartBreaks"] = projection.auto_start_breaks
+        settings["selectedTaskId"] = projection.selected_task_id
+        return settings
+
+    @staticmethod
+    def projected_history(
+        projection: ProjectionApplyV2,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Annotate core history with local-only pending-sync presentation state."""
+        pending_timer_ids = {
+            command.get("timerId")
+            for command in state["pending"]
+            if isinstance(command.get("timerId"), str)
+        }
+        return [
+            {**item, "pending": True}
+            if item.get("timerId") in pending_timer_ids
+            else item
+            for item in projection.history
+        ]
+
+    def _validated_projection_state(
+        self,
+        projection: dict[str, Any],
+        *,
+        context: str,
+    ) -> tuple[
+        dict[str, Any] | None,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, int],
+        bool,
+        str | None,
+    ]:
+        timer = projection.get("canonicalTimer")
+        history = projection.get("history")
+        tasks = projection.get("tasks")
+        durations = projection.get("durationsMs")
+        auto_start = projection.get("autoStartBreaks")
+        selected_task_id = projection.get("selectedTaskId")
+        if timer is not None and not isinstance(timer, dict):
+            raise ValueError(
+                f"Shared core returned an invalid {context} timer projection."
+            )
+        history = self._validated_projection_items(
+            history, f"Shared core returned an invalid {context} history projection."
+        )
+        tasks = self._validated_projection_items(
+            tasks, f"Shared core returned an invalid {context} task projection."
+        )
+        canonical_durations = self._canonical_durations(durations)
+        if not isinstance(auto_start, bool):
+            raise ValueError(
+                f"Shared core returned an invalid {context} auto-start projection."
+            )
+        if selected_task_id is not None and not isinstance(selected_task_id, str):
+            raise ValueError(
+                f"Shared core returned an invalid {context} selection projection."
+            )
+        if selected_task_id is not None and not any(
+            task.get("id") == selected_task_id for task in tasks
+        ):
+            raise ValueError(f"Shared core selected an unavailable {context} task.")
+        return (
+            timer,
+            history,
+            tasks,
+            canonical_durations,
+            auto_start,
+            selected_task_id,
+        )
+
+    @staticmethod
+    def _validated_projection_items(value: Any, error: str) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or not all(
+            isinstance(item, dict) for item in value
+        ):
+            raise ValueError(error)
+        return value
+
+    def _project_duration_operation(
+        self,
+        operation: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> dict[str, int]:
+        value = self._project_operation(settings, duration_operation=operation)
+        durations = value.durations_ms
+        duration_winners = value.winning_operation_ids.durations
+        if (
+            duration_winners.get(operation["phase"]) != operation["id"]
+            or durations[operation["phase"]] != operation["durationMs"]
+        ):
+            raise ValueError("Shared core returned an invalid duration projection.")
+        return durations
+
+    def _project_auto_start_operation(
+        self,
+        operation: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> bool:
+        value = self._project_operation(settings, auto_start_operation=operation)
+        enabled = value.auto_start_breaks
+        winner = value.winning_operation_ids.auto_start
+        if (
+            not isinstance(enabled, bool)
+            or enabled != operation["enabled"]
+            or winner != operation["id"]
+        ):
+            raise ValueError("Shared core returned an invalid auto-start projection.")
+        return enabled
+
+    def _project_selected_task_operation(
+        self,
+        operation: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> str | None:
+        value = self._project_operation(settings, selected_task_operation=operation)
+        selected_task_id = value.selected_task_id
+        winner = value.winning_operation_ids.selected_task
+        if selected_task_id != operation["taskId"] or winner != operation["id"]:
+            raise ValueError(
+                "Shared core returned an invalid selected-task projection."
+            )
+        return selected_task_id
+
+    def _project_timer_command(
+        self,
+        command: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> None:
+        value = self._project_operation(settings, command_operation=command)
+        outcome = value.timer_outcomes.get(command["id"])
+        if outcome is None or outcome["outcome"] != "applied":
+            raise ValueError("Shared core rejected the timer command projection.")
+
+    def _project_task_operation(
+        self,
+        operation: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> None:
+        value = self._project_operation(settings, task_operation=operation)
+        tasks = value.tasks
+        task_winners = value.winning_operation_ids.tasks
+        projected = next(
+            (
+                item
+                for item in tasks
+                if isinstance(item, dict) and item.get("id") == operation["taskId"]
+            ),
+            None,
+        )
+        expected = (
+            {"id": operation["taskId"], "title": operation["title"]}
+            if operation["type"] == "upsert"
+            else None
+        )
+        if (
+            task_winners.get(operation["taskId"]) != operation["id"]
+            or projected != expected
+        ):
+            raise ValueError("Shared core returned an invalid task projection.")
+
     def _queue_duration_operation(
         self,
         phase: str,
@@ -1905,6 +2567,16 @@ class Store:
         now_ms: int,
         bootstrap: bool = False,
         use_server_clock: bool = False,
+    ) -> dict[str, Any]:
+        operation = self._new_duration_operation(
+            phase, duration_ms, now_ms, bootstrap, use_server_clock
+        )
+        self._persist_duration_operation(operation, settings, bootstrap)
+        return operation
+
+    def _new_duration_operation(
+        self, phase: str, duration_ms: int, now_ms: int,
+        bootstrap: bool, use_server_clock: bool,
     ) -> dict[str, Any]:
         duration_ms = self._duration_ms(duration_ms)
         if bootstrap:
@@ -1929,22 +2601,36 @@ class Store:
             "hlcWallMs": wall_ms,
             "hlcCounter": counter,
         }
+        return operation
+
+    def _persist_duration_operation(
+        self, operation: dict[str, Any], settings: dict[str, Any], bootstrap: bool
+    ) -> None:
+        projected_durations = self._project_duration_operation(operation, settings)
         self.connection.execute(
             "INSERT INTO pending_duration_operations(id, phase, payload) "
             "VALUES (?, ?, ?) ON CONFLICT(phase) DO UPDATE SET "
             "id = excluded.id, payload = excluded.payload",
             (
                 operation["id"],
-                phase,
+                operation["phase"],
                 json.dumps(operation, separators=(",", ":")),
             ),
         )
-        settings["durationsMs"][phase] = duration_ms
-        settings["durations"][phase] = self._display_minutes(duration_ms)
+        settings["durationsMs"] = projected_durations
+        settings["durations"] = {
+            item_phase: self._display_minutes(item_duration)
+            for item_phase, item_duration in projected_durations.items()
+        }
         self._set_meta("settings", settings)
         if not bootstrap:
-            self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
-        return operation
+            self._set_meta(
+                "hlc",
+                {
+                    "wallMs": operation["hlcWallMs"],
+                    "counter": operation["hlcCounter"],
+                },
+            )
 
     def _queue_auto_start_operation(
         self,
@@ -1976,11 +2662,12 @@ class Store:
             "hlcWallMs": wall_ms,
             "hlcCounter": counter,
         }
+        projected_enabled = self._project_auto_start_operation(operation, settings)
         self.connection.execute(
             "INSERT INTO pending_auto_start_operations(id, payload) VALUES (?, ?)",
             (operation["id"], json.dumps(operation, separators=(",", ":"))),
         )
-        settings["autoStartBreaks"] = enabled
+        settings["autoStartBreaks"] = projected_enabled
         self._set_meta("settings", settings)
         if not bootstrap:
             self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
@@ -2016,2758 +2703,22 @@ class Store:
             "hlcWallMs": wall_ms,
             "hlcCounter": counter,
         }
+        projected_task_id = self._project_selected_task_operation(operation, settings)
         self.connection.execute(
             "INSERT INTO pending_selected_task_operations(id, payload) VALUES (?, ?)",
             (operation["id"], json.dumps(operation, separators=(",", ":"))),
         )
-        settings["selectedTaskId"] = task_id
+        settings["selectedTaskId"] = projected_task_id
         self._set_meta("settings", settings)
         if not bootstrap:
             self._set_meta("hlc", {"wallMs": wall_ms, "counter": counter})
         return operation
-
-    @staticmethod
-    def _wire_preference_operations(
-        operations: Any, error_message: str
-    ) -> list[dict[str, Any]]:
-        if not isinstance(operations, list) or any(
-            not isinstance(operation, dict) for operation in operations
-        ):
-            raise ValueError(error_message)
-        outbound = []
-        for operation in operations:
-            item = dict(operation)
-            item.pop("deviceId", None)
-            outbound.append(item)
-        return outbound
-
-    def _replace_meta_inside_or_outside_transaction(
-        self, key: str, value: Any
-    ) -> None:
-        if self.connection.in_transaction:
-            self._set_meta(key, value)
-        else:
-            self.set_meta(key, value)
-
-    def sync_payload(self) -> dict[str, Any]:
-        with self._immediate_transaction():
-            self._ensure_no_pending_resolution()
-            claimed = self.pending_sync()
-            if claimed is not None:
-                return claimed
-            pending = self._preflight_pending_queues()
-            snapshot = self.get_meta("snapshot", {})
-            revision = self._bounded_integer(
-                snapshot.get("revision", 0), "Persisted revision"
-            )
-            payload = {
-                "deviceId": self.device_id,
-                "lastRevision": revision,
-                "commands": pending["sendableCommands"][:256],
-                "taskOperations": pending["taskOperations"][:256],
-                "durationOperations": pending["durationOperations"][:256],
-                "autoStartOperations": self._wire_preference_operations(
-                    pending["autoStartOperations"][:256],
-                    "Pending auto-start operation is corrupted.",
-                ),
-                "selectedTaskOperations": self._wire_preference_operations(
-                    pending["selectedTaskOperations"][:256],
-                    "Pending selected-task operation is corrupted.",
-                ),
-            }
-            self._set_meta("pendingSync", payload)
-        return payload
-
-    def pending_sync(self) -> dict[str, Any] | None:
-        pending = self.get_meta("pendingSync")
-        if pending is None:
-            return None
-        current_keys = {
-            "deviceId",
-            "lastRevision",
-            "commands",
-            "taskOperations",
-            "durationOperations",
-            "autoStartOperations",
-            "selectedTaskOperations",
-        }
-        legacy_keys = current_keys - {"selectedTaskOperations"}
-        original = deepcopy(pending)
-        if isinstance(pending, dict) and set(pending) == legacy_keys:
-            pending = {**pending, "selectedTaskOperations": []}
-        if (
-            not isinstance(pending, dict)
-            or set(pending) != current_keys
-            or pending.get("deviceId") != self.device_id
-            or any(
-                not isinstance(pending.get(key), list)
-                for key in (
-                    "commands",
-                    "taskOperations",
-                    "durationOperations",
-                    "autoStartOperations",
-                    "selectedTaskOperations",
-                )
-            )
-        ):
-            raise ValueError("Pending normal sync claim is corrupted.")
-        self._bounded_integer(
-            pending.get("lastRevision"), "Pending normal sync revision"
-        )
-        pending = {
-            **pending,
-            "autoStartOperations": self._wire_preference_operations(
-                pending["autoStartOperations"],
-                "Pending normal sync claim is corrupted.",
-            ),
-            "selectedTaskOperations": self._wire_preference_operations(
-                pending["selectedTaskOperations"],
-                "Pending normal sync claim is corrupted.",
-            ),
-        }
-        if pending != original:
-            self._replace_meta_inside_or_outside_transaction("pendingSync", pending)
-        return pending
-
-    def has_sendable_sync_operations(self) -> bool:
-        with self._immediate_transaction():
-            self._ensure_no_pending_resolution()
-            pending = self._preflight_pending_queues()
-            return any(
-                pending[key]
-                for key in (
-                    "sendableCommands",
-                    "taskOperations",
-                    "durationOperations",
-                    "autoStartOperations",
-                    "selectedTaskOperations",
-                )
-            )
-
-    def pending_resolution(self, user_id: str | None = None) -> dict[str, Any] | None:
-        try:
-            pending = self.get_meta("pendingResolution")
-        except (TypeError, json.JSONDecodeError) as error:
-            raise ValueError("Pending account history is corrupted.") from error
-        if pending is None:
-            return None
-        if not isinstance(pending, dict):
-            raise ValueError("Pending account history is corrupted.")
-        owner = pending.get("owner")
-        request = pending.get("request")
-        queue_ids = pending.get("queueIds")
-        if (
-            not isinstance(owner, dict)
-            or not isinstance(request, dict)
-            or not isinstance(queue_ids, dict)
-            or set(queue_ids)
-            not in (
-                {"commands", "taskOperations", "durationOperations"},
-                {
-                    "commands",
-                    "taskOperations",
-                    "durationOperations",
-                    "autoStartOperations",
-                },
-                {
-                    "commands",
-                    "taskOperations",
-                    "durationOperations",
-                    "autoStartOperations",
-                    "selectedTaskOperations",
-                },
-            )
-            or any(
-                not isinstance(ids, list)
-                or any(not isinstance(item_id, str) for item_id in ids)
-                or len(ids) != len(set(ids))
-                for ids in queue_ids.values()
-            )
-            or not isinstance(owner.get("id"), str)
-            or not owner["id"]
-            or not isinstance(request.get("requestId"), str)
-            or not request["requestId"]
-            or request.get("deviceId") != self.device_id
-            or request.get("strategy")
-            not in {"keep_remote", "replace_remote", "merge"}
-        ):
-            raise ValueError("Pending account history is corrupted.")
-        normalized_request = dict(request)
-        for key in ("autoStartOperations", "selectedTaskOperations"):
-            if key in normalized_request:
-                normalized_request[key] = self._wire_preference_operations(
-                    normalized_request[key],
-                    "Pending account history is corrupted.",
-                )
-        if normalized_request != request:
-            pending = {**pending, "request": normalized_request}
-            self._replace_meta_inside_or_outside_transaction(
-                "pendingResolution", pending
-            )
-        if user_id is not None and owner.get("id") != user_id:
-            return None
-        return pending
-
-    def clear_pending_resolution(self) -> None:
-        self.set_meta("pendingResolution", None)
-
-    def _ensure_no_pending_resolution(self) -> None:
-        if self.pending_resolution() is not None:
-            raise ValueError("Resolve pending account history before making changes.")
-
-    def discard_pending_resolution(self, user_id: str, request_id: str) -> bool:
-        with self._immediate_transaction():
-            pending = self.pending_resolution(user_id)
-            if (
-                pending is None
-                or pending["request"].get("requestId") != request_id
-            ):
-                return False
-            self._set_meta("pendingResolution", None)
-        return True
-
-    def bootstrap_resolution_plan(
-        self,
-        response: dict[str, Any],
-        *,
-        request_physical_ms: int | None = None,
-        received_physical_ms: int | None = None,
-        request_monotonic_ms: int | None = None,
-        received_monotonic_ms: int | None = None,
-    ) -> dict[str, Any]:
-        canonical = self._validated_sync_response(
-            response,
-            {
-                "commands": [],
-                "taskOperations": [],
-                "durationOperations": [],
-                "autoStartOperations": [],
-                "selectedTaskOperations": [],
-            },
-        )
-        with self._immediate_transaction():
-            self._preflight_pending_queues()
-            sample, anchor = self._clock_sample_for_response(
-                canonical["serverTimeMs"],
-                request_physical_ms,
-                received_physical_ms,
-                request_monotonic_ms,
-                received_monotonic_ms,
-            )
-            state = self.load()
-            if sample is not None:
-                self._set_meta("serverClockSample", sample)
-        if anchor is not None:
-            self._set_trusted_time_anchor(anchor)
-        local_timer, local_history = rebuild_optimistic(
-            state["snapshot"].get("canonicalTimer"),
-            state["snapshot"].get("history", []),
-            state["pending"],
-        )
-        local_history_exists = any(
-            item.get("status") == "completed" for item in local_history
-        )
-        remote_history_exists = any(
-            item.get("status") == "completed" for item in canonical["history"]
-        )
-        local_state_exists = bool(
-            state["pending"]
-            or state["pendingTasks"]
-            or state["pendingDurations"]
-            or state["pendingAutoStarts"]
-            or state["pendingSelectedTasks"]
-            or state["snapshot"].get("canonicalTimer")
-            or state["snapshot"].get("history")
-            or state["snapshot"].get("tasks")
-            or state["snapshot"].get("selectedTaskId") is not None
-            or state["settings"].get("selectedTaskId") is not None
-            or state["settings"].get("autoStartBreaks")
-            or any(
-                state["settings"].get("durationsMs", {}).get(phase)
-                != definition["default_minutes"] * 60_000
-                for phase, definition in PHASES.items()
-            )
-        )
-        remote_state_exists = bool(
-            canonical["canonicalTimer"]
-            or canonical["history"]
-            or canonical["tasks"]
-            or canonical["selectedTaskId"] is not None
-            or canonical["autoStartBreaks"]
-            or any(
-                canonical["durationsMs"].get(phase)
-                != definition["default_minutes"] * 60_000
-                for phase, definition in PHASES.items()
-            )
-        )
-        local_state_exists = local_state_exists or local_timer is not None
-        if (
-            local_history_exists and remote_state_exists
-        ) or (
-            remote_history_exists and local_state_exists
-        ):
-            strategy = None
-        elif local_history_exists:
-            strategy = "replace_remote"
-        elif remote_history_exists:
-            strategy = "keep_remote"
-        elif local_state_exists:
-            strategy = "merge"
-        else:
-            strategy = "keep_remote"
-        return {
-            "expectedRevision": canonical["revision"],
-            "localHistory": local_history_exists,
-            "remoteHistory": remote_history_exists,
-            "strategy": strategy,
-        }
-
-    def prepare_resolution(
-        self,
-        user: dict[str, Any],
-        expected_revision: int,
-        strategy: str,
-    ) -> dict[str, Any]:
-        if strategy not in {"keep_remote", "replace_remote", "merge"}:
-            raise ValueError("Unsupported history resolution strategy.")
-        if (
-            isinstance(expected_revision, bool)
-            or not isinstance(expected_revision, int)
-            or not 0 <= expected_revision <= MAX_SAFE_INTEGER
-        ):
-            raise ValueError("Bootstrap returned an invalid revision.")
-        user_id = user.get("id") if isinstance(user, dict) else None
-        if not isinstance(user_id, str) or not user_id:
-            raise ValueError("Signed-in user has no stable identity.")
-
-        with self._immediate_transaction():
-            pending = self.pending_resolution()
-            if pending is not None:
-                if pending["owner"].get("id") != user_id:
-                    raise ValueError(
-                        "Pending account history belongs to another account."
-                    )
-                return pending["request"]
-            if self.pending_sync() is not None:
-                raise ValueError(
-                    "Finish pending normal sync before resolving account history."
-                )
-            validated_pending = self._preflight_pending_queues()
-            state = self.load(projection=True)
-            operations = state if strategy != "keep_remote" else None
-            sendable_commands = validated_pending["sendableCommands"]
-            outbound = {
-                "commands": sendable_commands if operations else [],
-                "taskOperations": (
-                    validated_pending["taskOperations"] if operations else []
-                ),
-                "durationOperations": (
-                    validated_pending["durationOperations"] if operations else []
-                ),
-                "autoStartOperations": (
-                    self._wire_preference_operations(
-                        validated_pending["autoStartOperations"],
-                        "Pending auto-start operation is corrupted.",
-                    )
-                    if operations
-                    else []
-                ),
-                "selectedTaskOperations": (
-                    self._wire_preference_operations(
-                        validated_pending["selectedTaskOperations"],
-                        "Pending selected-task operation is corrupted.",
-                    )
-                    if operations
-                    else []
-                ),
-            }
-            if (
-                strategy == "replace_remote"
-                and self.get_meta("autoStartLegacyDefaultUnknown", False)
-                and not state["pendingAutoStarts"]
-            ):
-                outbound.pop("autoStartOperations")
-            labels = {
-                "commands": "timer commands",
-                "taskOperations": "task operations",
-                "durationOperations": "duration operations",
-                "autoStartOperations": "auto-start operations",
-                "selectedTaskOperations": "selected-task operations",
-            }
-            for key, items in outbound.items():
-                if len(items) > RESOLUTION_OPERATION_MAX:
-                    raise ValueError(
-                        f"History resolution supports at most "
-                        f"{RESOLUTION_OPERATION_MAX} {labels[key]}."
-                    )
-            request = {
-                "requestId": str(uuid.uuid4()),
-                "deviceId": self.device_id,
-                "expectedRevision": expected_revision,
-                "strategy": strategy,
-                **outbound,
-            }
-            queue_ids = {
-                "commands": [
-                    item["id"]
-                    for item in (
-                        validated_pending["commands"]
-                        if strategy == "keep_remote"
-                        else sendable_commands
-                    )
-                ],
-                "taskOperations": [
-                    item["id"] for item in validated_pending["taskOperations"]
-                ],
-                "durationOperations": [
-                    item["id"] for item in validated_pending["durationOperations"]
-                ],
-                "autoStartOperations": [
-                    item["id"] for item in validated_pending["autoStartOperations"]
-                ],
-                "selectedTaskOperations": [
-                    item["id"] for item in validated_pending["selectedTaskOperations"]
-                ],
-            }
-            self._set_meta(
-                "pendingResolution",
-                {"owner": user, "request": request, "queueIds": queue_ids},
-            )
-        return request
-
-    @staticmethod
-    def _validate_acknowledgements(
-        request_items: Any,
-        response_items: Any,
-        acknowledgement_id_key: str,
-        label: str,
-    ) -> list[dict[str, Any]]:
-        if not isinstance(request_items, list) or not isinstance(response_items, list):
-            raise ValueError(f"Sync returned invalid {label} acknowledgements.")
-        sent_ids = [
-            item.get("id") if isinstance(item, dict) else None
-            for item in request_items
-        ]
-        acknowledged_ids: list[str] = []
-        normalized_response_items: list[dict[str, Any]] = []
-        for acknowledgement in response_items:
-            if not isinstance(acknowledgement, dict):
-                raise ValueError(f"Sync returned invalid {label} acknowledgements.")
-            normalized_acknowledgement = {
-                **acknowledgement,
-                "reason": acknowledgement.get("reason", ""),
-            }
-            if (
-                not isinstance(normalized_acknowledgement.get(acknowledgement_id_key), str)
-                or normalized_acknowledgement.get("outcome") not in ACKNOWLEDGEMENT_OUTCOMES
-                or not isinstance(normalized_acknowledgement["reason"], str)
-            ):
-                raise ValueError(f"Sync returned invalid {label} acknowledgements.")
-            acknowledged_ids.append(normalized_acknowledgement[acknowledgement_id_key])
-            normalized_response_items.append(normalized_acknowledgement)
-        if (
-            any(not isinstance(item_id, str) for item_id in sent_ids)
-            or len(sent_ids) != len(set(sent_ids))
-            or len(acknowledged_ids) != len(set(acknowledged_ids))
-            or set(acknowledged_ids) != set(sent_ids)
-        ):
-            raise ValueError(
-                f"Sync returned an invalid {label} acknowledgement set."
-            )
-        return normalized_response_items
-
-    def _validated_sync_response(
-        self,
-        response: dict[str, Any],
-        request: dict[str, Any],
-    ) -> dict[str, Any]:
-        if not isinstance(response, dict):
-            raise ValueError("Server returned an invalid sync response.")
-        required = {
-            "acknowledgements",
-            "taskAcknowledgements",
-            "durationAcknowledgements",
-            "autoStartAcknowledgements",
-            "selectedTaskAcknowledgements",
-            "revision",
-            "canonicalTimer",
-            "history",
-            "tasks",
-            "durationsMs",
-            "autoStartBreaks",
-            "selectedTaskId",
-            "serverTime",
-            "serverHlcWallMs",
-            "serverHlcCounter",
-        }
-        missing = required - set(response)
-        if missing:
-            raise ValueError(
-                "Server response omitted canonical fields: "
-                + ", ".join(sorted(missing))
-                + "."
-            )
-        acknowledgements = self._validate_acknowledgements(
-            request.get("commands"), response["acknowledgements"],
-            "commandId",
-            "command",
-        )
-        task_acknowledgements = self._validate_acknowledgements(
-            request.get("taskOperations"), response["taskAcknowledgements"],
-            "operationId",
-            "task",
-        )
-        duration_acknowledgements = self._validate_acknowledgements(
-            request.get("durationOperations"), response["durationAcknowledgements"],
-            "operationId",
-            "duration",
-        )
-        auto_start_acknowledgements = self._validate_acknowledgements(
-            request.get("autoStartOperations", []),
-            response["autoStartAcknowledgements"],
-            "operationId",
-            "auto-start",
-        )
-        selected_task_operations = request.get("selectedTaskOperations", [])
-        selected_task_acknowledgements = self._validate_acknowledgements(
-            selected_task_operations,
-            response["selectedTaskAcknowledgements"],
-            "operationId",
-            "selected-task",
-        )
-        canonical_durations = self._canonical_durations(response["durationsMs"])
-        auto_start_breaks = response["autoStartBreaks"]
-        if not isinstance(auto_start_breaks, bool):
-            raise ValueError("Server returned an invalid auto-start preference.")
-        revision = response["revision"]
-        if (
-            isinstance(revision, bool)
-            or not isinstance(revision, int)
-            or not 0 <= revision <= MAX_SAFE_INTEGER
-        ):
-            raise ValueError("Server returned an invalid revision.")
-        history = response["history"]
-        if not isinstance(history, list):
-            raise ValueError("Server returned invalid timer history.")
-        history_ids: list[str] = []
-        for item in history:
-            if not self._valid_history_item(item):
-                raise ValueError("Server returned invalid timer history.")
-            history_ids.append(item["id"])
-        if len(history_ids) != len(set(history_ids)):
-            raise ValueError("Server returned duplicate timer history.")
-        tasks = response["tasks"]
-        if not isinstance(tasks, list):
-            raise ValueError("Server returned invalid tasks.")
-        task_ids: list[str] = []
-        for task in tasks:
-            if not isinstance(task, dict):
-                raise ValueError("Server returned invalid tasks.")
-            task_id = task.get("id")
-            title = task.get("title")
-            try:
-                normalized = task_from_title(title) if isinstance(title, str) else None
-            except ValueError:
-                normalized = None
-            if normalized is None or normalized["id"] != task_id:
-                raise ValueError("Server returned invalid tasks.")
-            task_ids.append(task_id)
-        if len(task_ids) != len(set(task_ids)):
-            raise ValueError("Server returned duplicate tasks.")
-        selected_task_id = response["selectedTaskId"]
-        if (
-            selected_task_id is not None
-            and (
-                not isinstance(selected_task_id, str)
-                or not selected_task_id
-                or selected_task_id not in task_ids
-            )
-        ):
-            raise ValueError("Server returned an invalid selected-task preference.")
-        canonical_timer = response["canonicalTimer"]
-        if canonical_timer is not None and not self._valid_canonical_timer(
-            canonical_timer
-        ):
-            raise ValueError("Server returned an invalid canonical timer.")
-        server_hlc_wall_ms = response["serverHlcWallMs"]
-        server_hlc_counter = response["serverHlcCounter"]
-        server_time = response["serverTime"]
-        try:
-            server_clock = self._logical_clock(
-                {"wallMs": server_hlc_wall_ms, "counter": server_hlc_counter}
-            )
-            server_time_ms = (
-                parse_timestamp_ms(server_time)
-                if isinstance(server_time, str)
-                else None
-            )
-            if server_time_ms is None:
-                raise ValueError
-            self._physical_time_ms(server_time_ms)
-            if (
-                server_clock[0] < server_time_ms
-                or server_clock[0] - server_time_ms > MAX_CLOCK_SKEW_MS
-            ):
-                raise ValueError
-        except ValueError:
-            raise ValueError("Server returned an invalid logical clock.")
-        return {
-            "acknowledgements": acknowledgements,
-            "taskAcknowledgements": task_acknowledgements,
-            "durationAcknowledgements": duration_acknowledgements,
-            "autoStartAcknowledgements": auto_start_acknowledgements,
-            "selectedTaskAcknowledgements": selected_task_acknowledgements,
-            "revision": revision,
-            "canonicalTimer": canonical_timer,
-            "history": history,
-            "tasks": tasks,
-            "durationsMs": canonical_durations,
-            "autoStartBreaks": auto_start_breaks,
-            "selectedTaskId": selected_task_id,
-            "serverTime": server_time,
-            "serverTimeMs": server_time_ms,
-            "serverHlcWallMs": server_hlc_wall_ms,
-            "serverHlcCounter": server_hlc_counter,
-        }
-
-    @classmethod
-    def _valid_canonical_timer(cls, timer: Any) -> bool:
-        if not isinstance(timer, dict):
-            return False
-        required = {
-            "id",
-            "phase",
-            "status",
-            "plannedDurationMs",
-            "elapsedAtAnchorMs",
-            "anchorAt",
-        }
-        if required - set(timer):
-            return False
-        try:
-            planned_ms = cls._duration_ms(
-                timer["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS
-            )
-        except ValueError:
-            return False
-        elapsed = timer["elapsedAtAnchorMs"]
-        if (
-            not isinstance(timer["id"], str)
-            or not timer["id"]
-            or timer["phase"] not in PHASES
-            or timer["status"]
-            not in {"running", "paused", "completed", "cancelled", "superseded"}
-            or isinstance(elapsed, bool)
-            or not isinstance(elapsed, int)
-            or not 0 <= elapsed <= planned_ms
-            or not isinstance(timer["anchorAt"], str)
-            or parse_timestamp_ms(timer["anchorAt"]) is None
-            or not isinstance(timer.get("taskId"), (str, type(None)))
-            or isinstance(timer.get("taskId"), str)
-            and not timer["taskId"]
-        ):
-            return False
-        intent = timer.get("lastIntent")
-        return intent is None or (
-            isinstance(intent, dict)
-            and intent.get("type")
-            in {"start", "pause", "resume", "finish", "cancel", "clear"}
-            and isinstance(intent.get("commandId"), str)
-            and bool(intent["commandId"])
-            and isinstance(intent.get("occurredAt"), str)
-            and parse_timestamp_ms(intent["occurredAt"]) is not None
-        )
-
-    @classmethod
-    def _valid_history_item(cls, item: Any) -> bool:
-        if not isinstance(item, dict):
-            return False
-        required = {"id", "timerId", "phase", "status", "plannedDurationMs"}
-        if required - set(item):
-            return False
-        try:
-            cls._duration_ms(
-                item["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS
-            )
-        except ValueError:
-            return False
-        for timestamp_key in ("completedAt", "endedAt"):
-            timestamp = item.get(timestamp_key)
-            if timestamp is not None and (
-                not isinstance(timestamp, str)
-                or parse_timestamp_ms(timestamp) is None
-            ):
-                return False
-        return (
-            isinstance(item["id"], str)
-            and bool(item["id"])
-            and isinstance(item["timerId"], str)
-            and bool(item["timerId"])
-            and item["phase"] in PHASES
-            and item["status"] in {"completed", "cancelled", "superseded"}
-            and isinstance(item.get("commandId"), (str, type(None)))
-            and (item.get("commandId") is None or bool(item["commandId"]))
-            and isinstance(item.get("taskId"), (str, type(None)))
-            and (item.get("taskId") is None or bool(item["taskId"]))
-            and isinstance(item.get("pending", False), bool)
-        )
-
-    def _drop_auto_break_start(self, source_finish_command_id: str) -> None:
-        dependency = self.connection.execute(
-            "SELECT start_command_id, selected_phase_version "
-            "FROM pending_auto_break_starts WHERE source_finish_command_id = ?",
-            (source_finish_command_id,),
-        ).fetchone()
-        provisional_phase = None
-        if dependency is not None:
-            start_row = self.connection.execute(
-                "SELECT payload FROM pending_commands WHERE id = ?",
-                (dependency["start_command_id"],),
-            ).fetchone()
-            if start_row is not None:
-                try:
-                    command = json.loads(start_row["payload"])
-                    if command.get("type") == "start":
-                        provisional_phase = command.get("phase")
-                except (TypeError, json.JSONDecodeError):
-                    pass
-        self.connection.execute(
-            "DELETE FROM pending_commands WHERE depends_on_command_id = ?",
-            (source_finish_command_id,),
-        )
-        self.connection.execute(
-            "DELETE FROM pending_auto_break_starts "
-            "WHERE source_finish_command_id = ?",
-            (source_finish_command_id,),
-        )
-        self.connection.execute(
-            "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
-            (source_finish_command_id,),
-        )
-        if provisional_phase in PHASES and dependency is not None:
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            if (
-                settings["selectedPhase"] == provisional_phase
-                and int(self.get_meta("selectedPhaseVersion", 0))
-                == int(dependency["selected_phase_version"])
-            ):
-                settings["selectedPhase"] = "focus"
-                self._set_meta("settings", settings)
-
-    def _transform_auto_break_chain(
-        self,
-        source_finish_command_id: str,
-        start_command_id: str,
-        phase: str,
-        duration_ms: int,
-    ) -> str | None:
-        rows = self.connection.execute(
-            "SELECT id, device_sequence, payload FROM pending_commands "
-            "WHERE depends_on_command_id = ? ORDER BY device_sequence",
-            (source_finish_command_id,),
-        ).fetchall()
-        provisional_phase: str | None = None
-        generated_timer_id: str | None = None
-        allowed_followups = {"pause", "resume", "finish", "cancel", "clear"}
-        parsed_commands: list[dict[str, Any] | None] = []
-        for row in rows:
-            try:
-                parsed = json.loads(row["payload"])
-            except (TypeError, json.JSONDecodeError):
-                parsed = None
-            parsed_commands.append(parsed if isinstance(parsed, dict) else None)
-        start_command = next(
-            (
-                command
-                for row, command in zip(rows, parsed_commands, strict=True)
-                if row["id"] == start_command_id
-            ),
-            None,
-        )
-        preserves_completed_break = (
-            start_command is not None
-            and start_command.get("type") == "start"
-            and any(
-                command is not None
-                and command.get("type") == "finish"
-                and command.get("timerId") == start_command.get("timerId")
-                for command in parsed_commands
-            )
-        )
-        corrected_phase = (
-            str(start_command["phase"])
-            if preserves_completed_break
-            else phase
-        )
-        corrected_duration_ms = (
-            int(start_command["plannedDurationMs"])
-            if preserves_completed_break
-            else duration_ms
-        )
-        for row, command in zip(rows, parsed_commands, strict=True):
-            is_generated_start = row["id"] == start_command_id
-            valid = isinstance(command, dict)
-            if is_generated_start:
-                valid = valid and command.get("type") == "start"
-                if valid:
-                    provisional_phase = str(command["phase"])
-                    generated_timer_id = str(command["timerId"])
-            else:
-                valid = (
-                    valid
-                    and generated_timer_id is not None
-                    and command.get("type") in allowed_followups
-                    and command.get("timerId") == generated_timer_id
-                )
-            if not valid:
-                if is_generated_start:
-                    return None
-                self.connection.execute(
-                    "DELETE FROM pending_commands "
-                    "WHERE depends_on_command_id = ? AND device_sequence >= ?",
-                    (source_finish_command_id, int(row["device_sequence"])),
-                )
-                break
-            command["phase"] = corrected_phase
-            command["plannedDurationMs"] = corrected_duration_ms
-            if "observedElapsedMs" in command:
-                command["observedElapsedMs"] = min(
-                    corrected_duration_ms,
-                    max(0, int(command.get("observedElapsedMs", 0))),
-                )
-            self.connection.execute(
-                "UPDATE pending_commands SET payload = ? WHERE id = ?",
-                (json.dumps(command, separators=(",", ":")), row["id"]),
-            )
-        return provisional_phase
-
-    def _resolve_auto_break_dependencies(self, canonical: dict[str, Any]) -> None:
-        acknowledgements = {
-            acknowledgement["commandId"]: acknowledgement
-            for acknowledgement in canonical["acknowledgements"]
-        }
-        if not acknowledgements:
-            return
-        dependencies = {
-            str(row["source_finish_command_id"]): row
-            for row in self.connection.execute(
-                "SELECT source_finish_command_id, source_timer_id, start_command_id, "
-                "selected_phase_version "
-                "FROM pending_auto_break_starts"
-            )
-        }
-        triggers = {
-            str(row["finish_command_id"]): row
-            for row in self.connection.execute(
-                "SELECT finish_command_id, timer_id FROM pending_auto_breaks"
-            )
-        }
-        canonical_timer = canonical["canonicalTimer"]
-        for source_id, acknowledgement in acknowledgements.items():
-            dependency = dependencies.get(source_id)
-            trigger = triggers.get(source_id)
-            if dependency is None and trigger is None:
-                continue
-            source_timer_id = str(
-                dependency["source_timer_id"]
-                if dependency is not None
-                else trigger["timer_id"]
-            )
-            completion = next(
-                (
-                    item
-                    for item in canonical["history"]
-                    if item.get("phase") == "focus"
-                    and item.get("status") == "completed"
-                    and item.get("timerId") == source_timer_id
-                    and item.get("commandId") == source_id
-                ),
-                None,
-            )
-            timer_is_source = canonical_timer is not None and (
-                canonical_timer.get("id") == source_timer_id
-                and canonical_timer.get("phase") == "focus"
-                and canonical_timer.get("status") == "completed"
-            )
-            if (
-                acknowledgement["outcome"] not in {"applied", "ignored"}
-                or completion is None
-                or not timer_is_source
-            ):
-                self._drop_auto_break_start(source_id)
-                continue
-            if dependency is None:
-                continue
-
-            start_row = self.connection.execute(
-                "SELECT device_sequence, payload FROM pending_commands WHERE id = ?",
-                (dependency["start_command_id"],),
-            ).fetchone()
-            if start_row is None:
-                self._drop_auto_break_start(source_id)
-                continue
-            newer_sendable_commands = self.connection.execute(
-                "SELECT payload FROM pending_commands "
-                "WHERE device_sequence > ? AND depends_on_command_id IS NULL",
-                (int(start_row["device_sequence"]),),
-            ).fetchall()
-            if any(
-                not isinstance(command, dict) or command.get("type") == "start"
-                for command in (
-                    json.loads(row["payload"]) for row in newer_sendable_commands
-                )
-            ):
-                self._drop_auto_break_start(source_id)
-                continue
-
-            phase = next_break_phase(
-                canonical["history"],
-                completion.get("completedAt") or completion.get("endedAt"),
-            )
-            provisional_phase = self._transform_auto_break_chain(
-                source_id,
-                str(dependency["start_command_id"]),
-                phase,
-                canonical["durationsMs"][phase],
-            )
-            if provisional_phase is None:
-                self._drop_auto_break_start(source_id)
-                continue
-            self.connection.execute(
-                "UPDATE pending_commands SET depends_on_command_id = NULL "
-                "WHERE depends_on_command_id = ?",
-                (source_id,),
-            )
-            self.connection.execute(
-                "DELETE FROM pending_auto_break_starts "
-                "WHERE source_finish_command_id = ?",
-                (source_id,),
-            )
-            self.connection.execute(
-                "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
-                (source_id,),
-            )
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            if (
-                settings["selectedPhase"] == provisional_phase
-                and int(self.get_meta("selectedPhaseVersion", 0))
-                == int(dependency["selected_phase_version"])
-            ):
-                settings["selectedPhase"] = phase
-                self._set_meta("settings", settings)
-
-    def _reconcile_selected_phase_advances(
-        self,
-        canonical: dict[str, Any],
-        discarded_command_ids: set[str] | None = None,
-    ) -> None:
-        acknowledgements = {
-            acknowledgement["commandId"]: acknowledgement
-            for acknowledgement in canonical["acknowledgements"]
-        }
-        discarded_command_ids = discarded_command_ids or set()
-        canonical_timer = canonical["canonicalTimer"]
-        rows = self.connection.execute(
-            "SELECT finish_command_id, timer_id, source_phase, advanced_phase, "
-            "selected_phase_version FROM pending_phase_advances"
-        ).fetchall()
-        for row in rows:
-            finish_id = str(row["finish_command_id"])
-            acknowledgement = acknowledgements.get(finish_id)
-            discarded = finish_id in discarded_command_ids
-            if acknowledgement is None and not discarded:
-                continue
-            exact_completion = any(
-                item.get("timerId") == row["timer_id"]
-                and item.get("commandId") == finish_id
-                and item.get("phase") == row["source_phase"]
-                and item.get("status") == "completed"
-                for item in canonical["history"]
-            ) or (
-                canonical_timer is not None
-                and canonical_timer.get("id") == row["timer_id"]
-                and canonical_timer.get("phase") == row["source_phase"]
-                and canonical_timer.get("status") == "completed"
-                and isinstance(canonical_timer.get("lastIntent"), dict)
-                and canonical_timer["lastIntent"].get("commandId") == finish_id
-            )
-            non_applied = discarded or (
-                acknowledgement is not None
-                and acknowledgement["outcome"] != "applied"
-            )
-            if non_applied and not exact_completion:
-                settings = self._normalize_settings(self.get_meta("settings", {}))
-                if (
-                    settings["selectedPhase"] == row["advanced_phase"]
-                    and int(self.get_meta("selectedPhaseVersion", 0))
-                    == int(row["selected_phase_version"])
-                ):
-                    settings["selectedPhase"] = row["source_phase"]
-                    self._set_meta("settings", settings)
-            self.connection.execute(
-                "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
-                (finish_id,),
-            )
-
-    def _apply_acknowledgements(
-        self, canonical: dict[str, Any], *, delete: bool = True
-    ) -> list[str]:
-        notices: list[str] = []
-        groups = (
-            (
-                "acknowledgements",
-                "DELETE FROM pending_commands WHERE id = ?",
-                "commandId",
-            ),
-            (
-                "taskAcknowledgements",
-                "DELETE FROM pending_task_operations WHERE id = ?",
-                "operationId",
-            ),
-            (
-                "durationAcknowledgements",
-                "DELETE FROM pending_duration_operations WHERE id = ?",
-                "operationId",
-            ),
-            (
-                "autoStartAcknowledgements",
-                "DELETE FROM pending_auto_start_operations WHERE id = ?",
-                "operationId",
-            ),
-            (
-                "selectedTaskAcknowledgements",
-                "DELETE FROM pending_selected_task_operations WHERE id = ?",
-                "operationId",
-            ),
-        )
-        for response_key, delete_statement, id_key in groups:
-            for acknowledgement in canonical[response_key]:
-                if delete:
-                    self.connection.execute(
-                        delete_statement,
-                        (acknowledgement[id_key],),
-                    )
-                if acknowledgement["outcome"] != "applied":
-                    notices.append(
-                        acknowledgement["reason"] or acknowledgement["outcome"]
-                    )
-        return notices
-
-    def _rebase_retained_operations(
-        self,
-        canonical: dict[str, Any],
-        trusted_response_ms: int,
-    ) -> None:
-        minimum_ms = max(1, trusted_response_ms - MAX_CLOCK_SKEW_MS)
-        maximum_ms = min(
-            MAX_SAFE_INTEGER,
-            trusted_response_ms + MAX_CLOCK_SKEW_MS,
-        )
-        canonical_clock = (
-            canonical["serverHlcWallMs"],
-            canonical["serverHlcCounter"],
-        )
-        if not minimum_ms <= canonical_clock[0] <= maximum_ms:
-            raise ValueError("Canonical server clock leaves no safe rebase headroom.")
-        pending = self._preflight_pending_queues(require_clock_coverage=False)
-        if any(
-            operation["hlcWallMs"] > maximum_ms
-            for domain in (
-                pending["commands"],
-                pending["taskOperations"],
-                pending["durationOperations"],
-                pending["autoStartOperations"],
-                pending["selectedTaskOperations"],
-            )
-            for operation in domain
-            if operation["hlcWallMs"] > 0
-        ):
-            raise ValueError(
-                "Retained pending operation exceeds the trusted-time limit."
-            )
-
-        def next_clock(cursor: tuple[int, int]) -> tuple[int, int]:
-            wall_ms, counter = cursor
-            if counter < MAX_SAFE_INTEGER:
-                return wall_ms, counter + 1
-            if wall_ms >= maximum_ms:
-                raise ValueError(
-                    "Retained operation clock has no safe rebase headroom."
-                )
-            return wall_ms + 1, 0
-
-        def rebase_domain(
-            operations: list[dict[str, Any]],
-            sort_key: Any,
-        ) -> dict[str, tuple[int, int]]:
-            cursor = canonical_clock
-            replacements: dict[str, tuple[int, int]] = {}
-            for operation in sorted(operations, key=sort_key):
-                clock = (
-                    int(operation["hlcWallMs"]),
-                    int(operation["hlcCounter"]),
-                )
-                can_remain = (
-                    minimum_ms <= clock[0] <= maximum_ms
-                    and clock > cursor
-                )
-                if can_remain:
-                    cursor = clock
-                    continue
-                cursor = next_clock(cursor)
-                replacements[str(operation["id"])] = cursor
-            return replacements
-
-        replacements = {
-            "commands": rebase_domain(
-                pending["commands"],
-                lambda operation: (
-                    operation["deviceSequence"],
-                    operation["id"],
-                ),
-            ),
-            "taskOperations": rebase_domain(
-                pending["taskOperations"],
-                lambda operation: (
-                    operation["hlcWallMs"],
-                    operation["hlcCounter"],
-                    operation["id"],
-                ),
-            ),
-            "durationOperations": rebase_domain(
-                [
-                    operation
-                    for operation in pending["durationOperations"]
-                    if operation["hlcWallMs"] > 0
-                ],
-                lambda operation: (
-                    operation["hlcWallMs"],
-                    operation["hlcCounter"],
-                    operation["id"],
-                ),
-            ),
-            "autoStartOperations": rebase_domain(
-                [
-                    operation
-                    for operation in pending["autoStartOperations"]
-                    if operation["hlcWallMs"] > 0
-                ],
-                lambda operation: (
-                    operation["hlcWallMs"],
-                    operation["hlcCounter"],
-                    operation["id"],
-                ),
-            ),
-            "selectedTaskOperations": rebase_domain(
-                [
-                    operation
-                    for operation in pending["selectedTaskOperations"]
-                    if operation["hlcWallMs"] > 0
-                ],
-                lambda operation: (
-                    operation["hlcWallMs"],
-                    operation["hlcCounter"],
-                    operation["id"],
-                ),
-            ),
-        }
-        tables = {
-            "commands": "pending_commands",
-            "taskOperations": "pending_task_operations",
-            "durationOperations": "pending_duration_operations",
-            "autoStartOperations": "pending_auto_start_operations",
-            "selectedTaskOperations": "pending_selected_task_operations",
-        }
-        operations_by_domain = {
-            "commands": pending["commands"],
-            "taskOperations": pending["taskOperations"],
-            "durationOperations": pending["durationOperations"],
-            "autoStartOperations": pending["autoStartOperations"],
-            "selectedTaskOperations": pending["selectedTaskOperations"],
-        }
-        for domain, domain_replacements in replacements.items():
-            if not domain_replacements:
-                continue
-            for operation in operations_by_domain[domain]:
-                clock = domain_replacements.get(str(operation["id"]))
-                if clock is None:
-                    continue
-                rebased = dict(operation)
-                original_ms = parse_timestamp_ms(str(operation["occurredAt"]))
-                if (
-                    original_ms is None
-                    or not minimum_ms <= original_ms <= maximum_ms
-                    or abs(clock[0] - original_ms) > MAX_CLOCK_SKEW_MS
-                ):
-                    rebased["occurredAt"] = utc_timestamp(clock[0])
-                rebased["hlcWallMs"], rebased["hlcCounter"] = clock
-                self.connection.execute(
-                    f"UPDATE {tables[domain]} SET payload = ? WHERE id = ?",
-                    (
-                        json.dumps(rebased, separators=(",", ":")),
-                        rebased["id"],
-                    ),
-                )
-
-    def _delete_resolution_queue_ids(self, queue_ids: dict[str, list[str]]) -> None:
-        groups = (
-            ("commands", "DELETE FROM pending_commands WHERE id = ?"),
-            (
-                "taskOperations",
-                "DELETE FROM pending_task_operations WHERE id = ?",
-            ),
-            (
-                "durationOperations",
-                "DELETE FROM pending_duration_operations WHERE id = ?",
-            ),
-            (
-                "autoStartOperations",
-                "DELETE FROM pending_auto_start_operations WHERE id = ?",
-            ),
-            (
-                "selectedTaskOperations",
-                "DELETE FROM pending_selected_task_operations WHERE id = ?",
-            ),
-        )
-        for key, statement in groups:
-            if key not in queue_ids:
-                continue
-            self.connection.executemany(
-                statement, ((item_id,) for item_id in queue_ids[key])
-            )
-
-    def _install_canonical(
-        self,
-        canonical: dict[str, Any],
-        user: dict[str, Any] | None,
-        *,
-        preserve_known_tasks: bool,
-        clock_sample: dict[str, int] | None,
-        trusted_response_ms: int,
-    ) -> None:
-        now_ms = self._physical_time_ms(trusted_response_ms)
-        local_wall, local_counter = self._logical_clock(
-            self.get_meta("hlc", {"wallMs": 0, "counter": 0}),
-            allow_legacy_zero=True,
-        )
-        server_clock = (
-            canonical["serverHlcWallMs"],
-            canonical["serverHlcCounter"],
-        )
-        local_clock = (local_wall, local_counter)
-        pending = self._preflight_pending_queues(require_clock_coverage=False)
-        ownership = self.get_meta("centralizedTimerOwnership")
-        owned_timer_id = (
-            ownership.get("timerId") if isinstance(ownership, dict) else None
-        )
-        canonical_timer = canonical["canonicalTimer"]
-        retained_timer_ids = {
-            operation.get("timerId")
-            for operation in pending["commands"]
-            if operation.get("type") == "start"
-        }
-        if owned_timer_id is not None and (
-            not isinstance(canonical_timer, dict)
-            or canonical_timer.get("id") != owned_timer_id
-        ) and owned_timer_id not in retained_timer_ids:
-            self._set_meta("centralizedTimerOwnership", None)
-        retained_clocks = [
-            (operation["hlcWallMs"], operation["hlcCounter"])
-            for operations in (
-                pending["commands"],
-                pending["taskOperations"],
-                pending["durationOperations"],
-                pending["autoStartOperations"],
-                pending["selectedTaskOperations"],
-            )
-            for operation in operations
-            if operation["hlcWallMs"] > 0
-        ]
-        retained_clock = max(retained_clocks, default=(0, 0))
-        if retained_clock[0] - now_ms > MAX_CLOCK_SKEW_MS:
-            raise ValueError(
-                "Retained pending operation exceeds the trusted-time limit."
-            )
-        candidates = [server_clock, retained_clock]
-        if local_wall > 0 and local_wall - now_ms <= MAX_CLOCK_SKEW_MS:
-            candidates.append(local_clock)
-        merged_wall, merged_counter = max(candidates)
-
-        settings = self._normalize_settings(self.get_meta("settings", {}))
-        pending_duration_operations = [
-            json.loads(row["payload"])
-            for row in self.connection.execute(
-                "SELECT payload FROM pending_duration_operations"
-            )
-        ]
-        settings["durationsMs"] = project_durations(
-            canonical["durationsMs"], pending_duration_operations
-        )
-        settings["durations"] = {
-            phase: self._display_minutes(duration_ms)
-            for phase, duration_ms in settings["durationsMs"].items()
-        }
-        settings["autoStartBreaks"] = project_auto_start_breaks(
-            canonical["autoStartBreaks"], self._pending_auto_start_operations()
-        )
-        settings["selectedTaskId"] = canonical["selectedTaskId"]
-        pending_selected_tasks = self._pending_selected_task_operations()
-        if pending_selected_tasks:
-            settings["selectedTaskId"] = pending_selected_tasks[-1]["taskId"]
-        self._set_meta("settings", settings)
-
-        previous = self.get_meta("snapshot", {})
-        known = (
-            {
-                task["id"]: task
-                for task in previous.get("knownTasks", [])
-                if task.get("id") and task.get("title")
-            }
-            if preserve_known_tasks
-            else {}
-        )
-        for task in canonical["tasks"]:
-            if task.get("id") and task.get("title"):
-                known[task["id"]] = task
-        self._set_meta(
-            "snapshot",
-            {
-                "revision": canonical["revision"],
-                "canonicalTimer": canonical["canonicalTimer"],
-                "history": canonical["history"],
-                "tasks": canonical["tasks"],
-                "knownTasks": sorted(
-                    known.values(),
-                    key=lambda item: (item["title"].casefold(), item["id"]),
-                ),
-                "autoStartBreaks": canonical["autoStartBreaks"],
-                "selectedTaskId": canonical["selectedTaskId"],
-                "user": user,
-            },
-        )
-        self._set_meta("autoStartLegacyDefaultUnknown", False)
-        self._set_meta("hlc", {"wallMs": merged_wall, "counter": merged_counter})
-        if clock_sample is not None:
-            self._set_meta("serverClockSample", clock_sample)
-
-    def apply_sync(
-        self,
-        response: dict[str, Any],
-        request: dict[str, Any],
-        *,
-        request_physical_ms: int | None = None,
-        received_physical_ms: int | None = None,
-        request_monotonic_ms: int | None = None,
-        received_monotonic_ms: int | None = None,
-    ) -> list[str]:
-        with self._immediate_transaction():
-            self._ensure_no_pending_resolution()
-            claimed = self.pending_sync()
-            if claimed != request:
-                raise ValueError(
-                    "Sync response did not match an active normal sync claim."
-                )
-            previous = self.get_meta("snapshot")
-            canonical = self._validated_sync_response(response, request)
-            clock_sample, clock_anchor = self._clock_sample_for_response(
-                canonical["serverTimeMs"],
-                request_physical_ms,
-                received_physical_ms,
-                request_monotonic_ms,
-                received_monotonic_ms,
-            )
-            trusted_response_ms = (
-                canonical["serverTimeMs"]
-                if clock_anchor is None
-                else clock_anchor["acquiredTrustedMs"]
-            )
-            if canonical["revision"] < int(previous.get("revision", 0)):
-                raise ValueError("Server response would regress canonical revision.")
-            self._reconcile_selected_phase_advances(canonical)
-            self._resolve_auto_break_dependencies(canonical)
-            notices = self._apply_acknowledgements(canonical)
-            self._rebase_retained_operations(canonical, trusted_response_ms)
-            self._install_canonical(
-                canonical,
-                previous.get("user"),
-                preserve_known_tasks=True,
-                clock_sample=clock_sample,
-                trusted_response_ms=trusted_response_ms,
-            )
-            self._prune_command_physical_times()
-            if claimed is not None:
-                self._set_meta("pendingSync", None)
-        if clock_anchor is not None:
-            self._set_trusted_time_anchor(clock_anchor)
-        return notices
-
-    def apply_resolution(
-        self,
-        response: dict[str, Any],
-        user: dict[str, Any],
-        request_id: str | None = None,
-        *,
-        request_physical_ms: int | None = None,
-        received_physical_ms: int | None = None,
-        request_monotonic_ms: int | None = None,
-        received_monotonic_ms: int | None = None,
-    ) -> list[str]:
-        user_id = user.get("id") if isinstance(user, dict) else None
-        with self._immediate_transaction():
-            pending = self.pending_resolution(user_id)
-            if pending is None:
-                raise ValueError("No matching history resolution is pending.")
-            request = pending["request"]
-            if request_id is not None and request.get("requestId") != request_id:
-                raise ValueError("History resolution response matched a stale request.")
-            canonical = self._validated_sync_response(response, request)
-            clock_sample, clock_anchor = self._clock_sample_for_response(
-                canonical["serverTimeMs"],
-                request_physical_ms,
-                received_physical_ms,
-                request_monotonic_ms,
-                received_monotonic_ms,
-            )
-            trusted_response_ms = (
-                canonical["serverTimeMs"]
-                if clock_anchor is None
-                else clock_anchor["acquiredTrustedMs"]
-            )
-            previous = self.get_meta("snapshot", {})
-            minimum_revision = max(
-                int(previous.get("revision", 0)), int(request["expectedRevision"])
-            )
-            if canonical["revision"] < minimum_revision:
-                raise ValueError("Server response would regress canonical revision.")
-            strategy = request.get("strategy")
-            if strategy not in {"keep_remote", "replace_remote", "merge"}:
-                raise ValueError("Pending history resolution has an invalid strategy.")
-            queue_ids = pending["queueIds"]
-            request_ids = {
-                key: [item.get("id") for item in request.get(key, [])]
-                for key in queue_ids
-            }
-            if strategy == "keep_remote":
-                if any(request_ids.values()):
-                    raise ValueError("Keep-remote resolution contains local operations.")
-            elif request_ids != queue_ids:
-                raise ValueError(
-                    "Pending history resolution does not match captured queue IDs."
-                )
-            self._reconcile_selected_phase_advances(
-                canonical,
-                set(queue_ids["commands"]) if strategy == "keep_remote" else None,
-            )
-            self._resolve_auto_break_dependencies(canonical)
-            notices = self._apply_acknowledgements(canonical, delete=False)
-            self._delete_resolution_queue_ids(queue_ids)
-            self._rebase_retained_operations(canonical, trusted_response_ms)
-            if strategy == "keep_remote" and "autoStartOperations" not in queue_ids:
-                self.connection.execute("DELETE FROM pending_auto_start_operations")
-            if strategy == "keep_remote" and "selectedTaskOperations" not in queue_ids:
-                self.connection.execute("DELETE FROM pending_selected_task_operations")
-            if strategy == "keep_remote":
-                self.connection.execute("DELETE FROM pending_auto_breaks")
-                self.connection.execute("DELETE FROM pending_auto_break_starts")
-            self._install_canonical(
-                canonical,
-                user,
-                preserve_known_tasks=strategy != "keep_remote",
-                clock_sample=clock_sample,
-                trusted_response_ms=trusted_response_ms,
-            )
-            self._prune_command_physical_times()
-            self._set_meta("pendingResolution", None)
-        if clock_anchor is not None:
-            self._set_trusted_time_anchor(clock_anchor)
-        return notices
 
     def set_user(self, user: dict[str, Any] | None) -> None:
         with self._immediate_transaction():
             snapshot = self.get_meta("snapshot")
             snapshot["user"] = user
             self._set_meta("snapshot", snapshot)
-
-    @property
-    def replication_mode(self) -> str:
-        mode = self.get_meta("replicationMode", "centralized")
-        return mode if mode in {"offline", "iroh", "centralized"} else "centralized"
-
-    @property
-    def active_iroh_room_id(self) -> str | None:
-        room_id = self.get_meta("activeIrohRoomId")
-        return room_id if isinstance(room_id, str) and room_id else None
-
-    def _capture_workspace(self) -> dict[str, Any]:
-        metadata = {
-            key: self.get_meta(key)
-            for key in (
-                "settings",
-                "snapshot",
-                "deviceSequence",
-                "hlc",
-                "lastUuidV7",
-                "serverClockSample",
-                "commandPhysicalTimes",
-                "selectedPhaseVersion",
-                "autoStartLegacyDefaultUnknown",
-                "pendingSync",
-                "pendingResolution",
-            )
-        }
-        tables = {}
-        for table, columns in (
-            (
-                "pending_commands",
-                ("id", "device_sequence", "payload", "depends_on_command_id"),
-            ),
-            ("pending_task_operations", ("id", "payload")),
-            ("pending_duration_operations", ("id", "phase", "payload")),
-            ("pending_auto_start_operations", ("id", "payload")),
-            ("pending_selected_task_operations", ("id", "payload")),
-            (
-                "pending_auto_breaks",
-                ("finish_command_id", "timer_id", "finish_device_sequence"),
-            ),
-            (
-                "pending_auto_break_starts",
-                (
-                    "source_finish_command_id",
-                    "source_timer_id",
-                    "start_command_id",
-                    "selected_phase_version",
-                ),
-            ),
-            (
-                "pending_phase_advances",
-                (
-                    "finish_command_id",
-                    "timer_id",
-                    "source_phase",
-                    "advanced_phase",
-                    "selected_phase_version",
-                ),
-            ),
-        ):
-            tables[table] = [
-                {column: row[column] for column in columns}
-                for row in self.connection.execute(
-                    f"SELECT {', '.join(columns)} FROM {table} ORDER BY rowid"
-                )
-            ]
-        return {"metadata": metadata, "tables": tables}
-
-    def _restore_workspace(self, workspace: dict[str, Any]) -> None:
-        if (
-            not isinstance(workspace, dict)
-            or not isinstance(workspace.get("metadata"), dict)
-            or not isinstance(workspace.get("tables"), dict)
-        ):
-            raise ValueError("Saved replication workspace is invalid.")
-        table_columns = {
-            "pending_commands": (
-                "id",
-                "device_sequence",
-                "payload",
-                "depends_on_command_id",
-            ),
-            "pending_task_operations": ("id", "payload"),
-            "pending_duration_operations": ("id", "phase", "payload"),
-            "pending_auto_start_operations": ("id", "payload"),
-            "pending_selected_task_operations": ("id", "payload"),
-            "pending_auto_breaks": (
-                "finish_command_id",
-                "timer_id",
-                "finish_device_sequence",
-            ),
-            "pending_auto_break_starts": (
-                "source_finish_command_id",
-                "source_timer_id",
-                "start_command_id",
-                "selected_phase_version",
-            ),
-            "pending_phase_advances": (
-                "finish_command_id",
-                "timer_id",
-                "source_phase",
-                "advanced_phase",
-                "selected_phase_version",
-            ),
-        }
-        for table in table_columns:
-            self.connection.execute(f"DELETE FROM {table}")
-        for table, columns in table_columns.items():
-            rows = workspace["tables"].get(table, [])
-            if not isinstance(rows, list):
-                raise ValueError("Saved replication queue is invalid.")
-            for row in rows:
-                if not isinstance(row, dict) or set(row) != set(columns):
-                    raise ValueError("Saved replication queue row is invalid.")
-                self.connection.execute(
-                    f"INSERT INTO {table}({', '.join(columns)}) VALUES "
-                    f"({', '.join('?' for _ in columns)})",
-                    tuple(row[column] for column in columns),
-                )
-        for key, value in workspace["metadata"].items():
-            if key in {
-                "settings",
-                "snapshot",
-                "deviceSequence",
-                "hlc",
-                "lastUuidV7",
-                "serverClockSample",
-                "commandPhysicalTimes",
-                "selectedPhaseVersion",
-                "autoStartLegacyDefaultUnknown",
-                "pendingSync",
-                "pendingResolution",
-            }:
-                self._set_meta(key, value)
-
-    def _workspace_without_account(
-        self, workspace: dict[str, Any], *, preserve_domain: bool
-    ) -> dict[str, Any]:
-        cleared = deepcopy(workspace)
-        metadata = cleared["metadata"]
-        settings = self._normalize_settings(metadata.get("settings", {}))
-        snapshot = deepcopy(metadata.get("snapshot", {}))
-        snapshot["revision"] = 0
-        snapshot["user"] = None
-        metadata.update(
-            pendingSync=None,
-            pendingResolution=None,
-            serverClockSample=None,
-            commandPhysicalTimes={},
-        )
-        if preserve_domain:
-            metadata["snapshot"] = snapshot
-            return cleared
-
-        settings["durations"] = {
-            phase: int(definition["default_minutes"])
-            for phase, definition in PHASES.items()
-        }
-        settings["durationsMs"] = {
-            phase: int(definition["default_minutes"]) * 60_000
-            for phase, definition in PHASES.items()
-        }
-        settings["selectedTaskId"] = None
-        settings["autoStartBreaks"] = False
-        metadata["settings"] = settings
-        metadata["snapshot"] = {
-            "revision": 0,
-            "canonicalTimer": None,
-            "history": [],
-            "tasks": [],
-            "knownTasks": [],
-            "autoStartBreaks": False,
-            "selectedTaskId": None,
-            "user": None,
-        }
-        metadata["autoStartLegacyDefaultUnknown"] = False
-        for table in cleared["tables"]:
-            cleared["tables"][table] = []
-        return cleared
-
-    def _projected_local_genesis(self) -> dict[str, Any]:
-        state = self.load()
-        snapshot = state["snapshot"]
-        timer, history = rebuild_optimistic(
-            snapshot.get("canonicalTimer"),
-            snapshot.get("history", []),
-            state["pending"],
-        )
-        tasks = rebuild_tasks(snapshot.get("tasks", []), state["pendingTasks"])
-        durations = project_durations(
-            self._normalize_settings(state["settings"])["durationsMs"],
-            state["pendingDurations"],
-        )
-        auto_start = project_auto_start_breaks(
-            bool(snapshot.get("autoStartBreaks", False)), state["pendingAutoStarts"]
-        )
-        selected_task_id = state["settings"].get("selectedTaskId")
-        clocks = [
-            (int(operation.get("hlcWallMs", 0)), int(operation.get("hlcCounter", 0)))
-            for operations in (
-                state["pending"],
-                state["pendingTasks"],
-                state["pendingDurations"],
-                state["pendingAutoStarts"],
-                state["pendingSelectedTasks"],
-            )
-            for operation in operations
-        ]
-        clocks.append(
-            self._logical_clock(
-                self.get_meta("hlc", {"wallMs": 0, "counter": 0}),
-                allow_legacy_zero=True,
-            )
-        )
-        wall, counter = max(clocks, default=(0, 0))
-        clean_history = []
-        for item in history:
-            cleaned = deepcopy(item)
-            cleaned.pop("pending", None)
-            cleaned["id"] = cleaned["timerId"]
-            for key in ("commandId", "taskId", "completedAt", "endedAt"):
-                if cleaned.get(key) is None:
-                    cleaned.pop(key, None)
-            clean_history.append(cleaned)
-        clean_history.sort(key=self._history_order)
-        clean_timer = deepcopy(timer)
-        if clean_timer is not None:
-            for key in ("taskId", "startedByDeviceId", "lastIntent"):
-                if clean_timer.get(key) is None:
-                    clean_timer.pop(key, None)
-            intent = clean_timer.get("lastIntent")
-            if isinstance(intent, dict):
-                intent.pop("deviceId", None)
-        return {
-            "canonicalTimer": clean_timer,
-            "history": clean_history,
-            "tasks": tasks,
-            "durationsMs": durations,
-            "autoStartBreaks": auto_start,
-            "selectedTaskId": selected_task_id,
-            "hlcWallMs": wall,
-            "hlcCounter": counter,
-        }
-
-    @staticmethod
-    def _history_order(item: dict[str, Any]) -> tuple[int, bytes]:
-        timestamp = item.get("endedAt") or item.get("completedAt")
-        milliseconds = parse_timestamp_ms(timestamp) if isinstance(timestamp, str) else None
-        return (-(milliseconds or 0), str(item.get("timerId", "")).encode("utf-8"))
-
-    def _empty_iroh_workspace(self, genesis: dict[str, Any]) -> dict[str, Any]:
-        workspace = self._capture_workspace()
-        settings = self._normalize_settings(workspace["metadata"]["settings"])
-        settings["durationsMs"] = deepcopy(genesis["durationsMs"])
-        settings["durations"] = {
-            phase: self._display_minutes(duration)
-            for phase, duration in genesis["durationsMs"].items()
-        }
-        settings["autoStartBreaks"] = genesis["autoStartBreaks"]
-        settings["selectedTaskId"] = genesis["selectedTaskId"]
-        workspace["metadata"].update(
-            settings=settings,
-            snapshot={
-                "revision": 0,
-                "canonicalTimer": deepcopy(genesis["canonicalTimer"]),
-                "history": deepcopy(genesis["history"]),
-                "tasks": sorted(
-                    deepcopy(genesis["tasks"]),
-                    key=lambda item: (item["title"].encode(), item["id"].encode()),
-                ),
-                "knownTasks": sorted(
-                    deepcopy(genesis["tasks"]),
-                    key=lambda item: (item["title"].encode(), item["id"].encode()),
-                ),
-                "autoStartBreaks": genesis["autoStartBreaks"],
-                "selectedTaskId": settings["selectedTaskId"],
-                "user": None,
-            },
-            hlc={"wallMs": genesis["hlcWallMs"], "counter": genesis["hlcCounter"]},
-            serverClockSample=None,
-            commandPhysicalTimes={},
-            pendingSync=None,
-            pendingResolution=None,
-        )
-        for table in workspace["tables"]:
-            workspace["tables"][table] = []
-        return workspace
-
-    def create_iroh_room(
-        self,
-        room_secret: bytes,
-        room_name: str | None = None,
-        *,
-        now_ms: int | None = None,
-    ) -> str:
-        from .iroh_protocol import (
-            IrohProtocolError,
-            record_digest,
-            room_id_for_secret,
-            validate_record,
-        )
-
-        if room_name is not None and not 1 <= len(room_name) <= 64:
-            raise ValueError("Room name must contain 1 through 64 Unicode scalar values.")
-        room_id = room_id_for_secret(room_secret)
-        genesis = self._projected_local_genesis()
-        record = {
-            "domain": "genesis",
-            "deviceId": self.device_id,
-            "operation": genesis,
-        }
-        try:
-            validate_record(record)
-            digest = record_digest(record)
-        except IrohProtocolError as error:
-            raise ValueError(str(error)) from error
-        return_workspace = self._capture_workspace()
-        room_workspace = self._empty_iroh_workspace(genesis)
-        created_at = now_ms if now_ms is not None else int(time.time() * 1000)
-        with self._immediate_transaction():
-            if self.connection.execute(
-                "SELECT 1 FROM iroh_rooms WHERE room_id = ?", (room_id,)
-            ).fetchone():
-                raise ValueError("An Iroh room with this identity already exists.")
-            self.connection.execute(
-                "INSERT INTO iroh_rooms(room_id, room_secret, room_name, "
-                "return_workspace, workspace, created_at_ms, conflict) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                (
-                    room_id,
-                    self._secure_reference(self._room_secret_key(room_id)),
-                    room_name,
-                    json.dumps(return_workspace, separators=(",", ":")),
-                    json.dumps(room_workspace, separators=(",", ":")),
-                    created_at,
-                ),
-            )
-            self.connection.execute(
-                "INSERT INTO iroh_records(room_id, domain, operation_id, device_id, digest, record) "
-                "VALUES (?, 'genesis', 'genesis', ?, ?, ?)",
-                (
-                    room_id,
-                    self.device_id,
-                    digest,
-                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
-                ),
-            )
-            self._restore_workspace(room_workspace)
-            self._set_meta("activeIrohRoomId", room_id)
-            self._set_meta("replicationMode", "iroh")
-            try:
-                self._iroh_secret_store.save(self._room_secret_key(room_id), room_secret)
-            except Exception:
-                self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
-                raise
-        return room_id
-
-    def prepare_iroh_join(
-        self,
-        room_id: str,
-        room_secret: bytes,
-        room_name: str | None,
-        endpoint_id: str,
-        endpoint_ticket: str,
-        *,
-        now_ms: int | None = None,
-    ) -> None:
-        from .iroh_protocol import room_id_for_secret, valid_room_id
-
-        if (
-            not valid_room_id(room_id)
-            or room_id_for_secret(room_secret) != room_id
-            or room_name is not None
-            and not 1 <= len(room_name) <= 64
-        ):
-            raise ValueError("Iroh room metadata is invalid.")
-        created_at = now_ms if now_ms is not None else int(time.time() * 1000)
-        return_workspace = self._capture_workspace()
-        room_workspace = self._empty_iroh_workspace(
-            {
-                "canonicalTimer": None,
-                "history": [],
-                "tasks": [],
-                "durationsMs": self._normalize_settings(
-                    return_workspace["metadata"]["settings"]
-                )["durationsMs"],
-                "autoStartBreaks": False,
-                "selectedTaskId": None,
-                "hlcWallMs": 0,
-                "hlcCounter": 0,
-            }
-        )
-        with self._immediate_transaction():
-            existing = self.connection.execute(
-                "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
-            ).fetchone()
-            if existing is not None:
-                saved = self.iroh_room_secret(room_id)
-                if saved != room_secret:
-                    raise ValueError("Saved Iroh room credentials do not match invite.")
-                if existing["conflict"] is not None:
-                    raise ValueError("Saved Iroh room requires immutable-conflict repair.")
-                self._upsert_iroh_peer(
-                    room_id, endpoint_id, endpoint_ticket, None, None, None
-                )
-                return
-            self.connection.execute(
-                "INSERT INTO iroh_rooms(room_id, room_secret, room_name, "
-                "return_workspace, workspace, created_at_ms, conflict) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                (
-                    room_id,
-                    self._secure_reference(self._room_secret_key(room_id)),
-                    room_name,
-                    json.dumps(return_workspace, separators=(",", ":")),
-                    json.dumps(room_workspace, separators=(",", ":")),
-                    created_at,
-                ),
-            )
-            self._upsert_iroh_peer(
-                room_id, endpoint_id, endpoint_ticket, None, None, None
-            )
-            try:
-                self._iroh_secret_store.save(self._room_secret_key(room_id), room_secret)
-            except Exception:
-                self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
-                raise
-
-    def discard_inactive_iroh_room(self, room_id: str) -> None:
-        with self._immediate_transaction():
-            if self.active_iroh_room_id == room_id:
-                raise ValueError("Active Iroh room cannot be discarded.")
-            conflict = self.connection.execute(
-                "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
-            ).fetchone()
-            if conflict is not None and conflict["conflict"] is not None:
-                return
-            peers = self.connection.execute(
-                "SELECT endpoint_id FROM iroh_peers WHERE room_id = ?", (room_id,)
-            ).fetchall()
-            self.connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
-            self._iroh_secret_store.delete(self._room_secret_key(room_id))
-            for peer in peers:
-                self._iroh_secret_store.delete(
-                    self._peer_ticket_key(room_id, str(peer["endpoint_id"]))
-                )
-
-    def activate_joined_iroh_room(self, room_id: str) -> None:
-        with self._immediate_transaction():
-            room = self.connection.execute(
-                "SELECT workspace, conflict FROM iroh_rooms WHERE room_id = ?",
-                (room_id,),
-            ).fetchone()
-            genesis = self.connection.execute(
-                "SELECT 1 FROM iroh_records WHERE room_id = ? AND domain = 'genesis' "
-                "AND operation_id = 'genesis'",
-                (room_id,),
-            ).fetchone()
-            if room is None or genesis is None or room["conflict"] is not None:
-                raise ValueError("Joined Iroh room has no valid genesis or requires repair.")
-            projection = self._project_iroh_room(room_id)
-            return_workspace = self._capture_workspace()
-            workspace = self._workspace_with_iroh_projection(
-                json.loads(room["workspace"]), projection
-            )
-            self.connection.execute(
-                "UPDATE iroh_rooms SET return_workspace = ?, workspace = ? WHERE room_id = ?",
-                (
-                    json.dumps(return_workspace, separators=(",", ":")),
-                    json.dumps(workspace, separators=(",", ":")),
-                    room_id,
-                ),
-            )
-            self._restore_workspace(workspace)
-            self._set_meta("activeIrohRoomId", room_id)
-            self._set_meta("replicationMode", "iroh")
-
-    def set_replication_mode(self, mode: str) -> None:
-        if mode not in {"offline", "iroh", "centralized"}:
-            raise ValueError("Replication mode must be offline, iroh, or centralized.")
-        with self._immediate_transaction():
-            current = self.replication_mode
-            if current == mode:
-                return
-            if current == "iroh":
-                room_id = self.active_iroh_room_id
-                if room_id is None:
-                    raise ValueError("Active Iroh room metadata is missing.")
-                room = self.connection.execute(
-                    "SELECT return_workspace, conflict FROM iroh_rooms WHERE room_id = ?",
-                    (room_id,),
-                ).fetchone()
-                if room is None:
-                    raise ValueError("Active Iroh room workspace is missing.")
-                if room["conflict"] is None:
-                    self._capture_local_iroh_records_locked(room_id)
-                else:
-                    self.connection.execute(
-                        "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-                        (
-                            json.dumps(self._capture_workspace(), separators=(",", ":")),
-                            room_id,
-                        ),
-                    )
-                self._restore_workspace(json.loads(room["return_workspace"]))
-                self._set_meta("activeIrohRoomId", None)
-            if mode == "iroh":
-                room = self.connection.execute(
-                    "SELECT room_id, workspace, conflict FROM iroh_rooms "
-                    "WHERE EXISTS (SELECT 1 FROM iroh_records AS records "
-                    "WHERE records.room_id = iroh_rooms.room_id "
-                    "AND records.domain = 'genesis' AND records.operation_id = 'genesis') "
-                    "ORDER BY created_at_ms DESC LIMIT 1"
-                ).fetchone()
-                if room is None:
-                    raise ValueError("Create or join an Iroh room before selecting Iroh mode.")
-                if room["conflict"] is not None:
-                    raise ValueError("Saved Iroh room requires repair before activation.")
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET return_workspace = ? WHERE room_id = ?",
-                    (
-                        json.dumps(self._capture_workspace(), separators=(",", ":")),
-                        room["room_id"],
-                    ),
-                )
-                self._restore_workspace(json.loads(room["workspace"]))
-                self._set_meta("activeIrohRoomId", str(room["room_id"]))
-            self._set_meta("replicationMode", mode)
-
-    def leave_iroh_room(self) -> None:
-        if self.replication_mode != "iroh":
-            raise ValueError("No Iroh room is active.")
-        self.set_replication_mode("offline")
-
-    def iroh_room(self, room_id: str | None = None) -> dict[str, Any] | None:
-        room_id = room_id or self.active_iroh_room_id
-        if room_id is None:
-            return None
-        row = self.connection.execute(
-            "SELECT room_id, room_name, created_at_ms, conflict FROM iroh_rooms "
-            "WHERE room_id = ?",
-            (room_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        peer_count = int(
-            self.connection.execute(
-                "SELECT COUNT(*) AS count FROM iroh_peers WHERE room_id = ?",
-                (room_id,),
-            ).fetchone()["count"]
-        )
-        operation_count = int(
-            self.connection.execute(
-                "SELECT COUNT(*) AS count FROM iroh_records WHERE room_id = ?",
-                (room_id,),
-            ).fetchone()["count"]
-        )
-        return {
-            "roomId": str(row["room_id"]),
-            "roomName": row["room_name"],
-            "createdAtMs": int(row["created_at_ms"]),
-            "peerCount": peer_count,
-            "operationCount": operation_count,
-            "conflict": json.loads(row["conflict"]) if row["conflict"] else None,
-        }
-
-    def iroh_room_secret(self, room_id: str) -> bytes:
-        row = self.connection.execute(
-            "SELECT room_secret FROM iroh_rooms WHERE room_id = ?", (room_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError("Saved Iroh room secret is unavailable or invalid.")
-        secret = self._iroh_secret_store.load(self._room_secret_key(room_id))
-        if secret is None or len(secret) != 32:
-            raise ValueError("Saved Iroh room secret is unavailable or invalid.")
-        return secret
-
-    def capture_local_iroh_records(self) -> bool:
-        room_id = self.active_iroh_room_id
-        if self.replication_mode != "iroh" or room_id is None:
-            return False
-        with self._immediate_transaction():
-            return self._capture_local_iroh_records_locked(room_id)
-
-    def _capture_iroh_after_mutation(self) -> None:
-        with self._immediate_transaction():
-            self._capture_iroh_after_mutation_locked()
-
-    def _capture_iroh_after_mutation_locked(self) -> None:
-        if self.replication_mode == "iroh":
-            room = self.iroh_room()
-            if room is not None and room.get("conflict") is not None:
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-                    (
-                        json.dumps(self._capture_workspace(), separators=(",", ":")),
-                        room["roomId"],
-                    ),
-                )
-                return
-            self._capture_local_iroh_records_locked(room["roomId"])
-
-    def _capture_local_iroh_records_locked(self, room_id: str) -> bool:
-        pending = self._preflight_pending_queues()
-        records = []
-        for domain, operations in (
-            ("timer", pending["commands"]),
-            ("task", pending["taskOperations"]),
-            ("duration", pending["durationOperations"]),
-            ("autoStart", pending["autoStartOperations"]),
-            ("selectedTask", pending["selectedTaskOperations"]),
-        ):
-            for operation in operations:
-                wire_operation = deepcopy(operation)
-                if domain in {"autoStart", "selectedTask"}:
-                    wire_operation.pop("deviceId", None)
-                records.append(
-                    {
-                        "domain": domain,
-                        "deviceId": self.device_id,
-                        "operation": wire_operation,
-                    }
-                )
-        if not records:
-            self.connection.execute(
-                "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-                (json.dumps(self._capture_workspace(), separators=(",", ":")), room_id),
-            )
-            return False
-        self._insert_iroh_records_locked(room_id, records)
-        command_ids = [record["operation"]["id"] for record in records if record["domain"] == "timer"]
-        self.connection.execute("DELETE FROM pending_commands")
-        self.connection.execute("DELETE FROM pending_task_operations")
-        self.connection.execute("DELETE FROM pending_duration_operations")
-        self.connection.execute("DELETE FROM pending_auto_start_operations")
-        self.connection.execute("DELETE FROM pending_selected_task_operations")
-        self.connection.executemany(
-            "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
-            ((identifier,) for identifier in command_ids),
-        )
-        self.connection.execute("DELETE FROM pending_auto_break_starts")
-        self._set_meta("commandPhysicalTimes", {})
-        self._set_meta("pendingSync", None)
-        projection = self._project_iroh_room(room_id)
-        room = self.connection.execute(
-            "SELECT workspace FROM iroh_rooms WHERE room_id = ?", (room_id,)
-        ).fetchone()
-        if room is None:
-            raise ValueError("Active Iroh room workspace is missing.")
-        workspace = self._workspace_with_iroh_projection(
-            self._capture_workspace(), projection
-        )
-        self.connection.execute(
-            "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-            (json.dumps(workspace, separators=(",", ":")), room_id),
-        )
-        self._restore_workspace(workspace)
-        return True
-
-    def _workspace_with_iroh_projection(
-        self, workspace: dict[str, Any], projection: dict[str, Any]
-    ) -> dict[str, Any]:
-        settings = self._normalize_settings(workspace["metadata"]["settings"])
-        settings["durationsMs"] = deepcopy(projection["durationsMs"])
-        settings["durations"] = {
-            phase: self._display_minutes(duration)
-            for phase, duration in projection["durationsMs"].items()
-        }
-        settings["autoStartBreaks"] = projection["autoStartBreaks"]
-        settings["selectedTaskId"] = projection["selectedTaskId"]
-        previous = workspace["metadata"].get("snapshot", {})
-        known = {
-            item["id"]: item
-            for item in previous.get("knownTasks", [])
-            if isinstance(item, dict) and item.get("id") and item.get("title")
-        }
-        known.update(
-            {
-                item["id"]: item
-                for item in projection.get("knownTasks", projection["tasks"])
-            }
-        )
-        workspace["metadata"].update(
-            settings=settings,
-            snapshot={
-                "revision": 0,
-                "canonicalTimer": projection["canonicalTimer"],
-                "history": projection["history"],
-                "tasks": projection["tasks"],
-                "knownTasks": sorted(
-                    known.values(),
-                    key=lambda item: (item["title"].encode(), item["id"].encode()),
-                ),
-                "autoStartBreaks": projection["autoStartBreaks"],
-                "selectedTaskId": settings["selectedTaskId"],
-                "user": None,
-            },
-            hlc={"wallMs": projection["hlcWallMs"], "counter": projection["hlcCounter"]},
-            serverClockSample=None,
-            commandPhysicalTimes={},
-            pendingSync=None,
-            pendingResolution=None,
-        )
-        for table in (
-            "pending_commands",
-            "pending_task_operations",
-            "pending_duration_operations",
-            "pending_auto_start_operations",
-            "pending_selected_task_operations",
-            "pending_auto_break_starts",
-            "pending_phase_advances",
-        ):
-            workspace["tables"][table] = []
-        return workspace
-
-    def _project_iroh_room(
-        self, room_id: str, *, now_ms: int | None = None
-    ) -> dict[str, Any]:
-        from .iroh_protocol import operation_order, validate_record
-
-        rows = self.connection.execute(
-            "SELECT record FROM iroh_records WHERE room_id = ?", (room_id,)
-        ).fetchall()
-        records = [json.loads(row["record"]) for row in rows]
-        for record in records:
-            validate_record(record)
-        genesis_records = [record for record in records if record["domain"] == "genesis"]
-        if len(genesis_records) != 1:
-            raise ValueError("Iroh room genesis is missing or conflicting.")
-        genesis_record = genesis_records[0]
-        genesis = deepcopy(genesis_record["operation"])
-        timer = genesis["canonicalTimer"]
-        history = genesis["history"]
-        tasks = genesis["tasks"]
-        durations = genesis["durationsMs"]
-        auto_start = genesis["autoStartBreaks"]
-        selected_task_id = genesis["selectedTaskId"]
-        clocks = [(genesis["hlcWallMs"], genesis["hlcCounter"])]
-        known_tasks = {task["id"]: task for task in genesis["tasks"]}
-        timer_starters = {
-            item["timerId"]: genesis_record["deviceId"]
-            for item in genesis["history"]
-        }
-        if timer is not None:
-            timer_starters[timer["id"]] = timer.get(
-                "startedByDeviceId", genesis_record["deviceId"]
-            )
-        for record in sorted(
-            (record for record in records if record["domain"] != "genesis"),
-            key=operation_order,
-        ):
-            operation = record["operation"]
-            clocks.append((operation["hlcWallMs"], operation["hlcCounter"]))
-            if record["domain"] == "timer":
-                timer, history = reduce_command(timer, history, operation)
-                if (
-                    operation.get("type") == "start"
-                    and timer
-                    and timer.get("id") == operation.get("timerId")
-                    and isinstance(timer.get("lastIntent"), dict)
-                    and timer["lastIntent"].get("commandId") == operation["id"]
-                ):
-                    timer_starters[operation["timerId"]] = record["deviceId"]
-                if timer:
-                    timer["startedByDeviceId"] = timer_starters.get(timer["id"])
-                if (
-                    timer
-                    and isinstance(timer.get("lastIntent"), dict)
-                    and timer["lastIntent"].get("commandId") == operation["id"]
-                ):
-                    timer["lastIntent"]["deviceId"] = record["deviceId"]
-            elif record["domain"] == "task":
-                tasks = rebuild_tasks(tasks, [operation])
-                if operation.get("type") == "upsert":
-                    try:
-                        known = task_from_title(operation.get("title", ""))
-                    except ValueError:
-                        known = None
-                    if known is not None and known["id"] == operation.get("taskId"):
-                        known_tasks[known["id"]] = known
-            elif record["domain"] == "duration":
-                durations = project_durations(durations, [operation])
-            elif record["domain"] == "autoStart":
-                projected_operation = {**operation, "deviceId": record["deviceId"]}
-                auto_start = project_auto_start_breaks(auto_start, [projected_operation])
-            elif record["domain"] == "selectedTask":
-                selected_task_id = operation["taskId"]
-        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        if (
-            timer is not None
-            and timer.get("status") == "running"
-            and elapsed_ms(timer, now_ms) >= int(timer["plannedDurationMs"])
-        ):
-            anchor_ms = parse_timestamp_ms(timer.get("anchorAt"))
-            if anchor_ms is None:
-                raise ValueError("Iroh room timer anchor is invalid.")
-            completed_ms = (
-                anchor_ms
-                + int(timer["plannedDurationMs"])
-                - int(timer.get("elapsedAtAnchorMs", 0))
-            )
-            completed_at = utc_timestamp(completed_ms)
-            timer["status"] = "completed"
-            timer["elapsedAtAnchorMs"] = int(timer["plannedDurationMs"])
-            timer["anchorAt"] = completed_at
-            if not any(item.get("timerId") == timer["id"] for item in history):
-                completion = {
-                    "id": timer["id"],
-                    "timerId": timer["id"],
-                    "phase": timer["phase"],
-                    "status": "completed",
-                    "plannedDurationMs": timer["plannedDurationMs"],
-                    "completedAt": completed_at,
-                    "endedAt": completed_at,
-                }
-                if timer.get("taskId") is not None:
-                    completion["taskId"] = timer["taskId"]
-                history.append(completion)
-        for item in history:
-            if item.get("timerId"):
-                item["id"] = item["timerId"]
-        clean_history = []
-        for item in history:
-            cleaned = deepcopy(item)
-            cleaned.pop("pending", None)
-            for key in ("commandId", "taskId", "completedAt", "endedAt"):
-                if cleaned.get(key) is None:
-                    cleaned.pop(key, None)
-            clean_history.append(cleaned)
-        clean_history.sort(key=self._history_order)
-        if timer is not None and not self._valid_canonical_timer(timer):
-            raise ValueError("Iroh room projected an invalid canonical timer.")
-        if any(not self._valid_history_item(item) for item in clean_history):
-            raise ValueError("Iroh room projected invalid timer history.")
-        wall, counter = max(clocks)
-        return {
-            "canonicalTimer": timer,
-            "history": clean_history,
-            "tasks": tasks,
-            "knownTasks": sorted(
-                known_tasks.values(),
-                key=lambda item: (item["title"].encode(), item["id"].encode()),
-            ),
-            "durationsMs": durations,
-            "autoStartBreaks": auto_start,
-            "selectedTaskId": selected_task_id,
-            "hlcWallMs": wall,
-            "hlcCounter": counter,
-        }
-
-    def project_iroh_expiry(self, now_ms: int | None = None) -> bool:
-        room_id = self.active_iroh_room_id
-        if self.replication_mode != "iroh" or room_id is None:
-            return False
-        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        with self._immediate_transaction():
-            self._capture_local_iroh_records_locked(room_id)
-            before = self.get_meta("snapshot", {}).get("canonicalTimer")
-            projection = self._project_iroh_room(room_id, now_ms=now_ms)
-            expired = (
-                isinstance(before, dict)
-                and before.get("status") == "running"
-                and isinstance(projection.get("canonicalTimer"), dict)
-                and projection["canonicalTimer"].get("id") == before.get("id")
-                and projection["canonicalTimer"].get("status") == "completed"
-            )
-            timer = projection.get("canonicalTimer")
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            if (
-                expired
-                and isinstance(timer, dict)
-                and settings["selectedPhase"] == timer.get("phase")
-            ):
-                settings["selectedPhase"] = (
-                    next_break_phase(projection["history"], timer.get("anchorAt"))
-                    if timer.get("phase") == "focus"
-                    else "focus"
-                )
-                self._set_meta("settings", settings)
-            workspace = self._workspace_with_iroh_projection(
-                self._capture_workspace(), projection
-            )
-            self.connection.execute(
-                "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-                (json.dumps(workspace, separators=(",", ":")), room_id),
-            )
-            self._restore_workspace(workspace)
-            timer = projection.get("canonicalTimer")
-            if (
-                expired
-                and isinstance(timer, dict)
-                and timer.get("phase") == "focus"
-                and timer.get("startedByDeviceId") == self.device_id
-                and projection["autoStartBreaks"]
-            ):
-                settings = self._normalize_settings(self.get_meta("settings", {}))
-                phase = next_break_phase(projection["history"], timer.get("anchorAt"))
-                trusted_ms, sequences, clocks = self._reserve_generation(
-                    now_ms, sequence_count=1, clock_count=1, use_server_clock=False
-                )
-                self._queue_command(
-                    "start",
-                    None,
-                    phase,
-                    settings["durationsMs"],
-                    None,
-                    now_ms,
-                    timer_now_ms=now_ms,
-                    trusted_ms=trusted_ms,
-                    sequence=sequences[0],
-                    clock=clocks[0],
-                    command_id=self._reserve_uuid7_ids(clocks[0][0], 1)[0],
-                )
-                self._capture_local_iroh_records_locked(room_id)
-            return expired
-
-    def insert_remote_iroh_records(
-        self,
-        room_id: str,
-        records: list[dict[str, Any]],
-        advertised_digests: dict[tuple[str, str], str] | None = None,
-    ) -> bool:
-        if not records:
-            raise ValueError("Iroh operation batch must not be empty.")
-        conflict: Exception | None = None
-        with self._immediate_transaction():
-            if advertised_digests is not None:
-                from .iroh_protocol import record_digest, record_id
-
-                returned = {
-                    (record["domain"], record_id(record)): record_digest(record)
-                    for record in records
-                }
-                if returned != advertised_digests:
-                    raise ValueError(
-                        "Fetched Iroh records do not match advertised inventory digests."
-                    )
-            active = self.active_iroh_room_id == room_id and self.replication_mode == "iroh"
-            if active:
-                self._capture_local_iroh_records_locked(room_id)
-            try:
-                inserted = self._insert_iroh_records_locked(room_id, records)
-            except Exception as error:
-                if error.__class__.__name__ != "ImmutableConflict":
-                    raise
-                inserted = False
-                conflict = error
-            if inserted:
-                projection = self._project_iroh_room(room_id)
-                room = self.connection.execute(
-                    "SELECT workspace FROM iroh_rooms WHERE room_id = ?", (room_id,)
-                ).fetchone()
-                if room is None:
-                    raise ValueError("Iroh room workspace is missing.")
-                workspace = self._workspace_with_iroh_projection(
-                    json.loads(room["workspace"]), projection
-                )
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET workspace = ? WHERE room_id = ?",
-                    (json.dumps(workspace, separators=(",", ":")), room_id),
-                )
-                if active:
-                    self._restore_workspace(workspace)
-        if conflict is not None:
-            raise conflict
-        return inserted
-
-    def _insert_iroh_records_locked(
-        self, room_id: str, records: list[dict[str, Any]]
-    ) -> bool:
-        from .iroh_protocol import (
-            ImmutableConflict,
-            MAX_OPERATION_REFS,
-            record_digest,
-            record_id,
-            validate_record,
-        )
-
-        if len(records) > MAX_OPERATION_REFS:
-            raise ValueError("Iroh operation batch exceeds 256 records.")
-        room = self.connection.execute(
-            "SELECT conflict FROM iroh_rooms WHERE room_id = ?", (room_id,)
-        ).fetchone()
-        if room is None:
-            raise ValueError("Iroh room does not exist.")
-        if room["conflict"] is not None:
-            raise ImmutableConflict("Iroh room requires repair before replication can continue.")
-        prepared = []
-        keys = set()
-        for record in records:
-            validate_record(record)
-            identifier = record_id(record)
-            key = (record["domain"], identifier)
-            if key in keys:
-                raise ValueError("Iroh operation batch contains duplicate references.")
-            keys.add(key)
-            prepared.append((record, identifier, record_digest(record)))
-        for record, identifier, digest in prepared:
-            existing = self.connection.execute(
-                "SELECT digest, record FROM iroh_records WHERE room_id = ? "
-                "AND domain = ? AND operation_id = ?",
-                (room_id, record["domain"], identifier),
-            ).fetchone()
-            if existing is not None and existing["digest"] != digest:
-                evidence = {
-                    "domain": record["domain"],
-                    "id": identifier,
-                    "localDigest": str(existing["digest"]),
-                    "receivedDigest": digest,
-                    "detectedAtMs": int(time.time() * 1000),
-                }
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO iroh_conflicts(room_id, domain, operation_id, "
-                    "local_digest, received_digest, received_record, detected_at_ms) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        room_id,
-                        record["domain"],
-                        identifier,
-                        existing["digest"],
-                        digest,
-                        json.dumps(record, ensure_ascii=False, separators=(",", ":")),
-                        evidence["detectedAtMs"],
-                    ),
-                )
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET conflict = ? WHERE room_id = ?",
-                    (json.dumps(evidence, separators=(",", ":")), room_id),
-                )
-                raise ImmutableConflict(
-                    "Iroh room contains different immutable payloads for the same operation ID."
-                )
-        sequence_owners: dict[tuple[str, int], str] = {}
-        for row in self.connection.execute(
-            "SELECT device_id, operation_id, record FROM iroh_records "
-            "WHERE room_id = ? AND domain = 'timer'",
-            (room_id,),
-        ):
-            record = json.loads(row["record"])
-            sequence_owners[(str(row["device_id"]), int(record["operation"]["deviceSequence"]))] = str(row["operation_id"])
-        for record, identifier, _digest in prepared:
-            if record["domain"] != "timer":
-                continue
-            key = (record["deviceId"], int(record["operation"]["deviceSequence"]))
-            owner = sequence_owners.get(key)
-            if owner is not None and owner != identifier:
-                raise ValueError("Iroh timer operation reuses a device sequence.")
-            sequence_owners[key] = identifier
-        inserted = False
-        for record, identifier, digest in prepared:
-            cursor = self.connection.execute(
-                "INSERT OR IGNORE INTO iroh_records(room_id, domain, operation_id, "
-                "device_id, digest, record) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    room_id,
-                    record["domain"],
-                    identifier,
-                    record["deviceId"],
-                    digest,
-                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
-                ),
-            )
-            inserted = inserted or cursor.rowcount > 0
-        return inserted
-
-    def iroh_inventory(
-        self, room_id: str, after: str | None, limit: int
-    ) -> tuple[list[dict[str, str]], str | None]:
-        from .iroh_protocol import MAX_INVENTORY
-
-        if isinstance(limit, bool) or not 1 <= limit <= MAX_INVENTORY:
-            raise ValueError("Iroh inventory limit must be 1 through 1024.")
-        parameters: list[Any] = [room_id]
-        where = "room_id = ?"
-        if after is not None:
-            if not isinstance(after, str) or after.count("\0") != 1:
-                raise ValueError("Iroh inventory cursor is invalid.")
-            domain, identifier = after.split("\0")
-            where += " AND (domain > ? OR (domain = ? AND operation_id > ?))"
-            parameters.extend((domain, domain, identifier))
-        rows = self.connection.execute(
-            "SELECT domain, operation_id, digest FROM iroh_records WHERE "
-            + where
-            + " ORDER BY domain, operation_id LIMIT ?",
-            (*parameters, limit + 1),
-        ).fetchall()
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        entries = [
-            {
-                "domain": str(row["domain"]),
-                "id": str(row["operation_id"]),
-                "digest": str(row["digest"]),
-            }
-            for row in rows
-        ]
-        next_cursor = (
-            f'{rows[-1]["domain"]}\0{rows[-1]["operation_id"]}'
-            if has_more and rows
-            else None
-        )
-        return entries, next_cursor
-
-    def iroh_operations(
-        self, room_id: str, references: list[dict[str, str]]
-    ) -> list[dict[str, Any]]:
-        from .iroh_protocol import MAX_OPERATION_REFS
-
-        if not 1 <= len(references) <= MAX_OPERATION_REFS:
-            raise ValueError("Iroh operation request must contain 1 through 256 references.")
-        keys = [(item.get("domain"), item.get("id")) for item in references]
-        if len(keys) != len(set(keys)):
-            raise ValueError("Iroh operation request contains duplicate references.")
-        records = []
-        for domain, identifier in keys:
-            row = self.connection.execute(
-                "SELECT record FROM iroh_records WHERE room_id = ? AND domain = ? "
-                "AND operation_id = ?",
-                (room_id, domain, identifier),
-            ).fetchone()
-            if row is None:
-                raise KeyError("Requested Iroh operation was not found.")
-            records.append(json.loads(row["record"]))
-        return records
-
-    def missing_iroh_references(
-        self, room_id: str, remote_entries: list[dict[str, str]]
-    ) -> list[dict[str, str]]:
-        from .iroh_protocol import ImmutableConflict, MAX_INVENTORY
-
-        if len(remote_entries) > MAX_INVENTORY:
-            raise ValueError("Iroh inventory exceeds 1024 entries.")
-        missing = []
-        conflict: ImmutableConflict | None = None
-        with self._immediate_transaction():
-            for entry in remote_entries:
-                row = self.connection.execute(
-                    "SELECT digest FROM iroh_records WHERE room_id = ? AND domain = ? "
-                    "AND operation_id = ?",
-                    (room_id, entry["domain"], entry["id"]),
-                ).fetchone()
-                if row is None:
-                    missing.append({"domain": entry["domain"], "id": entry["id"]})
-                    continue
-                if row["digest"] == entry["digest"]:
-                    continue
-                evidence = {
-                    "domain": entry["domain"],
-                    "id": entry["id"],
-                    "localDigest": str(row["digest"]),
-                    "receivedDigest": entry["digest"],
-                    "detectedAtMs": int(time.time() * 1000),
-                }
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO iroh_conflicts(room_id, domain, operation_id, "
-                    "local_digest, received_digest, received_record, detected_at_ms) "
-                    "VALUES (?, ?, ?, ?, ?, NULL, ?)",
-                    (
-                        room_id,
-                        entry["domain"],
-                        entry["id"],
-                        row["digest"],
-                        entry["digest"],
-                        evidence["detectedAtMs"],
-                    ),
-                )
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET conflict = ? WHERE room_id = ?",
-                    (json.dumps(evidence, separators=(",", ":")), room_id),
-                )
-                conflict = ImmutableConflict(
-                    "Iroh room inventory contains an immutable-ID conflict."
-                )
-                break
-        if conflict is not None:
-            raise conflict
-        return missing
-
-    def _upsert_iroh_peer(
-        self,
-        room_id: str,
-        endpoint_id: str,
-        endpoint_ticket: str,
-        device_id: str | None,
-        display_name: str | None,
-        last_seen_at_ms: int | None,
-    ) -> None:
-        from .iroh_protocol import MAX_ENDPOINT_TICKET, MAX_PEERS
-
-        if (
-            not endpoint_id
-            or not endpoint_ticket
-            or len(endpoint_ticket.encode()) > MAX_ENDPOINT_TICKET
-            or display_name is not None
-            and not 1 <= len(display_name) <= 64
-        ):
-            raise ValueError("Iroh peer metadata is invalid.")
-        exists = self.connection.execute(
-            "SELECT 1 FROM iroh_peers WHERE room_id = ? AND endpoint_id = ?",
-            (room_id, endpoint_id),
-        ).fetchone()
-        count = self.connection.execute(
-            "SELECT COUNT(*) AS count FROM iroh_peers WHERE room_id = ?", (room_id,)
-        ).fetchone()["count"]
-        if exists is None and count >= MAX_PEERS:
-            raise ValueError("Iroh room address book contains 64 peers.")
-        ticket_key = self._peer_ticket_key(room_id, endpoint_id)
-        self._iroh_secret_store.save(ticket_key, endpoint_ticket.encode("utf-8"))
-        self.connection.execute(
-            "INSERT INTO iroh_peers(room_id, endpoint_id, endpoint_ticket, device_id, "
-            "display_name, last_seen_at_ms) VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(room_id, endpoint_id) DO UPDATE SET "
-            "endpoint_ticket = excluded.endpoint_ticket, device_id = excluded.device_id, "
-            "display_name = excluded.display_name, last_seen_at_ms = excluded.last_seen_at_ms",
-            (
-                room_id,
-                endpoint_id,
-                f"secure:{ticket_key}",
-                device_id,
-                display_name,
-                last_seen_at_ms,
-            ),
-        )
-
-    def upsert_iroh_peer(
-        self,
-        room_id: str,
-        endpoint_id: str,
-        endpoint_ticket: str,
-        device_id: str | None,
-        display_name: str | None,
-        last_seen_at_ms: int | None = None,
-    ) -> None:
-        with self._immediate_transaction():
-            self._upsert_iroh_peer(
-                room_id,
-                endpoint_id,
-                endpoint_ticket,
-                device_id,
-                display_name,
-                last_seen_at_ms,
-            )
-
-    def iroh_peers(self, room_id: str) -> list[dict[str, Any]]:
-        peers = []
-        for row in self.connection.execute(
-            "SELECT endpoint_id, endpoint_ticket, device_id, display_name, "
-            "last_seen_at_ms FROM iroh_peers WHERE room_id = ? "
-            "ORDER BY last_seen_at_ms DESC, endpoint_id",
-            (room_id,),
-        ):
-            endpoint_id = str(row["endpoint_id"])
-            ticket = self._iroh_secret_store.load(
-                self._peer_ticket_key(room_id, endpoint_id)
-            )
-            if ticket is None:
-                raise ValueError("Saved Iroh peer capability is unavailable.")
-            try:
-                endpoint_ticket = ticket.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise ValueError("Saved Iroh peer capability is invalid.") from error
-            peers.append(
-                {
-                    "endpointId": endpoint_id,
-                    "endpointTicket": endpoint_ticket,
-                    "deviceId": row["device_id"],
-                    "displayName": row["display_name"],
-                    "lastSeenAtMs": row["last_seen_at_ms"],
-                }
-            )
-        return peers
-
-    def has_pending_auto_break(self) -> bool:
-        return (
-            self.connection.execute(
-                "SELECT 1 FROM pending_auto_breaks LIMIT 1"
-            ).fetchone()
-            is not None
-        )
 
     def provisional_auto_break_timer_ids(self) -> set[str]:
         timer_ids: set[str] = set()
@@ -4812,201 +2763,179 @@ class Store:
                     use_server_clock=use_server_clock,
                     use_monotonic=use_server_clock,
                 )
-            while True:
-                trigger = self.connection.execute(
-                    "SELECT finish_command_id, timer_id, finish_device_sequence "
-                    "FROM pending_auto_breaks ORDER BY rowid LIMIT 1"
-                ).fetchone()
-                if trigger is None:
-                    return []
-                finish_command_id = str(trigger["finish_command_id"])
-                timer_id = str(trigger["timer_id"])
-                finish_sequence = int(trigger["finish_device_sequence"])
-                pending = self._physical_pending_commands([
-                    json.loads(row["payload"])
-                    for row in self.connection.execute(
-                        "SELECT payload FROM pending_commands ORDER BY device_sequence"
-                    )
-                ])
-                if any(
-                    int(command.get("deviceSequence", 0)) > finish_sequence
-                    and not (
-                        command.get("type") == "finish"
-                        and command.get("timerId") == timer_id
-                    )
-                    for command in pending
-                ):
-                    self.connection.execute(
-                        "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
-                        (timer_id,),
-                    )
-                    continue
-                source_finish_pending = any(
-                    command.get("id") == finish_command_id for command in pending
-                )
-                if require_canonical and source_finish_pending:
-                    return []
+            return self._process_auto_break_queue(
+                require_canonical, now_ms, use_server_clock)
 
-                snapshot = self.get_meta("snapshot", {})
-                if require_canonical and self._pending_auto_start_operations():
-                    return []
-                canonical_timer = snapshot.get("canonicalTimer")
-                base_history = snapshot.get("history", [])
-                canonical_completion = next(
-                    (
-                        item
-                        for item in base_history
-                        if item.get("phase") == "focus"
-                        and item.get("status") == "completed"
-                        and item.get("timerId") == timer_id
-                        and item.get("commandId") == finish_command_id
-                    ),
-                    None,
-                )
-                canonical_timer_is_source = canonical_timer is not None and (
-                    canonical_timer.get("id") == timer_id
-                    and canonical_timer.get("phase") == "focus"
-                    and canonical_timer.get("status") == "completed"
-                )
-                source_already_accepted = (
-                    not source_finish_pending
-                    and canonical_completion is not None
-                    and canonical_timer_is_source
-                )
-                optimistic_timer, optimistic_history = rebuild_optimistic(
-                    canonical_timer, base_history, pending
-                )
-                current_timer = (
-                    canonical_timer if require_canonical else optimistic_timer
-                )
-                if (
-                    not source_already_accepted
-                    and (
-                        not isinstance(current_timer, dict)
-                        or current_timer.get("id") != timer_id
-                        or current_timer.get("phase") != "focus"
-                        or current_timer.get("status") != "completed"
-                    )
-                ):
-                    self.connection.execute(
-                        "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
-                        (timer_id,),
-                    )
-                    continue
-                settings = self._normalize_settings(self.get_meta("settings", {}))
-                history = (
-                    base_history
-                    if require_canonical or source_already_accepted
-                    else optimistic_history
-                )
-                completion = (
-                    canonical_completion
-                    if require_canonical or source_already_accepted
-                    else next(
-                        (
-                            item
-                            for item in history
-                            if item.get("phase") == "focus"
-                            and item.get("status") == "completed"
-                            and item.get("timerId") == timer_id
-                            and item.get("commandId") == finish_command_id
-                        ),
-                        None,
-                    )
-                )
-                trusted_ms, sequences, clocks = self._reserve_generation(
-                    now_ms,
-                    sequence_count=1,
-                    clock_count=1,
-                    use_server_clock=use_server_clock,
-                    use_monotonic=use_server_clock,
-                )
-                self.connection.execute(
-                    "DELETE FROM pending_auto_breaks WHERE timer_id = ?",
-                    (timer_id,),
-                )
-                if completion is None:
-                    continue
+    def _process_auto_break_queue(
+        self, require_canonical: bool, now_ms: int, use_server_clock: bool
+    ) -> list[dict[str, Any]]:
+        while True:
+            trigger = self._next_auto_break_trigger()
+            if trigger is None:
+                return []
+            pending = self._pending_commands_for_auto_break()
+            if self._auto_break_has_later_command(trigger, pending):
+                self._discard_auto_break(trigger.timer_id)
+                continue
+            source_finish_pending = any(
+                command.get("id") == trigger.finish_command_id for command in pending
+            )
+            if require_canonical and source_finish_pending:
+                return []
+            snapshot = self.get_meta("snapshot", {})
+            if require_canonical and self._pending_auto_start_operations():
+                return []
+            context = self._auto_break_context(
+                trigger, pending, snapshot, source_finish_pending,
+                require_canonical, now_ms,
+            )
+            if context is None:
+                self._discard_auto_break(trigger.timer_id)
+                continue
+            trusted_ms, sequences, clocks = self._reserve_generation(
+                now_ms, sequence_count=1, clock_count=1,
+                use_server_clock=use_server_clock,
+                use_monotonic=use_server_clock,
+            )
+            self._discard_auto_break(trigger.timer_id)
+            if context.completion is None:
+                continue
+            command = self._queue_auto_break_start(
+                trigger, context, require_canonical, now_ms,
+                trusted_ms, sequences[0], clocks[0],
+            )
+            return [command]
 
-                phase = next_break_phase(
-                    history, completion.get("completedAt") or completion.get("endedAt")
-                )
-                settings["selectedPhase"] = phase
-                self._set_meta("settings", settings)
-                command_id = self._reserve_uuid7_ids(clocks[0][0], 1)[0]
-                command = self._queue_command(
-                    "start",
-                    None,
-                    phase,
-                    settings["durationsMs"],
-                    None,
-                    now_ms,
-                    (
-                        finish_command_id
-                        if not require_canonical and not source_already_accepted
-                        else None
-                    ),
-                    trusted_ms=trusted_ms,
-                    sequence=sequences[0],
-                    clock=clocks[0],
-                    command_id=command_id,
-                )
-                if not require_canonical and not source_already_accepted:
-                    self.connection.execute(
-                        "INSERT INTO pending_auto_break_starts("
-                        "source_finish_command_id, source_timer_id, start_command_id, "
-                        "selected_phase_version) VALUES (?, ?, ?, ?)",
-                        (
-                            finish_command_id,
-                            timer_id,
-                            command["id"],
-                            int(self.get_meta("selectedPhaseVersion", 0)),
-                        ),
-                    )
-                return [command]
+    def _next_auto_break_trigger(self) -> _AutoBreakTrigger | None:
+        row = self.connection.execute(
+            "SELECT finish_command_id, timer_id, finish_device_sequence "
+            "FROM pending_auto_breaks ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return _AutoBreakTrigger(
+            str(row["finish_command_id"]),
+            str(row["timer_id"]),
+            int(row["finish_device_sequence"]),
+        )
+
+    def _pending_commands_for_auto_break(self) -> list[dict[str, Any]]:
+        commands = [
+            json.loads(row["payload"])
+            for row in self.connection.execute(
+                "SELECT payload FROM pending_commands ORDER BY device_sequence"
+            )
+        ]
+        return self._physical_pending_commands(commands)
+
+    @staticmethod
+    def _auto_break_has_later_command(
+        trigger: _AutoBreakTrigger, pending: list[dict[str, Any]]
+    ) -> bool:
+        return any(
+            int(command.get("deviceSequence", 0)) > trigger.finish_sequence
+            and not (
+                command.get("type") == "finish"
+                and command.get("timerId") == trigger.timer_id
+            )
+            for command in pending
+        )
+
+    def _discard_auto_break(self, timer_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM pending_auto_breaks WHERE timer_id = ?", (timer_id,)
+        )
+
+    def _auto_break_context(
+        self, trigger: _AutoBreakTrigger, pending: list[dict[str, Any]],
+        snapshot: dict[str, Any], source_finish_pending: bool,
+        require_canonical: bool, now_ms: int,
+    ) -> _AutoBreakContext | None:
+        canonical_timer = snapshot.get("canonicalTimer")
+        base_history = snapshot.get("history", [])
+        canonical_completion = self._focus_completion(
+            base_history, trigger.timer_id, trigger.finish_command_id
+        )
+        canonical_timer_is_source = canonical_timer is not None and (
+            canonical_timer.get("id") == trigger.timer_id
+            and canonical_timer.get("phase") == "focus"
+            and canonical_timer.get("status") == "completed"
+        )
+        source_already_accepted = (
+            not source_finish_pending
+            and canonical_completion is not None
+            and canonical_timer_is_source
+        )
+        settings = self._normalize_settings(self.get_meta("settings", {}))
+        state = self.load(projection=True)
+        optimistic = self._project_operation(
+            settings, now=utc_timestamp(now_ms), base=snapshot, state=state,
+            pending_commands=pending,
+        )
+        current_timer = (
+            canonical_timer if require_canonical else optimistic.canonical_timer
+        )
+        if not source_already_accepted and (
+            not isinstance(current_timer, dict)
+            or current_timer.get("id") != trigger.timer_id
+            or current_timer.get("phase") != "focus"
+            or current_timer.get("status") != "completed"
+        ):
+            return None
+        use_canonical = require_canonical or source_already_accepted
+        history = base_history if use_canonical else optimistic.history
+        completion = (
+            canonical_completion
+            if use_canonical
+            else self._focus_completion(
+                history, trigger.timer_id, trigger.finish_command_id
+            )
+        )
+        return _AutoBreakContext(
+            settings, history, completion, source_already_accepted
+        )
+
+    def _queue_auto_break_start(
+        self, trigger: _AutoBreakTrigger, context: _AutoBreakContext,
+        require_canonical: bool, now_ms: int, trusted_ms: int,
+        sequence: int, clock: tuple[int, int],
+    ) -> dict[str, Any]:
+        completion = context.completion
+        if completion is None:
+            raise ValueError("Automatic break completion is missing.")
+        phase = next_break_phase(
+            context.history,
+            completion.get("completedAt") or completion.get("endedAt"),
+        )
+        context.settings["selectedPhase"] = phase
+        self._set_meta("settings", context.settings)
+        command_id = self._reserve_uuid7_ids(clock[0], 1)[0]
+        provisional = not require_canonical and not context.source_already_accepted
+        command = self._queue_command(
+            "start", None, phase, context.settings["durationsMs"], None, now_ms,
+            trigger.finish_command_id if provisional else None,
+            trusted_ms=trusted_ms, sequence=sequence, clock=clock,
+            command_id=command_id,
+        )
+        if provisional:
+            self.connection.execute(
+                "INSERT INTO pending_auto_break_starts("
+                "source_finish_command_id, source_timer_id, start_command_id, "
+                "selected_phase_version) VALUES (?, ?, ?, ?)",
+                (
+                    trigger.finish_command_id, trigger.timer_id, command["id"],
+                    int(self.get_meta("selectedPhaseVersion", 0)),
+                ),
+            )
+        return command
 
     def reset_account_data(self) -> None:
         with self._immediate_transaction():
             room_id = self.active_iroh_room_id
             if self.replication_mode == "iroh" and room_id is not None:
-                self._capture_local_iroh_records_locked(room_id)
-                room = self.connection.execute(
-                    "SELECT return_workspace FROM iroh_rooms WHERE room_id = ?",
-                    (room_id,),
-                ).fetchone()
-                if room is None:
-                    raise ValueError("Active Iroh room workspace is missing.")
-                returned = json.loads(room["return_workspace"])
-                return_snapshot = returned.get("metadata", {}).get("snapshot", {})
-                preserve_return_domain = (
-                    isinstance(return_snapshot, dict)
-                    and return_snapshot.get("user") is None
-                )
-                cleared_current = self._workspace_without_account(
-                    self._capture_workspace(), preserve_domain=True
-                )
-                cleared_return = self._workspace_without_account(
-                    returned, preserve_domain=preserve_return_domain
-                )
-                self.connection.execute(
-                    "UPDATE iroh_rooms SET return_workspace = ?, workspace = ? "
-                    "WHERE room_id = ?",
-                    (
-                        json.dumps(cleared_return, separators=(",", ":")),
-                        json.dumps(cleared_current, separators=(",", ":")),
-                        room_id,
-                    ),
-                )
-                self._restore_workspace(cleared_current)
+                self._reset_iroh_account_data(room_id)
                 return
-            self.connection.execute("DELETE FROM pending_commands")
-            self.connection.execute("DELETE FROM pending_task_operations")
-            self.connection.execute("DELETE FROM pending_duration_operations")
-            self.connection.execute("DELETE FROM pending_auto_start_operations")
-            self.connection.execute("DELETE FROM pending_selected_task_operations")
-            self.connection.execute("DELETE FROM pending_auto_breaks")
-            self.connection.execute("DELETE FROM pending_auto_break_starts")
-            self.connection.execute("DELETE FROM pending_phase_advances")
+            self._clear_account_queues()
             self._set_meta("commandPhysicalTimes", {})
             self._set_meta("centralizedTimerOwnership", None)
             self._set_meta("pendingSync", None)
@@ -5026,14 +2955,35 @@ class Store:
             self._set_meta("settings", settings)
             self._set_meta(
                 "snapshot",
-                {
-                    "revision": 0,
-                    "canonicalTimer": None,
-                    "history": [],
-                    "tasks": [],
-                    "knownTasks": [],
-                    "autoStartBreaks": False,
-                    "selectedTaskId": None,
-                    "user": None,
-                },
+                {"revision": 0, "canonicalTimer": None, "history": [], "tasks": [],
+                 "knownTasks": [], "autoStartBreaks": False,
+                 "selectedTaskId": None, "user": None},
             )
+
+    def _reset_iroh_account_data(self, room_id: str) -> None:
+        self._capture_local_iroh_records_locked(room_id)
+        room = self.connection.execute(
+            "SELECT return_workspace FROM iroh_rooms WHERE room_id = ?", (room_id,)).fetchone()
+        if room is None:
+            raise ValueError("Active Iroh room workspace is missing.")
+        returned = self._workspace_storage.deserialize(room["return_workspace"])
+        return_snapshot = returned.get("metadata", {}).get("snapshot", {})
+        preserve = isinstance(return_snapshot, dict) and return_snapshot.get("user") is None
+        current = self._workspace_without_account(self._capture_workspace(), preserve_domain=True)
+        returned = self._workspace_without_account(returned, preserve_domain=preserve)
+        self.connection.execute(
+            "UPDATE iroh_rooms SET return_workspace = ?, workspace = ? WHERE room_id = ?",
+            (
+                self._workspace_storage.serialize(returned),
+                self._workspace_storage.serialize(current),
+                room_id,
+            ),
+        )
+        self._restore_workspace(current)
+
+    def _clear_account_queues(self) -> None:
+        for table in ("pending_commands", "pending_task_operations",
+                      "pending_duration_operations", "pending_auto_start_operations",
+                      "pending_selected_task_operations", "pending_auto_breaks",
+                      "pending_auto_break_starts", "pending_phase_advances"):
+            self.connection.execute(f"DELETE FROM {table}")

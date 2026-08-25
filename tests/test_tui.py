@@ -66,8 +66,8 @@ class TuiTests(unittest.TestCase):
             ("finish uppercase", ord("F"), "issue", ("finish",)),
             ("cancel", ord("x"), "issue", ("cancel",)),
             ("cancel uppercase", ord("X"), "issue", ("cancel",)),
-            ("clear", ord("c"), "issue", ("clear",)),
-            ("clear uppercase", ord("C"), "issue", ("clear",)),
+            ("dismiss", ord("c"), "issue", ("dismiss",)),
+            ("dismiss uppercase", ord("C"), "issue", ("dismiss",)),
             ("focus", ord("1"), "select_phase", ("focus",)),
             ("short break", ord("2"), "select_phase", ("short_break",)),
             ("long break", ord("3"), "select_phase", ("long_break",)),
@@ -104,11 +104,17 @@ class TuiTests(unittest.TestCase):
             [
                 {
                     "phase": "focus",
+                    "status": "cancelled",
                     "taskTitle": "Ship release",
                     "plannedDurationMs": 125_999,
                     "pending": True,
                 },
-                {"phase": "short_break", "plannedDurationMs": 60_000},
+                {
+                    "phase": "short_break",
+                    "status": "superseded",
+                    "taskTitle": "Unassigned",
+                    "plannedDurationMs": 60_000,
+                },
             ],
             80,
             "Cannot pause now",
@@ -121,16 +127,17 @@ class TuiTests(unittest.TestCase):
         self.assertIn("4 auto-start preference operation(s) pending sync", rendered)
         self.assertIn("Account history resolution pending", rendered)
         self.assertIn("Cannot pause now", rendered)
+        self.assertIn("c dismiss", rendered)
         self.assertIn("Focus: Ship release", rendered)
-        self.assertIn("  2 min *", rendered)
-        self.assertIn("Short Break    1 min", rendered)
+        self.assertIn("Cancelled | 2 min *", rendered)
+        self.assertIn("Short Break: Unassigned | Superseded | 1 min", rendered)
 
     def test_build_lines_reports_empty_history(self) -> None:
         rendered = "\n".join(tui.build_lines(timer_state(status="waiting"), [], 80))
 
         self.assertIn("WAITING", rendered)
         self.assertIn("No arrivals yet", rendered)
-        self.assertIn("Your first run appears here.", rendered)
+        self.assertIn("Completed, cancelled, and superseded timers appear here.", rendered)
         self.assertNotIn("TASK:", rendered)
         self.assertNotIn("pending sync", rendered)
 
@@ -146,7 +153,7 @@ class TuiTests(unittest.TestCase):
         screen = FakeScreen(5, 8)
         timer = Mock()
         timer.state.return_value = timer_state()
-        timer.completed_history.return_value = []
+        timer.retained_history.return_value = []
 
         tui._draw(screen, timer, "")
 
@@ -154,13 +161,13 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(screen.refreshes, 1)
         self.assertEqual(screen.writes, [(0, 0, "Termina", 7, None)])
         timer.state.assert_called_once_with(auto_finish=True)
-        timer.completed_history.assert_called_once_with(5)
+        timer.retained_history.assert_called_once_with(5)
 
     def test_draw_renders_normal_screen_and_truncates_writes(self) -> None:
         screen = FakeScreen(14, 40)
         timer = Mock()
         timer.state.return_value = timer_state()
-        timer.completed_history.return_value = []
+        timer.retained_history.return_value = []
 
         tui._draw(screen, timer, "")
 

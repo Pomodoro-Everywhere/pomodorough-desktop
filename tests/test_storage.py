@@ -6,29 +6,117 @@ import tempfile
 import time
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta
 from itertools import permutations
 from pathlib import Path
 from queue import Queue
 from threading import Barrier, Event, Thread
 from unittest.mock import patch
 
+import pomodorough.storage as storage
+from pomodorough import storage_model
 from pomodorough.core import (
     project_auto_start_breaks,
     rebuild_optimistic,
     rebuild_tasks,
     task_from_title,
 )
+from pomodorough.shared_core import SharedCore, SharedCoreLoadError
 from pomodorough.storage import (
     MAX_CLOCK_SKEW_MS,
     MAX_SAFE_INTEGER,
     MAX_SERVER_TIME_UNCERTAINTY_MS,
     Store,
     default_data_path,
+    parse_timestamp_ms,
     utc_timestamp,
 )
 
 
+class _RecordingSharedCore:
+    def __init__(self, result: object = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[tuple[str, object]] = []
+
+    def dispatch(self, operation: str, input_value: object) -> object:
+        self.calls.append((operation, input_value))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _DelegatingRecordingSharedCore:
+    def __init__(self) -> None:
+        self.delegate = SharedCore()
+        self.calls: list[tuple[str, object, object]] = []
+
+    def dispatch(self, operation: str, input_value: object) -> object:
+        result = self.delegate.dispatch(operation, input_value)
+        self.calls.append((operation, deepcopy(input_value), deepcopy(result)))
+        return result
+
+
+class _OperationOverrideSharedCore(_DelegatingRecordingSharedCore):
+    def __init__(self, operation: str, result: object) -> None:
+        super().__init__()
+        self.operation = operation
+        self.result = result
+
+    def dispatch(self, operation: str, input_value: object) -> object:
+        if operation == self.operation:
+            self.calls.append((operation, deepcopy(input_value), deepcopy(self.result)))
+            return self.result
+        return super().dispatch(operation, input_value)
+
+
 class StorageTests(unittest.TestCase):
+    def test_storage_modules_share_default_shared_core(self) -> None:
+        self.assertIs(
+            storage._default_shared_core(),
+            storage_model._default_shared_core(),
+        )
+        self.assertIs(
+            storage._default_shared_core,
+            storage_model._default_shared_core,
+        )
+
+    def test_storage_reexports_shared_storage_policy(self) -> None:
+        compatibility_names = (
+            "ACKNOWLEDGEMENT_OUTCOMES",
+            "CANONICAL_DURATION_MAX_MS",
+            "COMMAND_TYPES",
+            "DURATION_MIN_MS",
+            "MAX_CLOCK_CONTINUITY_DRIFT_MS",
+            "MAX_CLOCK_SKEW_MS",
+            "MAX_SAFE_INTEGER",
+            "MAX_SERVER_TIME_UNCERTAINTY_MS",
+            "PREFERENCE_DURATION_MAX_MS",
+            "RESOLUTION_OPERATION_MAX",
+            "utc_timestamp",
+        )
+
+        for name in compatibility_names:
+            with self.subTest(name=name):
+                self.assertIs(getattr(storage, name), getattr(storage_model, name))
+
+    def test_storage_model_utc_timestamp_normalizes_platform_range_errors(
+        self,
+    ) -> None:
+        for platform_error in (
+            OverflowError("platform overflow"),
+            OSError("platform timestamp range"),
+            ValueError("platform timestamp range"),
+        ):
+            with self.subTest(error=type(platform_error).__name__):
+                with patch.object(storage_model, "datetime") as datetime_type:
+                    datetime_type.fromtimestamp.side_effect = platform_error
+                    with self.assertRaisesRegex(
+                        ValueError, "^timestamp is out of range$"
+                    ) as raised:
+                        storage_model.utc_timestamp(0)
+                self.assertIs(raised.exception.__cause__, platform_error)
+
     def test_default_data_path_uses_platform_data_directory(self) -> None:
         root = Path("platform-data")
         with patch("pomodorough.storage.user_data_path", return_value=root) as path:
@@ -45,6 +133,535 @@ class StorageTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.temporary.cleanup()
+
+    def test_production_projection_reader_matches_protocol_transition_matrix(
+        self,
+    ) -> None:
+        core = SharedCore()
+        states = (
+            "absent",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "superseded",
+        )
+        action_types = ("start", "pause", "resume", "finish", "cancel", "clear")
+        cases = 0
+
+        def command(
+            command_type: str,
+            sequence: int,
+            *,
+            timer_id: str = "timer-a",
+            observed_ms: int = 0,
+        ) -> dict[str, object]:
+            return {
+                "id": f"command-{sequence:03d}-{command_type}-{timer_id}",
+                "deviceId": "device-a",
+                "deviceSequence": sequence,
+                "timerId": timer_id,
+                "type": command_type,
+                "phase": "focus",
+                "plannedDurationMs": 1_500_000,
+                "occurredAt": utc_timestamp(1_000 + sequence),
+                "hlcWallMs": 1_000 + sequence,
+                "hlcCounter": 0,
+                "observedElapsedMs": observed_ms,
+            }
+
+        for state_name in states:
+            for action_type in action_types:
+                for target in ("same", "foreign"):
+                    setup = [command("start", 1)] if state_name != "absent" else []
+                    if state_name == "paused":
+                        setup.append(command("pause", 2, observed_ms=1_000))
+                    elif state_name == "completed":
+                        setup.append(command("finish", 2, observed_ms=1_000))
+                    elif state_name == "cancelled":
+                        setup.append(command("cancel", 2, observed_ms=1_000))
+                    elif state_name == "superseded":
+                        setup.append(command("start", 2, timer_id="timer-current"))
+                    action = command(
+                        action_type,
+                        99,
+                        timer_id="timer-a" if target == "same" else "timer-foreign",
+                        observed_ms=123_000,
+                    )
+                    commands = setup + [action]
+                    state = self.store.load(projection=True)
+                    state["projectionPending"] = commands
+
+                    projection = self.store.projected_state(now_ms=1_099, state=state)
+                    reference = core.dispatch(
+                        "timer.reduce.v1",
+                        {
+                            "canonicalTimer": None,
+                            "history": [],
+                            "commands": commands,
+                            "now": utc_timestamp(1_099),
+                        },
+                    )
+
+                    with self.subTest(
+                        state=state_name, action=action_type, target=target
+                    ):
+                        self.assertEqual(
+                            projection.canonical_timer, reference["canonicalTimer"]
+                        )
+                        self.assertEqual(projection.history, reference["history"])
+                        self.assertEqual(
+                            projection.timer_outcomes, reference["outcomes"]
+                        )
+                    cases += 1
+
+        self.assertEqual(cases, 72)
+
+    def test_production_projection_reader_completes_overdue_pause_then_resume(
+        self,
+    ) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        running = self.store.projected_state(now_ms=1_000).canonical_timer
+        self.assertIsNotNone(running)
+
+        self.store.queue_command(
+            "pause", running, "focus", durations_ms, now_ms=70_000
+        )
+        paused = self.store.projected_state(now_ms=70_000).canonical_timer
+        self.assertIsNotNone(paused)
+        self.store.queue_command(
+            "resume", paused, "focus", durations_ms, now_ms=80_000
+        )
+
+        projection = self.store.projected_state(now_ms=90_000)
+        timer_id = running["id"]
+        self.assertEqual(projection.canonical_timer["status"], "completed")
+        self.assertEqual(
+            projection.canonical_timer["lastIntent"]["type"], "resume"
+        )
+        self.assertEqual(
+            (projection.history[0]["id"], projection.history[0]["timerId"]),
+            (timer_id, timer_id),
+        )
+
+    def test_production_projection_reader_matches_convergence_fixture(self) -> None:
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "convergence-v1.json").read_text()
+        )
+        epoch = datetime.fromisoformat(fixture["epoch"])
+        epoch_ms = int(epoch.timestamp() * 1_000)
+
+        def normalize(timer: dict | None, history: list[dict]) -> dict:
+            def relative_ms(timestamp: str) -> int:
+                value = datetime.fromisoformat(timestamp)
+                return int((value - epoch).total_seconds() * 1_000)
+
+            normalized = {
+                "history": [
+                    {
+                        key: value
+                        for key, value in {
+                            "timerId": item["timerId"],
+                            "status": item["status"],
+                            "phase": item["phase"],
+                            "durationMs": item["plannedDurationMs"],
+                            "commandId": item.get("commandId"),
+                            "endedMs": relative_ms(item["endedAt"]),
+                            "taskId": item.get("taskId"),
+                        }.items()
+                        if value is not None
+                    }
+                    for item in history
+                ]
+            }
+            if timer is not None:
+                normalized["timer"] = {
+                    key: value
+                    for key, value in {
+                        "id": timer["id"],
+                        "status": timer["status"],
+                        "phase": timer["phase"],
+                        "durationMs": timer["plannedDurationMs"],
+                        "elapsedMs": timer["elapsedAtAnchorMs"],
+                        "anchorMs": relative_ms(timer["anchorAt"]),
+                        "lastCommandId": timer.get("lastIntent", {}).get(
+                            "commandId", ""
+                        ),
+                        "taskId": timer.get("taskId"),
+                    }.items()
+                    if value is not None
+                }
+            return normalized
+
+        for scenario in fixture["cases"]:
+            commands = [
+                {
+                    "id": item["id"],
+                    "deviceSequence": item["sequence"],
+                    "deviceId": item["deviceId"],
+                    "timerId": item["timerId"],
+                    "type": item["type"],
+                    "phase": item["phase"],
+                    "plannedDurationMs": item["durationMs"],
+                    "occurredAt": (
+                        epoch + timedelta(milliseconds=item["atMs"])
+                    ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "hlcWallMs": item["wallMs"],
+                    "hlcCounter": item["counter"],
+                    "observedElapsedMs": item["elapsedMs"],
+                    **({"taskId": item["taskId"]} if item.get("taskId") else {}),
+                }
+                for item in scenario["commands"]
+            ]
+            now_ms = epoch_ms + max(item["atMs"] for item in scenario["commands"])
+            for arrival_order in (commands, list(reversed(commands))):
+                state = self.store.load(projection=True)
+                state["projectionPending"] = arrival_order
+                projection = self.store.projected_state(now_ms=now_ms, state=state)
+
+                with self.subTest(
+                    scenario=scenario["name"], first=arrival_order[0]["id"]
+                ):
+                    self.assertEqual(
+                        normalize(projection.canonical_timer, projection.history),
+                        scenario["expected"],
+                    )
+
+        for scenario in fixture["projectionCases"]:
+            def operations(
+                scenario_value: dict[str, object], name: str
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        key: value
+                        for key, value in {
+                            **item,
+                            "occurredAt": (
+                                epoch + timedelta(milliseconds=item["atMs"])
+                            ).isoformat(timespec="milliseconds").replace(
+                                "+00:00", "Z"
+                            ),
+                            "hlcWallMs": item["wallMs"],
+                            "hlcCounter": item["counter"],
+                        }.items()
+                        if key not in {"atMs", "wallMs", "counter"}
+                    }
+                    for item in scenario_value[name]
+                ]
+
+            state = self.store.load(projection=True)
+            state["pendingTasks"] = operations(scenario, "taskOperations")
+            state["pendingDurations"] = operations(scenario, "durationOperations")
+            state["pendingAutoStarts"] = operations(
+                scenario, "autoStartOperations"
+            )
+            projection = self.store.projected_state(now_ms=epoch_ms + 10_000, state=state)
+
+            with self.subTest(scenario=scenario["name"], domain="projection"):
+                self.assertEqual(projection.tasks, scenario["expected"]["tasks"])
+                self.assertEqual(
+                    projection.durations_ms, scenario["expected"]["durationsMs"]
+                )
+                self.assertEqual(
+                    projection.auto_start_breaks,
+                    scenario["expected"]["autoStartBreaks"],
+                )
+
+    def test_projection_reader_fails_closed_on_malformed_shared_core_output(self) -> None:
+        self.store.close()
+        core = _OperationOverrideSharedCore(
+            "projection.apply.v2", {"canonicalTimer": None}
+        )
+        self.store = Store(self.path, shared_core=core)
+
+        with self.assertRaisesRegex(
+            ValueError, "malformed projection.apply.v2 output"
+        ):
+            self.store.projected_state(now_ms=1_000)
+
+    def test_task_write_uses_shared_core_identity_before_persistence(self) -> None:
+        self.store.close()
+
+        class IdentityProjectionCore:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, object]] = []
+
+            def dispatch(self, operation: str, input_value: object) -> object:
+                self.calls.append((operation, input_value))
+                if operation == "task.identity.v1":
+                    return {
+                        "id": "core-task-id",
+                        "title": "Core task",
+                        "utf8Bytes": 9,
+                    }
+                assert isinstance(input_value, dict)
+                task_operation = input_value["pending"]["taskOperations"][-1]
+                return {
+                    "canonicalTimer": input_value["base"]["canonicalTimer"],
+                    "history": input_value["base"]["history"],
+                    "tasks": [{"id": "core-task-id", "title": "Core task"}],
+                    "durationsMs": input_value["base"]["durationsMs"],
+                    "autoStartBreaks": input_value["base"]["autoStartBreaks"],
+                    "selectedTaskId": input_value["base"]["selectedTaskId"],
+                    "timerOutcomes": {},
+                    "winningOperationIds": {
+                        "tasks": {"core-task-id": task_operation["id"]},
+                        "durations": {},
+                        "autoStart": None,
+                        "selectedTask": None,
+                    },
+                }
+
+        core = IdentityProjectionCore()
+        self.store = Store(self.path, shared_core=core)
+
+        operation = self.store.queue_task_operation(
+            "upsert", {"id": "core-task-id", "title": "client task"}, now_ms=1
+        )
+
+        self.assertEqual(
+            core.calls[0],
+            ("task.identity.v1", {"title": "client task"}),
+        )
+        self.assertEqual(core.calls[1][0], "projection.apply.v2")
+        self.assertEqual(operation["taskId"], "core-task-id")
+        self.assertEqual(operation["title"], "Core task")
+
+    def test_task_write_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM pending_task_operations"
+        ).fetchone()[0]
+        before_hlc = self.store.get_meta("hlc")
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.queue_task_operation(
+                "upsert", {"id": "native-task-id", "title": "Task"}, now_ms=1
+            )
+
+        after = self.store.connection.execute(
+            "SELECT COUNT(*) FROM pending_task_operations"
+        ).fetchone()[0]
+        self.assertEqual(after, before)
+        self.assertEqual(self.store.get_meta("hlc"), before_hlc)
+
+    def test_task_write_fails_closed_on_malformed_shared_core_output(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(
+            {"id": "core-task-id", "title": "Core task", "utf8Bytes": 8}
+        )
+        self.store = Store(self.path, shared_core=core)
+
+        with self.assertRaisesRegex(ValueError, "invalid task identity"):
+            self.store.queue_task_operation(
+                "upsert", {"id": "core-task-id", "title": "Task"}, now_ms=1
+            )
+
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM pending_task_operations"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_task_write_rolls_back_when_projection_fails_after_identity(self) -> None:
+        task = task_from_title("Projected task")
+
+        class TaskThenProjectionFailure:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def dispatch(self, operation: str, input_value: object) -> object:
+                self.calls.append(operation)
+                if operation == "task.identity.v1":
+                    return {
+                        "id": task["id"],
+                        "title": task["title"],
+                        "utf8Bytes": len(task["title"].encode("utf-8")),
+                    }
+                raise SharedCoreLoadError("projection unavailable")
+
+        self.store.close()
+        core = TaskThenProjectionFailure()
+        self.store = Store(self.path, shared_core=core)
+        before_snapshot = self.store.get_meta("snapshot")
+        before_hlc = self.store.get_meta("hlc")
+        before_uuid = self.store.get_meta("lastUuidV7")
+
+        with self.assertRaisesRegex(ValueError, "projection unavailable"):
+            self.store.queue_task_operation("upsert", task, now_ms=1_000)
+
+        self.assertEqual(core.calls, ["task.identity.v1", "projection.apply.v2"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM pending_task_operations"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.store.get_meta("snapshot"), before_snapshot)
+        self.assertEqual(self.store.get_meta("hlc"), before_hlc)
+        self.assertEqual(self.store.get_meta("lastUuidV7"), before_uuid)
+
+    def test_duration_write_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        before_settings = self.store.get_meta("settings")
+        before_hlc = self.store.get_meta("hlc")
+        before_uuid = self.store.get_meta("lastUuidV7")
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
+
+        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM pending_duration_operations"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.store.get_meta("settings"), before_settings)
+        self.assertEqual(self.store.get_meta("hlc"), before_hlc)
+        self.assertEqual(self.store.get_meta("lastUuidV7"), before_uuid)
+
+    def test_auto_start_write_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        before_settings = self.store.get_meta("settings")
+        before_hlc = self.store.get_meta("hlc")
+        before_uuid = self.store.get_meta("lastUuidV7")
+        before_legacy = self.store.get_meta("autoStartLegacyDefaultUnknown")
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.set_auto_start_breaks(True, now_ms=1_000)
+
+        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM pending_auto_start_operations"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.store.get_meta("settings"), before_settings)
+        self.assertEqual(self.store.get_meta("hlc"), before_hlc)
+        self.assertEqual(self.store.get_meta("lastUuidV7"), before_uuid)
+        self.assertEqual(
+            self.store.get_meta("autoStartLegacyDefaultUnknown"), before_legacy
+        )
+
+    def test_selected_task_write_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        before_settings = self.store.get_meta("settings")
+        before_hlc = self.store.get_meta("hlc")
+        before_uuid = self.store.get_meta("lastUuidV7")
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.set_selected_task_id("task-id", now_ms=1_000)
+
+        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM pending_selected_task_operations"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.store.get_meta("settings"), before_settings)
+        self.assertEqual(self.store.get_meta("hlc"), before_hlc)
+        self.assertEqual(self.store.get_meta("lastUuidV7"), before_uuid)
+
+    def test_timer_write_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        settings = self.store.load()["settings"]
+        before = {
+            key: self.store.get_meta(key)
+            for key in (
+                "settings",
+                "commandPhysicalTimes",
+                "centralizedTimerOwnership",
+                "deviceSequence",
+                "hlc",
+                "lastUuidV7",
+            )
+        }
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.queue_command(
+                "start", None, "focus", settings["durationsMs"], now_ms=1_000
+            )
+
+        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM pending_commands"
+            ).fetchone()[0],
+            0,
+        )
+        for key, value in before.items():
+            self.assertEqual(self.store.get_meta(key), value)
+
+    def test_local_genesis_projection_fails_closed_when_shared_core_fails(self) -> None:
+        self.store.close()
+        core = _RecordingSharedCore(error=SharedCoreLoadError("core unavailable"))
+        self.store = Store(self.path, shared_core=core)
+        before = self.store.load()
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store._projected_local_genesis()
+
+        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(self.store.load(), before)
+
+    def test_automatic_finish_is_exactly_once_across_two_store_instances(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        timer, _history = rebuild_optimistic(None, [], [start])
+        barrier = Barrier(3)
+        results = Queue()
+
+        def finish() -> None:
+            store = Store(self.path)
+            try:
+                barrier.wait()
+                results.put(
+                    store.queue_command(
+                        "finish",
+                        timer,
+                        "focus",
+                        settings["durationsMs"],
+                        now_ms=1_000 + settings["durationsMs"]["focus"],
+                        automatic=True,
+                    )
+                )
+            finally:
+                store.close()
+
+        workers = [Thread(target=finish) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+
+        outcomes = [results.get_nowait() for _ in workers]
+        self.assertEqual(sum(outcome is not None for outcome in outcomes), 1)
+        finish_commands = [
+            command for command in self.store.load()["pending"]
+            if command["type"] == "finish" and command["timerId"] == timer["id"]
+        ]
+        self.assertEqual(len(finish_commands), 1)
 
     def test_canonical_shipping_fixture_uses_production_sync_decoder(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures/protocol-fixtures-v1.json"
@@ -84,6 +701,74 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(self.store.owns_timer(running))
         self.store.reset_account_data()
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
+
+    def test_history_identity_survives_sqlite_restart_and_acknowledgement(self) -> None:
+        historical = {
+            "id": "history-custom",
+            "timerId": "timer-a",
+            "commandId": "old-finish",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 25 * 60_000,
+            "completedAt": utc_timestamp(900),
+            "endedAt": utc_timestamp(900),
+            "taskId": None,
+        }
+        snapshot = self.store.load()["snapshot"]
+        snapshot["history"] = [historical]
+        self.store.set_meta("snapshot", snapshot)
+        historical_timer = {
+            "id": "timer-a",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 25 * 60_000,
+            "elapsedAtAnchorMs": 25 * 60_000,
+            "anchorAt": utc_timestamp(900),
+            "taskId": None,
+        }
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "pause", historical_timer, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        projected = self.store.load()
+        timer, history = rebuild_optimistic(
+            projected["snapshot"].get("canonicalTimer"),
+            projected["snapshot"]["history"],
+            projected["pending"],
+        )
+        self.assertEqual(
+            next(item for item in history if item["timerId"] == "timer-a")["id"],
+            "history-custom",
+        )
+
+        self.store.close()
+        self.store = Store(self.path)
+        restarted = self.store.load()
+        restarted_timer, restarted_history = rebuild_optimistic(
+            restarted["snapshot"].get("canonicalTimer"),
+            restarted["snapshot"]["history"],
+            restarted["pending"],
+        )
+        self.assertEqual(restarted_timer, timer)
+        self.assertEqual(restarted_history, history)
+
+        request = self.store.sync_payload()
+        response = self._canonical_response(request, history=deepcopy(history))
+        response["canonicalTimer"] = deepcopy(timer)
+        self.store.apply_sync(response, request)
+        acknowledged = self.store.load()
+        self.assertEqual(acknowledged["pending"], [])
+        self.assertEqual(
+            next(
+                item
+                for item in acknowledged["snapshot"]["history"]
+                if item["timerId"] == "timer-a"
+            )["id"],
+            "history-custom",
+        )
 
     def test_canonical_replacement_clears_centralized_timer_ownership(self) -> None:
         settings = self.store.load()["settings"]
@@ -125,6 +810,20 @@ class StorageTests(unittest.TestCase):
             "plannedDurationMs": 25 * 60_000,
             "completedAt": completed_at,
         }
+
+    @classmethod
+    def _prior_focus_history(
+        cls, prefix: str, completed_at: str
+    ) -> list[dict[str, object]]:
+        completed_ms = parse_timestamp_ms(completed_at)
+        if completed_ms is None:
+            raise ValueError("Test completion timestamp is invalid.")
+        return [
+            cls._history_item(
+                f"{prefix}-{index}", utc_timestamp(completed_ms - (4 - index))
+            )
+            for index in range(1, 4)
+        ]
 
     @staticmethod
     def _operation_intent(operation: dict[str, object]) -> dict[str, object]:
@@ -315,6 +1014,55 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(local_history_remote_task["localHistory"])
         self.assertFalse(local_history_remote_task["remoteHistory"])
         self.assertIsNone(local_history_remote_task["strategy"])
+
+    def test_bootstrap_resolution_plan_matches_pinned_shared_core(self) -> None:
+        self.store.queue_task_operation(
+            "upsert", task_from_title("Local task"), now_ms=100
+        )
+        response = self._canonical_response(
+            {"commands": [], "taskOperations": [], "durationOperations": []},
+            revision=7,
+        )
+        core = _DelegatingRecordingSharedCore()
+        self.store._shared_core = core
+
+        plan = self.store.bootstrap_resolution_plan(response)
+
+        operation, input_value, core_plan = next(
+            call for call in core.calls if call[0] == "bootstrap.plan.v1"
+        )
+        self.assertEqual(operation, "bootstrap.plan.v1")
+        self.assertEqual(
+            set(input_value),
+            {"localHistory", "remoteHistory", "hasLocalState", "hasRemoteState"},
+        )
+        self.assertEqual(input_value["remoteHistory"], response["history"])
+        self.assertEqual(plan["strategy"], core_plan["strategy"])
+        self.assertEqual(plan["expectedRevision"], 7)
+
+    def test_bootstrap_resolution_plan_rolls_back_malformed_core_output(self) -> None:
+        response = self._canonical_response(
+            {"commands": [], "taskOperations": [], "durationOperations": []}
+        )
+        before = self.store.get_meta("serverClockSample")
+        before_anchor = self.store._trusted_time_anchor
+        core = _OperationOverrideSharedCore(
+            "bootstrap.plan.v1", {"mode": "auto"}
+        )
+        self.store._shared_core = core
+
+        with self.assertRaisesRegex(ValueError, "invalid bootstrap plan"):
+            self.store.bootstrap_resolution_plan(
+                response,
+                request_physical_ms=900,
+                received_physical_ms=1_100,
+                request_monotonic_ms=10_000,
+                received_monotonic_ms=10_200,
+            )
+
+        self.assertIn("bootstrap.plan.v1", [call[0] for call in core.calls])
+        self.assertEqual(self.store.get_meta("serverClockSample"), before)
+        self.assertEqual(self.store._trusted_time_anchor, before_anchor)
 
     def test_bootstrap_meaningful_state_matrix_covers_settings_and_terminal_history(self) -> None:
         empty_remote = self._canonical_response(
@@ -1429,6 +2177,7 @@ class StorageTests(unittest.TestCase):
 
     def test_selected_task_response_validation_is_atomic(self) -> None:
         task = task_from_title("Strict focus task")
+        self.store.queue_task_operation("upsert", task, now_ms=999)
         operation = self.store.set_selected_task_id(task["id"], now_ms=1_000)
         request = self.store.sync_payload()
         response = self._canonical_response(
@@ -1679,6 +2428,7 @@ class StorageTests(unittest.TestCase):
         task = task_from_title("Concurrent selected task")
         other = Store(self.path)
         try:
+            other.queue_task_operation("upsert", task, now_ms=999)
             other.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
             other.set_selected_task_id(task["id"], now_ms=1_001)
         finally:
@@ -1691,6 +2441,107 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(settings["durationsMs"]["focus"], 30 * 60_000)
         self.assertFalse(settings["autoStartBreaks"])
         self.assertEqual(settings["selectedTaskId"], task["id"])
+
+    def test_sync_reconciliation_rolls_back_when_shared_core_fails(self) -> None:
+        sent = self.store.queue_duration_operation(
+            "focus", 26 * 60_000, now_ms=1_000
+        )
+        request = self.store.sync_payload()
+        response = self._canonical_response(request, revision=1)
+        response["durationsMs"] = {
+            "focus": sent["durationMs"],
+            "short_break": 5 * 60_000,
+            "long_break": 15 * 60_000,
+        }
+        before = self.store.load()
+        before_sync = self.store.get_meta("pendingSync")
+        self.store._shared_core = _RecordingSharedCore(
+            error=SharedCoreLoadError("core unavailable")
+        )
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.store.get_meta("pendingSync"), before_sync)
+
+    def test_sync_reconciliation_matches_pinned_shared_core_queue_output(self) -> None:
+        sent = self.store.queue_duration_operation(
+            "focus", 26 * 60_000, now_ms=1_000
+        )
+        request = self.store.sync_payload()
+        retained = self.store.queue_task_operation(
+            "upsert", task_from_title("Retained"), now_ms=2_000
+        )
+        response = self._canonical_response(request, revision=1)
+        response["durationsMs"] = {
+            "focus": sent["durationMs"],
+            "short_break": 5 * 60_000,
+            "long_break": 15 * 60_000,
+        }
+        core = _DelegatingRecordingSharedCore()
+        self.store._shared_core = core
+
+        self.store.apply_sync(response, request)
+
+        _operation, input_value, core_output = next(
+            call for call in core.calls if call[0] == "reconcile.rebase.v1"
+        )
+        self.assertEqual(
+            set(input_value), {"local", "sent", "response", "timerDependencies"}
+        )
+        self.assertNotIn("serverTimeMs", input_value["response"])
+        self.assertEqual(
+            input_value["sent"]["durationOperations"], [{"id": sent["id"]}]
+        )
+        self.assertEqual(
+            input_value["local"]["taskOperations"][0]["deviceId"],
+            self.store.device_id,
+        )
+        expected = deepcopy(core_output["pendingTaskOperations"])
+        for operation in expected:
+            operation.pop("deviceId")
+        self.assertEqual(self.store.load()["pendingTasks"], expected)
+        self.assertEqual(expected[0]["id"], retained["id"])
+
+    def test_sync_reconciliation_rolls_back_malformed_core_output(self) -> None:
+        self.store.queue_duration_operation("focus", 26 * 60_000, now_ms=1_000)
+        request = self.store.sync_payload()
+        response = self._canonical_response(request, revision=1)
+        before = self.store.load()
+        before_sync = self.store.get_meta("pendingSync")
+        self.store._shared_core = _OperationOverrideSharedCore(
+            "reconcile.rebase.v1", {"revision": 1}
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid reconciliation"):
+            self.store.apply_sync(response, request)
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.store.get_meta("pendingSync"), before_sync)
+
+    def test_resolution_reconciliation_rolls_back_malformed_core_output(
+        self,
+    ) -> None:
+        self._queue_completed_timer()
+        user = {"id": "user-1"}
+        request = self.store.prepare_resolution(user, 1, "replace_remote")
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(request, revision=1, history=history)
+        response["canonicalTimer"] = canonical_timer
+        before = self.store.load()
+        before_resolution = self.store.get_meta("pendingResolution")
+        self.store._shared_core = _OperationOverrideSharedCore(
+            "reconcile.rebase.v1", {"revision": 1}
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid reconciliation"):
+            self.store.apply_resolution(response, user)
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(
+            self.store.get_meta("pendingResolution"), before_resolution
+        )
 
     def test_sync_applies_canonical_then_replays_newer_in_flight_edit(self) -> None:
         sent = self.store.queue_duration_operation(
@@ -2488,7 +3339,7 @@ class StorageTests(unittest.TestCase):
         )
         self.assertTrue(loaded["settings"]["autoStartBreaks"])
 
-    def test_sync_rolls_back_when_retained_operation_exceeds_trusted_time(self) -> None:
+    def test_shared_core_rebases_retained_operation_beyond_trusted_time(self) -> None:
         sent = self.store.queue_task_operation(
             "upsert", task_from_title("Sent rollback"), now_ms=1_000
         )
@@ -2510,20 +3361,26 @@ class StorageTests(unittest.TestCase):
         )
         self.store.connection.commit()
         response = self._canonical_response(request, revision=1)
-        before = self.store.load()
 
-        with self.assertRaisesRegex(ValueError, "Retained pending operation"):
-            self.store.apply_sync(
-                response,
-                request,
-                request_physical_ms=1_000,
-                received_physical_ms=1_000,
-                request_monotonic_ms=0,
-                received_monotonic_ms=0,
-            )
+        self.store.apply_sync(
+            response,
+            request,
+            request_physical_ms=1_000,
+            received_physical_ms=1_000,
+            request_monotonic_ms=0,
+            received_monotonic_ms=0,
+        )
 
-        self.assertEqual(self.store.load(), before)
-        self.assertEqual(self.store.sync_payload()["taskOperations"][0], sent)
+        rebased = self.store.load()["pendingTasks"]
+        self.assertEqual(len(rebased), 1)
+        self.assertEqual(rebased[0]["id"], retained["id"])
+        self.assertEqual(rebased[0]["occurredAt"], utc_timestamp(1_000))
+        self.assertEqual(
+            (rebased[0]["hlcWallMs"], rebased[0]["hlcCounter"]),
+            (1_000, 1),
+        )
+        self.assertEqual(self.store.sync_payload()["taskOperations"], rebased)
+        self.assertNotIn(sent, rebased)
 
     def test_persisted_server_time_uncertainty_is_validated(self) -> None:
         self.store.set_meta(
@@ -3339,6 +4196,9 @@ class StorageTests(unittest.TestCase):
 
     def test_legacy_selected_task_migration_queues_choice_once(self) -> None:
         task = task_from_title("Legacy focus task")
+        snapshot = self.store.load()["snapshot"]
+        snapshot["tasks"] = [task]
+        self.store.set_meta("snapshot", snapshot)
         settings = self.store.load()["settings"]
         settings["selectedTaskId"] = task["id"]
         self.store.set_meta("settings", settings)
@@ -3364,6 +4224,9 @@ class StorageTests(unittest.TestCase):
         self,
     ) -> None:
         task = task_from_title("Deferred legacy focus task")
+        snapshot = self.store.load()["snapshot"]
+        snapshot["tasks"] = [task]
+        self.store.set_meta("snapshot", snapshot)
         self.store.prepare_resolution({"id": "user-1"}, 1, "merge")
         settings = self.store.load()["settings"]
         settings["selectedTaskId"] = task["id"]
@@ -3856,10 +4719,10 @@ class StorageTests(unittest.TestCase):
         )
         self.assertFalse(self.store.load()["settings"]["autoStartBreaks"])
 
-    def test_duplicate_second_instance_finish_does_not_supersede_decided_break(
+    def test_duplicate_second_instance_finish_converges_without_resending_break(
         self,
     ) -> None:
-        start, _finish, generated = self._queue_offline_auto_break()
+        start, _finish, _generated = self._queue_offline_auto_break()
         source_running, _history = rebuild_optimistic(None, [], [start])
         other = Store(self.path)
         try:
@@ -3885,15 +4748,7 @@ class StorageTests(unittest.TestCase):
         self.store.apply_sync(response, request)
 
         resent = self.store.sync_payload()["commands"]
-        self.assertEqual(len(resent), 1)
-        self.assertEqual(
-            self._operation_intent(resent[0]),
-            self._operation_intent(generated),
-        )
-        self.assertGreater(
-            (resent[0]["hlcWallMs"], resent[0]["hlcCounter"]),
-            (response["serverHlcWallMs"], response["serverHlcCounter"]),
-        )
+        self.assertEqual(resent, [])
 
     def test_canonical_phase_transforms_dependent_finish_pause_and_resume(self) -> None:
         cases = {
@@ -3928,9 +4783,7 @@ class StorageTests(unittest.TestCase):
                 completed_at = str(local_history[0]["completedAt"])
                 history = [
                     local_history[0],
-                    self._history_item("remote-1", completed_at),
-                    self._history_item("remote-2", completed_at),
-                    self._history_item("remote-3", completed_at),
+                    *self._prior_focus_history("remote", completed_at),
                 ]
                 response = self._canonical_response(
                     request,
@@ -4038,10 +4891,9 @@ class StorageTests(unittest.TestCase):
                                         local_history[0]["completedAt"]
                                     )
                                     history.extend(
-                                        self._history_item(
-                                            f"matrix-remote-{index}", completed_at
+                                        self._prior_focus_history(
+                                            "matrix-remote", completed_at
                                         )
-                                        for index in range(1, 4)
                                     )
                                 response = self._canonical_response(
                                     request,
@@ -4120,9 +4972,7 @@ class StorageTests(unittest.TestCase):
         completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1", completed_at),
-            self._history_item("remote-2", completed_at),
-            self._history_item("remote-3", completed_at),
+            *self._prior_focus_history("remote", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -4193,9 +5043,7 @@ class StorageTests(unittest.TestCase):
         completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1", completed_at),
-            self._history_item("remote-2", completed_at),
-            self._history_item("remote-3", completed_at),
+            *self._prior_focus_history("remote", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -4220,9 +5068,7 @@ class StorageTests(unittest.TestCase):
             request,
             history=[
                 local_history[0],
-                self._history_item("remote-1", completed_at),
-                self._history_item("remote-2", completed_at),
-                self._history_item("remote-3", completed_at),
+                *self._prior_focus_history("remote", completed_at),
             ],
             auto_start_breaks=True,
         )
@@ -4514,9 +5360,7 @@ class StorageTests(unittest.TestCase):
         completed_at = str(local_history[0]["completedAt"])
         history = [
             local_history[0],
-            self._history_item("remote-1", completed_at),
-            self._history_item("remote-2", completed_at),
-            self._history_item("remote-3", completed_at),
+            *self._prior_focus_history("remote", completed_at),
         ]
         response = self._canonical_response(
             request,
@@ -4567,9 +5411,19 @@ class StorageTests(unittest.TestCase):
         timer, _history = rebuild_optimistic(
             remote_timer, self.store.load()["snapshot"]["history"], []
         )
-        self.assertEqual(timer, remote_timer)
+        self.assertEqual(
+            timer,
+            {
+                "id": "newer-remote-timer",
+                "phase": "short_break",
+                "status": "running",
+                "plannedDurationMs": 5 * 60_000,
+                "elapsedAtAnchorMs": 0,
+                "anchorAt": "1970-01-01T00:00:04Z",
+            },
+        )
 
-    def test_applied_finish_with_remote_clear_does_not_resurrect_break(self) -> None:
+    def test_exact_finish_evidence_promotes_break_after_canonical_clear(self) -> None:
         _start, _finish, generated = self._queue_offline_auto_break()
         request = self.store.sync_payload()
         _completed, history = self._canonical_completion(request["commands"])
@@ -4583,10 +5437,10 @@ class StorageTests(unittest.TestCase):
         self.store.apply_sync(response, request)
 
         loaded = self.store.load()
-        self.assertNotIn(generated, loaded["pending"])
-        self.assertEqual(self.store.sync_payload()["commands"], [])
+        self.assertEqual(loaded["pending"], [generated])
+        self.assertEqual(self.store.sync_payload()["commands"], [generated])
         self.assertIsNone(loaded["snapshot"]["canonicalTimer"])
-        self.assertEqual(loaded["settings"]["selectedPhase"], "focus")
+        self.assertEqual(loaded["settings"]["selectedPhase"], "short_break")
         self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
 
     def test_process_auto_break_does_not_resurrect_after_canonical_clear(self) -> None:
@@ -5009,7 +5863,7 @@ class StorageTests(unittest.TestCase):
                 focus_state["plannedDurationMs"], custom_durations["focus"]
             )
 
-        completed = timer.completed_history()
+        completed = timer.completed_history(now_ms=now_ms)
         self.assertEqual(
             [item["phase"] for item in completed],
             [
@@ -5054,10 +5908,28 @@ class StorageTests(unittest.TestCase):
             for operation in request[key]
         )
         response["serverTime"] = utc_timestamp(response["serverHlcWallMs"])
+        final_generated = next(
+            command
+            for command in self.store.load()["pending"]
+            if command["type"] == "start"
+            and command["timerId"] == timer.timer["id"]
+        )
         self.store.apply_sync(response, request)
 
         loaded = self.store.load()
-        self.assertEqual(loaded["pending"], [])
+        self.assertEqual(len(loaded["pending"]), 1)
+        self.assertEqual(
+            self._operation_intent(loaded["pending"][0]),
+            self._operation_intent(final_generated),
+        )
+        self.assertGreater(
+            (
+                loaded["pending"][0]["hlcWallMs"],
+                loaded["pending"][0]["hlcCounter"],
+            ),
+            (response["serverHlcWallMs"], response["serverHlcCounter"]),
+        )
+        self.assertEqual(self.store.sync_payload()["commands"], loaded["pending"])
         self.assertEqual(loaded["pendingTasks"], [])
         self.assertEqual(loaded["pendingDurations"], [])
         self.assertEqual(loaded["pendingAutoStarts"], [])

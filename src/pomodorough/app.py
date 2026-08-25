@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import signal
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QLockFile, QStandardPaths, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -18,6 +19,12 @@ def _iroh_service(store: Store) -> IrohService:
     return IrohService(store.path, store.device_id)
 
 
+def _instance_lock() -> QLockFile:
+    data_home = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
+    data_home.mkdir(parents=True, exist_ok=True)
+    return QLockFile(str(data_home / "pomodorough.lock"))
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Pomodorough")
@@ -27,6 +34,10 @@ def main() -> int:
     icon = QIcon(str(resource_path("icon.svg")))
     app.setWindowIcon(icon)
     app.setQuitOnLastWindowClosed(True)
+
+    instance_lock = _instance_lock()
+    if not instance_lock.tryLock(0):
+        return 0
 
     store = Store()
     cloud = CloudService(store.device_id)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pomodorough.core import task_from_title
 from pomodorough.iroh_protocol import ImmutableConflict, room_id_for_secret
+from pomodorough.shared_core import SharedCoreLoadError
 from pomodorough.storage import Store, utc_timestamp
 
 
@@ -88,13 +89,95 @@ class IrohStorageTests(unittest.TestCase):
         self.assertEqual(self.store.replication_mode, "iroh")
         self.assertEqual(self.store.iroh_room(room_id)["operationCount"], 2)
 
-    def test_selected_task_is_captured_and_survives_restart_and_deselection(self) -> None:
+    def test_room_genesis_preserves_custom_history_identity_across_restart(self) -> None:
+        historical = {
+            "id": "history-custom1",
+            "timerId": "timer-a0001",
+            "commandId": "command-old1",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 1_500_000,
+            "completedAt": utc_timestamp(1_786_000_000_000),
+            "endedAt": utc_timestamp(1_786_000_000_000),
+        }
+        snapshot = self.store.load()["snapshot"]
+        snapshot["history"] = [historical]
+        self.store.set_meta("snapshot", snapshot)
+
         room_id = self.store.create_iroh_room(bytes(range(32)))
 
-        selected = self.store.set_selected_task_id("local-room-task", now_ms=1_000)
+        self.assertEqual(
+            self.store.load()["snapshot"]["history"][0]["id"], "history-custom1"
+        )
+        genesis = self.store.iroh_operations(
+            room_id, [{"domain": "genesis", "id": "genesis"}]
+        )[0]["operation"]
+        self.assertEqual(genesis["history"][0]["id"], "history-custom1")
+
+        pause_ms = 1_786_000_001_000
+        start_ms = pause_ms + 1_000
+        records = [
+            {
+                "domain": "timer",
+                "deviceId": "device-alpha",
+                "operation": {
+                    "id": "command-pause1",
+                    "deviceSequence": 1,
+                    "timerId": "timer-a0001",
+                    "type": "pause",
+                    "phase": "focus",
+                    "plannedDurationMs": 1_500_000,
+                    "occurredAt": utc_timestamp(pause_ms),
+                    "hlcWallMs": pause_ms,
+                    "hlcCounter": 0,
+                    "observedElapsedMs": 123_000,
+                },
+            },
+            {
+                "domain": "timer",
+                "deviceId": "device-beta",
+                "operation": {
+                    "id": "command-start1",
+                    "deviceSequence": 1,
+                    "timerId": "timer-b0001",
+                    "type": "start",
+                    "phase": "focus",
+                    "plannedDurationMs": 1_500_000,
+                    "occurredAt": utc_timestamp(start_ms),
+                    "hlcWallMs": start_ms,
+                    "hlcCounter": 0,
+                    "observedElapsedMs": 0,
+                },
+            },
+        ]
+        self.store.insert_remote_iroh_records(room_id, list(reversed(records)))
+        projected = self.store.load()["snapshot"]
+        retained = next(
+            item for item in projected["history"] if item["timerId"] == "timer-a0001"
+        )
+        self.assertEqual(retained["id"], "history-custom1")
+        self.assertEqual(retained["commandId"], "command-start1")
+        self.assertEqual(retained["status"], "superseded")
+        self.assertEqual(projected["canonicalTimer"]["id"], "timer-b0001")
+
+        self.store.close()
+        self.store = Store(self.path, iroh_secret_store=self.secrets)
+        restarted = self.store.load()["snapshot"]
+        retained = next(
+            item for item in restarted["history"] if item["timerId"] == "timer-a0001"
+        )
+        self.assertEqual(retained["id"], "history-custom1")
+        self.assertEqual(retained["commandId"], "command-start1")
+
+    def test_selected_task_is_captured_and_survives_restart_and_deselection(self) -> None:
+        task = task_from_title("Local room task")
+        self.store.queue_task_operation("upsert", task, now_ms=999)
+        room_id = self.store.create_iroh_room(bytes(range(32)))
+
+        selected = self.store.set_selected_task_id(task["id"], now_ms=1_000)
 
         loaded = self.store.load()
-        self.assertEqual(loaded["settings"]["selectedTaskId"], "local-room-task")
+        self.assertEqual(loaded["settings"]["selectedTaskId"], task["id"])
         self.assertEqual(loaded["pendingSelectedTasks"], [])
         self.assertEqual(self.store.iroh_room(room_id)["operationCount"], 2)
         record = self.store.iroh_operations(
@@ -110,7 +193,7 @@ class IrohStorageTests(unittest.TestCase):
         self.store.close()
         self.store = Store(self.path, iroh_secret_store=self.secrets)
         self.assertEqual(
-            self.store.load()["settings"]["selectedTaskId"], "local-room-task"
+            self.store.load()["settings"]["selectedTaskId"], task["id"]
         )
 
         cleared = self.store.set_selected_task_id(None, now_ms=2_000)
@@ -124,29 +207,65 @@ class IrohStorageTests(unittest.TestCase):
     def test_selected_task_projection_uses_deterministic_record_order(self) -> None:
         room_id = self.store.create_iroh_room(bytes(range(32)))
         wall_ms = 1_786_000_000_000
+        task_a = task_from_title("Selection A")
+        task_z = task_from_title("Selection Z")
+
+        def upsert(operation_id: str, task: dict[str, str]) -> dict[str, object]:
+            return {
+                "domain": "task",
+                "deviceId": "device-zulu",
+                "operation": {
+                    "id": operation_id,
+                    "taskId": task["id"],
+                    "type": "upsert",
+                    "title": task["title"],
+                    "occurredAt": utc_timestamp(wall_ms - 1),
+                    "hlcWallMs": wall_ms - 1,
+                    "hlcCounter": 0,
+                },
+            }
+
         records = [
-            self._selected_task_record("operation-early", "task-early", wall_ms - 1),
+            upsert("operation-upsert-a", task_a),
+            upsert("operation-upsert-z", task_z),
             self._selected_task_record(
-                "operation-zulu", "task-operation-zulu", wall_ms, device_id="device-zulu"
+                "operation-alpha", task_a["id"], wall_ms, device_id="device-zulu"
             ),
             self._selected_task_record(
-                "operation-alpha", "task-operation-a", wall_ms, device_id="device-zulu"
-            ),
-            self._selected_task_record(
-                "operation-omega", "task-operation-z", wall_ms, device_id="device-zulu"
-            ),
-            self._selected_task_record(
-                "operation-last", "task-device-loses", wall_ms, device_id="device-alpha"
+                "operation-omega", task_z["id"], wall_ms, device_id="device-zulu"
             ),
         ]
 
         self.store.insert_remote_iroh_records(room_id, list(reversed(records)))
 
         self.assertEqual(
-            self.store.load()["settings"]["selectedTaskId"], "task-operation-zulu"
+            self.store.load()["settings"]["selectedTaskId"], task_z["id"]
         )
 
-    def test_selected_task_raw_identity_survives_task_deletion(self) -> None:
+    def test_remote_iroh_projection_rolls_back_when_shared_core_fails(self) -> None:
+        room_id = self.store.create_iroh_room(bytes(range(32)))
+        before = self.store.load()
+        before_count = self.store.iroh_room(room_id)["operationCount"]
+
+        class FailingCore:
+            @staticmethod
+            def dispatch(operation: str, input_value: object) -> object:
+                raise SharedCoreLoadError("core unavailable")
+
+        self.store._shared_core = FailingCore()
+        record = self._selected_task_record(
+            "operation-rejected", None, 1_786_000_000_000
+        )
+
+        with self.assertRaisesRegex(ValueError, "core unavailable"):
+            self.store.insert_remote_iroh_records(room_id, [record])
+
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(
+            self.store.iroh_room(room_id)["operationCount"], before_count
+        )
+
+    def test_selected_task_is_cleared_after_task_deletion(self) -> None:
         room_id = self.store.create_iroh_room(bytes(range(32)))
         task = task_from_title("Deleted but selected")
         wall_ms = 1_786_000_000_000
@@ -184,8 +303,8 @@ class IrohStorageTests(unittest.TestCase):
         state = self.store.load()
         self.assertEqual(state["snapshot"]["tasks"], [])
         self.assertIn(task, state["snapshot"]["knownTasks"])
-        self.assertEqual(state["settings"]["selectedTaskId"], task["id"])
-        self.assertEqual(state["snapshot"]["selectedTaskId"], task["id"])
+        self.assertIsNone(state["settings"]["selectedTaskId"])
+        self.assertIsNone(state["snapshot"]["selectedTaskId"])
 
     def test_joined_genesis_and_room_switch_restore_selected_tasks(self) -> None:
         central_task = task_from_title("Central task")

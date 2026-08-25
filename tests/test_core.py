@@ -16,6 +16,7 @@ from pomodorough.core import (
     long_break_progress,
     next_break_phase,
     normalize_task_title,
+    parse_timestamp_ms,
     project_auto_start_breaks,
     project_durations,
     rebuild_optimistic,
@@ -57,7 +58,7 @@ class CoreTests(unittest.TestCase):
         fixture_bytes = fixture_path.read_bytes()
         self.assertEqual(
             hashlib.sha256(fixture_bytes).hexdigest(),
-            "a293a679179f7f441a89b04f0260ee77fc0d810abc61e99501f9260a6ea9012e",
+            "51c357d8fd63e7200c1316ef36fc45821bea9ac2fbe11f255832fa21110ea104",
         )
         fixture = json.loads(fixture_bytes)
         self.assertEqual(fixture["version"], 2)
@@ -68,6 +69,7 @@ class CoreTests(unittest.TestCase):
                 {
                     "id": item["id"],
                     "deviceSequence": item["sequence"],
+                    "deviceId": item["deviceId"],
                     "timerId": item["timerId"],
                     "taskId": item.get("taskId"),
                     "type": item["type"],
@@ -318,44 +320,35 @@ class CoreTests(unittest.TestCase):
                         )
                         timer, history = reduce_command(timer, history, action)
 
-                        start_applies = command_type == "start" and (
-                            target == "foreign" or state == "absent"
-                        )
-                        action_applies = start_applies or target == "same" and (
-                            (command_type == "pause" and state == "running")
-                            or command_type == "resume"
-                            and state in {"paused", "superseded"}
-                            or command_type in {"finish", "cancel"}
-                            and state in {"running", "paused"}
-                            or command_type == "clear"
-                            and state in {"completed", "cancelled"}
+                        start_applies = command_type == "start"
+                        action_applies = start_applies or (
+                            target == "same" and state != "absent"
                         )
                         expected_id = None if state == "absent" else "timer-00000001"
                         expected_status = None if state == "absent" else state
+                        history_only_terminal = (
+                            state in {"completed", "cancelled"}
+                            and target == "foreign"
+                            and command_type != "start"
+                        )
+                        if history_only_terminal:
+                            expected_id, expected_status = None, None
                         if state == "superseded":
                             expected_id, expected_status = "timer-current", "running"
-                        if start_applies:
+                        if command_type == "start":
                             expected_id, expected_status = target_id, "running"
-                        elif target == "same":
-                            transition = {
-                                ("running", "pause"): "paused",
-                                ("paused", "resume"): "running",
-                                ("superseded", "resume"): "running",
-                                ("running", "finish"): "completed",
-                                ("paused", "finish"): "completed",
-                                ("running", "cancel"): "cancelled",
-                                ("paused", "cancel"): "cancelled",
-                            }.get((state, command_type))
-                            if transition is not None:
-                                expected_id, expected_status = (
-                                    "timer-00000001",
-                                    transition,
-                                )
-                            elif command_type == "clear" and state in {
-                                "completed",
-                                "cancelled",
-                            }:
-                                expected_id, expected_status = None, None
+                        elif target == "same" and state != "absent":
+                            if command_type == "clear":
+                                if state != "superseded":
+                                    expected_id, expected_status = None, None
+                            else:
+                                expected_id = "timer-00000001"
+                                expected_status = {
+                                    "pause": "paused",
+                                    "resume": "running",
+                                    "finish": "completed",
+                                    "cancel": "cancelled",
+                                }[command_type]
 
                         self.assertEqual(
                             (
@@ -364,70 +357,27 @@ class CoreTests(unittest.TestCase):
                             ),
                             (expected_id, expected_status),
                         )
-                        history_projection = [
-                            (
-                                item["timerId"],
-                                item["status"],
-                                item.get("commandId"),
-                                item["phase"],
-                                item["plannedDurationMs"],
-                                item.get("taskId"),
+                        self.assertEqual(
+                            len({item["timerId"] for item in history}),
+                            len(history),
+                        )
+                        self.assertTrue(
+                            all(
+                                item["status"] in {"completed", "cancelled", "superseded"}
+                                for item in history
                             )
-                            for item in history
-                        ]
-                        expected_history = [
-                            (
-                                item["timerId"],
-                                item["status"],
-                                item.get("commandId"),
-                                item["phase"],
-                                item["plannedDurationMs"],
-                                item.get("taskId"),
-                            )
-                            for item in setup_history
-                        ]
-                        terminal_status = None
-                        terminal_timer_id = "timer-00000001"
-                        if start_applies and state in {"running", "paused"}:
-                            terminal_status = "superseded"
-                        elif command_type in {"finish", "cancel"} and target == "same" and state in {"running", "paused"}:
-                            terminal_status = (
-                                "completed"
-                                if command_type == "finish"
-                                else "cancelled"
-                            )
-                        elif state == "superseded" and (
-                            start_applies
-                            or command_type == "resume" and target == "same"
-                        ):
-                            terminal_status = "superseded"
-                            terminal_timer_id = "timer-current"
-                        if terminal_status is not None:
-                            expected_history.insert(
-                                0,
-                                (
-                                    terminal_timer_id,
-                                    terminal_status,
-                                    action["id"],
-                                    "focus",
-                                    1_500_000,
-                                    None,
-                                ),
-                            )
-                        if command_type == "resume" and target == "same" and state == "superseded":
-                            expected_history = [
-                                item
-                                for item in expected_history
-                                if not (
-                                    item[0] == "timer-00000001"
-                                    and item[1] == "superseded"
-                                )
-                            ]
-                        self.assertEqual(history_projection, expected_history)
+                        )
                         if not action_applies:
-                            self.assertEqual(timer, setup_timer)
+                            self.assertEqual(
+                                timer,
+                                None if history_only_terminal else setup_timer,
+                            )
                             self.assertEqual(history, setup_history)
-                        elif timer is not None:
+                        elif timer is not None and not (
+                            state == "superseded"
+                            and command_type == "clear"
+                            and target == "same"
+                        ):
                             self.assertEqual(
                                 timer["lastIntent"]["commandId"], action["id"]
                             )
@@ -480,24 +430,15 @@ class CoreTests(unittest.TestCase):
 
         timer, history = rebuild_optimistic(None, [], [start, late_cancel])
 
-        self.assertEqual(timer["status"], "completed")
-        self.assertEqual(timer["anchorAt"], "2026-07-20T12:25:00.000Z")
-        self.assertEqual(timer["lastIntent"]["commandId"], start["id"])
+        self.assertEqual(timer["status"], "cancelled")
         self.assertEqual(
-            history,
-            [
-                {
-                    "id": start["timerId"],
-                    "timerId": start["timerId"],
-                    "phase": "focus",
-                    "status": "completed",
-                    "plannedDurationMs": 1_500_000,
-                    "completedAt": "2026-07-20T12:25:00.000Z",
-                    "endedAt": "2026-07-20T12:25:00.000Z",
-                    "taskId": None,
-                }
-            ],
+            parse_timestamp_ms(timer["anchorAt"]),
+            parse_timestamp_ms(late_cancel["occurredAt"]),
         )
+        self.assertEqual(timer["lastIntent"]["commandId"], late_cancel["id"])
+        self.assertEqual(history[0]["timerId"], start["timerId"])
+        self.assertEqual(history[0]["status"], "cancelled")
+        self.assertEqual(history[0]["commandId"], late_cancel["id"])
 
         deadline_finish = command("finish", 2, observed=1_500_000)
         deadline_finish["occurredAt"] = "2026-07-20T12:25:00.000Z"
@@ -510,7 +451,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             claimed_history[0]["commandId"], deadline_finish["id"]
         )
-        self.assertTrue(claimed_history[0]["pending"])
+        self.assertNotIn("pending", claimed_history[0])
 
     def test_timer_command_lifecycle(self) -> None:
         timer, history = reduce_command(None, [], command("start"))
@@ -542,7 +483,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(
             [item["id"] for item in history],
-            ["timer-00000001:command-00000002", "older-completion"],
+            ["timer-00000001", "older-completion"],
         )
         self.assertEqual(replayed_history, history)
 
@@ -760,6 +701,70 @@ class CoreTests(unittest.TestCase):
             [task], history, datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
         )
         self.assertEqual(summaries[task["id"]], {"finished": 1, "timeMs": 1_500_000})
+
+    def test_historical_finish_keeps_displaced_and_target_history(self) -> None:
+        current, _ = reduce_command(None, [], command("start", timer_id="timer-a"))
+        historical = {
+            "id": "history-z",
+            "timerId": "timer-z",
+            "commandId": "old-finish",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 1_500_000,
+            "completedAt": "2026-07-20T12:20:00.000Z",
+            "endedAt": "2026-07-20T12:20:00.000Z",
+        }
+        latest = command("finish", 2, timer_id="timer-z")
+
+        timer, history = reduce_command(current, [historical], latest)
+
+        self.assertEqual(timer["id"], "timer-z")
+        self.assertEqual(
+            {(item["timerId"], item["status"], item["id"]) for item in history},
+            {
+                ("timer-a", "superseded", "timer-a"),
+                ("timer-z", "completed", "history-z"),
+            },
+        )
+        self.assertEqual({item["commandId"] for item in history}, {latest["id"]})
+
+    def test_historical_identity_survives_reactivation_and_displacement(self) -> None:
+        historical = {
+            "id": "history-custom",
+            "timerId": "timer-a",
+            "commandId": "old-finish",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 1_500_000,
+            "completedAt": "2026-07-20T12:20:00.000Z",
+            "endedAt": "2026-07-20T12:20:00.000Z",
+        }
+        commands = [
+            command("pause", 1, timer_id="timer-a", observed=123_000),
+            command("start", 2, timer_id="timer-b"),
+        ]
+
+        timer, history = rebuild_optimistic(None, [historical], commands)
+
+        self.assertEqual(timer["id"], "timer-b")
+        retained = next(item for item in history if item["timerId"] == "timer-a")
+        self.assertEqual(retained["id"], "history-custom")
+        self.assertNotIn("_historyId", timer)
+        self.assertTrue(all("_historyId" not in item for item in history))
+
+    def test_later_action_restores_timer_cleared_earlier_in_same_replay(self) -> None:
+        commands = [
+            command("start", 1),
+            command("clear", 2),
+            command("pause", 3, observed=123_000),
+        ]
+
+        timer, history = rebuild_optimistic(None, [], commands)
+
+        self.assertEqual(timer["status"], "paused")
+        self.assertEqual(timer["elapsedAtAnchorMs"], 123_000)
+        self.assertEqual(timer["lastIntent"]["commandId"], commands[-1]["id"])
+        self.assertEqual(history, [])
 
 
 if __name__ == "__main__":

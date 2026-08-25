@@ -25,6 +25,18 @@ def build_lines(
     strings: Strings | None = None,
 ) -> list[str]:
     strings = strings or Strings()
+    lines = _timer_lines(state, width, strings)
+    lines.extend(_pending_lines(state, strings))
+    if message:
+        lines.extend(("", message))
+    lines.extend(("", strings.text("arrivals.title")))
+    lines.extend(_history_lines(history, width, strings))
+    return lines
+
+
+def _timer_lines(
+    state: dict[str, Any], width: int, strings: Strings
+) -> list[str]:
     display = state.get("display", state)
     bar_width = max(10, min(48, width - 12))
     filled = round(display["progress"] * bar_width)
@@ -45,6 +57,11 @@ def build_lines(
     ]
     if display["taskTitle"]:
         lines.insert(6, strings.text("terminal.task_upper", task=display["taskTitle"]))
+    return lines
+
+
+def _pending_lines(state: dict[str, Any], strings: Strings) -> list[str]:
+    lines = []
     for key, count in (
         ("terminal.pending_commands", state["pendingCommands"]),
         ("terminal.pending_durations", state["pendingDurationOperations"]),
@@ -54,9 +71,13 @@ def build_lines(
             lines.append(strings.plural(key, count))
     if state["historyResolutionPending"]:
         lines.append(strings.text("terminal.history_resolution_pending"))
-    if message:
-        lines.extend(("", message))
-    lines.extend(("", strings.text("arrivals.title")))
+    return lines
+
+
+def _history_lines(
+    history: list[dict[str, Any]], width: int, strings: Strings
+) -> list[str]:
+    lines = []
     if not history:
         empty_title, empty_detail = strings.text("terminal.history_empty").split("\n", 1)
         lines.extend((empty_title.center(width), empty_detail.center(width)))
@@ -66,11 +87,15 @@ def build_lines(
             phase = strings.text(
                 "tui.phase_task", phase=phase, task=item["taskTitle"]
             )
+        status = strings.text(
+            f"arrivals.status.{item.get('status', 'completed')}"
+        )
         minutes = int(item.get("plannedDurationMs", 0)) // 60_000
         lines.append(
             strings.text(
                 "tui.history_row",
                 phase=phase,
+                status=status,
                 minutes=minutes,
                 pending=(strings.text("tui.pending_mark") if item.get("pending") else ""),
             )
@@ -88,7 +113,7 @@ def handle_key(timer: LocalTimer, key: int) -> bool:
     elif key in (ord("x"), ord("X")):
         timer.issue("cancel")
     elif key in (ord("c"), ord("C")):
-        timer.issue("clear")
+        timer.issue("dismiss")
     elif key == ord("1"):
         timer.select_phase("focus")
     elif key == ord("2"):
@@ -109,7 +134,7 @@ def _draw(
     height, width = screen.getmaxyx()
     state = timer.state(auto_finish=True)
     lines = build_lines(
-        state, timer.completed_history(5), width, message, strings=strings
+        state, timer.retained_history(5), width, message, strings=strings
     )
     screen.erase()
     if height < 12 or width < 40:

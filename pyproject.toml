@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pomodorough-linux"
-version = "0.4.0"
+version = "0.4.1"
 description = "Cross-platform, local-first Pomodoro timer"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,7 +23,7 @@ iroh = [
 
 [project.urls]
 Homepage = "https://github.com/Pomodoro-Everywhere/pomodorough-desktop"
-Privacy = "https://pomodoro-everywhere.github.io/pomodorough-server/privacy/"
+Privacy = "https://pomodorough.egigoka.me/privacy"
 Repository = "https://github.com/Pomodoro-Everywhere/pomodorough-desktop"
 Issues = "https://github.com/Pomodoro-Everywhere/pomodorough-desktop/issues"
 
@@ -43,6 +43,7 @@ where = ["src"]
 pomodorough = [
     "resources/*.json",
     "resources/*.svg",
+    "resources/*.wav",
     "resources/*.wasm",
     "resources/*.wasm.sha256",
     "resources/CORE_COMMIT",

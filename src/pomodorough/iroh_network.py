@@ -255,6 +255,19 @@ class IrohService(QObject):
             return
         await self._stop_endpoint()
         owner = self._generation
+        opened = await self._open_room_endpoint(iroh, owner)
+        if opened is None:
+            return
+        endpoint, relay_ready = opened
+        self._activate_room_endpoint(
+            iroh, endpoint, room_id, room_secret, relay_ready
+        )
+        if emit_invite:
+            await self._emit_invite()
+
+    async def _open_room_endpoint(
+        self, iroh: Any, owner: int
+    ) -> tuple[Any, bool] | None:
         self.status_changed.emit("OPENING ROUTE")
         key = self.key_store.load_or_create()
         endpoint = await iroh.Endpoint.bind(
@@ -266,7 +279,7 @@ class IrohService(QObject):
         )
         if owner != self._generation or self._closing:
             await endpoint.close()
-            return
+            return None
         try:
             try:
                 async with asyncio.timeout(5):
@@ -280,7 +293,13 @@ class IrohService(QObject):
             raise
         if owner != self._generation or self._closing:
             await endpoint.close()
-            return
+            return None
+        return endpoint, relay_ready
+
+    def _activate_room_endpoint(
+        self, iroh: Any, endpoint: Any, room_id: str,
+        room_secret: bytes, relay_ready: bool,
+    ) -> None:
         self._endpoint = endpoint
         self._room_id = room_id
         self._room_secret = room_secret
@@ -292,8 +311,6 @@ class IrohService(QObject):
         self._periodic_task = asyncio.create_task(self._periodic_sync(generation))
         self._emit_ready_status()
         self._emit_details()
-        if emit_invite:
-            await self._emit_invite()
 
     async def _stop_endpoint(self) -> None:
         self._generation += 1
