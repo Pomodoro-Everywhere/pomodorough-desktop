@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from .secure_store import SecretMutationJournal
 from .storage_iroh_records import IrohRecordPersistence
 from .storage_replication_projection import (
     GeneratedBreakPlanner,
@@ -297,6 +298,7 @@ class ReplicationTransactionCoordinator:
         device_id: str | None,
         display_name: str | None,
         last_seen_at_ms: int | None,
+        secret_mutations: SecretMutationJournal,
     ) -> None:
         from .iroh_protocol import MAX_ENDPOINT_TICKET, MAX_PEERS
 
@@ -319,7 +321,7 @@ class ReplicationTransactionCoordinator:
         if exists is None and count >= MAX_PEERS:
             raise ValueError("Iroh room address book contains 64 peers.")
         ticket_key = self._dependencies.peer_ticket_key(room_id, endpoint_id)
-        self._dependencies.secret_store.save(
+        secret_mutations.save(
             ticket_key,
             endpoint_ticket.encode("utf-8"),
         )
@@ -348,15 +350,17 @@ class ReplicationTransactionCoordinator:
         display_name: str | None,
         last_seen_at_ms: int | None = None,
     ) -> None:
-        with self._dependencies.immediate_transaction():
-            self.upsert_peer_locked(
-                room_id,
-                endpoint_id,
-                endpoint_ticket,
-                device_id,
-                display_name,
-                last_seen_at_ms,
-            )
+        with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
+            with self._dependencies.immediate_transaction():
+                self.upsert_peer_locked(
+                    room_id,
+                    endpoint_id,
+                    endpoint_ticket,
+                    device_id,
+                    display_name,
+                    last_seen_at_ms,
+                    secret_mutations,
+                )
 
     def peers(self, room_id: str) -> list[dict[str, Any]]:
         peers = []

@@ -3820,7 +3820,7 @@ class StorageTests(unittest.TestCase):
                 response[response_key].append(
                     {id_key: item["id"], "outcome": outcome, "reason": reason}
                 )
-                if reason:
+                if outcome == "rejected":
                     expected_notices.append(reason)
 
         notices = self.store.apply_sync(response, request)
@@ -5139,7 +5139,10 @@ class StorageTests(unittest.TestCase):
 
                 notices = self.store.apply_sync(response, request)
 
-                self.assertEqual(notices, ["finish not accepted"])
+                self.assertEqual(
+                    notices,
+                    [] if outcome == "ignored" else ["finish not accepted"],
+                )
                 self.assertNotIn(generated, self.store.load()["pending"])
                 self.assertEqual(self.store.sync_payload()["commands"], [])
                 self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())

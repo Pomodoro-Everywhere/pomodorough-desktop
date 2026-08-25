@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CORE_COMMIT: "0c2068a128c51e95aef580a916df7778c927e748"
-  CORE_SHA256: "2f259ce1ab446fae665e8ed78bd198201b7aa594df297293c86b8406d7699525"
+  CORE_COMMIT: "155cfb720d50ff11d9535e9bc24a8200dc022020"
+  CORE_SHA256: "aec9688661f39b92f21de8a26231419f0a2839ab7629bd158af5a46d49632ddf"
 
 jobs:
   tests:
@@ -65,7 +65,7 @@ jobs:
 
   quality:
     name: Static checks
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -127,7 +127,9 @@ jobs:
         run: ruff check .
 
       - name: Check shell syntax
-        run: sh -n deploy/install.sh
+        run: >-
+          sh -n deploy/install.sh scripts/unpack_release_artifacts.sh
+          scripts/verify_release_artifacts.sh
 
   dependency-review:
     name: Dependency review

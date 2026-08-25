@@ -9,7 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pomodorough.secure_store import PlatformSecretStore, SecureStoreError
+from pomodorough.secure_store import (
+    PlatformSecretStore,
+    SecretMutationJournal,
+    SecureStoreError,
+)
 
 
 class PlatformSecretStoreTests(unittest.TestCase):
@@ -51,9 +55,33 @@ class PlatformSecretStoreTests(unittest.TestCase):
             patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
+            self.assertRaisesRegex(SecureStoreError, "malformed data"),
         ):
-            with self.assertRaisesRegex(SecureStoreError, "malformed data"):
-                self.store.load("endpoint-key")
+            self.store.load("endpoint-key")
+
+    def test_missing_platform_value_returns_none(self) -> None:
+        response = subprocess.CompletedProcess([], 1, "", "")
+        with (
+            patch("pomodorough.secure_store.os.name", "posix"),
+            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            patch("pomodorough.secure_store.subprocess.run", return_value=response),
+        ):
+            self.assertIsNone(self.store.load("endpoint-key"))
+
+    def test_failed_journal_lookup_aborts_before_mutating_existing_secret(self) -> None:
+        response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
+        with (
+            patch("pomodorough.secure_store.os.name", "posix"),
+            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
+            patch("pomodorough.secure_store.subprocess.run", return_value=response) as run,
+            self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
+            SecretMutationJournal(self.store) as journal,
+        ):
+            journal.save("existing-key", b"replacement")
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:2], ["secret-tool", "lookup"])
 
     def test_rejected_save_preserves_platform_error(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
@@ -62,9 +90,20 @@ class PlatformSecretStoreTests(unittest.TestCase):
             patch("pomodorough.secure_store.sys_platform", return_value="linux"),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
+            self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
         ):
-            with self.assertRaisesRegex(SecureStoreError, "keyring is locked"):
-                self.store.save("endpoint-key", b"secret")
+            self.store.save("endpoint-key", b"secret")
+
+    def test_rejected_delete_preserves_platform_error(self) -> None:
+        response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
+        with (
+            patch("pomodorough.secure_store.os.name", "posix"),
+            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
+            patch("pomodorough.secure_store.subprocess.run", return_value=response),
+            self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
+        ):
+            self.store.delete("endpoint-key")
 
     def test_unavailable_store_rejects_save_without_spawning_process(self) -> None:
         with (
@@ -79,6 +118,18 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
         self.assertFalse(available)
         self.assertIn("secret-tool", reason)
+        run.assert_not_called()
+
+    def test_unavailable_store_rejects_delete_without_spawning_process(self) -> None:
+        with (
+            patch("pomodorough.secure_store.os.name", "posix"),
+            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            patch("pomodorough.secure_store.shutil.which", return_value=None),
+            patch("pomodorough.secure_store.subprocess.run") as run,
+            self.assertRaisesRegex(SecureStoreError, "secret-tool was not found"),
+        ):
+            self.store.delete("endpoint-key")
+
         run.assert_not_called()
 
     def test_invalid_keys_and_values_fail_before_platform_access(self) -> None:
@@ -105,9 +156,8 @@ class PlatformSecretStoreTests(unittest.TestCase):
         with patch(
             "pomodorough.secure_store.subprocess.run",
             side_effect=subprocess.TimeoutExpired(["secret-tool"], 15),
-        ):
-            with self.assertRaisesRegex(SecureStoreError, "Platform secure storage failed"):
-                self.store._run(["secret-tool", "lookup"])
+        ), self.assertRaisesRegex(SecureStoreError, "Platform secure storage failed"):
+            self.store._run(["secret-tool", "lookup"])
 
     def test_macos_save_passes_secret_as_keychain_argument_not_stdin(self) -> None:
         response = subprocess.CompletedProcess([], 0, "", "")
@@ -123,6 +173,65 @@ class PlatformSecretStoreTests(unittest.TestCase):
         self.assertEqual(command[:2], ["security", "add-generic-password"])
         self.assertEqual(command[-1], base64.b64encode(b"secret").decode("ascii"))
         self.assertIsNone(run.call_args.kwargs["input"])
+
+
+class MemorySecretStore:
+    def __init__(self, values: dict[str, bytes]) -> None:
+        self.values = dict(values)
+        self.fail_save_key: str | None = None
+
+    def load(self, key: str) -> bytes | None:
+        return self.values.get(key)
+
+    def save(self, key: str, value: bytes) -> None:
+        if key == self.fail_save_key:
+            raise OSError("restore failed")
+        self.values[key] = value
+
+    def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
+class SecretMutationJournalTests(unittest.TestCase):
+    def test_successful_journal_commits_external_mutations(self) -> None:
+        store = MemorySecretStore({"existing": b"before", "deleted": b"remove"})
+
+        with SecretMutationJournal(store) as journal:
+            journal.save("existing", b"after")
+            journal.save("created", b"new")
+            journal.delete("deleted")
+
+        self.assertEqual(store.values, {"existing": b"after", "created": b"new"})
+
+    def test_failed_transaction_restores_original_values_and_removes_new_keys(self) -> None:
+        original = {"existing": b"before", "deleted": b"remove"}
+        store = MemorySecretStore(original)
+
+        with (
+            self.assertRaisesRegex(RuntimeError, "transaction failed"),
+            SecretMutationJournal(store) as journal,
+        ):
+            journal.save("existing", b"first")
+            journal.save("existing", b"second")
+            journal.save("created", b"new")
+            journal.delete("deleted")
+            raise RuntimeError("transaction failed")
+
+        self.assertEqual(store.values, original)
+
+    def test_rollback_failure_is_explicit_and_preserves_its_cause(self) -> None:
+        store = MemorySecretStore({"existing": b"before"})
+
+        with (
+            self.assertRaisesRegex(SecureStoreError, "rollback failed") as raised,
+            SecretMutationJournal(store) as journal,
+        ):
+            journal.save("existing", b"after")
+            store.fail_save_key = "existing"
+            raise RuntimeError("transaction failed")
+
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(store.values["existing"], b"after")
 
 
 if __name__ == "__main__":

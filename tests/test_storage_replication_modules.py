@@ -3,6 +3,8 @@ from __future__ import annotations
 import inspect
 import tempfile
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from pomodorough.storage import Store, utc_timestamp
@@ -21,16 +23,21 @@ class MemorySecretStore:
     def __init__(self) -> None:
         self.values: dict[str, bytes] = {}
         self.fail_saves = False
+        self.fail_save_key: str | None = None
+        self.fail_delete_key: str | None = None
 
     def load(self, key: str) -> bytes | None:
         return self.values.get(key)
 
     def save(self, key: str, value: bytes) -> None:
-        if self.fail_saves:
+        if self.fail_saves or key == self.fail_save_key:
             raise OSError("secret store unavailable")
         self.values[key] = value
 
     def delete(self, key: str) -> None:
+        if key == self.fail_delete_key:
+            self.fail_delete_key = None
+            raise OSError("secret deletion unavailable")
         self.values.pop(key, None)
 
 
@@ -140,6 +147,107 @@ class ReplicationStorageModuleTests(unittest.TestCase):
             ).fetchone()["count"],
             0,
         )
+
+    def test_peer_secret_is_removed_when_sql_upsert_fails(self) -> None:
+        with self.assertRaises(Exception):
+            self.store.upsert_iroh_peer(
+                "missing-room",
+                "endpoint-1",
+                "ticket-1",
+                None,
+                None,
+            )
+
+        self.assertNotIn(
+            self.store._peer_ticket_key("missing-room", "endpoint-1"),
+            self.secrets.values,
+        )
+
+    def test_peer_secret_is_restored_when_transaction_commit_fails(self) -> None:
+        room_id = self.store.create_iroh_room(bytes(range(32)))
+        self.store.upsert_iroh_peer(
+            room_id,
+            "endpoint-1",
+            "ticket-before",
+            None,
+            None,
+        )
+        transactions = self.store._replication_storage._transactions
+        original_dependencies = transactions._dependencies
+
+        @contextmanager
+        def failing_transaction():
+            self.store.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            finally:
+                self.store.connection.rollback()
+            raise OSError("commit failed")
+
+        transactions._dependencies = replace(
+            original_dependencies,
+            immediate_transaction=failing_transaction,
+        )
+        try:
+            with self.assertRaisesRegex(OSError, "commit failed"):
+                self.store.upsert_iroh_peer(
+                    room_id,
+                    "endpoint-1",
+                    "ticket-after",
+                    None,
+                    None,
+                )
+        finally:
+            transactions._dependencies = original_dependencies
+
+        self.assertEqual(
+            self.secrets.load(self.store._peer_ticket_key(room_id, "endpoint-1")),
+            b"ticket-before",
+        )
+
+    def test_join_restores_peer_secret_when_room_secret_save_fails(self) -> None:
+        from pomodorough.iroh_protocol import room_id_for_secret
+
+        room_secret = bytes(range(32))
+        room_id = room_id_for_secret(room_secret)
+        self.secrets.fail_save_key = self.store._room_secret_key(room_id)
+
+        with self.assertRaisesRegex(OSError, "secret store unavailable"):
+            self.store.prepare_iroh_join(
+                room_id,
+                room_secret,
+                "Joined room",
+                "endpoint-1",
+                "ticket-1",
+            )
+
+        self.assertNotIn(
+            self.store._peer_ticket_key(room_id, "endpoint-1"),
+            self.secrets.values,
+        )
+        self.assertIsNone(self.store.iroh_room(room_id))
+
+    def test_discard_restores_every_secret_when_later_delete_fails(self) -> None:
+        room_id = self.store.create_iroh_room(bytes(range(32)))
+        self.store.upsert_iroh_peer(
+            room_id,
+            "endpoint-1",
+            "ticket-1",
+            None,
+            None,
+        )
+        self.store.leave_iroh_room()
+        room_key = self.store._room_secret_key(room_id)
+        peer_key = self.store._peer_ticket_key(room_id, "endpoint-1")
+        before = dict(self.secrets.values)
+        self.secrets.fail_delete_key = peer_key
+
+        with self.assertRaisesRegex(OSError, "secret deletion unavailable"):
+            self.store.discard_inactive_iroh_room(room_id)
+
+        self.assertEqual(self.secrets.values, before)
+        self.assertIsNotNone(self.store.iroh_room(room_id))
+        self.assertIn(room_key, self.secrets.values)
 
     def test_remote_timer_owner_cannot_generate_local_auto_break(self) -> None:
         room_id = self.store.create_iroh_room(bytes(range(32)))

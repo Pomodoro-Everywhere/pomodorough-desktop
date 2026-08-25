@@ -9,12 +9,66 @@ import subprocess
 import tempfile
 from ctypes import wintypes
 from pathlib import Path
+from typing import Protocol
 
 from platformdirs import user_config_path
 
 
 class SecureStoreError(OSError):
     pass
+
+
+class SecretStore(Protocol):
+    def load(self, key: str) -> bytes | None: ...
+
+    def save(self, key: str, value: bytes) -> None: ...
+
+    def delete(self, key: str) -> None: ...
+
+
+class SecretMutationJournal:
+    """Compensate external secret mutations when a surrounding transaction fails."""
+
+    def __init__(self, store: SecretStore) -> None:
+        self._store = store
+        self._snapshots: dict[str, bytes | None] = {}
+        self._order: list[str] = []
+
+    def __enter__(self) -> SecretMutationJournal:
+        return self
+
+    def __exit__(self, error_type: object, _error: object, _traceback: object) -> bool:
+        if error_type is None:
+            return False
+        failures: list[BaseException] = []
+        for key in reversed(self._order):
+            previous = self._snapshots[key]
+            try:
+                if previous is None:
+                    self._store.delete(key)
+                else:
+                    self._store.save(key, previous)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            raise SecureStoreError(
+                "Secure storage rollback failed after a transaction error."
+            ) from failures[0]
+        return False
+
+    def save(self, key: str, value: bytes) -> None:
+        self._watch(key)
+        self._store.save(key, value)
+
+    def delete(self, key: str) -> None:
+        self._watch(key)
+        self._store.delete(key)
+
+    def _watch(self, key: str) -> None:
+        if key in self._snapshots:
+            return
+        self._snapshots[key] = self._store.load(key)
+        self._order.append(key)
 
 
 class PlatformSecretStore:
@@ -47,7 +101,12 @@ class PlatformSecretStore:
         command = self._command("find")
         result = self._run(command)
         if result.returncode != 0:
-            return None
+            if self._lookup_not_found(result):
+                return None
+            raise SecureStoreError(
+                result.stderr.strip()
+                or "Platform secure storage rejected credential lookup."
+            )
         encoded = result.stdout.strip()
         if not encoded:
             return None
@@ -88,9 +147,15 @@ class PlatformSecretStore:
             except OSError as error:
                 raise SecureStoreError(f"Secure value could not be deleted: {error}") from error
             return
-        if not self.availability()[0]:
-            return
-        self._run(self._command("delete"))
+        available, reason = self.availability()
+        if not available:
+            raise SecureStoreError(reason)
+        result = self._run(self._command("delete"))
+        if result.returncode != 0:
+            raise SecureStoreError(
+                result.stderr.strip()
+                or "Platform secure storage rejected credential deletion."
+            )
 
     def _command(self, operation: str) -> list[str]:
         if sys_platform() == "darwin":
@@ -114,6 +179,12 @@ class PlatformSecretStore:
         if operation == "save":
             return ["secret-tool", "store", "--label=Pomodorough Iroh", *attributes]
         return ["secret-tool", "clear", *attributes]
+
+    @staticmethod
+    def _lookup_not_found(result: subprocess.CompletedProcess[str]) -> bool:
+        if sys_platform() == "darwin":
+            return result.returncode == 44
+        return result.returncode == 1 and not result.stderr.strip()
 
     def _run(
         self, command: list[str], *, input_text: str | None = None
@@ -207,4 +278,4 @@ def sys_platform() -> str:
     return sys.platform
 
 
-__all__ = ["PlatformSecretStore", "SecureStoreError"]
+__all__ = ["PlatformSecretStore", "SecretMutationJournal", "SecureStoreError"]

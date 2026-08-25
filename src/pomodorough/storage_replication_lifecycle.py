@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
+from .secure_store import SecretMutationJournal
 from .storage_replication_coordination import ReplicationTransactionCoordinator
 from .storage_replication_projection import ReplicatedStateProjection
 from .storage_workspace import WorkspacePersistence
@@ -62,17 +63,19 @@ class RoomWorkspaceLifecycle:
         return_workspace = self._dependencies.workspace.capture()
         room_workspace = self._dependencies.projection.empty_workspace(genesis)
         created_at = now_ms if now_ms is not None else int(time.time() * 1000)
-        with self._dependencies.immediate_transaction():
-            self._create_room_locked(
-                room_id,
-                room_secret,
-                room_name,
-                return_workspace,
-                room_workspace,
-                created_at,
-                record,
-                digest,
-            )
+        with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
+            with self._dependencies.immediate_transaction():
+                self._create_room_locked(
+                    room_id,
+                    room_secret,
+                    room_name,
+                    return_workspace,
+                    room_workspace,
+                    created_at,
+                    record,
+                    digest,
+                    secret_mutations,
+                )
         return room_id
 
     def _create_room_locked(
@@ -85,6 +88,7 @@ class RoomWorkspaceLifecycle:
         created_at: int,
         record: dict[str, Any],
         digest: str,
+        secret_mutations: SecretMutationJournal,
     ) -> None:
         connection = self._dependencies.connection
         if connection.execute(
@@ -119,11 +123,7 @@ class RoomWorkspaceLifecycle:
         self._dependencies.workspace.restore(room_workspace)
         self._dependencies.write_meta("activeIrohRoomId", room_id)
         self._dependencies.write_meta("replicationMode", "iroh")
-        try:
-            self._dependencies.secret_store.save(room_secret_key, room_secret)
-        except Exception:
-            connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
-            raise
+        secret_mutations.save(room_secret_key, room_secret)
 
     def _validated_genesis(
         self,
@@ -166,17 +166,19 @@ class RoomWorkspaceLifecycle:
         room_workspace = self._dependencies.projection.empty_joined_workspace(
             return_workspace
         )
-        with self._dependencies.immediate_transaction():
-            self._prepare_join_locked(
-                room_id,
-                room_secret,
-                room_name,
-                endpoint_id,
-                endpoint_ticket,
-                return_workspace,
-                room_workspace,
-                created_at,
-            )
+        with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
+            with self._dependencies.immediate_transaction():
+                self._prepare_join_locked(
+                    room_id,
+                    room_secret,
+                    room_name,
+                    endpoint_id,
+                    endpoint_ticket,
+                    return_workspace,
+                    room_workspace,
+                    created_at,
+                    secret_mutations,
+                )
 
     def _validate_existing_join_locked(
         self,
@@ -205,6 +207,7 @@ class RoomWorkspaceLifecycle:
         return_workspace: dict[str, Any],
         room_workspace: dict[str, Any],
         created_at: int,
+        secret_mutations: SecretMutationJournal,
     ) -> None:
         if self._validate_existing_join_locked(room_id, room_secret):
             self._dependencies.transactions.upsert_peer_locked(
@@ -214,6 +217,7 @@ class RoomWorkspaceLifecycle:
                 None,
                 None,
                 None,
+                secret_mutations,
             )
             return
         connection = self._dependencies.connection
@@ -238,41 +242,37 @@ class RoomWorkspaceLifecycle:
             None,
             None,
             None,
+            secret_mutations,
         )
-        try:
-            self._dependencies.secret_store.save(room_secret_key, room_secret)
-        except Exception:
-            connection.execute("DELETE FROM iroh_rooms WHERE room_id = ?", (room_id,))
-            raise
+        secret_mutations.save(room_secret_key, room_secret)
 
     def discard_inactive_room(self, room_id: str) -> None:
-        with self._dependencies.immediate_transaction():
-            if self.active_room_id == room_id:
-                raise ValueError("Active Iroh room cannot be discarded.")
-            conflict = self._dependencies.connection.execute(
-                "SELECT conflict FROM iroh_rooms WHERE room_id = ?",
-                (room_id,),
-            ).fetchone()
-            if conflict is not None and conflict["conflict"] is not None:
-                return
-            peers = self._dependencies.connection.execute(
-                "SELECT endpoint_id FROM iroh_peers WHERE room_id = ?",
-                (room_id,),
-            ).fetchall()
-            self._dependencies.connection.execute(
-                "DELETE FROM iroh_rooms WHERE room_id = ?",
-                (room_id,),
-            )
-            self._dependencies.secret_store.delete(
-                self._dependencies.room_secret_key(room_id)
-            )
-            for peer in peers:
-                self._dependencies.secret_store.delete(
-                    self._dependencies.peer_ticket_key(
-                        room_id,
-                        str(peer["endpoint_id"]),
-                    )
+        with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
+            with self._dependencies.immediate_transaction():
+                if self.active_room_id == room_id:
+                    raise ValueError("Active Iroh room cannot be discarded.")
+                conflict = self._dependencies.connection.execute(
+                    "SELECT conflict FROM iroh_rooms WHERE room_id = ?",
+                    (room_id,),
+                ).fetchone()
+                if conflict is not None and conflict["conflict"] is not None:
+                    return
+                peers = self._dependencies.connection.execute(
+                    "SELECT endpoint_id FROM iroh_peers WHERE room_id = ?",
+                    (room_id,),
+                ).fetchall()
+                self._dependencies.connection.execute(
+                    "DELETE FROM iroh_rooms WHERE room_id = ?",
+                    (room_id,),
                 )
+                secret_mutations.delete(self._dependencies.room_secret_key(room_id))
+                for peer in peers:
+                    secret_mutations.delete(
+                        self._dependencies.peer_ticket_key(
+                            room_id,
+                            str(peer["endpoint_id"]),
+                        )
+                    )
 
     def activate_joined_room(self, room_id: str) -> None:
         with self._dependencies.immediate_transaction():

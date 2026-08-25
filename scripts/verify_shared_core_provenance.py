@@ -12,6 +12,12 @@ def verify(rebuilt: Path, embedded: list[Path], expected_sha256: str) -> None:
     rebuilt_bytes = rebuilt.read_bytes()
     if not rebuilt_bytes.startswith(b"\0asm\x01\0\0\0"):
         raise ValueError("rebuilt shared core is not a WebAssembly module")
+    rebuilt_sha256 = hashlib.sha256(rebuilt_bytes).hexdigest()
+    if rebuilt_sha256 != expected_sha256.lower():
+        raise ValueError(
+            f"rebuilt shared core SHA-256 is {rebuilt_sha256}, "
+            f"expected {expected_sha256}"
+        )
 
     canonical_bytes: bytes | None = None
     for candidate in embedded:
@@ -22,6 +28,8 @@ def verify(rebuilt: Path, embedded: list[Path], expected_sha256: str) -> None:
                 f"embedded shared core SHA-256 is {candidate_sha256}, "
                 f"expected {expected_sha256}: {candidate}"
             )
+        if candidate_bytes != rebuilt_bytes:
+            raise ValueError(f"rebuilt and embedded shared core differ: {candidate}")
         if canonical_bytes is None:
             canonical_bytes = candidate_bytes
         elif candidate_bytes != canonical_bytes:

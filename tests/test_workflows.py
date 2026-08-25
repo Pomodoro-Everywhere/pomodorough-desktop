@@ -18,9 +18,11 @@ WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
-CORE_COMMIT = "0c2068a128c51e95aef580a916df7778c927e748"
-CORE_SHA256 = "2f259ce1ab446fae665e8ed78bd198201b7aa594df297293c86b8406d7699525"
+CORE_COMMIT = "155cfb720d50ff11d9535e9bc24a8200dc022020"
+CORE_SHA256 = "aec9688661f39b92f21de8a26231419f0a2839ab7629bd158af5a46d49632ddf"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
+UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
+VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
 VALID_WASM = b"\0asm\x01\0\0\0"
 DIFFERENT_VALID_WASM = VALID_WASM + b"\0\x01\0"
 
@@ -56,12 +58,20 @@ class SharedCoreProvenanceTests(unittest.TestCase):
                 text=True,
             )
 
-    def test_accepts_host_specific_rebuild_with_pinned_embedded_modules(self) -> None:
+    def test_rejects_rebuilt_module_that_differs_from_pinned_embedded_modules(
+        self,
+    ) -> None:
         result = self.run_provenance(
             DIFFERENT_VALID_WASM,
             [VALID_WASM, VALID_WASM],
             expected_sha256=hashlib.sha256(VALID_WASM).hexdigest(),
         )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rebuilt shared core SHA-256 is", result.stderr)
+
+    def test_accepts_exact_rebuild_with_pinned_embedded_modules(self) -> None:
+        result = self.run_provenance(VALID_WASM, [VALID_WASM, VALID_WASM])
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -88,10 +98,12 @@ class SharedCoreProvenanceTests(unittest.TestCase):
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_ci_rebuilds_and_verifies_pinned_shared_core(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        quality_job = workflow.split("  quality:\n", 1)[1]
         rebuild_step = workflow.split(
             "      - name: Rebuild and verify pinned shared core\n", 1
         )[1].split("      - name:", 1)[0]
 
+        self.assertIn("runs-on: macos-15", quality_job.split("  dependency-review:", 1)[0])
         self.assertIn(f'CORE_COMMIT: "{CORE_COMMIT}"', workflow)
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
         self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
@@ -176,13 +188,47 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_compromised_secret_scan_gates_release_publication(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         publication = workflow.split("  release:", 1)[1]
-        scan_index = publication.index("scripts/scan_secret.py")
+        scan_index = publication.index("scripts/verify_release_artifacts.sh")
         publish_index = publication.index("--draft=false")
 
         self.assertLess(scan_index, publish_index)
         self.assertIn("COMPROMISED_GOOGLE_CLIENT_SECRET", publication)
-        self.assertIn("python -m zipfile -e", publication)
-        self.assertIn("python -m tarfile -e", publication)
+        self.assertGreaterEqual(
+            publication.count("scripts/verify_release_artifacts.sh"), 2
+        )
+        self.assertIn("flatpak ostree", publication)
+        self.assertIn("uv==0.12.5", publication)
+
+    def test_published_recovery_assets_are_unpacked_and_secret_scanned(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        publication = workflow.split("      - name: Publish GitHub release", 1)[1]
+        verification = publication.split("          verify_release_assets() {", 1)[1].split(
+            "          }", 1
+        )[0]
+
+        self.assertIn("COMPROMISED_GOOGLE_CLIENT_SECRET", publication)
+        self.assertIn("scripts/verify_release_artifacts.sh", verification)
+        self.assertIn('"$published_dir"', verification)
+
+    def test_release_verifier_checks_packaged_oauth_and_raw_and_unpacked_secrets(self) -> None:
+        verifier = VERIFY_RELEASE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("unpack_release_artifacts.sh", verifier)
+        self.assertIn("verify_packaged_oauth.py", verifier)
+        self.assertEqual(verifier.count("scan_secret.py"), 2)
+        for package_root in ("wheel", "sdist", "flatpak-root", "windows"):
+            self.assertIn(f'"$scan_root/{package_root}"', verifier)
+
+    def test_release_unpacker_covers_every_compressed_package_format(self) -> None:
+        unpacker = UNPACK_RELEASE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("python -m zipfile -e", unpacker)
+        self.assertIn("python -m tarfile -e", unpacker)
+        self.assertIn("flatpak build-import-bundle", unpacker)
+        self.assertIn("ostree", unpacker)
+        self.assertIn("pyinstxtractor-ng==2026.7.3", unpacker)
+        self.assertIn("Pomodorough-${version}-x86_64.flatpak", unpacker)
+        self.assertIn("Pomodorough-${version}-windows-x86_64.exe", unpacker)
 
     def test_platform_packages_include_wasmtime_runtime(self) -> None:
         flatpak = FLATPAK_MANIFEST.read_text(encoding="utf-8")

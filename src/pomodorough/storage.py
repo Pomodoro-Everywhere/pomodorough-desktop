@@ -22,7 +22,7 @@ from .core import (
     project_auto_start_breaks,
     task_from_title,
 )
-from .secure_store import PlatformSecretStore
+from .secure_store import PlatformSecretStore, SecretMutationJournal
 from .shared_core import (
     ProjectionApplyV2,
     SharedCore as SharedCore,
@@ -244,13 +244,16 @@ class Store:
         self.connection.commit()
 
     def _migrate_local_schema(self) -> None:
-        with self._immediate_transaction():
+        with (
+            SecretMutationJournal(self._iroh_secret_store) as secrets,
+            self._immediate_transaction(),
+        ):
             self._migrate_pending_command_dependency()
             self._migrate_auto_break_phase_version()
             for statement in _IROH_SCHEMA_STATEMENTS:
                 self.connection.execute(statement)
             self._migrated_iroh_capabilities = (
-                self._migrate_plaintext_iroh_capabilities()
+                self._migrate_plaintext_iroh_capabilities(secrets)
             )
             self._set_meta("irohSchemaVersion", 1)
 
@@ -551,7 +554,9 @@ class Store:
     def _secure_reference(key: str) -> bytes:
         return f"secure:{key}".encode("utf-8")
 
-    def _migrate_plaintext_iroh_capabilities(self) -> bool:
+    def _migrate_plaintext_iroh_capabilities(
+        self, secrets: SecretMutationJournal
+    ) -> bool:
         migrated = False
         for row in self.connection.execute(
             "SELECT room_id, room_secret FROM iroh_rooms"
@@ -561,7 +566,7 @@ class Store:
                 continue
             room_id = str(row["room_id"])
             key = self._room_secret_key(room_id)
-            self._iroh_secret_store.save(key, bytes(secret))
+            secrets.save(key, bytes(secret))
             self.connection.execute(
                 "UPDATE iroh_rooms SET room_secret = ? WHERE room_id = ?",
                 (self._secure_reference(key), room_id),
@@ -576,7 +581,7 @@ class Store:
             room_id = str(row["room_id"])
             endpoint_id = str(row["endpoint_id"])
             key = self._peer_ticket_key(room_id, endpoint_id)
-            self._iroh_secret_store.save(key, ticket.encode("utf-8"))
+            secrets.save(key, ticket.encode("utf-8"))
             self.connection.execute(
                 "UPDATE iroh_peers SET endpoint_ticket = ? "
                 "WHERE room_id = ? AND endpoint_id = ?",
@@ -1214,7 +1219,11 @@ class Store:
             self.connection.rollback()
             raise
         else:
-            self.connection.commit()
+            try:
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
 
     def set_meta(self, key: str, value: Any) -> None:
         with self._immediate_transaction():

@@ -347,7 +347,7 @@ class CanonicalAcknowledgementStorage:
                         delete_statement,
                         (acknowledgement[id_key],),
                     )
-                if acknowledgement["outcome"] != "applied":
+                if acknowledgement["outcome"] == "rejected":
                     notices.append(
                         acknowledgement["reason"] or acknowledgement["outcome"]
                     )

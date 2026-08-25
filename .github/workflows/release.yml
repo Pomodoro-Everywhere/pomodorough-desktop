@@ -294,6 +294,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Install artifact inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends flatpak ostree
+          python -m pip install --disable-pip-version-check --no-deps uv==0.12.5
+
       - name: Reject compromised credential in final artifacts
         shell: bash
         env:
@@ -303,11 +309,11 @@ jobs:
           test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
           version="${RELEASE_TAG#v}"
           scan_root="$RUNNER_TEMP/release-secret-scan"
-          mkdir -p "$scan_root/wheel" "$scan_root/sdist"
-          python -m zipfile -e "dist/pomodorough_linux-${version}-py3-none-any.whl" "$scan_root/wheel"
-          python -m tarfile -e "dist/pomodorough_linux-${version}.tar.gz" "$scan_root/sdist"
-          python scripts/scan_secret.py "$scan_root"
-          python scripts/scan_secret.py dist
+          scripts/verify_release_artifacts.sh \
+            dist \
+            "$scan_root" \
+            "$version" \
+            src/pomodorough/resources/oauth-client.json
 
       - name: Export SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -351,6 +357,7 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
         shell: bash
         run: |
           set -euo pipefail
@@ -383,6 +390,13 @@ jobs:
               done
               gh attestation verify SHA256SUMS.txt --repo "$GITHUB_REPOSITORY"
             )
+            test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
+            published_scan="$(mktemp -d "$RUNNER_TEMP/published-secret-scan.XXXXXX")"
+            scripts/verify_release_artifacts.sh \
+              "$published_dir" \
+              "$published_scan" \
+              "$version" \
+              src/pomodorough/resources/oauth-client.json
           }
 
           release_state="missing"

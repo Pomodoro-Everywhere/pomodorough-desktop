@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pomodorough.core import task_from_title
 from pomodorough.iroh_protocol import ImmutableConflict, room_id_for_secret
@@ -23,6 +25,17 @@ class MemorySecretStore:
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
+
+
+class CommitFailingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.connection, name)
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("forced commit failure")
 
 
 class IrohStorageTests(unittest.TestCase):
@@ -51,6 +64,53 @@ class IrohStorageTests(unittest.TestCase):
         self.store = Store(self.path, iroh_secret_store=self.secrets)
         self.assertEqual(self.store.get_meta("irohSchemaVersion"), 1)
         self.assertEqual(self.store.replication_mode, "centralized")
+
+    def _seed_plaintext_room_capability(self) -> tuple[str, bytes, str]:
+        secret = bytes(range(32))
+        room_id = self.store.create_iroh_room(secret, "Legacy room")
+        key = self.store._room_secret_key(room_id)
+        self.store.connection.execute(
+            "UPDATE iroh_rooms SET room_secret = ? WHERE room_id = ?",
+            (secret, room_id),
+        )
+        self.store.connection.commit()
+        self.secrets.delete(key)
+        return room_id, secret, key
+
+    def _room_secret_value(self, room_id: str) -> bytes:
+        row = self.store.connection.execute(
+            "SELECT room_secret FROM iroh_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return row["room_secret"]
+
+    def test_plaintext_capability_migration_compensates_later_sql_failure(self) -> None:
+        room_id, secret, key = self._seed_plaintext_room_capability()
+
+        with (
+            patch.object(
+                self.store,
+                "_set_meta",
+                side_effect=sqlite3.OperationalError("forced later SQL failure"),
+            ),
+            self.assertRaisesRegex(sqlite3.OperationalError, "forced later SQL failure"),
+        ):
+            self.store._migrate_local_schema()
+
+        self.assertEqual(self._room_secret_value(room_id), secret)
+        self.assertNotIn(key, self.secrets.values)
+
+    def test_plaintext_capability_migration_compensates_commit_failure(self) -> None:
+        room_id, secret, key = self._seed_plaintext_room_capability()
+        connection = self.store.connection
+        self.store.connection = CommitFailingConnection(connection)  # type: ignore[assignment]
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "forced commit failure"):
+            self.store._migrate_local_schema()
+
+        self.store.connection = connection
+        self.assertEqual(self._room_secret_value(room_id), secret)
+        self.assertNotIn(key, self.secrets.values)
 
     def test_room_writes_are_durable_and_mode_switching_is_non_destructive(self) -> None:
         local_before = self.store.load()
