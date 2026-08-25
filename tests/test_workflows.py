@@ -19,7 +19,7 @@ HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
 CORE_COMMIT = "155cfb720d50ff11d9535e9bc24a8200dc022020"
-CORE_SHA256 = "aec9688661f39b92f21de8a26231419f0a2839ab7629bd158af5a46d49632ddf"
+CORE_SHA256 = "37ef1625285e91d7ba7d0e75ef03dff36c8d5eb9fd3734a8187de39b8391c247"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
 UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
 VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
