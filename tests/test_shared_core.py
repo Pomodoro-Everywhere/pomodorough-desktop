@@ -80,7 +80,7 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(version("wasmtime"), "48.0.0")
         self.assertEqual(
             self.core.dispatch("core.version", {}),
-            {"schemaVersion": 1, "coreVersion": "0.1.4"},
+            {"schemaVersion": 1, "coreVersion": "0.1.5"},
         )
 
     def test_hlc_head_through_bundled_wasm(self) -> None:
