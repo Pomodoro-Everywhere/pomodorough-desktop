@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -12,9 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QStackedWidget,
-    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -83,67 +80,23 @@ class MainWindowViewMixin:
         self._apply_responsive_layout()
 
     def _build_header(self) -> None:
-        if sys.platform == "darwin":
-            self._build_macos_header()
-            return
         header = QHBoxLayout()
-        self._populate_header(
-            header,
-            include_tagline=True,
-            center_navigation=False,
-        )
-        self.outer_layout.addLayout(header)
-
-    def _build_macos_header(self) -> None:
-        toolbar = QToolBar(self)
-        toolbar.setObjectName("macosUnifiedHeader")
-        toolbar.setMovable(False)
-        toolbar.setFloatable(False)
-        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
-        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
-        content = QWidget(toolbar)
-        content.setObjectName("macosHeaderContent")
-        content.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        header = QHBoxLayout(content)
-        header.setContentsMargins(12, 0, 8, 0)
-        header.setSpacing(8)
-        self._populate_header(
-            header,
-            include_tagline=False,
-            center_navigation=True,
-        )
-        toolbar.addWidget(content)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
-        self.setUnifiedTitleAndToolBarOnMac(True)
-        self.header_toolbar = toolbar
-
-    def _populate_header(
-        self,
-        header: QHBoxLayout,
-        *,
-        include_tagline: bool,
-        center_navigation: bool,
-    ) -> None:
         brand = QVBoxLayout()
         brand.setSpacing(0)
         title = QLabel(self.strings.text("brand.name"))
         title.setObjectName("brand")
+        tagline = QLabel(self.strings.text("brand.tagline"))
+        tagline.setObjectName("tagline")
         brand.addWidget(title)
-        if include_tagline:
-            tagline = QLabel(self.strings.text("brand.tagline"))
-            tagline.setObjectName("tagline")
-            brand.addWidget(tagline)
+        brand.addWidget(tagline)
         header.addLayout(brand)
-        if center_navigation:
-            header.addStretch()
         self.navigation = ScreenNavigation(self.strings, self)
         self.screen_group = self.navigation.group
         self.screen_buttons = self.navigation.buttons
         header.addWidget(self.navigation)
         header.addStretch()
         self._build_header_actions(header)
+        self.outer_layout.addLayout(header)
 
     def _build_header_actions(self, header: QHBoxLayout) -> None:
         self.settings_button = QToolButton()
@@ -518,14 +471,6 @@ class MainWindowViewMixin:
         QPushButton#accountButton[authenticated="true"] { min-width: 36px; max-width: 36px; min-height: 36px; max-height: 36px; padding: 0; }
         QPushButton[screen="true"] { min-width: 64px; font-family: "DejaVu Sans Condensed"; letter-spacing: 1px; }
         QPushButton[screen="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
-        QToolBar#macosUnifiedHeader { border: 0; spacing: 0; background: palette(window); }
-        QToolBar#macosUnifiedHeader QWidget#macosHeaderContent { background: transparent; }
-        QToolBar#macosUnifiedHeader QLabel#brand { font-size: 16px; letter-spacing: 0; }
-        QToolBar#macosUnifiedHeader QPushButton[screen="true"] { min-width: 54px; min-height: 28px; border: 0; border-radius: 7px; padding: 1px 7px; background: transparent; font-family: "SF Pro Text", "Helvetica Neue"; font-weight: 500; letter-spacing: 0; }
-        QToolBar#macosUnifiedHeader QPushButton[screen="true"]:hover { background: palette(midlight); }
-        QToolBar#macosUnifiedHeader QPushButton[screen="true"]:checked { background: palette(midlight); color: palette(window-text); border: 0; }
-        QToolBar#macosUnifiedHeader QPushButton[screen="true"]:focus { border: 2px solid palette(highlight); }
-        QToolBar#macosUnifiedHeader QPushButton[screen="true"]:pressed { padding: 1px 7px; }
         QToolButton#settingsButton { font-size: 24px; }
         QLabel#microLabel { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QLabel#taskSubtitle { color: palette(mid); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
