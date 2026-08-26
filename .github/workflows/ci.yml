@@ -87,6 +87,7 @@ jobs:
           set -euo pipefail
           test "$(git -C pomodorough-core-source rev-parse HEAD)" = "$CORE_COMMIT"
           rustup toolchain install 1.97.1 --profile minimal
+          rustup target add wasm32-unknown-unknown --toolchain 1.97.1
           (
             cd pomodorough-core-source
             cargo +1.97.1 test --all-targets --locked
