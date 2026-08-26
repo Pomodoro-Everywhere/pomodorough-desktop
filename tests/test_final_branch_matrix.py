@@ -436,7 +436,7 @@ class SharedCoreBoundaryTests(unittest.TestCase):
             SharedCoreError, "commit mismatch"
         ):
             _read_packaged_wasm()
-        values["CORE_COMMIT"] = "155cfb720d50ff11d9535e9bc24a8200dc022020"
+        values["CORE_COMMIT"] = "49efee8c5ac390d5dd7bd5c1a3537fb889fa6f10"
         with patch("pomodorough.shared_core.files", return_value=Resource(values)), self.assertRaisesRegex(
             SharedCoreError, "manifest is invalid"
         ):

@@ -80,7 +80,23 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(version("wasmtime"), "48.0.0")
         self.assertEqual(
             self.core.dispatch("core.version", {}),
-            {"schemaVersion": 1, "coreVersion": "0.1.2"},
+            {"schemaVersion": 1, "coreVersion": "0.1.4"},
+        )
+
+    def test_hlc_head_through_bundled_wasm(self) -> None:
+        self.assertEqual(
+            self.core.dispatch(
+                "hlc.head.v1",
+                {
+                    "physicalNowMs": 100,
+                    "observed": [
+                        {"wallMs": 101, "counter": 2},
+                        {"wallMs": 101, "counter": 7},
+                        {"wallMs": 99, "counter": 99},
+                    ],
+                },
+            ),
+            {"wallMs": 101, "counter": 7},
         )
 
     def test_typed_projection_overdue_pause_then_resume_keeps_history_identity(
