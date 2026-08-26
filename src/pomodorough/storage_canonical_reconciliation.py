@@ -88,13 +88,17 @@ _QUEUE_TABLES = {
 
 
 class CanonicalReconciliationDependencies(Protocol):
-    connection: sqlite3.Connection
-    device_id: str
-    _shared_core: Any
+    @property
+    def connection(self) -> sqlite3.Connection: ...
+
+    @property
+    def device_id(self) -> str: ...
+
+    def shared_core(self) -> Any: ...
 
     def _command_physical_times(self) -> dict[str, int]: ...
 
-    def _normalize_settings(self, value: Any) -> dict[str, Any]: ...
+    def _normalize_settings(self, settings: Any) -> dict[str, Any]: ...
 
     def _preflight_pending_queues(
         self, *, require_clock_coverage: bool = True
@@ -103,7 +107,7 @@ class CanonicalReconciliationDependencies(Protocol):
     def _set_meta(self, key: str, value: Any) -> None: ...
 
     def _validated_projection_state(
-        self, value: Any, *, context: str
+        self, projection: dict[str, Any], *, context: str
     ) -> tuple[
         dict[str, Any] | None,
         list[dict[str, Any]],

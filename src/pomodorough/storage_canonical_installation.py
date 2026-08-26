@@ -28,7 +28,8 @@ _RESOLUTION_QUEUE_DELETIONS = (
 
 
 class CanonicalInstallationDependencies(Protocol):
-    connection: sqlite3.Connection
+    @property
+    def connection(self) -> sqlite3.Connection: ...
 
     def _clock_sample_for_response(
         self,
@@ -49,7 +50,7 @@ class CanonicalInstallationDependencies(Protocol):
         self, value: Any, *, allow_legacy_zero: bool = False
     ) -> tuple[int, int]: ...
 
-    def _normalize_settings(self, value: Any) -> dict[str, Any]: ...
+    def _normalize_settings(self, settings: Any) -> dict[str, Any]: ...
 
     def _physical_time_ms(self, value: Any) -> int: ...
 
@@ -57,7 +58,20 @@ class CanonicalInstallationDependencies(Protocol):
         self, *, require_clock_coverage: bool = True
     ) -> dict[str, list[dict[str, Any]]]: ...
 
-    def _project_operation(self, *args: Any, **kwargs: Any) -> Any: ...
+    def _project_operation(
+        self,
+        settings: dict[str, Any],
+        *,
+        duration_operation: dict[str, Any] | None = None,
+        auto_start_operation: dict[str, Any] | None = None,
+        selected_task_operation: dict[str, Any] | None = None,
+        command_operation: dict[str, Any] | None = None,
+        task_operation: dict[str, Any] | None = None,
+        now: str | None = None,
+        base: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+        pending_commands: list[dict[str, Any]] | None = None,
+    ) -> Any: ...
 
     def _prune_command_physical_times(self) -> None: ...
 

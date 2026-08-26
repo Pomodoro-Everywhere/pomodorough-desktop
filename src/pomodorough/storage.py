@@ -243,8 +243,16 @@ class Store:
             _normalize_settings=self._normalize_settings,
             _set_meta=self._set_meta,
             get_meta=self.get_meta,
-            _clock_sample_for_response=lambda *args: (
-                self._clock_sample_for_response(*args)
+            _clock_sample_for_response=lambda server_time_ms,
+            request_physical_ms,
+            received_physical_ms,
+            request_monotonic_ms,
+            received_monotonic_ms: self._clock_sample_for_response(
+                server_time_ms,
+                request_physical_ms,
+                received_physical_ms,
+                request_monotonic_ms,
+                received_monotonic_ms,
             ),
             _display_minutes=self._display_minutes,
             _ensure_no_pending_resolution=(

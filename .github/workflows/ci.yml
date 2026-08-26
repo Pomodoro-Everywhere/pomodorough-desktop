@@ -138,6 +138,35 @@ jobs:
       - name: Lint Python sources
         run: ruff check .
 
+      - name: Check canonical dependency contracts
+        run: >-
+          npx --yes pyright@1.1.413 --pythonversion 3.12
+          src/pomodorough/storage_canonical.py
+          src/pomodorough/storage_canonical_acknowledgements.py
+          src/pomodorough/storage_canonical_reconciliation.py
+          src/pomodorough/storage_canonical_installation.py
+          tests/typecheck_canonical_dependencies.py
+
+      - name: Reject invalid canonical type contracts
+        shell: bash
+        run: |
+          check_negative() {
+            fixture=$1
+            diagnostic=$2
+            output=$(mktemp)
+            if npx --yes pyright@1.1.413 --pythonversion 3.12 "$fixture" >"$output" 2>&1; then
+              echo "Pyright unexpectedly accepted $fixture" >&2
+              exit 1
+            fi
+            grep -Fq "$diagnostic" "$output"
+          }
+          check_negative \
+            tests/typecheck_canonical_invalid_project_keyword.py \
+            reportCallIssue
+          check_negative \
+            tests/typecheck_canonical_invalid_duration_callback.py \
+            reportArgumentType
+
       - name: Check shell syntax
         run: >-
           sh -n deploy/install.sh scripts/unpack_release_artifacts.sh
