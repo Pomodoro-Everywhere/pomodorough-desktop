@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QPushButton,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from pomodorough.arrivals_screen import ArrivalsScreen
 from pomodorough.localization import Strings
@@ -13,7 +22,7 @@ from pomodorough.network_screen import NetworkScreen
 from pomodorough.tasks_screen import TasksScreen
 from pomodorough.timer_screen import TimerScreen
 from pomodorough.ui_controller import WindowApplicationController
-from pomodorough.ui_views import ScreenNavigation
+from pomodorough.ui_views import MainWindowViewMixin, ScreenNavigation
 
 
 class ScreenSignalTests(unittest.TestCase):
@@ -33,6 +42,68 @@ class ScreenSignalTests(unittest.TestCase):
 
         self.assertEqual(requested, [2])
         self.assertTrue(navigation.buttons[2].isChecked())
+
+    def _header_window(self) -> QMainWindow:
+        class HeaderWindow(MainWindowViewMixin, QMainWindow):
+            def __init__(self, strings: Strings) -> None:
+                super().__init__()
+                self.strings = strings
+                self.unified_titlebar_requested = False
+                root = QWidget()
+                self.outer_layout = QVBoxLayout(root)
+                self.setCentralWidget(root)
+
+            def setUnifiedTitleAndToolBarOnMac(self, enabled: bool) -> None:
+                self.unified_titlebar_requested = enabled
+
+            def _settings_toggled(self, _visible: bool) -> None:
+                pass
+
+            def _account_action(self) -> None:
+                pass
+
+        return HeaderWindow(self.strings)
+
+    def test_macos_header_uses_one_unified_toolbar_plane(self) -> None:
+        window = self._header_window()
+        with patch("pomodorough.ui_views.sys.platform", "darwin"):
+            window._build_header()
+
+        toolbar = window.findChild(QToolBar, "macosUnifiedHeader")
+        self.assertIsNotNone(toolbar)
+        self.assertEqual(window.outer_layout.count(), 0)
+        self.assertTrue(window.unified_titlebar_requested)
+        self.assertFalse(toolbar.isMovable())
+        self.assertFalse(toolbar.isFloatable())
+        self.assertTrue(all(toolbar.isAncestorOf(button) for button in window.screen_buttons))
+
+    def test_non_macos_header_keeps_navigation_beside_brand(self) -> None:
+        window = self._header_window()
+        with patch("pomodorough.ui_views.sys.platform", "linux"):
+            window._build_header()
+
+        header = window.outer_layout.itemAt(0).layout()
+        self.assertIs(header.itemAt(1).widget(), window.navigation)
+
+    def test_macos_navigation_focus_has_visible_rendering(self) -> None:
+        window = self._header_window()
+        with patch("pomodorough.ui_views.sys.platform", "darwin"):
+            window._build_header()
+        window.setStyleSheet(window._stylesheet())
+        window.show()
+        self.app.processEvents()
+        button = window.screen_buttons[1]
+        window.setFocus()
+        self.app.processEvents()
+        unfocused = button.grab().toImage()
+
+        button.setFocus(Qt.FocusReason.TabFocusReason)
+        self.app.processEvents()
+        focused = button.grab().toImage()
+
+        self.assertTrue(button.hasFocus())
+        self.assertNotEqual(unfocused, focused)
+        window.close()
 
     def test_controller_orders_navigation_render_before_optional_sync(self) -> None:
         class Controller(WindowApplicationController):
