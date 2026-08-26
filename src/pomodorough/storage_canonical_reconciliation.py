@@ -104,7 +104,14 @@ class CanonicalReconciliationDependencies(Protocol):
 
     def _validated_projection_state(
         self, value: Any, *, context: str
-    ) -> dict[str, Any]: ...
+    ) -> tuple[
+        dict[str, Any] | None,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, int],
+        bool,
+        str | None,
+    ]: ...
 
     def get_meta(self, key: str, default: Any = None) -> Any: ...
 
@@ -357,10 +364,10 @@ def validated_reconciliation_dependencies(
 class SharedCoreReconciliationAdapter:
     def __init__(
         self,
-        store: CanonicalReconciliationDependencies,
+        dependencies: CanonicalReconciliationDependencies,
         hooks: CanonicalReconciliationHooks,
     ) -> None:
-        self._store = store
+        self._dependencies = dependencies
         self._hooks = hooks
 
     def _core_timer_dependencies(
@@ -368,8 +375,8 @@ class SharedCoreReconciliationAdapter:
     ) -> list[dict[str, Any]]:
         commands = {str(command["id"]): command for command in pending["commands"]}
         generated = self._hooks._pending_generated_break_metadata()
-        physical_times = self._store._command_physical_times()
-        rows = self._store.connection.execute(
+        physical_times = self._dependencies._command_physical_times()
+        rows = self._dependencies.connection.execute(
             "SELECT id, depends_on_command_id FROM pending_commands "
             "WHERE depends_on_command_id IS NOT NULL ORDER BY device_sequence"
         )
@@ -384,7 +391,7 @@ class SharedCoreReconciliationAdapter:
     def _pending_generated_break_metadata(self) -> dict[str, Any]:
         return {
             str(row["start_command_id"]): row
-            for row in self._store.connection.execute(
+            for row in self._dependencies.connection.execute(
                 "SELECT source_finish_command_id, source_timer_id, start_command_id, "
                 "selected_phase_version FROM pending_auto_break_starts"
             )
@@ -432,11 +439,11 @@ class SharedCoreReconciliationAdapter:
         canonical: dict[str, Any],
         request: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
-        pending = self._store._preflight_pending_queues(require_clock_coverage=False)
+        pending = self._dependencies._preflight_pending_queues(require_clock_coverage=False)
 
         def with_device_id(operation: dict[str, Any]) -> dict[str, Any]:
             item = dict(operation)
-            item.setdefault("deviceId", self._store.device_id)
+            item.setdefault("deviceId", self._dependencies.device_id)
             return item
 
         queue_keys = tuple(_QUEUE_OUTPUT_KEYS)
@@ -493,7 +500,7 @@ class SharedCoreReconciliationAdapter:
     ) -> dict[str, Any]:
         if (
             not isinstance(value, dict)
-            or value.get("deviceId") != self._store.device_id
+            or value.get("deviceId") != self._dependencies.device_id
         ):
             raise ValueError("Shared core returned invalid reconciliation queues.")
         required = _CORE_QUEUE_OPERATION_FIELDS[domain]
@@ -587,7 +594,7 @@ class SharedCoreReconciliationAdapter:
             "autoStartBreaks": value["autoStartBreaks"],
             "selectedTaskId": value["selectedTaskId"],
         }
-        self._store._validated_projection_state(projection, context="reconciliation")
+        self._dependencies._validated_projection_state(projection, context="reconciliation")
         base = self._hooks._core_canonical_response(canonical)
         pairs = (
             ("baseTimer", "canonicalTimer"),
@@ -612,7 +619,7 @@ class SharedCoreReconciliationAdapter:
             )
         self._hooks._persist_reconciliation_dependencies(result)
         self._hooks._reconcile_removed_auto_break_starts(result, pending)
-        self._store._preflight_pending_queues(require_clock_coverage=False)
+        self._dependencies._preflight_pending_queues(require_clock_coverage=False)
 
     def _persist_reconciliation_queue(
         self,
@@ -627,12 +634,12 @@ class SharedCoreReconciliationAdapter:
             operation_id = str(original["id"])
             operation = retained.get(operation_id)
             if operation is None:
-                self._store.connection.execute(
+                self._dependencies.connection.execute(
                     f"DELETE FROM {table} WHERE id = ?", (operation_id,)
                 )
             else:
                 payload = json.dumps(operation, separators=(",", ":"))
-                self._store.connection.execute(
+                self._dependencies.connection.execute(
                     f"UPDATE {table} SET payload = ? WHERE id = ?",
                     (payload, operation_id),
                 )
@@ -643,7 +650,7 @@ class SharedCoreReconciliationAdapter:
             for item in result["dependencies"]
         }
         for operation in result["queues"]["commands"]:
-            self._store.connection.execute(
+            self._dependencies.connection.execute(
                 "UPDATE pending_commands SET depends_on_command_id = ? WHERE id = ?",
                 (parents.get(operation["id"]), operation["id"]),
             )
@@ -658,7 +665,7 @@ class SharedCoreReconciliationAdapter:
             for dependency in result["dependencies"]
             if dependency.get("generatedBreak", False)
         }
-        rows = self._store.connection.execute(
+        rows = self._dependencies.connection.execute(
             "SELECT source_finish_command_id, start_command_id, "
             "selected_phase_version FROM pending_auto_break_starts"
         ).fetchall()
@@ -681,26 +688,26 @@ class SharedCoreReconciliationAdapter:
         if start_id in generated:
             return
         source_id = str(row["source_finish_command_id"])
-        self._store.connection.execute(
+        self._dependencies.connection.execute(
             "DELETE FROM pending_auto_break_starts WHERE source_finish_command_id = ?",
             (source_id,),
         )
-        self._store.connection.execute(
+        self._dependencies.connection.execute(
             "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
             (source_id,),
         )
         operation = before.get(start_id)
         if operation is None:
             return
-        settings = self._store._normalize_settings(self._store.get_meta("settings", {}))
+        settings = self._dependencies._normalize_settings(self._dependencies.get_meta("settings", {}))
         if settings["selectedPhase"] == operation.get("phase") and int(
-            self._store.get_meta("selectedPhaseVersion", 0)
+            self._dependencies.get_meta("selectedPhaseVersion", 0)
         ) == int(row["selected_phase_version"]):
             if start_id in result["promoted"] and start_id in after:
                 settings["selectedPhase"] = after[start_id]["phase"]
             elif start_id in result["dropped"]:
                 settings["selectedPhase"] = "focus"
-            self._store._set_meta("settings", settings)
+            self._dependencies._set_meta("settings", settings)
 
     def _reconcile_with_shared_core(
         self,
@@ -710,11 +717,7 @@ class SharedCoreReconciliationAdapter:
         input_value, pending = self._hooks._core_reconciliation_input(
             canonical, request
         )
-        core = (
-            self._store._shared_core
-            if self._store._shared_core is not None
-            else _default_shared_core()
-        )
+        core = self._dependencies.shared_core() or _default_shared_core()
         try:
             value = core.dispatch("reconcile.rebase.v1", input_value)
         except SharedCoreError as error:

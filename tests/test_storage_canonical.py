@@ -82,7 +82,11 @@ class CanonicalStorageContractTests(unittest.TestCase):
         )
         self.assertIsInstance(storage._reconciliation, SharedCoreReconciliationAdapter)
         self.assertIsInstance(storage._installation, AtomicCanonicalInstaller)
-        self.assertIs(storage._validation._store, self.store)
+        self.assertIs(storage._validation._dependencies, storage._dependencies)
+        self.assertIs(storage._installation._dependencies, storage._dependencies)
+        self.assertIsNot(storage._dependencies, self.store)
+        self.assertEqual(storage._dependencies.device_id, self.store.device_id)
+        self.assertFalse(hasattr(storage._installation, "_store"))
         self.assertIs(storage._validation._hooks, storage)
 
     def test_wire_validation_error_order_is_stable(self) -> None:

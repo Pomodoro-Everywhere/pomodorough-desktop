@@ -117,10 +117,10 @@ def validate_reconciliation_queues(
 class CanonicalAcknowledgementStorage:
     def __init__(
         self,
-        store: CanonicalAcknowledgementDependencies,
+        dependencies: CanonicalAcknowledgementDependencies,
         hooks: CanonicalAcknowledgementHooks,
     ) -> None:
-        self._store = store
+        self._dependencies = dependencies
         self._hooks = hooks
 
     def _validated_sync_acknowledgements(
@@ -182,7 +182,7 @@ class CanonicalAcknowledgementStorage:
         }
         discarded_command_ids = discarded_command_ids or set()
         canonical_timer = canonical["canonicalTimer"]
-        rows = self._store.connection.execute(
+        rows = self._dependencies.connection.execute(
             "SELECT finish_command_id, timer_id, source_phase, advanced_phase, "
             "selected_phase_version FROM pending_phase_advances"
         ).fetchall()
@@ -200,7 +200,7 @@ class CanonicalAcknowledgementStorage:
             )
             if non_applied and not exact_completion:
                 self._restore_selected_phase(row)
-            self._store.connection.execute(
+            self._dependencies.connection.execute(
                 "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
                 (finish_id,),
             )
@@ -228,12 +228,12 @@ class CanonicalAcknowledgementStorage:
         )
 
     def _restore_selected_phase(self, row: sqlite3.Row) -> None:
-        settings = self._store._normalize_settings(self._store.get_meta("settings", {}))
+        settings = self._dependencies._normalize_settings(self._dependencies.get_meta("settings", {}))
         if settings["selectedPhase"] == row["advanced_phase"] and int(
-            self._store.get_meta("selectedPhaseVersion", 0)
+            self._dependencies.get_meta("selectedPhaseVersion", 0)
         ) == int(row["selected_phase_version"]):
             settings["selectedPhase"] = row["source_phase"]
-            self._store._set_meta("settings", settings)
+            self._dependencies._set_meta("settings", settings)
 
     def _reconcile_unmaterialized_auto_break_triggers(
         self,
@@ -262,13 +262,13 @@ class CanonicalAcknowledgementStorage:
                 discarded,
             )
             if not accepted:
-                self._store.connection.execute(
+                self._dependencies.connection.execute(
                     "DELETE FROM pending_auto_breaks WHERE finish_command_id = ?",
                     (finish_id,),
                 )
 
     def _unmaterialized_auto_break_rows(self) -> list[sqlite3.Row]:
-        return self._store.connection.execute(
+        return self._dependencies.connection.execute(
             "SELECT triggers.finish_command_id, triggers.timer_id "
             "FROM pending_auto_breaks AS triggers "
             "LEFT JOIN pending_auto_break_starts AS starts "
@@ -343,7 +343,7 @@ class CanonicalAcknowledgementStorage:
         for response_key, delete_statement, id_key in groups:
             for acknowledgement in canonical[response_key]:
                 if delete:
-                    self._store.connection.execute(
+                    self._dependencies.connection.execute(
                         delete_statement,
                         (acknowledgement[id_key],),
                     )

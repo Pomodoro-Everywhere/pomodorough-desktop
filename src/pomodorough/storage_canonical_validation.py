@@ -195,10 +195,10 @@ def validated_sync_tasks(
 class CanonicalWireValidator:
     def __init__(
         self,
-        store: CanonicalValidationDependencies,
+        dependencies: CanonicalValidationDependencies,
         hooks: CanonicalValidationHooks,
     ) -> None:
-        self._store = store
+        self._dependencies = dependencies
         self._hooks = hooks
 
     def _validated_sync_response(
@@ -210,7 +210,7 @@ class CanonicalWireValidator:
         acknowledgements = self._hooks._validated_sync_acknowledgements(
             response, request
         )
-        canonical_durations = self._store._canonical_durations(response["durationsMs"])
+        canonical_durations = self._dependencies._canonical_durations(response["durationsMs"])
         revision, auto_start_breaks = self._hooks._validated_sync_scalars(response)
         history = self._hooks._validated_sync_history(response["history"])
         tasks, task_ids = self._hooks._validated_sync_tasks(response["tasks"])
@@ -251,7 +251,7 @@ class CanonicalWireValidator:
         counter = response["serverHlcCounter"]
         server_time = response["serverTime"]
         try:
-            clock = self._store._logical_clock({"wallMs": wall, "counter": counter})
+            clock = self._dependencies._logical_clock({"wallMs": wall, "counter": counter})
             time_ms = (
                 parse_timestamp_ms(server_time)
                 if isinstance(server_time, str)
@@ -259,7 +259,7 @@ class CanonicalWireValidator:
             )
             if time_ms is None:
                 raise ValueError
-            self._store._physical_time_ms(time_ms)
+            self._dependencies._physical_time_ms(time_ms)
             if clock[0] < time_ms or clock[0] - time_ms > MAX_CLOCK_SKEW_MS:
                 raise ValueError
         except ValueError:
@@ -277,7 +277,7 @@ class CanonicalWireValidator:
         return history
 
     def _valid_canonical_timer(self, timer: Any) -> bool:
-        return valid_canonical_timer(timer, self._store._duration_ms)
+        return valid_canonical_timer(timer, self._dependencies._duration_ms)
 
     def _valid_history_item(self, item: Any) -> bool:
-        return valid_history_item(item, self._store._duration_ms)
+        return valid_history_item(item, self._dependencies._duration_ms)

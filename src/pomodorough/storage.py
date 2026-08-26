@@ -32,6 +32,7 @@ from .shared_core import (
 )
 from .storage_canonical import (
     CanonicalResponseStorage,
+    CanonicalStorageDependencies,
     valid_canonical_timer,
     valid_history_item,
 )
@@ -205,8 +206,8 @@ class Store:
         if self._migrated_iroh_capabilities:
             self.connection.execute("VACUUM")
             self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        self._configure_storage_responsibilities()
         self._initialize()
+        self._configure_storage_responsibilities()
         self._restore_trusted_time_anchor()
 
     def _configure_storage_responsibilities(self) -> None:
@@ -221,11 +222,45 @@ class Store:
             _iroh_conflict_time_ms,
         )
         self._sync_storage = SyncStorage(self)
-        self._canonical_storage = CanonicalResponseStorage(self)
+        self._canonical_storage = CanonicalResponseStorage(
+            self._canonical_dependencies()
+        )
         self._replication_storage = ReplicationStorage(
             self,
             self._workspace_storage,
             self._iroh_record_storage,
+        )
+
+    def _canonical_dependencies(self) -> CanonicalStorageDependencies:
+        return CanonicalStorageDependencies(
+            connection=self.connection,
+            device_id=self.device_id,
+            shared_core=lambda: self._shared_core,
+            _canonical_durations=self._canonical_durations,
+            _duration_ms=self._duration_ms,
+            _logical_clock=self._logical_clock,
+            _physical_time_ms=self._physical_time_ms,
+            _normalize_settings=self._normalize_settings,
+            _set_meta=self._set_meta,
+            get_meta=self.get_meta,
+            _clock_sample_for_response=lambda *args: (
+                self._clock_sample_for_response(*args)
+            ),
+            _display_minutes=self._display_minutes,
+            _ensure_no_pending_resolution=(
+                self._sync_storage._ensure_no_pending_resolution
+            ),
+            _immediate_transaction=self._immediate_transaction,
+            _preflight_pending_queues=self._preflight_pending_queues,
+            _project_operation=self._project_operation,
+            _prune_command_physical_times=self._prune_command_physical_times,
+            _set_trusted_time_anchor=lambda anchor: (
+                self._set_trusted_time_anchor(anchor)
+            ),
+            pending_resolution=self._sync_storage.pending_resolution,
+            pending_sync=self._sync_storage.pending_sync,
+            _command_physical_times=self._command_physical_times,
+            _validated_projection_state=self._validated_projection_state,
         )
 
     def _open_database(self) -> None:

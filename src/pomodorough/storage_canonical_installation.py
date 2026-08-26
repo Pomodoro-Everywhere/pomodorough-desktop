@@ -200,17 +200,17 @@ def validated_pending_resolution_apply(
 class AtomicCanonicalInstaller:
     def __init__(
         self,
-        store: CanonicalInstallationDependencies,
+        dependencies: CanonicalInstallationDependencies,
         hooks: CanonicalInstallationHooks,
     ) -> None:
-        self._store = store
+        self._dependencies = dependencies
         self._hooks = hooks
 
     def _delete_resolution_queue_ids(self, queue_ids: dict[str, list[str]]) -> None:
         for key, statement in _RESOLUTION_QUEUE_DELETIONS:
             if key not in queue_ids:
                 continue
-            self._store.connection.executemany(
+            self._dependencies.connection.executemany(
                 statement, ((item_id,) for item_id in queue_ids[key])
             )
 
@@ -224,7 +224,7 @@ class AtomicCanonicalInstaller:
         trusted_response_ms: int,
         expected_projection: dict[str, Any] | None = None,
     ) -> None:
-        pending = self._store._preflight_pending_queues(require_clock_coverage=False)
+        pending = self._dependencies._preflight_pending_queues(require_clock_coverage=False)
         merged_clock = self._hooks._merged_install_clock(
             canonical, pending, trusted_response_ms
         )
@@ -234,19 +234,19 @@ class AtomicCanonicalInstaller:
         )
         self._hooks._install_projected_settings(projection)
         self._hooks._install_snapshot(canonical, user, preserve_known_tasks)
-        self._store._set_meta("autoStartLegacyDefaultUnknown", False)
-        self._store._set_meta(
+        self._dependencies._set_meta("autoStartLegacyDefaultUnknown", False)
+        self._dependencies._set_meta(
             "hlc", {"wallMs": merged_clock[0], "counter": merged_clock[1]}
         )
         if clock_sample is not None:
-            self._store._set_meta("serverClockSample", clock_sample)
+            self._dependencies._set_meta("serverClockSample", clock_sample)
 
     def _clear_stale_timer_ownership(
         self,
         canonical: dict[str, Any],
         pending: dict[str, list[dict[str, Any]]],
     ) -> None:
-        ownership = self._store.get_meta("centralizedTimerOwnership")
+        ownership = self._dependencies.get_meta("centralizedTimerOwnership")
         owned_timer_id = (
             ownership.get("timerId") if isinstance(ownership, dict) else None
         )
@@ -264,7 +264,7 @@ class AtomicCanonicalInstaller:
             )
             and owned_timer_id not in retained_timer_ids
         ):
-            self._store._set_meta("centralizedTimerOwnership", None)
+            self._dependencies._set_meta("centralizedTimerOwnership", None)
 
     def _merged_install_clock(
         self,
@@ -272,9 +272,9 @@ class AtomicCanonicalInstaller:
         pending: dict[str, list[dict[str, Any]]],
         trusted_response_ms: int,
     ) -> tuple[int, int]:
-        now_ms = self._store._physical_time_ms(trusted_response_ms)
-        local_clock = self._store._logical_clock(
-            self._store.get_meta("hlc", {"wallMs": 0, "counter": 0}),
+        now_ms = self._dependencies._physical_time_ms(trusted_response_ms)
+        local_clock = self._dependencies._logical_clock(
+            self._dependencies.get_meta("hlc", {"wallMs": 0, "counter": 0}),
             allow_legacy_zero=True,
         )
         server_clock = (
@@ -310,10 +310,10 @@ class AtomicCanonicalInstaller:
         trusted_response_ms: int,
         expected: dict[str, Any] | None,
     ) -> Any:
-        settings = self._store._normalize_settings(self._store.get_meta("settings", {}))
+        settings = self._dependencies._normalize_settings(self._dependencies.get_meta("settings", {}))
         projection_settings = deepcopy(settings)
         projection_settings["durationsMs"] = canonical["durationsMs"]
-        projection = self._store._project_operation(
+        projection = self._dependencies._project_operation(
             projection_settings,
             now=utc_timestamp(trusted_response_ms),
             base=canonical,
@@ -333,16 +333,16 @@ class AtomicCanonicalInstaller:
         return projection
 
     def _install_projected_settings(self, projection: Any) -> None:
-        settings = self._store._normalize_settings(self._store.get_meta("settings", {}))
+        settings = self._dependencies._normalize_settings(self._dependencies.get_meta("settings", {}))
         projected_durations = projection.durations_ms
         settings["durationsMs"] = projected_durations
         settings["durations"] = {
-            phase: self._store._display_minutes(duration_ms)
+            phase: self._dependencies._display_minutes(duration_ms)
             for phase, duration_ms in settings["durationsMs"].items()
         }
         settings["autoStartBreaks"] = projection.auto_start_breaks
         settings["selectedTaskId"] = projection.selected_task_id
-        self._store._set_meta("settings", settings)
+        self._dependencies._set_meta("settings", settings)
 
     def _install_snapshot(
         self,
@@ -350,7 +350,7 @@ class AtomicCanonicalInstaller:
         user: dict[str, Any] | None,
         preserve_known_tasks: bool,
     ) -> None:
-        previous = self._store.get_meta("snapshot", {})
+        previous = self._dependencies.get_meta("snapshot", {})
         known = (
             {
                 task["id"]: task
@@ -363,7 +363,7 @@ class AtomicCanonicalInstaller:
         for task in canonical["tasks"]:
             if task.get("id") and task.get("title"):
                 known[task["id"]] = task
-        self._store._set_meta(
+        self._dependencies._set_meta(
             "snapshot",
             {
                 "revision": canonical["revision"],
@@ -390,14 +390,14 @@ class AtomicCanonicalInstaller:
         request_monotonic_ms: int | None = None,
         received_monotonic_ms: int | None = None,
     ) -> list[str]:
-        with self._store._immediate_transaction():
-            self._store._ensure_no_pending_resolution()
-            claimed = self._store.pending_sync()
+        with self._dependencies._immediate_transaction():
+            self._dependencies._ensure_no_pending_resolution()
+            claimed = self._dependencies.pending_sync()
             if claimed != request:
                 raise ValueError(
                     "Sync response did not match an active normal sync claim."
                 )
-            previous = self._store.get_meta("snapshot")
+            previous = self._dependencies.get_meta("snapshot")
             canonical = self._hooks._validated_sync_response(response, request)
             clock_sample, clock_anchor, trusted_response_ms = (
                 self._hooks._response_clock_context(
@@ -412,9 +412,9 @@ class AtomicCanonicalInstaller:
                 canonical, request, previous, clock_sample, trusted_response_ms
             )
             if claimed is not None:
-                self._store._set_meta("pendingSync", None)
+                self._dependencies._set_meta("pendingSync", None)
         if clock_anchor is not None:
-            self._store._set_trusted_time_anchor(clock_anchor)
+            self._dependencies._set_trusted_time_anchor(clock_anchor)
         return notices
 
     def _finish_sync_install(
@@ -439,7 +439,7 @@ class AtomicCanonicalInstaller:
             trusted_response_ms=trusted_response_ms,
             expected_projection=reconciliation["projection"],
         )
-        self._store._prune_command_physical_times()
+        self._dependencies._prune_command_physical_times()
         return notices
 
     def apply_resolution(
@@ -454,8 +454,8 @@ class AtomicCanonicalInstaller:
         received_monotonic_ms: int | None = None,
     ) -> list[str]:
         user_id = user.get("id") if isinstance(user, dict) else None
-        with self._store._immediate_transaction():
-            pending = self._store.pending_resolution(user_id)
+        with self._dependencies._immediate_transaction():
+            pending = self._dependencies.pending_resolution(user_id)
             if pending is None:
                 raise ValueError("No matching history resolution is pending.")
             request, strategy, queue_ids = (
@@ -480,9 +480,9 @@ class AtomicCanonicalInstaller:
                 clock_sample,
                 trusted_response_ms,
             )
-            self._store._set_meta("pendingResolution", None)
+            self._dependencies._set_meta("pendingResolution", None)
         if clock_anchor is not None:
-            self._store._set_trusted_time_anchor(clock_anchor)
+            self._dependencies._set_trusted_time_anchor(clock_anchor)
         return notices
 
     def _finish_resolution_install(
@@ -507,7 +507,7 @@ class AtomicCanonicalInstaller:
             trusted_response_ms=trusted_response_ms,
             expected_projection=reconciliation["projection"],
         )
-        self._store._prune_command_physical_times()
+        self._dependencies._prune_command_physical_times()
         return notices
 
     def _response_clock_context(
@@ -518,7 +518,7 @@ class AtomicCanonicalInstaller:
         request_monotonic_ms: int | None,
         received_monotonic_ms: int | None,
     ) -> tuple[dict[str, int] | None, dict[str, int] | None, int]:
-        sample, anchor = self._store._clock_sample_for_response(
+        sample, anchor = self._dependencies._clock_sample_for_response(
             canonical["serverTimeMs"],
             request_physical_ms,
             received_physical_ms,
@@ -537,7 +537,7 @@ class AtomicCanonicalInstaller:
         strategy: str,
         queue_ids: dict[str, list[str]],
     ) -> list[str]:
-        previous = self._store.get_meta("snapshot", {})
+        previous = self._dependencies.get_meta("snapshot", {})
         minimum_revision = max(
             int(previous.get("revision", 0)), int(request["expectedRevision"])
         )
@@ -554,10 +554,10 @@ class AtomicCanonicalInstaller:
     def _clear_keep_remote_queues(self, queue_ids: dict[str, list[str]]) -> None:
         self._hooks._delete_resolution_queue_ids(queue_ids)
         if "autoStartOperations" not in queue_ids:
-            self._store.connection.execute("DELETE FROM pending_auto_start_operations")
+            self._dependencies.connection.execute("DELETE FROM pending_auto_start_operations")
         if "selectedTaskOperations" not in queue_ids:
-            self._store.connection.execute(
+            self._dependencies.connection.execute(
                 "DELETE FROM pending_selected_task_operations"
             )
-        self._store.connection.execute("DELETE FROM pending_auto_breaks")
-        self._store.connection.execute("DELETE FROM pending_auto_break_starts")
+        self._dependencies.connection.execute("DELETE FROM pending_auto_breaks")
+        self._dependencies.connection.execute("DELETE FROM pending_auto_break_starts")

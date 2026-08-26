@@ -1,22 +1,21 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Protocol
+from typing import Any
 
 from .storage_canonical_acknowledgements import (
-    CanonicalAcknowledgementDependencies,
     CanonicalAcknowledgementStorage,
     validate_acknowledgements,
     validate_reconciliation_queues,
 )
 from .storage_canonical_installation import (
     AtomicCanonicalInstaller,
-    CanonicalInstallationDependencies,
     validated_pending_resolution_apply,
 )
 from .storage_canonical_reconciliation import (
-    CanonicalReconciliationDependencies,
     SharedCoreReconciliationAdapter,
     core_canonical_timer,
     core_history,
@@ -26,7 +25,6 @@ from .storage_canonical_reconciliation import (
     validated_reconciliation_id_sets,
 )
 from .storage_canonical_validation import (
-    CanonicalValidationDependencies,
     CanonicalWireValidator,
     require_sync_response_fields,
     valid_canonical_timer,
@@ -43,14 +41,40 @@ __all__ = (
 )
 
 
-class CanonicalStorageDependencies(
-    CanonicalValidationDependencies,
-    CanonicalAcknowledgementDependencies,
-    CanonicalReconciliationDependencies,
-    CanonicalInstallationDependencies,
-    Protocol,
-):
-    pass
+@dataclass(frozen=True)
+class CanonicalStorageDependencies:
+    connection: sqlite3.Connection
+    device_id: str
+    shared_core: Callable[[], Any]
+    _canonical_durations: Callable[..., dict[str, int]]
+    _duration_ms: Callable[..., int]
+    _logical_clock: Callable[..., tuple[int, int]]
+    _physical_time_ms: Callable[..., int]
+    _normalize_settings: Callable[..., dict[str, Any]]
+    _set_meta: Callable[[str, Any], None]
+    get_meta: Callable[..., Any]
+    _clock_sample_for_response: Callable[..., tuple[Any, Any]]
+    _display_minutes: Callable[[int], int]
+    _ensure_no_pending_resolution: Callable[[], None]
+    _immediate_transaction: Callable[[], Any]
+    _preflight_pending_queues: Callable[..., dict[str, Any]]
+    _project_operation: Callable[..., Any]
+    _prune_command_physical_times: Callable[[], None]
+    _set_trusted_time_anchor: Callable[[dict[str, int]], None]
+    pending_resolution: Callable[..., dict[str, Any] | None]
+    pending_sync: Callable[[], dict[str, Any] | None]
+    _command_physical_times: Callable[[], dict[str, int]]
+    _validated_projection_state: Callable[
+        ...,
+        tuple[
+            dict[str, Any] | None,
+            list[dict[str, Any]],
+            list[dict[str, Any]],
+            dict[str, int],
+            bool,
+            str | None,
+        ],
+    ]
 
 
 _COMPONENT_TYPES = {
@@ -186,9 +210,9 @@ class CanonicalResponseStorage:
         "_installation", "_clear_keep_remote_queues"
     )
 
-    def __init__(self, store: CanonicalStorageDependencies) -> None:
-        self._store = store
-        self._validation = CanonicalWireValidator(store, self)
-        self._acknowledgements = CanonicalAcknowledgementStorage(store, self)
-        self._reconciliation = SharedCoreReconciliationAdapter(store, self)
-        self._installation = AtomicCanonicalInstaller(store, self)
+    def __init__(self, dependencies: CanonicalStorageDependencies) -> None:
+        self._dependencies = dependencies
+        self._validation = CanonicalWireValidator(dependencies, self)
+        self._acknowledgements = CanonicalAcknowledgementStorage(dependencies, self)
+        self._reconciliation = SharedCoreReconciliationAdapter(dependencies, self)
+        self._installation = AtomicCanonicalInstaller(dependencies, self)
