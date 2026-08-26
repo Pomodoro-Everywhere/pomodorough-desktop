@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any, Protocol
 
 from .core import PHASES, parse_timestamp_ms, task_from_title
@@ -12,7 +11,7 @@ from .storage_model import (
 
 
 class CanonicalValidationDependencies(Protocol):
-    def _canonical_durations(self, value: Any) -> dict[str, int]: ...
+    def _canonical_durations(self, durations_ms: Any) -> dict[str, int]: ...
 
     def _duration_ms(self, value: Any, *, maximum: int) -> int: ...
 
@@ -45,9 +44,13 @@ class CanonicalValidationHooks(Protocol):
     ) -> tuple[str, int, int, int]: ...
 
 
+class DurationMs(Protocol):
+    def __call__(self, value: Any, *, maximum: int) -> int: ...
+
+
 def valid_canonical_timer(
     timer: Any,
-    duration_ms: Callable[..., int],
+    duration_ms: DurationMs,
 ) -> bool:
     if not isinstance(timer, dict):
         return False
@@ -98,7 +101,7 @@ def valid_canonical_timer(
 
 def valid_history_item(
     item: Any,
-    duration_ms: Callable[..., int],
+    duration_ms: DurationMs,
 ) -> bool:
     if not isinstance(item, dict):
         return False

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import tempfile
+import textwrap
 import unittest
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -82,12 +86,50 @@ class CanonicalStorageContractTests(unittest.TestCase):
         )
         self.assertIsInstance(storage._reconciliation, SharedCoreReconciliationAdapter)
         self.assertIsInstance(storage._installation, AtomicCanonicalInstaller)
-        self.assertIs(storage._validation._dependencies, storage._dependencies)
-        self.assertIs(storage._installation._dependencies, storage._dependencies)
+        components = (
+            storage._validation,
+            storage._acknowledgements,
+            storage._reconciliation,
+            storage._installation,
+        )
+        for component in components:
+            with self.subTest(component=type(component).__name__):
+                self.assertIs(component._dependencies, storage._dependencies)
+                self.assertIs(component._hooks, storage)
+                self.assertFalse(hasattr(component, "_store"))
         self.assertIsNot(storage._dependencies, self.store)
         self.assertEqual(storage._dependencies.device_id, self.store.device_id)
-        self.assertFalse(hasattr(storage._installation, "_store"))
-        self.assertIs(storage._validation._hooks, storage)
+        with self.assertRaises(FrozenInstanceError):
+            setattr(storage._dependencies, "device_id", "replacement")
+
+    def test_typecheck_fixture_matches_production_dependency_wiring(self) -> None:
+        production = ast.parse(
+            textwrap.dedent(inspect.getsource(Store._canonical_dependencies))
+        )
+        fixture = ast.parse(
+            Path(__file__).with_name("typecheck_canonical_dependencies.py").read_text()
+        )
+
+        class NormalizeProviderName(ast.NodeTransformer):
+            def visit_Name(self, node: ast.Name) -> ast.Name:
+                if node.id in {"self", "store"}:
+                    return ast.copy_location(ast.Name(id="provider", ctx=node.ctx), node)
+                return node
+
+        def returned_constructor(tree: ast.Module) -> ast.expr:
+            function = next(
+                node for node in tree.body if isinstance(node, ast.FunctionDef)
+            )
+            returned = next(
+                node for node in function.body if isinstance(node, ast.Return)
+            )
+            assert returned.value is not None
+            return NormalizeProviderName().visit(returned.value)
+
+        self.assertEqual(
+            ast.dump(returned_constructor(production), include_attributes=False),
+            ast.dump(returned_constructor(fixture), include_attributes=False),
+        )
 
     def test_wire_validation_error_order_is_stable(self) -> None:
         request = _empty_request()
