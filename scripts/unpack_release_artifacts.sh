@@ -33,6 +33,7 @@ flatpak_ref="$(
 )"
 test -n "$flatpak_ref"
 ostree --repo="$scan_root/flatpak-repo" checkout \
+  --user-mode \
   "$flatpak_ref" \
   "$scan_root/flatpak-root"
 

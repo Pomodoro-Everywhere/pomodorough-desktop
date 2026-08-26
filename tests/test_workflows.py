@@ -214,6 +214,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("python -m tarfile -e", unpacker)
         self.assertIn("flatpak build-import-bundle", unpacker)
         self.assertIn("ostree", unpacker)
+        self.assertIn("--user-mode", unpacker)
         self.assertIn("pyinstxtractor-ng==2026.7.3", unpacker)
         self.assertIn("Pomodorough-${version}-x86_64.flatpak", unpacker)
         self.assertIn("Pomodorough-${version}-windows-x86_64.exe", unpacker)
