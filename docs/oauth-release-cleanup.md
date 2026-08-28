@@ -44,6 +44,7 @@ mkdir -p "scan-$VERSION"
 gh release download "$TAG" --repo "$REPOSITORY" --dir "scan-$VERSION"
 cd "scan-$VERSION"
 sha256sum --check SHA256SUMS.txt
+gh attestation verify "pomodorough_linux-$VERSION-py3-none-any.whl" --repo "$REPOSITORY"
 gh attestation verify "Pomodorough-$VERSION-x86_64.flatpak" --repo "$REPOSITORY"
 gh attestation verify "Pomodorough-$VERSION-windows-x86_64.exe" --repo "$REPOSITORY"
 ```
@@ -120,12 +121,53 @@ python3 ../scripts/scan_secret.py windows-root
 
 The commands must find at least one `oauth-client.json`, every `jq` check must return `true`, and `scan_secret.py` must print `secret not found`.
 
+## Verify OAuth behavior from release artifacts
+
+Run the deterministic transaction verifier before any production sign-in. It uses controlled callback and API responses. It exercises the packaged OAuth contract, the loopback callback listener, token persistence, a child-process restart, refresh, `/api/v1/me`, and rejected responses. It does not prove that Google or the production API accepts the released client.
+
+For an installed wheel or source distribution, run:
+
+```bash
+python -m pomodorough.oauth_artifact_verifier --self-test
+```
+
+For the installed Flatpak, run:
+
+```bash
+flatpak run --user --command=python3 \
+  me.egigoka.Pomodorough \
+  -m pomodorough.oauth_artifact_verifier --self-test
+flatpak run --user --command=python3 \
+  me.egigoka.Pomodorough \
+  -m pomodorough.oauth_artifact_verifier --platform-store-self-test
+```
+
+The second Flatpak command writes random bytes through Secret Service, launches a second packaged process to read and delete them, and then verifies absence in the parent. The command prints only a boolean result. It fails if the sandbox cannot access `org.freedesktop.secrets` or the runtime lacks `secret-tool`.
+
+For the Windows executable, run both packaged modes in PowerShell:
+
+```powershell
+$env:POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST = "1"
+$oauth = Start-Process ".\Pomodorough-$VERSION-windows-x86_64.exe" -PassThru -Wait
+if ($oauth.ExitCode -ne 0) { throw "OAuth artifact self-test failed" }
+Remove-Item Env:POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST
+
+$env:POMODOROUGH_PLATFORM_STORE_SELF_TEST = "1"
+$store = Start-Process ".\Pomodorough-$VERSION-windows-x86_64.exe" -PassThru -Wait
+if ($store.ExitCode -ne 0) { throw "DPAPI self-test failed" }
+Remove-Item Env:POMODOROUGH_PLATFORM_STORE_SELF_TEST
+```
+
+The second Windows mode verifies a DPAPI save followed by load and delete in a second packaged process, then confirms absence in the parent. Neither mode prints the value.
+
 ## Close the blocked external release cleanup
 
 Close the external OAuth release-cleanup item only when all of these facts are recorded in the private release record:
 
 - Google revoked the compromised secret or deleted its old OAuth client.
 - Production accepts the retained or replacement Desktop client ID.
-- A built Desktop artifact completed Google sign-in without a client secret.
-- The downloaded Flatpak and Windows assets match `SHA256SUMS.txt` and their GitHub attestations.
+- A downloaded wheel, Flatpak, and Windows artifact each complete Google sign-in without a client secret.
+- Each artifact displays the authenticated account returned by production `/api/v1/me`.
+- Each artifact restores the account after the process exits and starts again.
+- The downloaded wheel, Flatpak, and Windows assets match `SHA256SUMS.txt` and their GitHub attestations.
 - The unpacked Flatpak and PyInstaller payloads contain no non-empty `client_secret` and no byte sequence equal to the compromised secret.

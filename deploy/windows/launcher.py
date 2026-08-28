@@ -1,6 +1,29 @@
 import os
 import sys
-from pathlib import Path
+
+
+if len(sys.argv) == 3 and sys.argv[1] == "--oauth-verifier-restart-child":
+    from pomodorough.oauth_artifact_verifier import main
+
+    raise SystemExit(main(["--restart-child", sys.argv[2]]))
+
+
+if len(sys.argv) == 5 and sys.argv[1] == "--platform-store-verifier-child":
+    from pomodorough.oauth_artifact_verifier import main
+
+    raise SystemExit(main(["--platform-store-child", *sys.argv[2:]]))
+
+
+if os.environ.get("POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST") == "1":
+    from pomodorough.oauth_artifact_verifier import main
+
+    raise SystemExit(main(["--self-test"]))
+
+
+if os.environ.get("POMODOROUGH_PLATFORM_STORE_SELF_TEST") == "1":
+    from pomodorough.oauth_artifact_verifier import main
+
+    raise SystemExit(main(["--platform-store-self-test"]))
 
 
 if os.environ.get("POMODOROUGH_SHARED_CORE_SMOKE") == "1":
@@ -25,18 +48,6 @@ if os.environ.get("POMODOROUGH_SHARED_CORE_SMOKE") == "1":
         or oauth_config.get("client_secret")
     ):
         raise SystemExit("packaged OAuth resource is invalid")
-    compromised_secret = os.environ.get("COMPROMISED_GOOGLE_CLIENT_SECRET", "")
-    if not compromised_secret:
-        raise SystemExit("compromised-secret scanner is not configured")
-    secret_bytes = compromised_secret.encode("utf-8")
-    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    for payload in bundle_root.rglob("*"):
-        if (
-            payload.is_file()
-            and not payload.is_symlink()
-            and secret_bytes in payload.read_bytes()
-        ):
-            raise SystemExit("compromised secret found in unpacked executable")
     raise SystemExit(0)
 
 from pomodorough.app import main

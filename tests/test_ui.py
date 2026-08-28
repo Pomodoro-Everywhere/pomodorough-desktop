@@ -1339,7 +1339,7 @@ class MainWindowDurationTests(unittest.TestCase):
             (self.window.timer["id"], self.window.timer["id"]),
         )
 
-    def test_tick_does_not_auto_finish_unowned_centralized_timer(self) -> None:
+    def test_tick_delegates_unowned_centralized_expiry_to_shared_core(self) -> None:
         remote_timer = {
             "id": "remote-timer",
             "phase": "focus",
@@ -1357,11 +1357,14 @@ class MainWindowDurationTests(unittest.TestCase):
 
         with (
             patch.object(self.store, "effective_timer_now_ms", return_value=61_000),
-            patch.object(self.window, "_issue") as issue,
+            patch.object(
+                self.store, "queue_command", wraps=self.store.queue_command
+            ) as queue_command,
         ):
             self.window._tick()
 
-        issue.assert_not_called()
+        queue_command.assert_called_once()
+        self.assertTrue(queue_command.call_args.kwargs["automatic"])
         self.assertEqual(self.store.load()["pending"], [])
 
     def test_tick_uses_monotonic_deadline_across_wall_jumps(self) -> None:

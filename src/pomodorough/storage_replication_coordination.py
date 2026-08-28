@@ -196,8 +196,8 @@ class ReplicationTransactionCoordinator:
                 (self._dependencies.workspace.serialize(workspace), room_id),
             )
             self._dependencies.workspace.restore(workspace)
-            if plan.auto_start_phase is not None:
-                self._queue_generated_break(plan.auto_start_phase, now_ms)
+            if plan.generated_break_phase is not None:
+                self._queue_generated_break(plan.generated_break_phase, now_ms)
                 self.capture_local_records_locked(room_id)
             return plan.expired
 

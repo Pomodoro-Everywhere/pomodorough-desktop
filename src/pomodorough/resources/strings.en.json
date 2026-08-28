@@ -168,6 +168,7 @@
   "network.error.sign_in_cancelled": "Google sign-in was cancelled.",
   "network.error.sign_in_timeout": "Google sign-in timed out.",
   "network.error.invalid_state": "Google sign-in returned an invalid state.",
+  "network.error.invalid_response": "Server returned an invalid JSON response.",
   "network.error.invalid_token": "Server returned an invalid token response.",
   "network.error.sign_in_required": "Sign in to sync across devices.",
   "network.error.missing_identity": "Google did not return an identity token.",

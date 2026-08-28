@@ -18,9 +18,8 @@ WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
-CORE_COMMIT = "8dc24486b38d87eb2c717e80b4315b31dd6a671d"
-CORE_SHA256 = "1e67043a8a652c5f9c6d36b28fe280b4bb5677e0c0279faaccdceb407181face"
-CORE_RELEASE = "v0.1.5"
+CORE_COMMIT = "71c85020eab69a803ab0d3046aa7abef890c4780"
+CORE_SHA256 = "69ecfeb3bf292866dca2c9dba936120cb6839a761111ce19087e30cbff1428a4"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
 UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
 VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
@@ -97,33 +96,46 @@ class SharedCoreProvenanceTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
-    def test_ci_tests_pinned_core_and_verifies_canonical_release_artifact(self) -> None:
+    def test_ci_rebuilds_and_verifies_pinned_shared_core(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         quality_job = workflow.split("  quality:\n", 1)[1]
-        provenance_step = workflow.split(
-            "      - name: Test pinned core and verify canonical release artifact\n", 1
+        rebuild_step = workflow.split(
+            "      - name: Rebuild and verify pinned shared core\n", 1
         )[1].split("      - name:", 1)[0]
 
         self.assertIn("runs-on: macos-15", quality_job.split("  dependency-review:", 1)[0])
         self.assertIn(f'CORE_COMMIT: "{CORE_COMMIT}"', workflow)
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
-        self.assertIn(f'CORE_RELEASE: "{CORE_RELEASE}"', workflow)
         self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
         self.assertIn("ref: ${{ env.CORE_COMMIT }}", workflow)
-        self.assertIn("cargo +1.97.1 test --all-targets --locked", workflow)
-        self.assertNotIn("cargo +1.97.1 build", workflow)
-        self.assertIn("git -C pomodorough-core-source rev-list -n 1", provenance_step)
-        self.assertIn("gh release download", provenance_step)
-        self.assertIn("verify_wasm_artifact.py", provenance_step)
-        self.assertIn('--sha256 "$CORE_SHA256"', provenance_step)
-        self.assertIn('"$published"', provenance_step)
+        self.assertIn(
+            "cargo +1.97.1 test --all-targets --locked",
+            workflow,
+        )
+        self.assertIn(
+            "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
+            workflow,
+        )
+        self.assertIn("verify_wasm_artifact.py", rebuild_step)
+        self.assertIn('--sha256 "$CORE_SHA256"', rebuild_step)
+        self.assertIn(
+            "rebuilt=pomodorough-core-source/target/wasm32-unknown-unknown/"
+            "release/pomodorough_core.wasm",
+            rebuild_step,
+        )
+        invocation = """          python3 scripts/verify_shared_core_provenance.py \\
+            --sha256 "$CORE_SHA256" \\
+            "$rebuilt" \\
+            src/pomodorough/resources/pomodorough_core.wasm
+"""
+        self.assertEqual(rebuild_step.count(invocation), 1)
         self.assertLess(
-            provenance_step.index("verify_wasm_artifact.py"),
-            provenance_step.index("verify_shared_core_provenance.py"),
+            rebuild_step.index("verify_wasm_artifact.py"),
+            rebuild_step.index("verify_shared_core_provenance.py"),
         )
         self.assertLess(
-            provenance_step.index("verify_shared_core_provenance.py"),
-            provenance_step.index("grep -Fx"),
+            rebuild_step.index("verify_shared_core_provenance.py"),
+            rebuild_step.index("grep -Fx"),
         )
 
     def test_release_checks_shared_core_in_built_distributions(self) -> None:
@@ -172,6 +184,49 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("client_secret", flatpak)
         self.assertNotIn("assert config.get", flatpak)
         self.assertIn("invalid packaged OAuth resource", flatpak)
+
+    def test_final_platform_artifacts_execute_oauth_transaction_self_test(self) -> None:
+        release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        flatpak = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+
+        verifier_command = "-m pomodorough.oauth_artifact_verifier --self-test"
+        self.assertGreaterEqual(release.count(verifier_command), 2)
+        self.assertIn(verifier_command, flatpak)
+        self.assertIn("POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST", windows)
+        self.assertIn("oauth_artifact_verifier import main", launcher)
+        self.assertIn('main(["--self-test"])', launcher)
+
+    def test_platform_artifacts_execute_real_secure_store_roundtrip(self) -> None:
+        windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        flatpak = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+        manifest = FLATPAK_MANIFEST.read_text(encoding="utf-8")
+
+        self.assertIn("--talk-name=org.freedesktop.secrets", manifest)
+        self.assertIn("libsecret-0.21.7.tar.xz", manifest)
+        self.assertIn(
+            "6b452e4750590a2b5617adc40026f28d2f4903de15f1250e1d1c40bfd68ed55e",
+            manifest,
+        )
+        self.assertIn("--platform-store-self-test", flatpak)
+        self.assertIn("gnome-keyring", flatpak)
+        self.assertIn("dbus-run-session", flatpak)
+        self.assertIn("POMODOROUGH_PLATFORM_STORE_SELF_TEST", windows)
+        self.assertIn("POMODOROUGH_PLATFORM_STORE_SELF_TEST", launcher)
+        self.assertIn('main(["--platform-store-self-test"])', launcher)
+        self.assertIn("--platform-store-verifier-child", launcher)
+        self.assertIn('main(["--platform-store-child", *sys.argv[2:]])', launcher)
+
+    def test_packaged_smoke_processes_never_receive_scan_secret(self) -> None:
+        windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+        flatpak = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertNotIn("COMPROMISED_GOOGLE_CLIENT_SECRET", windows)
+        self.assertNotIn("COMPROMISED_GOOGLE_CLIENT_SECRET", launcher)
+        self.assertNotIn("COMPROMISED_GOOGLE_CLIENT_SECRET", flatpak)
 
     def test_compromised_secret_scan_gates_release_publication(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

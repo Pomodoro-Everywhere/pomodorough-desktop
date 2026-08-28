@@ -13,8 +13,8 @@ from typing import Any, Final, Protocol, Self
 
 from wasmtime import Engine, Func, Instance, Memory, Module, Store, WasmtimeError
 
-CORE_COMMIT: Final = "8dc24486b38d87eb2c717e80b4315b31dd6a671d"
-CORE_SHA256: Final = "1e67043a8a652c5f9c6d36b28fe280b4bb5677e0c0279faaccdceb407181face"
+CORE_COMMIT: Final = "71c85020eab69a803ab0d3046aa7abef890c4780"
+CORE_SHA256: Final = "69ecfeb3bf292866dca2c9dba936120cb6839a761111ce19087e30cbff1428a4"
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
 _MAX_OPERATION_BYTES: Final = 256
@@ -77,6 +77,20 @@ class ProjectionApplyV2:
             raise SharedCoreABIError(
                 f"projection.apply.v2 rejected timer command {command_id}"
             )
+
+
+@dataclass(frozen=True)
+class TimerCompletionPlanV1:
+    """Validated policy result from SharedCore ``timer.completionPlan.v1``."""
+
+    expired: bool
+    command_eligible: bool
+    reserve_generated_break: bool
+    selected_phase: str | None
+    queue_auto_break: bool
+    generated_break_eligible: bool
+    generated_break_phase: str | None
+    source_already_accepted: bool
 
 
 def _reject_json_constant(value: str) -> object:
@@ -194,7 +208,9 @@ class SharedCore:
         self._allocate_export = self._require_func(
             "pomodorough_alloc", ("i32",), ("i32",)
         )
-        self._free_export = self._require_func("pomodorough_free", ("i32", "i32"), ())
+        self._free_export = self._require_func(
+            "pomodorough_free_v2", ("i32", "i32"), ("i32",)
+        )
         self._dispatch_export = self._require_func(
             "pomodorough_dispatch",
             ("i32", "i32", "i32", "i32"),
@@ -217,6 +233,12 @@ class SharedCore:
     def apply_projection_v2(self, input_value: object) -> ProjectionApplyV2:
         """Dispatch and strictly validate synchronized Desktop state."""
         return apply_projection_v2(self, input_value)
+
+    def plan_timer_completion_v1(
+        self, input_value: object
+    ) -> TimerCompletionPlanV1:
+        """Dispatch and strictly validate timer completion policy."""
+        return plan_timer_completion_v1(self, input_value)
 
     def dispatch_json(self, operation: str, input_json: str) -> object:
         """Call pinned WASM with an already serialized JSON value."""
@@ -292,12 +314,13 @@ class SharedCore:
         pointer = raw_pointer & _UINT32_MASK
         if pointer == 0:
             raise SharedCoreABIError("pomodorough_alloc returned a null pointer")
-        self._require_range(pointer, len(value), "allocated input")
         try:
+            self._require_range(pointer, len(value), "allocated input")
             written = self._memory.write(self._store, value, pointer)
             if written != len(value):
                 raise SharedCoreABIError("linear-memory input write was incomplete")
         except BaseException as primary:
+            self._unusable_cause = primary
             try:
                 self._release(pointer, len(value))
             except BaseException as cleanup:
@@ -313,7 +336,11 @@ class SharedCore:
             raise SharedCoreABIError(
                 "cannot release buffer with inconsistent pointer and length"
             )
-        self._free_export(self._store, _signed_i32(pointer), length)
+        status = self._free_export(self._store, _signed_i32(pointer), length)
+        if status != 1:
+            raise SharedCoreABIError(
+                f"pomodorough_free_v2 rejected buffer with status {status!r}"
+            )
 
     def _require_range(self, pointer: int, length: int, label: str) -> None:
         memory_bytes = self._memory.data_len(self._store)
@@ -413,6 +440,95 @@ def apply_projection_v2(
     """Use one strict adapter for production and injected SharedCore dispatchers."""
     value = dispatcher.dispatch("projection.apply.v2", input_value)
     return _validated_projection(value, input_value)
+
+
+_COMPLETION_PLAN_KEYS: Final = {
+    "expired",
+    "commandEligible",
+    "reserveGeneratedBreak",
+    "selectedPhase",
+    "queueAutoBreak",
+    "generatedBreakEligible",
+    "generatedBreakPhase",
+    "sourceAlreadyAccepted",
+}
+
+
+def plan_timer_completion_v1(
+    dispatcher: SharedCoreDispatcher, input_value: object
+) -> TimerCompletionPlanV1:
+    value = dispatcher.dispatch("timer.completionPlan.v1", input_value)
+    if not isinstance(value, dict) or set(value) != _COMPLETION_PLAN_KEYS:
+        raise _completion_plan_error("result has invalid fields")
+    bool_keys = _COMPLETION_PLAN_KEYS - {"selectedPhase", "generatedBreakPhase"}
+    if any(not isinstance(value[key], bool) for key in bool_keys):
+        raise _completion_plan_error("result has non-boolean flags")
+    selected = _completion_phase(value["selectedPhase"], "selectedPhase")
+    generated = _completion_phase(
+        value["generatedBreakPhase"], "generatedBreakPhase"
+    )
+    _validate_completion_relationships(value, input_value)
+    return TimerCompletionPlanV1(
+        value["expired"], value["commandEligible"],
+        value["reserveGeneratedBreak"], selected, value["queueAutoBreak"],
+        value["generatedBreakEligible"], generated,
+        value["sourceAlreadyAccepted"],
+    )
+
+
+def _validate_completion_relationships(
+    value: dict[str, Any], input_value: object
+) -> None:
+    kind = input_value.get("kind") if isinstance(input_value, dict) else None
+    if kind == "expiry":
+        invalid = any(value[key] for key in (
+            "commandEligible", "reserveGeneratedBreak", "queueAutoBreak",
+            "generatedBreakEligible", "sourceAlreadyAccepted",
+        )) or (not value["expired"] and (
+            value["selectedPhase"] is not None
+            or value["generatedBreakPhase"] is not None
+        ))
+    elif kind == "commandRequest":
+        invalid = any(value[key] for key in (
+            "expired", "queueAutoBreak", "generatedBreakEligible",
+            "sourceAlreadyAccepted",
+        )) or value["selectedPhase"] is not None or value[
+            "generatedBreakPhase"
+        ] is not None or (value["reserveGeneratedBreak"] and not value[
+            "commandEligible"
+        ])
+    elif kind == "finishApplied":
+        invalid = any(value[key] for key in (
+            "expired", "commandEligible", "reserveGeneratedBreak",
+            "generatedBreakEligible", "sourceAlreadyAccepted",
+        )) or value["selectedPhase"] is None or value["generatedBreakPhase"] is not None
+    elif kind == "generatedBreak":
+        invalid = any(value[key] for key in (
+            "expired", "commandEligible", "reserveGeneratedBreak", "queueAutoBreak",
+        )) or value["selectedPhase"] is not None or (
+            value["generatedBreakEligible"]
+            != (value["generatedBreakPhase"] is not None)
+        ) or (value["sourceAlreadyAccepted"] and not value[
+            "generatedBreakEligible"
+        ])
+    else:
+        invalid = True
+    if invalid:
+        raise _completion_plan_error("result is internally inconsistent")
+
+
+def _completion_phase(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _completion_plan_error(f"{label} is not a string or null")
+    if value not in _PHASES:
+        raise _completion_plan_error(f"{label} is invalid")
+    return value
+
+
+def _completion_plan_error(detail: str) -> SharedCoreABIError:
+    return SharedCoreABIError(f"malformed timer.completionPlan.v1 output: {detail}")
 
 
 def _projection_error(detail: str) -> SharedCoreABIError:
@@ -587,22 +703,21 @@ def _input_operations(input_value: object) -> dict[str, list[dict[str, Any]]]:
     return result
 
 
-def _operation_winner(
-    operations: list[dict[str, Any]], label: str
-) -> dict[str, Any] | None:
-    if not operations:
-        return None
-    keys: list[tuple[int, int, str, str]] = []
+def _referenced_operation(
+    operations: list[dict[str, Any]], winner_id: str, label: str
+) -> dict[str, Any]:
+    indexed: dict[str, dict[str, Any]] = {}
     for operation in operations:
-        keys.append(
-            (
-                _integer(operation.get("hlcWallMs"), f"input {label}.hlcWallMs"),
-                _integer(operation.get("hlcCounter"), f"input {label}.hlcCounter"),
-                _nonempty_string(operation.get("deviceId"), f"input {label}.deviceId"),
-                _nonempty_string(operation.get("id"), f"input {label}.id"),
-            )
-        )
-    return operations[max(range(len(operations)), key=keys.__getitem__)]
+        operation_id = _nonempty_string(operation.get("id"), f"input {label}.id")
+        if operation_id in indexed:
+            raise _projection_error(f"input {label} identities are not unique")
+        indexed[operation_id] = operation
+    try:
+        return indexed[winner_id]
+    except KeyError as cause:
+        raise _projection_error(
+            f"{label} winner is inconsistent: identity does not reference an input"
+        ) from cause
 
 
 def _group_operations(
@@ -645,17 +760,16 @@ def _validated_task_winners(
 ) -> dict[str, Any]:
     winners = _exact_object(value, set(groups), label="winningOperationIds.tasks")
     for task_id, group in groups.items():
-        winner = _operation_winner(group, "task operation")
-        assert winner is not None
         winner_id = _nonempty_string(
             winners[task_id], f"winningOperationIds.tasks.{task_id}"
         )
+        winner = _referenced_operation(group, winner_id, "task")
         expected = (
             {"id": task_id, "title": winner.get("title")}
             if winner.get("type") == "upsert"
             else None
         )
-        if winner_id != winner["id"] or projected_tasks.get(task_id) != expected:
+        if projected_tasks.get(task_id) != expected:
             raise _projection_error("task winner is inconsistent")
     return winners
 
@@ -667,14 +781,11 @@ def _validated_duration_winners(
 ) -> dict[str, Any]:
     winners = _exact_object(value, set(groups), label="winningOperationIds.durations")
     for phase, group in groups.items():
-        winner = _operation_winner(group, "duration operation")
-        assert winner is not None
         winner_id = _nonempty_string(
             winners[phase], f"winningOperationIds.durations.{phase}"
         )
-        if winner_id != winner["id"] or durations.get(phase) != winner.get(
-            "durationMs"
-        ):
+        winner = _referenced_operation(group, winner_id, "duration")
+        if durations.get(phase) != winner.get("durationMs"):
             raise _projection_error("duration winner is inconsistent")
     return winners
 
@@ -694,11 +805,8 @@ def _validated_scalar_winner(
         if raw_winner_id is not None:
             raise _projection_error(f"{output_key} winner must be null")
         return None
-    winner = _operation_winner(group, f"{output_key} operation")
-    assert winner is not None
     winner_id = _nonempty_string(raw_winner_id, f"winningOperationIds.{output_key}")
-    if winner_id != winner["id"]:
-        raise _projection_error(f"{output_key} winner is inconsistent")
+    winner = _referenced_operation(group, winner_id, output_key)
     expected = winner.get(value_key)
     if output_key == "selectedTask" and expected not in projected_tasks:
         expected = None
@@ -833,5 +941,7 @@ __all__ = [
     "SharedCoreError",
     "SharedCoreLoadError",
     "SharedCoreOperationError",
+    "TimerCompletionPlanV1",
     "apply_projection_v2",
+    "plan_timer_completion_v1",
 ]

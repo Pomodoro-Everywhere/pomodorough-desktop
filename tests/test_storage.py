@@ -399,6 +399,8 @@ class StorageTests(unittest.TestCase):
                         "title": "Core task",
                         "utf8Bytes": 9,
                     }
+                if operation == "hlc.tick.v1":
+                    return SharedCore().dispatch(operation, input_value)
                 assert isinstance(input_value, dict)
                 task_operation = input_value["pending"]["taskOperations"][-1]
                 return {
@@ -428,7 +430,8 @@ class StorageTests(unittest.TestCase):
             core.calls[0],
             ("task.identity.v1", {"title": "client task"}),
         )
-        self.assertEqual(core.calls[1][0], "projection.apply.v2")
+        self.assertEqual(core.calls[1][0], "hlc.tick.v1")
+        self.assertEqual(core.calls[2][0], "projection.apply.v2")
         self.assertEqual(operation["taskId"], "core-task-id")
         self.assertEqual(operation["title"], "Core task")
 
@@ -484,6 +487,8 @@ class StorageTests(unittest.TestCase):
                         "title": task["title"],
                         "utf8Bytes": len(task["title"].encode("utf-8")),
                     }
+                if operation == "hlc.tick.v1":
+                    return SharedCore().dispatch(operation, input_value)
                 raise SharedCoreLoadError("projection unavailable")
 
         self.store.close()
@@ -496,7 +501,10 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "projection unavailable"):
             self.store.queue_task_operation("upsert", task, now_ms=1_000)
 
-        self.assertEqual(core.calls, ["task.identity.v1", "projection.apply.v2"])
+        self.assertEqual(
+            core.calls,
+            ["task.identity.v1", "hlc.tick.v1", "projection.apply.v2"],
+        )
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_task_operations"
@@ -518,7 +526,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_duration_operations"
@@ -541,7 +549,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.set_auto_start_breaks(True, now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_auto_start_operations"
@@ -566,7 +574,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.set_selected_task_id("task-id", now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_selected_task_operations"
@@ -694,11 +702,13 @@ class StorageTests(unittest.TestCase):
         )
         running, _history = rebuild_optimistic(None, [], [start])
 
-        self.assertTrue(self.store.owns_timer(running))
+        ownership = self.store.get_meta("centralizedTimerOwnership")
+        self.assertEqual(ownership["timerId"], running["id"])
+        self.assertEqual(ownership["deviceId"], self.store.device_id)
         self.store.close()
         self.store = Store(self.path)
 
-        self.assertTrue(self.store.owns_timer(running))
+        self.assertEqual(self.store.get_meta("centralizedTimerOwnership"), ownership)
         self.store.reset_account_data()
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
 
@@ -776,7 +786,10 @@ class StorageTests(unittest.TestCase):
             "start", None, "focus", settings["durationsMs"], now_ms=1_000
         )
         local_timer, _history = rebuild_optimistic(None, [], [start])
-        self.assertTrue(self.store.owns_timer(local_timer))
+        self.assertEqual(
+            self.store.get_meta("centralizedTimerOwnership")["timerId"],
+            local_timer["id"],
+        )
         request = self.store.sync_payload()
         remote_timer = {
             "id": "remote-timer",
@@ -793,10 +806,9 @@ class StorageTests(unittest.TestCase):
         self.store.apply_sync(response, request)
 
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
-        self.assertFalse(self.store.owns_timer(remote_timer))
         self.store.close()
         self.store = Store(self.path)
-        self.assertFalse(self.store.owns_timer(remote_timer))
+        self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
 
     @staticmethod
     def _history_item(

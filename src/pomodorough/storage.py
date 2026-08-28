@@ -17,7 +17,6 @@ from .core import (
     ACTIVE_STATUSES,
     PHASES,
     elapsed_ms,
-    next_break_phase,
     parse_timestamp_ms,
     project_auto_start_breaks,
     task_from_title,
@@ -37,6 +36,9 @@ from .storage_canonical import (
     valid_history_item,
 )
 from .storage_iroh_records import IrohRecordPersistence
+from .storage_generation import GenerationReservation
+from .storage_completion import TimerCompletionPolicy
+
 from .storage_model import (
     ACKNOWLEDGEMENT_OUTCOMES as ACKNOWLEDGEMENT_OUTCOMES,
     CANONICAL_DURATION_MAX_MS as CANONICAL_DURATION_MAX_MS,
@@ -52,7 +54,7 @@ from .storage_model import (
     utc_timestamp as utc_timestamp,
 )
 from .storage_replication import ReplicationStorage, _iroh_conflict_time_ms
-from .storage_sync import SyncStorage
+from .storage_sync import SyncStorage, SyncStorageDependencies
 from .storage_workspace import WorkspacePersistence
 from .uuid7 import reserve_uuid7, uuid7_parts
 
@@ -178,8 +180,7 @@ class _AutoBreakTrigger:
 @dataclass(frozen=True)
 class _AutoBreakContext:
     settings: dict[str, Any]
-    history: list[dict[str, Any]]
-    completion: dict[str, Any] | None
+    generated_phase: str | None
     source_already_accepted: bool
 
 
@@ -211,6 +212,17 @@ class Store:
         self._restore_trusted_time_anchor()
 
     def _configure_storage_responsibilities(self) -> None:
+        self._generation_storage = GenerationReservation(
+            self.get_meta,
+            self._trusted_now_ms,
+            lambda: self._shared_core,
+        )
+        self._completion_policy = TimerCompletionPolicy(
+            lambda: self._shared_core,
+            lambda: self.device_id,
+            lambda: self.replication_mode,
+            self.get_meta,
+        )
         self._workspace_storage = WorkspacePersistence(
             self.connection,
             self.get_meta,
@@ -221,7 +233,7 @@ class Store:
             self.connection,
             _iroh_conflict_time_ms,
         )
-        self._sync_storage = SyncStorage(self)
+        self._sync_storage = SyncStorage(self._sync_dependencies())
         self._canonical_storage = CanonicalResponseStorage(
             self._canonical_dependencies()
         )
@@ -229,6 +241,26 @@ class Store:
             self,
             self._workspace_storage,
             self._iroh_record_storage,
+        )
+
+    def _sync_dependencies(self) -> SyncStorageDependencies:
+        return SyncStorageDependencies(
+            connection=self.connection,
+            device_id=lambda: self.device_id,
+            shared_core=lambda: self._shared_core,
+            validate_integer=self._bounded_integer,
+            response_clock_sample=self._clock_sample_for_response,
+            transaction=self._immediate_transaction,
+            preflight_pending_queues=self._preflight_pending_queues,
+            project_operation=self._project_operation,
+            write_meta=self._set_meta,
+            set_trusted_time_anchor=self._set_trusted_time_anchor,
+            validate_sync_response=lambda response, request: (
+                self._canonical_storage._validated_sync_response(response, request)
+            ),
+            read_meta=self.get_meta,
+            load_state=self.load,
+            replace_meta=self.set_meta,
         )
 
     def _canonical_dependencies(self) -> CanonicalStorageDependencies:
@@ -243,16 +275,8 @@ class Store:
             _normalize_settings=self._normalize_settings,
             _set_meta=self._set_meta,
             get_meta=self.get_meta,
-            _clock_sample_for_response=lambda server_time_ms,
-            request_physical_ms,
-            received_physical_ms,
-            request_monotonic_ms,
-            received_monotonic_ms: self._clock_sample_for_response(
-                server_time_ms,
-                request_physical_ms,
-                received_physical_ms,
-                request_monotonic_ms,
-                received_monotonic_ms,
+            _clock_sample_for_response=lambda *args: (
+                self._clock_sample_for_response(*args)
             ),
             _display_minutes=self._display_minutes,
             _ensure_no_pending_resolution=(
@@ -262,9 +286,7 @@ class Store:
             _preflight_pending_queues=self._preflight_pending_queues,
             _project_operation=self._project_operation,
             _prune_command_physical_times=self._prune_command_physical_times,
-            _set_trusted_time_anchor=lambda anchor: (
-                self._set_trusted_time_anchor(anchor)
-            ),
+            _set_trusted_time_anchor=lambda anchor: self._set_trusted_time_anchor(anchor),
             pending_resolution=self._sync_storage.pending_resolution,
             pending_sync=self._sync_storage.pending_sync,
             _command_physical_times=self._command_physical_times,
@@ -1170,33 +1192,13 @@ class Store:
         use_server_clock: bool = True,
         use_monotonic: bool = False,
     ) -> tuple[int, list[int], list[tuple[int, int]]]:
-        now_ms = self._trusted_now_ms(
+        return self._generation_storage.reserve(
             physical_now_ms,
+            sequence_count=sequence_count,
+            clock_count=clock_count,
             use_server_clock=use_server_clock,
             use_monotonic=use_monotonic,
         )
-        sequence = self._bounded_integer(
-            self.get_meta("deviceSequence", 0), "Persisted device sequence"
-        )
-        old_wall_ms, old_counter = self._logical_clock(
-            self.get_meta("hlc", {"wallMs": 0, "counter": 0}),
-            allow_legacy_zero=True,
-        )
-        if sequence_count < 0 or clock_count < 0:
-            raise ValueError("Generation reservation is invalid.")
-        if sequence_count > MAX_SAFE_INTEGER - sequence:
-            raise ValueError("Device sequence has no safe integer headroom.")
-
-        wall_ms = max(now_ms, old_wall_ms)
-        if wall_ms - now_ms > MAX_CLOCK_SKEW_MS:
-            raise ValueError("Persisted logical clock exceeds the trusted-time limit.")
-        first_counter = old_counter + 1 if wall_ms == old_wall_ms else 0
-        if clock_count and first_counter > MAX_SAFE_INTEGER - (clock_count - 1):
-            raise ValueError("Logical clock counter has no safe integer headroom.")
-
-        sequences = [sequence + offset for offset in range(1, sequence_count + 1)]
-        clocks = [(wall_ms, first_counter + offset) for offset in range(clock_count)]
-        return now_ms, sequences, clocks
 
     def _pending_uuid7_ids(self) -> list[str]:
         identifiers: list[str] = []
@@ -1283,17 +1285,6 @@ class Store:
     def device_id(self) -> str:
         return str(self.get_meta("deviceId"))
 
-    def owns_timer(self, timer: dict[str, Any] | None) -> bool:
-        if not isinstance(timer, dict) or not timer.get("id"):
-            return False
-        if self.replication_mode == "iroh":
-            return timer.get("startedByDeviceId") == self.device_id
-        ownership = self.get_meta("centralizedTimerOwnership")
-        return (
-            isinstance(ownership, dict)
-            and ownership.get("timerId") == timer["id"]
-            and ownership.get("deviceId") == self.device_id
-        )
 
     def load(self, *, projection: bool = False) -> dict[str, Any]:
         owns_transaction = not self.connection.in_transaction
@@ -1811,48 +1802,25 @@ class Store:
         state = self.load(projection=True)
         projection = self.projected_state(now_ms=effective_now_ms, state=state)
         settings = self.projected_settings(state, projection)
+        policy = self._completion_policy.command_request(
+            command_type, timer, projection.canonical_timer, automatic,
+            generate_auto_break, settings["autoStartBreaks"],
+        )
+        if not policy.command_eligible:
+            return None
         if automatic:
-            if command_type != "finish":
-                raise ValueError("Only Finish can be queued automatically.")
-            current_timer = projection.canonical_timer
-            if (
-                not isinstance(timer, dict)
-                or not isinstance(current_timer, dict)
-                or current_timer.get("id") != timer.get("id")
-                or current_timer.get("status") != "completed"
-                or current_timer.get("lastIntent", {}).get("type") == "finish"
-                or not self.owns_timer(current_timer)
-            ):
-                return None
-            timer = current_timer
+            timer = projection.canonical_timer
         if command_type == "start":
             selected_task_id = projection.selected_task_id
             if not any(
                 task.get("id") == selected_task_id for task in projection.tasks
             ):
                 selected_task_id = None
-        generates_break = self._command_generates_auto_break(
-            command_type, timer, settings, generate_auto_break
-        )
         return _CommandQueueContext(
-            effective_now_ms, timer, selected_task_id, generates_break
+            effective_now_ms, timer, selected_task_id,
+            policy.reserve_generated_break,
         )
 
-    def _command_generates_auto_break(
-        self, command_type: str, timer: dict[str, Any] | None,
-        settings: dict[str, Any], requested: bool,
-    ) -> bool:
-        return bool(
-            requested
-            and command_type == "finish"
-            and isinstance(timer, dict)
-            and timer.get("phase") == "focus"
-            and settings["autoStartBreaks"]
-            and (
-                self.replication_mode != "iroh"
-                or timer.get("startedByDeviceId") == self.device_id
-            )
-        )
 
     def _queue_prepared_timer_command(
         self, command_type: str, context: _CommandQueueContext,
@@ -2116,15 +2084,13 @@ class Store:
         self, command: dict[str, Any], timer: dict[str, Any] | None
     ) -> None:
         settings = self._normalize_settings(self.get_meta("settings", {}))
-        history = self._project_operation(
+        projection = self._project_operation(
             settings, now=command["occurredAt"]
-        ).history
-        phase = command["phase"]
-        advanced_phase = (
-            next_break_phase(history, command["occurredAt"])
-            if phase == "focus"
-            else "focus"
         )
+        policy = self._completion_policy.finish_applied(command, timer, projection)
+        advanced_phase = policy.selected_phase
+        if advanced_phase is None:
+            raise ValueError("SharedCore omitted completed timer phase advance.")
         settings["selectedPhase"] = advanced_phase
         self._set_meta("settings", settings)
         self.connection.execute(
@@ -2132,25 +2098,18 @@ class Store:
             "finish_command_id, timer_id, source_phase, advanced_phase, "
             "selected_phase_version) VALUES (?, ?, ?, ?, ?)",
             (
-                command["id"], command["timerId"], phase, advanced_phase,
+                command["id"], command["timerId"], command["phase"], advanced_phase,
                 int(self.get_meta("selectedPhaseVersion", 0)),
             ),
         )
-        if (
-            phase == "focus"
-            and settings["autoStartBreaks"]
-            and (
-                self.replication_mode != "iroh"
-                or timer is not None
-                and timer.get("startedByDeviceId") == self.device_id
-            )
-        ):
+        if policy.queue_auto_break:
             self.connection.execute(
                 "INSERT OR IGNORE INTO pending_auto_breaks("
                 "finish_command_id, timer_id, finish_device_sequence) "
                 "VALUES (?, ?, ?)",
                 (command["id"], command["timerId"], command["deviceSequence"]),
             )
+
 
     def _command_generation(self, now_ms: int, timer_now_ms: int | None,
                             trusted_ms: int | None, sequence: int | None,
@@ -2179,15 +2138,20 @@ class Store:
         command_id: str,
     ) -> dict[str, Any]:
         settings = self._normalize_settings(self.get_meta("settings", {}))
-        history = self._project_operation(settings, now=finish["occurredAt"]).history
-        completion = self._focus_completion(history, finish["timerId"], finish["id"])
-        if completion is None:
+        state = self.load(projection=True)
+        snapshot = state.get("projectionSnapshot", state["snapshot"])
+        optimistic = self._project_operation(
+            settings, now=finish["occurredAt"], base=snapshot, state=state,
+        )
+        policy = self._completion_policy.generated_break(
+            {"commandId": finish["id"], "timerId": finish["timerId"]},
+            snapshot, optimistic, True, False, finish["occurredAt"],
+        )
+        phase = policy.generated_break_phase
+        if not policy.generated_break_eligible or phase is None:
             raise ValueError(
                 "Automatic break generation requires an accepted focus finish."
             )
-        phase = next_break_phase(
-            history, completion.get("completedAt") or completion.get("endedAt")
-        )
         settings["selectedPhase"] = phase
         self._set_meta("settings", settings)
         self.connection.execute(
@@ -2211,13 +2175,6 @@ class Store:
         self._record_auto_break_start(finish["id"], finish["timerId"], command["id"])
         return command
 
-    @staticmethod
-    def _focus_completion(history: list[dict[str, Any]], timer_id: str,
-                          command_id: str) -> dict[str, Any] | None:
-        return next((item for item in history if item.get("phase") == "focus"
-                     and item.get("status") == "completed"
-                     and item.get("timerId") == timer_id
-                     and item.get("commandId") == command_id), None)
 
     def _record_auto_break_start(self, finish_id: str, timer_id: str, start_id: str) -> None:
         self.connection.execute(
@@ -2850,7 +2807,7 @@ class Store:
                 use_monotonic=use_server_clock,
             )
             self._discard_auto_break(trigger.timer_id)
-            if context.completion is None:
+            if context.generated_phase is None:
                 continue
             command = self._queue_auto_break_start(
                 trigger, context, require_canonical, now_ms,
@@ -2903,62 +2860,55 @@ class Store:
         snapshot: dict[str, Any], source_finish_pending: bool,
         require_canonical: bool, now_ms: int,
     ) -> _AutoBreakContext | None:
-        canonical_timer = snapshot.get("canonicalTimer")
         base_history = snapshot.get("history", [])
-        canonical_completion = self._focus_completion(
-            base_history, trigger.timer_id, trigger.finish_command_id
-        )
-        canonical_timer_is_source = canonical_timer is not None and (
-            canonical_timer.get("id") == trigger.timer_id
-            and canonical_timer.get("phase") == "focus"
-            and canonical_timer.get("status") == "completed"
-        )
-        source_already_accepted = (
-            not source_finish_pending
-            and canonical_completion is not None
-            and canonical_timer_is_source
-        )
         settings = self._normalize_settings(self.get_meta("settings", {}))
         state = self.load(projection=True)
         optimistic = self._project_operation(
             settings, now=utc_timestamp(now_ms), base=snapshot, state=state,
             pending_commands=pending,
         )
-        current_timer = (
-            canonical_timer if require_canonical else optimistic.canonical_timer
+        source_timestamp = self._completion_source_timestamp(
+            trigger, pending, base_history, optimistic.history, now_ms
         )
-        if not source_already_accepted and (
-            not isinstance(current_timer, dict)
-            or current_timer.get("id") != trigger.timer_id
-            or current_timer.get("phase") != "focus"
-            or current_timer.get("status") != "completed"
-        ):
+        policy = self._completion_policy.generated_break(
+            {
+                "commandId": trigger.finish_command_id,
+                "timerId": trigger.timer_id,
+            },
+            snapshot, optimistic, source_finish_pending,
+            require_canonical, source_timestamp,
+        )
+        if not policy.generated_break_eligible:
             return None
-        use_canonical = require_canonical or source_already_accepted
-        history = base_history if use_canonical else optimistic.history
-        completion = (
-            canonical_completion
-            if use_canonical
-            else self._focus_completion(
-                history, trigger.timer_id, trigger.finish_command_id
-            )
-        )
         return _AutoBreakContext(
-            settings, history, completion, source_already_accepted
+            settings, policy.generated_break_phase,
+            policy.source_already_accepted,
         )
+
+    @staticmethod
+    def _completion_source_timestamp(
+        trigger: _AutoBreakTrigger, pending: list[dict[str, Any]],
+        canonical_history: list[dict[str, Any]],
+        optimistic_history: list[dict[str, Any]], now_ms: int,
+    ) -> str:
+        candidates = [*pending, *canonical_history, *optimistic_history]
+        source = next((item for item in candidates
+                       if item.get("timerId") == trigger.timer_id
+                       and (item.get("id") == trigger.finish_command_id
+                            or item.get("commandId") == trigger.finish_command_id)), None)
+        if source is None:
+            return utc_timestamp(now_ms)
+        return str(source.get("completedAt") or source.get("endedAt")
+                   or source.get("occurredAt") or utc_timestamp(now_ms))
 
     def _queue_auto_break_start(
         self, trigger: _AutoBreakTrigger, context: _AutoBreakContext,
         require_canonical: bool, now_ms: int, trusted_ms: int,
         sequence: int, clock: tuple[int, int],
     ) -> dict[str, Any]:
-        completion = context.completion
-        if completion is None:
+        phase = context.generated_phase
+        if phase is None:
             raise ValueError("Automatic break completion is missing.")
-        phase = next_break_phase(
-            context.history,
-            completion.get("completedAt") or completion.get("endedAt"),
-        )
         context.settings["selectedPhase"] = phase
         self._set_meta("settings", context.settings)
         command_id = self._reserve_uuid7_ids(clock[0], 1)[0]

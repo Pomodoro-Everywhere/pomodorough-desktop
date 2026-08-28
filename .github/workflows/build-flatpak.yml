@@ -6,9 +6,6 @@ on:
       tag:
         required: true
         type: string
-    secrets:
-      COMPROMISED_GOOGLE_CLIENT_SECRET:
-        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -57,11 +54,8 @@ jobs:
 
       - name: Verify shared core in Flatpak bundle
         shell: bash
-        env:
-          COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
           bundle="Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak"
           flatpak install --user --noninteractive "$bundle"
           flatpak run --user --command=python3 me.egigoka.Pomodorough -c \
@@ -69,15 +63,12 @@ jobs:
           expected_client_id="$(python3 -c 'import json; print(json.load(open("src/pomodorough/resources/oauth-client.json"))["installed"]["client_id"])')"
           flatpak run --user \
             --env=POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID="$expected_client_id" \
-            --env=COMPROMISED_GOOGLE_CLIENT_SECRET="$COMPROMISED_GOOGLE_CLIENT_SECRET" \
             --command=python3 \
             me.egigoka.Pomodorough \
             -c 'import json, os; from importlib.resources import files; document=json.loads(files("pomodorough").joinpath("resources/oauth-client.json").read_text(encoding="utf-8")); config=document.get("installed") or document; valid=config.get("client_id") == os.environ["POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID"] and not config.get("client_secret"); raise SystemExit(0 if valid else "invalid packaged OAuth resource")'
-          flatpak run --user \
-            --env=COMPROMISED_GOOGLE_CLIENT_SECRET="$COMPROMISED_GOOGLE_CLIENT_SECRET" \
-            --command=python3 \
+          flatpak run --user --command=python3 \
             me.egigoka.Pomodorough \
-            -c 'import os; from pathlib import Path; secret=os.environ["COMPROMISED_GOOGLE_CLIENT_SECRET"].encode(); found=any(secret in path.read_bytes() for path in Path("/app").rglob("*") if path.is_file() and not path.is_symlink()); raise SystemExit("compromised secret found in unpacked Flatpak" if found else 0)'
+            -m pomodorough.oauth_artifact_verifier --self-test
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -87,3 +78,38 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 7
+
+  flatpak-secure-store:
+    name: Verify Flatpak Secret Service persistence
+    needs: flatpak
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Flatpak artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-flatpak
+
+      - name: Install Flatpak and Secret Service provider
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            dbus-x11 \
+            flatpak \
+            gnome-keyring
+          sudo flatpak remote-add --if-not-exists \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Verify secure persistence from installed Flatpak
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$(printf '%s\n' Pomodorough-*-x86_64.flatpak)"
+          test -f "$bundle"
+          flatpak install --user --noninteractive "$bundle"
+          dbus-run-session -- bash -euo pipefail -c "
+            eval \"\$(printf '\n' | gnome-keyring-daemon --components=secrets --unlock)\"
+            flatpak run --user --command=python3 \\
+              me.egigoka.Pomodorough \\
+              -m pomodorough.oauth_artifact_verifier --platform-store-self-test
+          "

@@ -4,7 +4,8 @@ import json
 import sqlite3
 import uuid
 from copy import deepcopy
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from .core import PHASES
 from .shared_core import SharedCoreError
@@ -35,29 +36,27 @@ _PENDING_RESOLUTION_QUEUE_DOMAINS = (
     ),
 )
 
-class SyncStorageDependencies(Protocol):
+@dataclass(frozen=True)
+class SyncStorageDependencies:
     connection: sqlite3.Connection
-    device_id: str
-    _shared_core: Any
-
-    def _bounded_integer(self, value: Any, label: str) -> int: ...
-    def _clock_sample_for_response(self, *args: Any) -> tuple[Any, Any]: ...
-    def _immediate_transaction(self) -> Any: ...
-    def _preflight_pending_queues(self) -> dict[str, Any]: ...
-    def _project_operation(self, *args: Any, **kwargs: Any) -> Any: ...
-    def _set_meta(self, key: str, value: Any) -> None: ...
-    def _set_trusted_time_anchor(self, anchor: dict[str, int]) -> None: ...
-    def _validated_sync_response(
-        self, response: dict[str, Any], request: dict[str, Any]
-    ) -> dict[str, Any]: ...
-    def get_meta(self, key: str, default: Any = None) -> Any: ...
-    def load(self, *, projection: bool = False) -> dict[str, Any]: ...
-    def set_meta(self, key: str, value: Any) -> None: ...
+    device_id: Callable[[], str]
+    shared_core: Callable[[], Any]
+    validate_integer: Callable[..., int]
+    response_clock_sample: Callable[..., tuple[Any, Any]]
+    transaction: Callable[[], Any]
+    preflight_pending_queues: Callable[..., dict[str, Any]]
+    project_operation: Callable[..., Any]
+    write_meta: Callable[[str, Any], None]
+    set_trusted_time_anchor: Callable[[dict[str, int]], None]
+    validate_sync_response: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+    read_meta: Callable[..., Any]
+    load_state: Callable[..., dict[str, Any]]
+    replace_meta: Callable[[str, Any], None]
 
 
 class SyncStorage:
-    def __init__(self, store: SyncStorageDependencies) -> None:
-        self._store = store
+    def __init__(self, dependencies: SyncStorageDependencies) -> None:
+        self._dependencies = dependencies
 
     @staticmethod
     def _wire_preference_operations(
@@ -75,24 +74,24 @@ class SyncStorage:
         return outbound
 
     def _replace_meta_inside_or_outside_transaction(self, key: str, value: Any) -> None:
-        if self._store.connection.in_transaction:
-            self._store._set_meta(key, value)
+        if self._dependencies.connection.in_transaction:
+            self._dependencies.write_meta(key, value)
         else:
-            self._store.set_meta(key, value)
+            self._dependencies.replace_meta(key, value)
 
     def sync_payload(self) -> dict[str, Any]:
-        with self._store._immediate_transaction():
+        with self._dependencies.transaction():
             self._ensure_no_pending_resolution()
             claimed = self.pending_sync()
             if claimed is not None:
                 return claimed
-            pending = self._store._preflight_pending_queues()
-            snapshot = self._store.get_meta("snapshot", {})
-            revision = self._store._bounded_integer(
+            pending = self._dependencies.preflight_pending_queues()
+            snapshot = self._dependencies.read_meta("snapshot", {})
+            revision = self._dependencies.validate_integer(
                 snapshot.get("revision", 0), "Persisted revision"
             )
             payload = {
-                "deviceId": self._store.device_id,
+                "deviceId": self._dependencies.device_id(),
                 "lastRevision": revision,
                 "commands": pending["sendableCommands"][:256],
                 "taskOperations": pending["taskOperations"][:256],
@@ -106,11 +105,11 @@ class SyncStorage:
                     "Pending selected-task operation is corrupted.",
                 ),
             }
-            self._store._set_meta("pendingSync", payload)
+            self._dependencies.write_meta("pendingSync", payload)
         return payload
 
     def pending_sync(self) -> dict[str, Any] | None:
-        pending = self._store.get_meta("pendingSync")
+        pending = self._dependencies.read_meta("pendingSync")
         if pending is None:
             return None
         current_keys = {
@@ -129,7 +128,7 @@ class SyncStorage:
         if (
             not isinstance(pending, dict)
             or set(pending) != current_keys
-            or pending.get("deviceId") != self._store.device_id
+            or pending.get("deviceId") != self._dependencies.device_id()
             or any(
                 not isinstance(pending.get(key), list)
                 for key in (
@@ -142,7 +141,7 @@ class SyncStorage:
             )
         ):
             raise ValueError("Pending normal sync claim is corrupted.")
-        self._store._bounded_integer(
+        self._dependencies.validate_integer(
             pending.get("lastRevision"), "Pending normal sync revision"
         )
         pending = {
@@ -161,9 +160,9 @@ class SyncStorage:
         return pending
 
     def has_sendable_sync_operations(self) -> bool:
-        with self._store._immediate_transaction():
+        with self._dependencies.transaction():
             self._ensure_no_pending_resolution()
-            pending = self._store._preflight_pending_queues()
+            pending = self._dependencies.preflight_pending_queues()
             return any(
                 pending[key]
                 for key in (
@@ -177,7 +176,7 @@ class SyncStorage:
 
     def pending_resolution(self, user_id: str | None = None) -> dict[str, Any] | None:
         try:
-            pending = self._store.get_meta("pendingResolution")
+            pending = self._dependencies.read_meta("pendingResolution")
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("Pending account history is corrupted.") from error
         if pending is None:
@@ -216,7 +215,7 @@ class SyncStorage:
             or not owner["id"]
             or not isinstance(request.get("requestId"), str)
             or not request["requestId"]
-            or request.get("deviceId") != self._store.device_id
+            or request.get("deviceId") != self._dependencies.device_id()
             or request.get("strategy") not in {"keep_remote", "replace_remote", "merge"}
         ):
             raise ValueError("Pending account history is corrupted.")
@@ -235,18 +234,18 @@ class SyncStorage:
         return normalized_request
 
     def clear_pending_resolution(self) -> None:
-        self._store.set_meta("pendingResolution", None)
+        self._dependencies.replace_meta("pendingResolution", None)
 
     def _ensure_no_pending_resolution(self) -> None:
         if self.pending_resolution() is not None:
             raise ValueError("Resolve pending account history before making changes.")
 
     def discard_pending_resolution(self, user_id: str, request_id: str) -> bool:
-        with self._store._immediate_transaction():
+        with self._dependencies.transaction():
             pending = self.pending_resolution(user_id)
             if pending is None or pending["request"].get("requestId") != request_id:
                 return False
-            self._store._set_meta("pendingResolution", None)
+            self._dependencies.write_meta("pendingResolution", None)
         return True
 
     def bootstrap_resolution_plan(
@@ -258,18 +257,18 @@ class SyncStorage:
         request_monotonic_ms: int | None = None,
         received_monotonic_ms: int | None = None,
     ) -> dict[str, Any]:
-        canonical = self._store._validated_sync_response(response, self._empty_sync_request())
-        with self._store._immediate_transaction():
-            self._store._preflight_pending_queues()
-            sample, anchor = self._store._clock_sample_for_response(
+        canonical = self._dependencies.validate_sync_response(response, self._empty_sync_request())
+        with self._dependencies.transaction():
+            self._dependencies.preflight_pending_queues()
+            sample, anchor = self._dependencies.response_clock_sample(
                 canonical["serverTimeMs"],
                 request_physical_ms,
                 received_physical_ms,
                 request_monotonic_ms,
                 received_monotonic_ms,
             )
-            state = self._store.load()
-            projection = self._store._project_operation(
+            state = self._dependencies.load_state()
+            projection = self._dependencies.project_operation(
                 state["settings"],
                 now=canonical["serverTime"],
             )
@@ -279,9 +278,9 @@ class SyncStorage:
                 state, local_timer, local_history, canonical
             )
             if sample is not None:
-                self._store._set_meta("serverClockSample", sample)
+                self._dependencies.write_meta("serverClockSample", sample)
         if anchor is not None:
-            self._store._set_trusted_time_anchor(anchor)
+            self._dependencies.set_trusted_time_anchor(anchor)
         local_history_exists = any(
             item.get("status") == "completed" for item in local_history
         )
@@ -329,7 +328,7 @@ class SyncStorage:
             "hasLocalState": self._has_bootstrap_state(state, local_timer),
             "hasRemoteState": self._has_bootstrap_state(canonical),
         }
-        core = self._store._shared_core or _default_shared_core()
+        core = self._dependencies.shared_core() or _default_shared_core()
         try:
             value = core.dispatch("bootstrap.plan.v1", plan_input)
         except SharedCoreError as error:
@@ -407,7 +406,7 @@ class SyncStorage:
         user_id = self._validated_resolution_identity(
             user, expected_revision, strategy
         )
-        with self._store._immediate_transaction():
+        with self._dependencies.transaction():
             pending = self.pending_resolution()
             if pending is not None:
                 if pending["owner"].get("id") != user_id:
@@ -419,27 +418,27 @@ class SyncStorage:
                 raise ValueError(
                     "Finish pending normal sync before resolving account history."
                 )
-            validated_pending = self._store._preflight_pending_queues()
-            state = self._store.load(projection=True)
+            validated_pending = self._dependencies.preflight_pending_queues()
+            state = self._dependencies.load_state(projection=True)
             outbound = self._resolution_outbound(
                 validated_pending, strategy != "keep_remote"
             )
             if (
                 strategy == "replace_remote"
-                and self._store.get_meta("autoStartLegacyDefaultUnknown", False)
+                and self._dependencies.read_meta("autoStartLegacyDefaultUnknown", False)
                 and not state["pendingAutoStarts"]
             ):
                 outbound.pop("autoStartOperations")
             self._validate_resolution_operation_counts(outbound)
             request = {
                 "requestId": str(uuid.uuid4()),
-                "deviceId": self._store.device_id,
+                "deviceId": self._dependencies.device_id(),
                 "expectedRevision": expected_revision,
                 "strategy": strategy,
                 **outbound,
             }
             queue_ids = self._resolution_queue_ids(validated_pending, strategy)
-            self._store._set_meta(
+            self._dependencies.write_meta(
                 "pendingResolution",
                 {"owner": user, "request": request, "queueIds": queue_ids},
             )

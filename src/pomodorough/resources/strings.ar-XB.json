@@ -106,6 +106,7 @@
   "network.error.browser_open": "⟦‼ Cøüld nøt øpën thë systëm brøwsër før Gøøglë sïgn-ïn. ‼⟧",
   "network.error.http": "⟦‼ Sërvër rëtürnëd HTTP {status}. ‼⟧",
   "network.error.invalid_state": "⟦‼ Gøøglë sïgn-ïn rëtürnëd ån ïnvålïd ståtë. ‼⟧",
+  "network.error.invalid_response": "⟦‼ Sërvër rëtürnëd ån ïnvålïd JSØN rëspønsë. ‼⟧",
   "network.error.invalid_token": "⟦‼ Sërvër rëtürnëd ån ïnvålïd tøkën rëspønsë. ‼⟧",
   "network.error.missing_identity": "⟦‼ Gøøglë dïd nøt rëtürn ån ïdëntïty tøkën. ‼⟧",
   "network.error.oauth_config": "⟦‼ Gøøglë Dësktøp ØÅüth JSØN nøt føünd ør ïnvålïd åt {path}. ‼⟧",

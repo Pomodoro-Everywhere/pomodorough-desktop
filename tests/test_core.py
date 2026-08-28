@@ -14,7 +14,6 @@ from pomodorough.core import (
     elapsed_ms,
     format_remaining,
     long_break_progress,
-    next_break_phase,
     normalize_task_title,
     parse_timestamp_ms,
     project_auto_start_breaks,
@@ -517,8 +516,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(completed_focus_count_for_day(history, now), 4)
         self.assertEqual(long_break_progress(4), 4)
         self.assertEqual(long_break_progress(5), 1)
-        self.assertEqual(next_break_phase(history, now), "long_break")
-        self.assertEqual(next_break_phase(history[:-1], now), "short_break")
 
     def test_remaining_rounds_up(self) -> None:
         self.assertEqual(format_remaining(60_001), "01:01")

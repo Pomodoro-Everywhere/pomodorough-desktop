@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 
 from platformdirs import user_config_path
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
@@ -32,10 +32,8 @@ from .network_account import (
     AccountLifecycle,
     RevocationState,
 )
-from .network_revision import (
-    RevisionEventParser as _RevisionEventParser,
-    RevisionStream,
-)
+from .network_revision import RevisionEventParser, RevisionStream
+from .secure_store import PlatformSecretStore, SecretStore, SecureStoreError
 from .network_session import (
     ApiError,
     AuthenticatedSession,
@@ -43,16 +41,31 @@ from .network_session import (
     TimedDocument as TimedDocument,
 )
 
+_RevisionEventParser = RevisionEventParser
+
 API_BASE = "https://pomodorough.egigoka.me"
 RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS = frozenset(
     {
         "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com",
     }
 )
+_DEFAULT_SECRET_STORE = object()
 
 
 def _text(key: str, **values: Any) -> str:
     return Strings().text(key, **values)
+
+
+def _decode_success_document(body: bytes) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        document = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ApiError(_text("network.error.invalid_response")) from error
+    if not isinstance(document, dict):
+        raise ApiError(_text("network.error.invalid_response"))
+    return document
 
 
 def _request(
@@ -77,7 +90,7 @@ def _request(
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             body = response.read()
-            return json.loads(body) if body else {}
+            return _decode_success_document(body)
     except urllib.error.HTTPError as error:
         body = error.read()
         document = None
@@ -109,35 +122,95 @@ def _config_root() -> Path:
 
 
 class TokenStore:
-    def __init__(self, device_id: str) -> None:
+    def __init__(
+        self,
+        device_id: str,
+        secret_store: SecretStore | None | object = _DEFAULT_SECRET_STORE,
+        fallback_path: Path | None = None,
+    ) -> None:
         self.device_id = device_id
-        self.fallback_path = _config_root() / "session.json"
+        self.fallback_path = fallback_path or (_config_root() / "session.json")
+        if secret_store is _DEFAULT_SECRET_STORE:
+            self.secret_store: SecretStore | None = PlatformSecretStore(
+                root=_config_root() / "oauth-secrets-v1",
+                service="me.egigoka.pomodorough.oauth",
+                kind="oauth",
+                label="Pomodorough OAuth",
+            )
+        else:
+            self.secret_store = cast(SecretStore | None, secret_store)
+        self.secret_key = f"oauth:{device_id}"
 
     def load(self) -> dict[str, Any] | None:
         fallback = self._load_fallback()
         if fallback is not None:
             return None if fallback.get("signedOut") is True else fallback
-        if shutil.which("secret-tool"):
+        if self.secret_store is not None:
+            encoded = self.secret_store.load(self.secret_key)
+            if encoded is None:
+                return self._migrate_legacy_secret_tool()
+            document = json.loads(encoded)
+            return document if isinstance(document, dict) else None
+        return self._load_legacy_secret_tool()
+
+    def _load_legacy_secret_tool(self) -> dict[str, Any] | None:
+        if not shutil.which("secret-tool"):
+            return None
+        try:
+            result = subprocess.run(
+                ["secret-tool", "lookup", "service", "pomodorough", "device", self.device_id],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        return document if isinstance(document, dict) else None
+
+    def _clear_legacy_secret_tool(self) -> None:
+        if not shutil.which("secret-tool"):
+            raise SecureStoreError("Legacy OAuth credential cleanup is unavailable.")
+        try:
+            result = subprocess.run(
+                ["secret-tool", "clear", "service", "pomodorough", "device", self.device_id],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise SecureStoreError(
+                f"Legacy OAuth credential cleanup failed: {error}"
+            ) from error
+        if result.returncode != 0:
+            raise SecureStoreError(
+                result.stderr.strip() or "Legacy OAuth credential cleanup was rejected."
+            )
+
+    def _migrate_legacy_secret_tool(self) -> dict[str, Any] | None:
+        document = self._load_legacy_secret_tool()
+        if document is None or self.secret_store is None:
+            return document
+        encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self.secret_store.save(self.secret_key, encoded)
+        try:
+            self._clear_legacy_secret_tool()
+        except SecureStoreError:
             try:
-                result = subprocess.run(
-                    ["secret-tool", "lookup", "service", "pomodorough", "device", self.device_id],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            else:
-                if result.returncode == 0 and result.stdout.strip():
-                    try:
-                        document = json.loads(result.stdout)
-                    except json.JSONDecodeError:
-                        pass
-                    else:
-                        if isinstance(document, dict):
-                            return document
-        return None
+                self.secret_store.delete(self.secret_key)
+            except Exception as rollback_error:
+                raise SecureStoreError(
+                    "Legacy OAuth cleanup and secure-store rollback both failed."
+                ) from rollback_error
+            raise
+        return document
 
     def save(self, token_response: dict[str, Any]) -> None:
         stored = {
@@ -145,6 +218,13 @@ class TokenStore:
             "refreshTokenExpiresAt": token_response["refreshTokenExpiresAt"],
         }
         encoded = json.dumps(stored, separators=(",", ":"))
+        if self.secret_store is not None:
+            self.secret_store.save(self.secret_key, encoded.encode("utf-8"))
+            try:
+                self.fallback_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
         self._write_fallback(encoded)
         if shutil.which("secret-tool"):
             try:
@@ -175,6 +255,9 @@ class TokenStore:
 
     def clear(self) -> None:
         self._write_fallback('{"signedOut":true}')
+        if self.secret_store is not None:
+            self.secret_store.delete(self.secret_key)
+            return
         if shutil.which("secret-tool"):
             try:
                 subprocess.run(
@@ -326,8 +409,14 @@ class OAuthBrowserTransport(Protocol):
 
 
 class SystemOAuthBrowserTransport:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        open_browser: Callable[..., bool] | None = None,
+        callback_timeout: float = 180,
+    ) -> None:
         self._cancelled = threading.Event()
+        self._open_browser = open_browser
+        self._callback_timeout = callback_timeout
 
     def authorize(
         self,
@@ -340,10 +429,11 @@ class SystemOAuthBrowserTransport:
             {"result_queue": callback_results},
         )
         server = HTTPServer(("127.0.0.1", 0), handler)
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + self._callback_timeout
         redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
         try:
-            opened = webbrowser.open(
+            opener = self._open_browser or webbrowser.open
+            opened = opener(
                 authorization_url(redirect_uri),
                 new=1,
                 autoraise=True,
@@ -429,6 +519,30 @@ class DesktopOAuthContract:
         return payload
 
 
+class _CollaboratorAttribute:
+    """Compatibility descriptor for state now owned by explicit collaborators."""
+
+    def __init__(self, *path: str, writable: bool = True) -> None:
+        self._path = path
+        self._writable = writable
+
+    def __get__(self, instance: Any, owner: type[Any]) -> Any:
+        if instance is None:
+            return self
+        value = instance
+        for name in self._path:
+            value = getattr(value, name)
+        return value
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if not self._writable:
+            raise AttributeError(f"{self._path[-1]} is read-only")
+        target = instance
+        for name in self._path[:-1]:
+            target = getattr(target, name)
+        setattr(target, self._path[-1], value)
+
+
 class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
@@ -445,157 +559,60 @@ class CloudService(QObject):
     account_deletion_failed = Signal(str)
     _valid_revision_stream_response = staticmethod(RevisionStream.valid_response)
 
-    @property
-    def access_token(self) -> str | None:
-        return self._state.access_token
-
-    @access_token.setter
-    def access_token(self, value: str | None) -> None:
-        self._state.access_token = value
-
-    @property
-    def refresh_token(self) -> str | None:
-        return self._state.refresh_token
-
-    @refresh_token.setter
-    def refresh_token(self, value: str | None) -> None:
-        self._state.refresh_token = value
-
-    @property
-    def access_expires_at(self) -> datetime:
-        return self._state.access_expires_at
-
-    @access_expires_at.setter
-    def access_expires_at(self, value: datetime) -> None:
-        self._state.access_expires_at = value
-
-    @property
-    def authenticated(self) -> bool:
-        return self._state.authenticated
-
-    @authenticated.setter
-    def authenticated(self, value: bool) -> None:
-        self._state.authenticated = value
-
-    @property
-    def busy(self) -> bool:
-        return self._state.busy
-
-    @busy.setter
-    def busy(self, value: bool) -> None:
-        self._state.busy = value
-
-    @property
-    def deleting_account(self) -> bool:
-        return self._state.deleting_account
-
-    @deleting_account.setter
-    def deleting_account(self, value: bool) -> None:
-        self._state.deleting_account = value
-
-    @property
-    def _sync_queued(self) -> dict[str, Any] | None:
-        return self._state.sync_queued
-
-    @_sync_queued.setter
-    def _sync_queued(self, value: dict[str, Any] | None) -> None:
-        self._state.sync_queued = value
-
-    @property
-    def _account_generation(self) -> int:
-        return self._state.account_generation
-
-    @_account_generation.setter
-    def _account_generation(self, value: int) -> None:
-        self._state.account_generation = value
-
-    @property
-    def _shutting_down(self) -> bool:
-        return self._state.shutting_down
-
-    @_shutting_down.setter
-    def _shutting_down(self, value: bool) -> None:
-        self._state.shutting_down = value
-
-    @property
-    def _lifecycle_lock(self) -> threading.Lock:
-        return self._state.lock
-
-    @property
-    def _network(self) -> Any:
-        return self._revisions.network
-
-    @_network.setter
-    def _network(self, value: Any) -> None:
-        self._revisions.network = value
-
-    @property
-    def _revision_reply(self) -> QNetworkReply | None:
-        return self._revisions.state.reply
-
-    @_revision_reply.setter
-    def _revision_reply(self, value: QNetworkReply | None) -> None:
-        self._revisions.state.reply = value
-
-    @property
-    def _revision_parser(self) -> _RevisionEventParser:
-        return self._revisions.state.parser
-
-    @_revision_parser.setter
-    def _revision_parser(self, value: _RevisionEventParser) -> None:
-        self._revisions.state.parser = value
-
-    @property
-    def _revision_reconnect(self) -> QTimer:
-        return self._revisions.reconnect_timer
-
-    @property
-    def _revision_reconnect_attempt(self) -> int:
-        return self._revisions.state.reconnect_attempt
-
-    @_revision_reconnect_attempt.setter
-    def _revision_reconnect_attempt(self, value: int) -> None:
-        self._revisions.state.reconnect_attempt = value
+    # Compatibility surface for callers and tests that historically accessed facade state.
+    # CloudService itself now reads and mutates the owning collaborators directly.
+    access_token = _CollaboratorAttribute("_state", "access_token")
+    refresh_token = _CollaboratorAttribute("_state", "refresh_token")
+    access_expires_at = _CollaboratorAttribute("_state", "access_expires_at")
+    authenticated = _CollaboratorAttribute("_state", "authenticated")
+    busy = _CollaboratorAttribute("_state", "busy")
+    deleting_account = _CollaboratorAttribute("_state", "deleting_account")
+    _sync_queued = _CollaboratorAttribute("_state", "sync_queued")
+    _account_generation = _CollaboratorAttribute("_state", "account_generation")
+    _shutting_down = _CollaboratorAttribute("_state", "shutting_down")
+    _lifecycle_lock = _CollaboratorAttribute("_state", "lock", writable=False)
+    _network = _CollaboratorAttribute("_revisions", "network")
+    _revision_reply = _CollaboratorAttribute("_revisions", "state", "reply")
+    _revision_parser = _CollaboratorAttribute("_revisions", "state", "parser")
+    _revision_reconnect = _CollaboratorAttribute(
+        "_revisions", "reconnect_timer", writable=False
+    )
+    _revision_reconnect_attempt = _CollaboratorAttribute(
+        "_revisions", "state", "reconnect_attempt"
+    )
 
     def __init__(
         self, device_id: str, api_base: str = API_BASE,
         oauth_browser: OAuthBrowserTransport | None = None,
         token_urlsafe: Callable[[int], str] = secrets.token_urlsafe,
         strings: Strings | None = None,
+        token_store: TokenStore | None = None,
+        request: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         super().__init__()
         self.strings = strings or Strings()
         self.device_id = device_id
         self.api_base = api_base.rstrip("/")
         self._state = SessionState()
-        self.token_store = TokenStore(device_id)
+        self.token_store = token_store or TokenStore(device_id)
+        self._request = request or (lambda *args, **kwargs: _request(*args, **kwargs))
         self._session = AuthenticatedSession(
             self.api_base,
             self._state,
             self.token_store,
-            lambda *args, **kwargs: _request(*args, **kwargs),
+            self._request,
             _text,
             lambda: datetime.now(timezone.utc),
             lambda: time.time(), lambda: time.monotonic_ns(),
         )
-        self._accept_tokens = self._session.accept_tokens
-        self._accept_login_tokens = self._session.accept_login_tokens
-        self._ensure_access = self._session.ensure_access
-        self._authorized_request = self._session.authorized_request
-        self._timed_request = self._session.timed_request
         self._accounts = AccountLifecycle(
             self.api_base,
             self._state,
             self.token_store,
-            lambda *args, **kwargs: _request(*args, **kwargs),
+            self._request,
             _text,
             lambda: datetime.now(timezone.utc),
         )
-        self._begin_account_deletion = self._accounts.begin_deletion
-        self._delete_captured_account = self._accounts.delete_account
-        self._refresh_deletion_access = self._accounts.refresh_deletion_access
-        self._revoke_credentials = self._accounts.revoke
-        self._refresh_revocation_access = self._accounts.refresh_revocation_access
         self._workers: set[Worker] = set()
         self._worker_generations: dict[Worker, int] = {}
         self._revocation_workers: set[Worker] = set()
@@ -608,20 +625,70 @@ class CloudService(QObject):
         self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
         self._token_urlsafe = token_urlsafe
 
+    # Compatibility methods remain patchable, but resolve the current collaborator
+    # on every call instead of retaining construction-time bound method aliases.
+    def _accept_tokens(self, response: dict[str, Any]) -> None:
+        self._session.accept_tokens(response)
+
+    def _accept_login_tokens(
+        self,
+        response: dict[str, Any],
+        expected_generation: int | None = None,
+    ) -> None:
+        self._session.accept_login_tokens(response, expected_generation)
+
+    def _ensure_access(self, generation: int | None = None) -> str:
+        return self._session.ensure_access(generation)
+
+    def _authorized_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._session.authorized_request(method, path, payload)
+
+    def _timed_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None,
+        *,
+        access_token: str,
+    ) -> TimedDocument:
+        return self._session.timed_request(
+            method, path, payload, access_token=access_token
+        )
+
+    def _begin_account_deletion(self, confirmation: str) -> Any:
+        return self._accounts.begin_deletion(confirmation)
+
+    def _delete_captured_account(self, credentials: Any) -> dict[str, Any]:
+        return self._accounts.delete_account(credentials)
+
+    def _refresh_deletion_access(self, credentials: Any) -> str:
+        return self._accounts.refresh_deletion_access(credentials)
+
+    def _revoke_credentials(self, revocation: RevocationState) -> None:
+        self._accounts.revoke(revocation)
+
+    def _refresh_revocation_access(self, revocation: RevocationState) -> str:
+        return self._accounts.refresh_revocation_access(revocation)
+
     def _start(
         self,
         function: Callable[[], Any],
         on_result: Callable[[Any], None],
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
-        self.busy = True
+        self._state.busy = True
         worker = Worker(function)
-        generation = self._account_generation
+        generation = self._state.account_generation
         self._workers.add(worker)
         self._worker_generations[worker] = generation
         worker.signals.result.connect(
             lambda result: on_result(result)
-            if generation == self._account_generation
+            if generation == self._state.account_generation
             else None
         )
         worker.signals.error.connect(
@@ -630,7 +697,7 @@ class CloudService(QObject):
                 if on_error is not None
                 else self.failure.emit(str(error))
             )
-            if generation == self._account_generation
+            if generation == self._state.account_generation
             else None
         )
         worker.signals.finished.connect(lambda: self._finished(worker))
@@ -638,18 +705,18 @@ class CloudService(QObject):
 
     def _finished(self, worker: Worker) -> None:
         generation = self._worker_generations.pop(
-            worker, self._account_generation
+            worker, self._state.account_generation
         )
         self._workers.discard(worker)
-        self.busy = any(
-            worker_generation == self._account_generation
+        self._state.busy = any(
+            worker_generation == self._state.account_generation
             for worker_generation in self._worker_generations.values()
         )
-        if generation != self._account_generation:
+        if generation != self._state.account_generation:
             return
-        if self._sync_queued is not None:
-            payload = self._sync_queued
-            self._sync_queued = None
+        if self._state.sync_queued is not None:
+            payload = self._state.sync_queued
+            self._state.sync_queued = None
             self.sync(payload)
 
     def restore(self) -> None:
@@ -659,11 +726,13 @@ class CloudService(QObject):
             if not self.token_store.load():
                 return None
             token = self._ensure_access()
-            return _request("GET", f"{self.api_base}/api/v1/me", access_token=token)["user"]
+            return self._request(
+                "GET", f"{self.api_base}/api/v1/me", access_token=token
+            )["user"]
 
         def restored(user: dict[str, Any] | None) -> None:
             if user:
-                self.authenticated = True
+                self._state.authenticated = True
                 self.signed_in.emit(user)
                 self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
                 self.start_revision_stream()
@@ -674,20 +743,20 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
-            self.access_token = None
-            self.authenticated = False
+            self._state.access_token = None
+            self._state.authenticated = False
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))
             self.failure.emit(str(error))
 
         self._start(restore_session, restored, failed)
 
     def login(self) -> None:
-        if self.busy:
+        if self._state.busy:
             return
         self.status_changed.emit(self.strings.text("cloud.status.waiting_google"))
 
         def authorized(user: dict[str, Any]) -> None:
-            self.authenticated = True
+            self._state.authenticated = True
             self.signed_in.emit(user)
             self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
             self.start_revision_stream()
@@ -696,8 +765,8 @@ class CloudService(QObject):
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
             self.failure.emit(str(error))
 
-        with self._lifecycle_lock:
-            generation = self._account_generation
+        with self._state.lock:
+            generation = self._state.account_generation
         self._start(
             lambda: self._authorize_google(expected_generation=generation),
             authorized,
@@ -710,13 +779,13 @@ class CloudService(QObject):
     ) -> dict[str, Any]:
         generation = self._authorization_generation(expected_generation)
         credentials = _read_oauth_credentials()
-        challenge = _request(
+        challenge = self._request(
             "POST", f"{self.api_base}/api/v1/auth/google/challenge", {}
         )
         identity_token = self._google_identity_token(credentials, challenge)
         response = self._exchange_google_identity(identity_token, challenge)
         access_token = self._access_token_after_login(response, generation)
-        user = _request(
+        user = self._request(
             "GET",
             f"{self.api_base}/api/v1/me",
             access_token=access_token,
@@ -727,19 +796,19 @@ class CloudService(QObject):
     def _authorization_generation(
         self, expected_generation: int | None
     ) -> int:
-        with self._lifecycle_lock:
+        with self._state.lock:
             generation = (
-                self._account_generation
+                self._state.account_generation
                 if expected_generation is None
                 else expected_generation
             )
-            if self._shutting_down or generation != self._account_generation:
+            if self._state.shutting_down or generation != self._state.account_generation:
                 raise ApiError(_text("network.error.sign_in_cancelled"))
             return generation
 
     def _assert_authorization_generation(self, generation: int) -> None:
-        with self._lifecycle_lock:
-            if self._shutting_down or generation != self._account_generation:
+        with self._state.lock:
+            if self._state.shutting_down or generation != self._state.account_generation:
                 raise ApiError(_text("network.error.sign_in_cancelled"))
 
     def _google_identity_token(
@@ -765,7 +834,7 @@ class CloudService(QObject):
             redirect_uri,
             verifier,
         )
-        google_tokens = _request(
+        google_tokens = self._request(
             "POST", credentials["token_uri"], token_payload, form=True
         )
         identity_token = google_tokens.get("id_token")
@@ -778,7 +847,7 @@ class CloudService(QObject):
         identity_token: str,
         challenge: dict[str, Any],
     ) -> dict[str, Any]:
-        return _request(
+        return self._request(
             "POST",
             f"{self.api_base}/api/v1/auth/google/exchange",
             {
@@ -795,16 +864,16 @@ class CloudService(QObject):
         generation: int,
     ) -> str | None:
         self._accept_login_tokens(response, expected_generation=generation)
-        with self._lifecycle_lock:
-            if self._shutting_down or generation != self._account_generation:
+        with self._state.lock:
+            if self._state.shutting_down or generation != self._state.account_generation:
                 raise ApiError(_text("network.error.sign_in_cancelled"))
-            return self.access_token
+            return self._state.access_token
 
     def sync(self, payload: dict[str, Any]) -> None:
-        if self.busy:
-            self._sync_queued = payload
+        if self._state.busy:
+            self._state.sync_queued = payload
             return
-        if not self.authenticated:
+        if not self._state.authenticated:
             return
         self.status_changed.emit(self.strings.text("cloud.status.syncing"))
 
@@ -826,7 +895,7 @@ class CloudService(QObject):
         self._start(synchronize, synchronized, failed)
 
     def preview_bootstrap(self) -> None:
-        if self.busy or not self.authenticated:
+        if self._state.busy or not self._state.authenticated:
             return
         self.status_changed.emit(self.strings.text("cloud.status.checking_history"))
 
@@ -847,7 +916,7 @@ class CloudService(QObject):
         self._start(preview, ready, failed)
 
     def resolve_bootstrap(self, payload: dict[str, Any]) -> None:
-        if self.busy or not self.authenticated:
+        if self._state.busy or not self._state.authenticated:
             return
         self.status_changed.emit(self.strings.text("cloud.status.resolving_history"))
 
@@ -876,14 +945,14 @@ class CloudService(QObject):
 
     def start_revision_stream(self) -> None:
         if (
-            self._shutting_down
-            or not self.authenticated
-            or not self.access_token
-            or self._revision_reply is not None
+            self._state.shutting_down
+            or not self._state.authenticated
+            or not self._state.access_token
+            or self._revisions.state.reply is not None
         ):
             return
         self._revisions.start(
-            self.access_token,
+            self._state.access_token,
             self._read_revision_stream,
             self._revision_stream_finished,
         )
@@ -901,10 +970,10 @@ class CloudService(QObject):
             return
         for revision in finished.revisions:
             self.revision_available.emit(revision)
-        if self._shutting_down or not self.authenticated:
+        if self._state.shutting_down or not self._state.authenticated:
             return
         if finished.status == 401:
-            self.access_token = None
+            self._state.access_token = None
             self.authorization_stale.emit()
             return
         self._schedule_revision_reconnect()
@@ -919,14 +988,14 @@ class CloudService(QObject):
         self.status_changed.emit(self.strings.text("cloud.status.session_expired"))
 
     def shutdown(self) -> None:
-        with self._lifecycle_lock:
-            self._shutting_down = True
+        with self._state.lock:
+            self._state.shutting_down = True
             # Worker signals may already be queued when aboutToQuit fires.
             # Invalidate them before the UI and store are torn down.
-            self._account_generation += 1
-        self.busy = False
-        self.deleting_account = False
-        self._sync_queued = None
+            self._state.account_generation += 1
+        self._state.busy = False
+        self._state.deleting_account = False
+        self._state.sync_queued = None
         self._oauth_browser.cancel()
         self.stop_revision_stream()
 
@@ -998,7 +1067,7 @@ class CloudService(QObject):
         QThreadPool.globalInstance().start(worker)
 
     def _retry_revocation(self, state: RevocationState, attempt: int) -> None:
-        if self._shutting_down or attempt >= 3:
+        if self._state.shutting_down or attempt >= 3:
             return
         delay_ms = min(30_000, 1_000 * (2 ** (attempt - 1)))
         QTimer.singleShot(

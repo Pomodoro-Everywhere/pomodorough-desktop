@@ -16,7 +16,9 @@ from pomodorough.shared_core import (
     SharedCoreABIError,
     SharedCoreLoadError,
     SharedCoreOperationError,
+    TimerCompletionPlanV1,
     apply_projection_v2,
+    plan_timer_completion_v1,
 )
 
 SELECTED_TASK_ID = "33f9d32c-a7ee-8aa9-897a-13e19bc4e5d4"
@@ -71,6 +73,36 @@ def overdue_pause_resume_input() -> dict[str, object]:
     }
 
 
+def completion_plan_input() -> dict[str, object]:
+    history = [
+        {
+            "id": f"history-{index}",
+            "timerId": f"timer-{index}",
+            "commandId": f"finish-{index}",
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": 1_500_000,
+            "completedAt": f"2026-08-25T0{index}:00:00.000Z",
+        }
+        for index in (4, 2, 1, 3)
+    ]
+    timer = {
+        "id": "timer-4", "phase": "focus", "status": "completed",
+        "plannedDurationMs": 1_500_000, "elapsedAtAnchorMs": 1_500_000,
+        "anchorAt": "2026-08-25T04:00:00.000Z",
+        "startedByDeviceId": "device-a",
+    }
+    before = dict(timer, status="running", elapsedAtAnchorMs=0)
+    return {
+        "kind": "expiry", "beforeTimer": before, "projectedTimer": timer,
+        "history": history, "selectedPhase": "focus", "autoStartBreaks": True,
+        "localDeviceId": "device-a",
+        "ownership": {"timerId": "timer-4", "ownerDeviceId": "device-a"},
+        "dayStart": "2026-08-25T00:00:00.000Z",
+        "dayEnd": "2026-08-26T00:00:00.000Z",
+    }
+
+
 class SharedCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -80,7 +112,7 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(version("wasmtime"), "48.0.0")
         self.assertEqual(
             self.core.dispatch("core.version", {}),
-            {"schemaVersion": 1, "coreVersion": "0.1.5"},
+            {"schemaVersion": 1, "coreVersion": "0.1.6"},
         )
 
     def test_hlc_head_through_bundled_wasm(self) -> None:
@@ -159,6 +191,71 @@ class SharedCoreTests(unittest.TestCase):
             SharedCoreABIError, "timerOutcomes keys do not match pending commands"
         ):
             apply_projection_v2(MismatchedProjection(), overdue_pause_resume_input())
+
+    def test_typed_completion_plan_runs_bundled_wasm_policy(self) -> None:
+        result = self.core.plan_timer_completion_v1(completion_plan_input())
+
+        self.assertIsInstance(result, TimerCompletionPlanV1)
+        self.assertTrue(result.expired)
+        self.assertEqual(result.selected_phase, "long_break")
+        self.assertEqual(result.generated_break_phase, "long_break")
+
+    def test_typed_completion_plan_rejects_malformed_output(self) -> None:
+        class MalformedPlan:
+            @staticmethod
+            def dispatch(operation: str, input_value: object) -> object:
+                del input_value
+                self.assertEqual(operation, "timer.completionPlan.v1")
+                return {"expired": True}
+
+        with self.assertRaisesRegex(
+            SharedCoreABIError, "malformed timer.completionPlan.v1 output"
+        ):
+            plan_timer_completion_v1(MalformedPlan(), completion_plan_input())
+
+    def test_completion_plan_rejects_relational_contradictions(self) -> None:
+        valid = self.core.dispatch("timer.completionPlan.v1", completion_plan_input())
+        contradictions = (
+            {**valid, "reserveGeneratedBreak": True},
+            {**valid, "expired": False, "selectedPhase": "short_break"},
+            {**valid, "commandEligible": True},
+            {**valid, "sourceAlreadyAccepted": True},
+        )
+
+        for output in contradictions:
+            class ContradictoryPlan:
+                @staticmethod
+                def dispatch(operation: str, input_value: object) -> object:
+                    del operation, input_value
+                    return output
+
+            with self.subTest(output=output), self.assertRaisesRegex(
+                SharedCoreABIError, "internally inconsistent"
+            ):
+                plan_timer_completion_v1(
+                    ContradictoryPlan(), completion_plan_input()
+                )
+
+    def test_generated_break_eligibility_requires_a_phase_before_mutation(self) -> None:
+        output = {
+            "expired": False,
+            "commandEligible": False,
+            "reserveGeneratedBreak": False,
+            "selectedPhase": None,
+            "queueAutoBreak": False,
+            "generatedBreakEligible": True,
+            "generatedBreakPhase": None,
+            "sourceAlreadyAccepted": False,
+        }
+
+        class MissingPhasePlan:
+            @staticmethod
+            def dispatch(operation: str, input_value: object) -> object:
+                del operation, input_value
+                return output
+
+        with self.assertRaisesRegex(SharedCoreABIError, "internally inconsistent"):
+            plan_timer_completion_v1(MissingPhasePlan(), {"kind": "generatedBreak"})
 
     def test_selected_task_classification_through_wasm_abi(self) -> None:
         cases = (
@@ -306,7 +403,9 @@ class SharedCoreTests(unittest.TestCase):
         core._allocate = lambda _value: next(pointers)
         core._dispatch_export = lambda *_args: 7 << 32
         core._free_export = (
-            lambda _store, pointer, length: released.append((pointer, length))
+            lambda _store, pointer, length: (
+                released.append((pointer, length)) or 1
+            )
         )
 
         with self.assertRaisesRegex(
@@ -325,7 +424,9 @@ class SharedCoreTests(unittest.TestCase):
         core._allocate = lambda _value: next(pointers)
         core._dispatch_export = lambda *_args: 300
         core._free_export = (
-            lambda _store, pointer, length: released.append((pointer, length))
+            lambda _store, pointer, length: (
+                released.append((pointer, length)) or 1
+            )
         )
 
         with self.assertRaisesRegex(SharedCoreABIError, "empty result buffer"):
@@ -342,7 +443,9 @@ class SharedCoreTests(unittest.TestCase):
         core._allocate = lambda _value: next(pointers)
         core._dispatch_export = lambda *_args: 0
         core._free_export = (
-            lambda _store, pointer, length: released.append((pointer, length))
+            lambda _store, pointer, length: (
+                released.append((pointer, length)) or 1
+            )
         )
 
         with self.assertRaisesRegex(SharedCoreABIError, "empty result buffer"):
@@ -350,6 +453,46 @@ class SharedCoreTests(unittest.TestCase):
 
         self.assertEqual(released, [(200, 2), (100, 1)])
         self.assertIsNone(core._unusable_cause)
+
+    def test_rejected_free_status_invalidates_instance(self) -> None:
+        core = SharedCore()
+        core._free_export = lambda *_args: 0
+
+        with self.assertRaisesRegex(SharedCoreABIError, "cleanup failed"):
+            core.dispatch("core.version", {})
+        with self.assertRaisesRegex(SharedCoreABIError, "unusable after cleanup failure"):
+            core.dispatch("core.version", {})
+
+    def test_out_of_range_allocation_is_released_and_invalidates_instance(self) -> None:
+        core = SharedCore()
+        released: list[tuple[int, int]] = []
+        pointer = core._memory.data_len(core._store) + 1
+        core._allocate_export = lambda _store, _length: pointer
+        core._free_export = (
+            lambda _store, released_pointer, released_length: (
+                released.append((released_pointer, released_length)) or 1
+            )
+        )
+
+        with self.assertRaisesRegex(SharedCoreABIError, "outside linear memory"):
+            core._allocate(b"x")
+
+        self.assertEqual(released, [(pointer, 1)])
+        self.assertIsNotNone(core._unusable_cause)
+        with self.assertRaisesRegex(SharedCoreABIError, "unusable"):
+            core.dispatch("core.version", {})
+
+    def test_bundled_wasm_reports_invalid_and_duplicate_frees(self) -> None:
+        core = SharedCore()
+        free = core._require_func(
+            "pomodorough_free_v2", ("i32", "i32"), ("i32",)
+        )
+        pointer = core._allocate_export(core._store, 8)
+
+        self.assertEqual(free(core._store, pointer, 7), 0)
+        self.assertEqual(free(core._store, pointer, 8), 1)
+        self.assertEqual(free(core._store, pointer, 8), 0)
+        self.assertEqual(free(core._store, 0, 8), 0)
 
     def test_cleanup_failure_preserves_primary_and_invalidates_instance(self) -> None:
         core = SharedCore()
