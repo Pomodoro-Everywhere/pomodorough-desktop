@@ -28,6 +28,7 @@ from pomodorough.network_account import (
 )
 from pomodorough.network_session import ApiError, SessionState
 from pomodorough.shared_core import (
+    CORE_COMMIT,
     ProjectionApplyV2,
     ProjectionWinningOperationIds,
     SharedCore,
@@ -471,7 +472,7 @@ class SharedCoreBoundaryTests(unittest.TestCase):
             SharedCoreError, "commit mismatch"
         ):
             _read_packaged_wasm()
-        values["CORE_COMMIT"] = "71c85020eab69a803ab0d3046aa7abef890c4780"
+        values["CORE_COMMIT"] = CORE_COMMIT
         with patch("pomodorough.shared_core.files", return_value=Resource(values)), self.assertRaisesRegex(
             SharedCoreError, "manifest is invalid"
         ):

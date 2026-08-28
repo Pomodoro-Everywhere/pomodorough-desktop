@@ -112,7 +112,7 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(version("wasmtime"), "48.0.0")
         self.assertEqual(
             self.core.dispatch("core.version", {}),
-            {"schemaVersion": 1, "coreVersion": "0.1.6"},
+            {"schemaVersion": 1, "coreVersion": "0.1.7"},
         )
 
     def test_hlc_head_through_bundled_wasm(self) -> None:
@@ -199,6 +199,34 @@ class SharedCoreTests(unittest.TestCase):
         self.assertTrue(result.expired)
         self.assertEqual(result.selected_phase, "long_break")
         self.assertEqual(result.generated_break_phase, "long_break")
+
+    def test_generated_break_eligibility_requires_exact_source_evidence(self) -> None:
+        output = {
+            "expired": False,
+            "commandEligible": False,
+            "reserveGeneratedBreak": False,
+            "selectedPhase": None,
+            "queueAutoBreak": False,
+            "generatedBreakEligible": True,
+            "generatedBreakPhase": "short_break",
+            "sourceAlreadyAccepted": False,
+        }
+
+        class MissingEvidencePlan:
+            @staticmethod
+            def dispatch(operation: str, input_value: object) -> object:
+                del operation, input_value
+                return output
+
+        with self.assertRaisesRegex(SharedCoreABIError, "internally inconsistent"):
+            plan_timer_completion_v1(MissingEvidencePlan(), {
+                "kind": "generatedBreak",
+                "source": {"commandId": "finish", "timerId": "timer"},
+                "canonical": {"canonicalTimer": None, "history": []},
+                "optimistic": {"canonicalTimer": None, "history": []},
+                "sourceFinishPending": True,
+                "requireCanonical": False,
+            })
 
     def test_typed_completion_plan_rejects_malformed_output(self) -> None:
         class MalformedPlan:

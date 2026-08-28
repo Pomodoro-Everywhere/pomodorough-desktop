@@ -2799,8 +2799,7 @@ class Store:
                 require_canonical, now_ms,
             )
             if context is None:
-                self._discard_auto_break(trigger.timer_id)
-                continue
+                return []
             trusted_ms, sequences, clocks = self._reserve_generation(
                 now_ms, sequence_count=1, clock_count=1,
                 use_server_clock=use_server_clock,

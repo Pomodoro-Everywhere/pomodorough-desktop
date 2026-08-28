@@ -13,8 +13,8 @@ from typing import Any, Final, Protocol, Self
 
 from wasmtime import Engine, Func, Instance, Memory, Module, Store, WasmtimeError
 
-CORE_COMMIT: Final = "71c85020eab69a803ab0d3046aa7abef890c4780"
-CORE_SHA256: Final = "69ecfeb3bf292866dca2c9dba936120cb6839a761111ce19087e30cbff1428a4"
+CORE_COMMIT: Final = "4802ba99f9d97ee8d3aee3a84468b2f8c91ee443"
+CORE_SHA256: Final = "f96e712ca8350ca038888316ad2fc8bd0f08f72b3bc984f916f1127c644e776c"
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
 _MAX_OPERATION_BYTES: Final = 256
@@ -476,10 +476,60 @@ def plan_timer_completion_v1(
     )
 
 
+def _completion_projection_has_source(projection: object, source: object) -> bool:
+    if not isinstance(projection, dict) or not isinstance(source, dict):
+        return False
+    timer = projection.get("canonicalTimer")
+    history = projection.get("history")
+    if not isinstance(timer, dict) or not isinstance(history, list):
+        return False
+    timer_id = source.get("timerId")
+    command_id = source.get("commandId")
+    return (
+        isinstance(timer_id, str)
+        and isinstance(command_id, str)
+        and timer.get("id") == timer_id
+        and timer.get("phase") == "focus"
+        and timer.get("status") == "completed"
+        and any(
+            isinstance(item, dict)
+            and item.get("timerId") == timer_id
+            and item.get("commandId") == command_id
+            and item.get("phase") == "focus"
+            and item.get("status") == "completed"
+            for item in history
+        )
+    )
+
+
+def _generated_break_relationships_valid(
+    value: dict[str, Any], input_object: dict[str, Any]
+) -> bool:
+    canonical = input_object.get("canonical")
+    optimistic = input_object.get("optimistic")
+    source = input_object.get("source")
+    canonical_has_source = _completion_projection_has_source(canonical, source)
+    source_accepted = (
+        input_object.get("sourceFinishPending") is False and canonical_has_source
+    )
+    selected = canonical if (
+        input_object.get("requireCanonical") is True or source_accepted
+    ) else optimistic
+    return not any(value[key] for key in (
+        "expired", "commandEligible", "reserveGeneratedBreak", "queueAutoBreak",
+    )) and value["selectedPhase"] is None and (
+        value["generatedBreakEligible"]
+        == (value["generatedBreakPhase"] is not None)
+    ) and value["generatedBreakEligible"] == _completion_projection_has_source(
+        selected, source
+    ) and value["sourceAlreadyAccepted"] == source_accepted
+
+
 def _validate_completion_relationships(
     value: dict[str, Any], input_value: object
 ) -> None:
-    kind = input_value.get("kind") if isinstance(input_value, dict) else None
+    input_object = input_value if isinstance(input_value, dict) else None
+    kind = input_object.get("kind") if input_object is not None else None
     if kind == "expiry":
         invalid = any(value[key] for key in (
             "commandEligible", "reserveGeneratedBreak", "queueAutoBreak",
@@ -503,14 +553,8 @@ def _validate_completion_relationships(
             "generatedBreakEligible", "sourceAlreadyAccepted",
         )) or value["selectedPhase"] is None or value["generatedBreakPhase"] is not None
     elif kind == "generatedBreak":
-        invalid = any(value[key] for key in (
-            "expired", "commandEligible", "reserveGeneratedBreak", "queueAutoBreak",
-        )) or value["selectedPhase"] is not None or (
-            value["generatedBreakEligible"]
-            != (value["generatedBreakPhase"] is not None)
-        ) or (value["sourceAlreadyAccepted"] and not value[
-            "generatedBreakEligible"
-        ])
+        assert input_object is not None
+        invalid = not _generated_break_relationships_valid(value, input_object)
     else:
         invalid = True
     if invalid:
