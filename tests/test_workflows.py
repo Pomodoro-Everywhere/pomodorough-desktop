@@ -175,6 +175,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("doInstallCheck = true;", flake)
         self.assertIn('SharedCore().dispatch("core.version", {})', flake)
 
+    def test_flatpak_bundles_qtnetwork_kerberos_runtime(self) -> None:
+        workflow = FLATPAK_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("Add QtNetwork Kerberos runtime dependency", workflow)
+        self.assertIn("- name: krb5", workflow)
+        self.assertIn(
+            "https://kerberos.org/dist/krb5/1.22/krb5-1.22.1.tar.gz",
+            workflow,
+        )
+        self.assertIn(
+            "sha256: 1a8832b8cad923ebbf1394f67e2efcf41e3a49f460285a66e35adec8fa0053af",
+            workflow,
+        )
+
     def test_final_platform_artifacts_validate_exact_oauth_resource(self) -> None:
         windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
         launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
