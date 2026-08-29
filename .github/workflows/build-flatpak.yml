@@ -44,6 +44,39 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Add QtNetwork Kerberos runtime dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("deploy/flatpak/me.egigoka.Pomodorough.yml")
+          marker = "modules:\n  - name: libsecret"
+          krb5 = """modules:
+            - name: krb5
+              buildsystem: autotools
+              subdir: src
+              config-opts:
+                - --disable-static
+                - --disable-rpath
+              cleanup:
+                - /include
+                - /lib/*.a
+                - /lib/pkgconfig
+                - /share/man
+              sources:
+                - type: archive
+                  url: https://kerberos.org/dist/krb5/1.22/krb5-1.22.1.tar.gz
+                  sha256: 1a8832b8cad923ebbf1394f67e2efcf41e3a49f460285a66e35adec8fa0053af
+
+            - name: libsecret"""
+          text = manifest.read_text(encoding="utf-8")
+          if text.count(marker) != 1:
+              raise SystemExit("Flatpak manifest module marker is not unique")
+          manifest.write_text(text.replace(marker, krb5), encoding="utf-8")
+          PY
+
       - name: Build bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb
         with:
