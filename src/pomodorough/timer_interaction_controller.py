@@ -185,11 +185,8 @@ class TimerInteractionController:
                 self._ports.notice(str(error))
             self.auto_finish_in_progress = False
             return done(LoadState(), Render(), Synchronize())
-        if context.store.owns_timer(timer):
-            self._ports.issue_command("finish", True)
-            return done()
-        self.auto_finish_in_progress = False
-        return done(Render())
+        self._ports.issue_command("finish", True)
+        return done()
 
     def primary_action(self) -> ControllerOutcome[None]:
         context = self._context()

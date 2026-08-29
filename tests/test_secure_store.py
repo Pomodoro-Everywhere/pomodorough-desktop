@@ -159,20 +159,20 @@ class PlatformSecretStoreTests(unittest.TestCase):
         ), self.assertRaisesRegex(SecureStoreError, "Platform secure storage failed"):
             self.store._run(["secret-tool", "lookup"])
 
-    def test_macos_save_passes_secret_as_keychain_argument_not_stdin(self) -> None:
-        response = subprocess.CompletedProcess([], 0, "", "")
+    def test_macos_save_uses_in_process_keychain_api(self) -> None:
         with (
             patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="darwin"),
-            patch("pomodorough.secure_store.shutil.which", return_value="/usr/bin/security"),
-            patch("pomodorough.secure_store.subprocess.run", return_value=response) as run,
+            patch.object(self.store, "availability", return_value=(True, "ready")),
+            patch("pomodorough.secure_store._macos_save") as save,
+            patch("pomodorough.secure_store.subprocess.run") as run,
         ):
             self.store.save("endpoint-key", b"secret")
 
-        command = run.call_args.args[0]
-        self.assertEqual(command[:2], ["security", "add-generic-password"])
-        self.assertEqual(command[-1], base64.b64encode(b"secret").decode("ascii"))
-        self.assertIsNone(run.call_args.kwargs["input"])
+        save.assert_called_once_with(
+            self.store.service, "endpoint-key", b"secret"
+        )
+        run.assert_not_called()
 
 
 class MemorySecretStore:

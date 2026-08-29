@@ -30,7 +30,6 @@ class TimerHarness:
         self.store = Mock()
         self.store.has_pending_auto_break.return_value = False
         self.store.process_auto_break.return_value = []
-        self.store.owns_timer.return_value = False
         self.cloud = SimpleNamespace(authenticated=False, busy=False)
         self.closed = False
         self.current_timer: dict[str, object] | None = timer(status)
@@ -109,6 +108,13 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.controller.tick()
         harness.ports.notice.assert_called_with("projection failed")
         self.assertFalse(harness.controller.auto_finish_in_progress)
+
+    def test_expired_centralized_timer_delegates_eligibility_to_store(self) -> None:
+        harness = TimerHarness("completed")
+
+        self.assertEqual(harness.controller.tick().effects, ())
+
+        self.assertEqual(harness.issued, [("finish", True)])
 
     def test_primary_action_routes_each_status_and_terminal_boundaries(self) -> None:
         harness = TimerHarness()

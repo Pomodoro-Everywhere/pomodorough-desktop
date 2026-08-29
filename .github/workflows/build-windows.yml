@@ -7,9 +7,7 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      COMPROMISED_GOOGLE_CLIENT_SECRET:
-        required: true
+
   workflow_dispatch:
     inputs:
       tag:
@@ -66,6 +64,7 @@ jobs:
             --name "Pomodorough-$env:VERSION-windows-x86_64" `
             --collect-data pomodorough `
             --hidden-import pomodorough.shared_core `
+            --hidden-import pomodorough.oauth_artifact_verifier `
             --collect-all wasmtime `
             deploy/windows/launcher.py
 
@@ -73,11 +72,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
-          COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
         run: |
-          if (-not $env:COMPROMISED_GOOGLE_CLIENT_SECRET) {
-            throw "COMPROMISED_GOOGLE_CLIENT_SECRET is required"
-          }
           $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
           $env:POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID = python -c "import json; print(json.load(open('src/pomodorough/resources/oauth-client.json'))['installed']['client_id'])"
           $env:POMODOROUGH_SHARED_CORE_SMOKE = "1"
@@ -86,6 +81,18 @@ jobs:
           Remove-Item Env:POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID
           if ($coreProcess.ExitCode -ne 0) {
             throw "Packaged shared-core smoke test failed"
+          }
+          $env:POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST = "1"
+          $oauthProcess = Start-Process -FilePath $executable -PassThru -Wait
+          Remove-Item Env:POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST
+          if ($oauthProcess.ExitCode -ne 0) {
+            throw "Packaged OAuth transaction self-test failed"
+          }
+          $env:POMODOROUGH_PLATFORM_STORE_SELF_TEST = "1"
+          $storeProcess = Start-Process -FilePath $executable -PassThru -Wait
+          Remove-Item Env:POMODOROUGH_PLATFORM_STORE_SELF_TEST
+          if ($storeProcess.ExitCode -ne 0) {
+            throw "Packaged platform secure-store self-test failed"
           }
           $env:POMODOROUGH_SCREENSHOT = "$PWD/dist/smoke.png"
           $process = Start-Process -FilePath $executable -PassThru

@@ -22,6 +22,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEventLoop, QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
 
+from pomodorough.secure_store import SecureStoreError
+
 from pomodorough.network import (
     ApiError,
     CloudService,
@@ -913,6 +915,19 @@ class HTTPRequestTests(unittest.TestCase):
             "application/x-www-form-urlencoded",
         )
 
+    def test_request_rejects_malformed_or_non_object_success_documents(self) -> None:
+        for body in (b"not-json", b"[]", b'"string"', b"null"):
+            with self.subTest(body=body), patch(
+                "urllib.request.urlopen", return_value=_FakeHTTPResponse(body)
+            ):
+                with self.assertRaises(ApiError) as raised:
+                    _request("GET", "https://example.test/items")
+
+            self.assertEqual(
+                str(raised.exception), "Server returned an invalid JSON response."
+            )
+            self.assertIsNone(raised.exception.status)
+
     def test_request_normalizes_http_error_documents(self) -> None:
         cases = (
             (b'{"error":"fallback","error_description":"preferred"}', "preferred", {"error": "fallback", "error_description": "preferred"}),
@@ -1353,7 +1368,172 @@ class AuthenticationNetworkTests(unittest.TestCase):
         clear.assert_not_called()
 
 
+class _MemorySecretStore:
+    def __init__(self) -> None:
+        self.values: dict[str, bytes] = {}
+
+    def load(self, key: str) -> bytes | None:
+        return self.values.get(key)
+
+    def save(self, key: str, value: bytes) -> None:
+        self.values[key] = value
+
+    def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
 class TokenStoreTests(unittest.TestCase):
+    def test_secure_store_roundtrip_survives_restart_without_plaintext_fallback(self) -> None:
+        response = {
+            "accessToken": "access-secret",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "refresh-secret",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+        secure_store = _MemorySecretStore()
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ):
+            TokenStore("device-1", secret_store=secure_store).save(response)
+            restarted = TokenStore("device-1", secret_store=secure_store)
+
+            self.assertEqual(
+                restarted.load(),
+                {
+                    "refreshToken": "refresh-secret",
+                    "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+                },
+            )
+            self.assertFalse(restarted.fallback_path.exists())
+
+    def test_secure_store_clear_deletes_refresh_credential_and_keeps_tombstone(self) -> None:
+        secure_store = _MemorySecretStore()
+        secure_store.save("oauth:device-1", b'{"refreshToken":"secret"}')
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ):
+            store = TokenStore("device-1", secret_store=secure_store)
+            store.clear()
+
+            self.assertNotIn("oauth:device-1", secure_store.values)
+            self.assertEqual(
+                json.loads(store.fallback_path.read_text(encoding="utf-8")),
+                {"signedOut": True},
+            )
+
+    def test_default_store_uses_platform_oauth_namespace(self) -> None:
+        secure_store = _MemorySecretStore()
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ), patch(
+            "pomodorough.network.PlatformSecretStore", return_value=secure_store
+        ) as platform_store:
+            store = TokenStore("device-1")
+
+        platform_store.assert_called_once_with(
+            root=Path(directory) / "oauth-secrets-v1",
+            service="me.egigoka.pomodorough.oauth",
+            kind="oauth",
+            label="Pomodorough OAuth",
+        )
+        self.assertIs(store.secret_store, secure_store)
+
+    def test_default_store_migrates_legacy_secret_tool_item(self) -> None:
+        secure_store = _MemorySecretStore()
+        legacy = {
+            "refreshToken": "legacy-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        }
+        lookup = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(legacy), stderr=""
+        )
+        cleared = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ), patch(
+            "pomodorough.network.PlatformSecretStore", return_value=secure_store
+        ), patch(
+            "pomodorough.network.shutil.which", return_value="/usr/bin/secret-tool"
+        ), patch(
+            "pomodorough.network.subprocess.run", side_effect=[lookup, cleared]
+        ) as run:
+            loaded = TokenStore("device-1").load()
+
+        self.assertEqual(loaded, legacy)
+        self.assertEqual(
+            json.loads(secure_store.values["oauth:device-1"]),
+            legacy,
+        )
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(
+                    [
+                        "secret-tool",
+                        "lookup",
+                        "service",
+                        "pomodorough",
+                        "device",
+                        "device-1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                ),
+                call(
+                    [
+                        "secret-tool",
+                        "clear",
+                        "service",
+                        "pomodorough",
+                        "device",
+                        "device-1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                ),
+            ],
+        )
+
+    def test_legacy_migration_rolls_back_when_cleanup_is_rejected(self) -> None:
+        secure_store = _MemorySecretStore()
+        legacy = {"refreshToken": "legacy", "refreshTokenExpiresAt": "2099-01-01Z"}
+        lookup = subprocess.CompletedProcess([], 0, json.dumps(legacy), "")
+        rejected = subprocess.CompletedProcess([], 1, "", "keyring locked")
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ), patch(
+            "pomodorough.network.PlatformSecretStore", return_value=secure_store
+        ), patch(
+            "pomodorough.network.shutil.which", return_value="/usr/bin/secret-tool"
+        ), patch(
+            "pomodorough.network.subprocess.run", side_effect=[lookup, rejected]
+        ), self.assertRaisesRegex(SecureStoreError, "keyring locked"):
+            TokenStore("device-1").load()
+
+        self.assertNotIn("oauth:device-1", secure_store.values)
+
+    def test_legacy_migration_rolls_back_when_cleanup_process_fails(self) -> None:
+        secure_store = _MemorySecretStore()
+        legacy = {"refreshToken": "legacy", "refreshTokenExpiresAt": "2099-01-01Z"}
+        lookup = subprocess.CompletedProcess([], 0, json.dumps(legacy), "")
+        with TemporaryDirectory() as directory, patch(
+            "pomodorough.network._config_root", return_value=Path(directory)
+        ), patch(
+            "pomodorough.network.PlatformSecretStore", return_value=secure_store
+        ), patch(
+            "pomodorough.network.shutil.which", return_value="/usr/bin/secret-tool"
+        ), patch(
+            "pomodorough.network.subprocess.run",
+            side_effect=[lookup, subprocess.TimeoutExpired(["secret-tool"], 10)],
+        ), self.assertRaisesRegex(SecureStoreError, "Legacy OAuth credential"):
+            TokenStore("device-1").load()
+
+        self.assertNotIn("oauth:device-1", secure_store.values)
+
     def test_fallback_roundtrip_stores_only_refresh_fields_with_private_mode(self) -> None:
         response = {
             "accessToken": "access-secret",
@@ -1370,7 +1550,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             with (
                 patch("pomodorough.network.shutil.which", return_value=None),
                 patch("pomodorough.network.subprocess.run") as run,
@@ -1397,7 +1577,7 @@ class TokenStoreTests(unittest.TestCase):
                 with patch(
                     "pomodorough.network._config_root", return_value=Path(directory)
                 ):
-                    store = TokenStore("device-1")
+                    store = TokenStore("device-1", secret_store=None)
                 store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
                 if existing_mode is not None:
                     store.fallback_path.write_text("previous")
@@ -1444,7 +1624,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             with (
                 patch(
                     "pomodorough.network.shutil.which",
@@ -1471,7 +1651,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
             store.fallback_path.write_text(json.dumps(fallback))
             with (
@@ -1494,7 +1674,7 @@ class TokenStoreTests(unittest.TestCase):
                 with patch(
                     "pomodorough.network._config_root", return_value=Path(directory)
                 ):
-                    store = TokenStore("device-1")
+                    store = TokenStore("device-1", secret_store=None)
                 with (
                     patch(
                         "pomodorough.network.shutil.which",
@@ -1533,7 +1713,7 @@ class TokenStoreTests(unittest.TestCase):
                 with patch(
                     "pomodorough.network._config_root", return_value=Path(directory)
                 ):
-                    store = TokenStore("device-1")
+                    store = TokenStore("device-1", secret_store=None)
                 with (
                     patch(
                         "pomodorough.network.shutil.which",
@@ -1561,7 +1741,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             with (
                 patch(
                     "pomodorough.network.shutil.which",
@@ -1606,7 +1786,7 @@ class TokenStoreTests(unittest.TestCase):
                 with patch(
                     "pomodorough.network._config_root", return_value=Path(directory)
                 ):
-                    store = TokenStore("device-1")
+                    store = TokenStore("device-1", secret_store=None)
                 with (
                     patch(
                         "pomodorough.network.shutil.which",
@@ -1636,7 +1816,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
             store.fallback_path.write_text("stale")
             replacements = []
@@ -1691,7 +1871,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
             store.fallback_path.write_text("stale")
             with (
@@ -1727,7 +1907,7 @@ class TokenStoreTests(unittest.TestCase):
                 with patch(
                     "pomodorough.network._config_root", return_value=Path(directory)
                 ):
-                    store = TokenStore("device-1")
+                    store = TokenStore("device-1", secret_store=None)
                 store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
                 store.fallback_path.write_text("stale")
                 run_kwargs = (
@@ -1755,7 +1935,7 @@ class TokenStoreTests(unittest.TestCase):
             with patch(
                 "pomodorough.network._config_root", return_value=Path(directory)
             ):
-                store = TokenStore("device-1")
+                store = TokenStore("device-1", secret_store=None)
             store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
             store.fallback_path.write_text("stale")
 

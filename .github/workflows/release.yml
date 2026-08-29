@@ -207,6 +207,8 @@ jobs:
           python -m venv .release-wheel
           .release-wheel/bin/python -m pip install dist/*.whl
           .release-wheel/bin/python -m pip check
+          QT_QPA_PLATFORM=offscreen \
+            .release-wheel/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-wheel/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
           QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m unittest discover -s tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
@@ -224,6 +226,8 @@ jobs:
           python -m venv .release-sdist
           .release-sdist/bin/python -m pip install dist/*.tar.gz
           .release-sdist/bin/python -m pip check
+          QT_QPA_PLATFORM=offscreen \
+            .release-sdist/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-sdist/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
           QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m unittest discover -s tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
@@ -255,8 +259,6 @@ jobs:
     uses: ./.github/workflows/build-flatpak.yml
     with:
       tag: ${{ inputs.tag || github.ref_name }}
-    secrets:
-      COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
 
   windows:
     name: Build Windows executable
@@ -266,8 +268,6 @@ jobs:
     uses: ./.github/workflows/build-windows.yml
     with:
       tag: ${{ inputs.tag || github.ref_name }}
-    secrets:
-      COMPROMISED_GOOGLE_CLIENT_SECRET: ${{ secrets.COMPROMISED_GOOGLE_CLIENT_SECRET }}
 
   release:
     name: Create GitHub release

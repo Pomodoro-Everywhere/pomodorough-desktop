@@ -171,10 +171,6 @@ class LocalTimer:
             and not self.resolution_pending
             and status == "completed"
             and timer.get("lastIntent", {}).get("type") != "finish"
-            and (
-                self.store.replication_mode == "iroh"
-                or self.store.owns_timer(timer)
-            )
         )
         if not should_finish:
             return None

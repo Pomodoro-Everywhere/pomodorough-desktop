@@ -33,6 +33,17 @@ from pomodorough.storage import (
 )
 
 
+def _serialize_logical_database(connection: sqlite3.Connection) -> bytes:
+    with tempfile.TemporaryDirectory() as root:
+        snapshot = sqlite3.connect(Path(root) / "snapshot.db")
+        try:
+            connection.backup(snapshot)
+            snapshot.execute("PRAGMA journal_mode=DELETE")
+            return snapshot.serialize()
+        finally:
+            snapshot.close()
+
+
 class _RecordingSharedCore:
     def __init__(self, result: object = None, error: Exception | None = None) -> None:
         self.result = result
@@ -71,6 +82,31 @@ class _OperationOverrideSharedCore(_DelegatingRecordingSharedCore):
 
 
 class StorageTests(unittest.TestCase):
+    def test_logical_database_serialization_includes_wal_visible_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "wal-visible.db"
+            source = sqlite3.connect(path)
+            restored = sqlite3.connect(":memory:")
+            try:
+                self.assertEqual(source.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                source.execute("PRAGMA wal_autocheckpoint=0")
+                source.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+                source.commit()
+                source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                source.execute("INSERT INTO evidence(value) VALUES ('wal-visible')")
+                source.commit()
+                self.assertGreater(path.with_name(f"{path.name}-wal").stat().st_size, 0)
+
+                restored.deserialize(_serialize_logical_database(source))
+
+                self.assertEqual(
+                    restored.execute("SELECT value FROM evidence").fetchone(),
+                    ("wal-visible",),
+                )
+            finally:
+                restored.close()
+                source.close()
+
     def test_storage_modules_share_default_shared_core(self) -> None:
         self.assertIs(
             storage._default_shared_core(),
@@ -399,6 +435,8 @@ class StorageTests(unittest.TestCase):
                         "title": "Core task",
                         "utf8Bytes": 9,
                     }
+                if operation == "hlc.tick.v1":
+                    return SharedCore().dispatch(operation, input_value)
                 assert isinstance(input_value, dict)
                 task_operation = input_value["pending"]["taskOperations"][-1]
                 return {
@@ -428,7 +466,8 @@ class StorageTests(unittest.TestCase):
             core.calls[0],
             ("task.identity.v1", {"title": "client task"}),
         )
-        self.assertEqual(core.calls[1][0], "projection.apply.v2")
+        self.assertEqual(core.calls[1][0], "hlc.tick.v1")
+        self.assertEqual(core.calls[2][0], "projection.apply.v2")
         self.assertEqual(operation["taskId"], "core-task-id")
         self.assertEqual(operation["title"], "Core task")
 
@@ -484,6 +523,8 @@ class StorageTests(unittest.TestCase):
                         "title": task["title"],
                         "utf8Bytes": len(task["title"].encode("utf-8")),
                     }
+                if operation == "hlc.tick.v1":
+                    return SharedCore().dispatch(operation, input_value)
                 raise SharedCoreLoadError("projection unavailable")
 
         self.store.close()
@@ -496,7 +537,10 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "projection unavailable"):
             self.store.queue_task_operation("upsert", task, now_ms=1_000)
 
-        self.assertEqual(core.calls, ["task.identity.v1", "projection.apply.v2"])
+        self.assertEqual(
+            core.calls,
+            ["task.identity.v1", "hlc.tick.v1", "projection.apply.v2"],
+        )
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_task_operations"
@@ -518,7 +562,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_duration_operations"
@@ -541,7 +585,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.set_auto_start_breaks(True, now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_auto_start_operations"
@@ -566,7 +610,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core unavailable"):
             self.store.set_selected_task_id("task-id", now_ms=1_000)
 
-        self.assertEqual(core.calls[0][0], "projection.apply.v2")
+        self.assertEqual(core.calls[0][0], "hlc.tick.v1")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM pending_selected_task_operations"
@@ -694,11 +738,13 @@ class StorageTests(unittest.TestCase):
         )
         running, _history = rebuild_optimistic(None, [], [start])
 
-        self.assertTrue(self.store.owns_timer(running))
+        ownership = self.store.get_meta("centralizedTimerOwnership")
+        self.assertEqual(ownership["timerId"], running["id"])
+        self.assertEqual(ownership["deviceId"], self.store.device_id)
         self.store.close()
         self.store = Store(self.path)
 
-        self.assertTrue(self.store.owns_timer(running))
+        self.assertEqual(self.store.get_meta("centralizedTimerOwnership"), ownership)
         self.store.reset_account_data()
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
 
@@ -776,7 +822,10 @@ class StorageTests(unittest.TestCase):
             "start", None, "focus", settings["durationsMs"], now_ms=1_000
         )
         local_timer, _history = rebuild_optimistic(None, [], [start])
-        self.assertTrue(self.store.owns_timer(local_timer))
+        self.assertEqual(
+            self.store.get_meta("centralizedTimerOwnership")["timerId"],
+            local_timer["id"],
+        )
         request = self.store.sync_payload()
         remote_timer = {
             "id": "remote-timer",
@@ -793,10 +842,9 @@ class StorageTests(unittest.TestCase):
         self.store.apply_sync(response, request)
 
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
-        self.assertFalse(self.store.owns_timer(remote_timer))
         self.store.close()
         self.store = Store(self.path)
-        self.assertFalse(self.store.owns_timer(remote_timer))
+        self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
 
     @staticmethod
     def _history_item(
@@ -3535,6 +3583,157 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.load(), before)
         self.assertTrue(self.store.has_pending_auto_break())
 
+    def test_contradictory_generated_break_plan_preserves_store_bytes_and_heads(
+        self,
+    ) -> None:
+        self.store.set_auto_start_breaks(True, now_ms=100)
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        self.assertIsNotNone(start)
+        assert start is not None
+        running, _history = rebuild_optimistic(None, [], [start])
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        self.assertTrue(self.store.has_pending_auto_break())
+        self.store.close()
+        contradictory = {
+            "expired": False,
+            "commandEligible": False,
+            "reserveGeneratedBreak": False,
+            "selectedPhase": None,
+            "queueAutoBreak": False,
+            "generatedBreakEligible": True,
+            "generatedBreakPhase": None,
+            "sourceAlreadyAccepted": False,
+        }
+        core = _OperationOverrideSharedCore(
+            "timer.completionPlan.v1", contradictory
+        )
+        self.store = Store(self.path, shared_core=core)
+        before_state = json.dumps(
+            self.store.load(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        before_trigger = tuple(self.store.connection.execute(
+            "SELECT finish_command_id, timer_id, finish_device_sequence "
+            "FROM pending_auto_breaks"
+        ).fetchone())
+        before_heads = (
+            self.store.get_meta("deviceSequence"),
+            self.store.get_meta("hlc"),
+            self.store.get_meta("lastUuidV7"),
+        )
+        before_database = _serialize_logical_database(self.store.connection)
+
+        with self.assertRaisesRegex(ValueError, "internally inconsistent"):
+            self.store.process_auto_break(require_canonical=False, now_ms=3_000)
+
+        self.assertEqual(_serialize_logical_database(self.store.connection), before_database)
+        self.assertEqual(
+            json.dumps(
+                self.store.load(), sort_keys=True, separators=(",", ":")
+            ).encode(),
+            before_state,
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT finish_command_id, timer_id, finish_device_sequence "
+                "FROM pending_auto_breaks"
+            ).fetchone()),
+            before_trigger,
+        )
+        self.assertEqual(
+            (
+                self.store.get_meta("deviceSequence"),
+                self.store.get_meta("hlc"),
+                self.store.get_meta("lastUuidV7"),
+            ),
+            before_heads,
+        )
+
+    def test_missing_or_mismatched_source_history_preserves_store_bytes_and_heads(
+        self,
+    ) -> None:
+        for corruption in ("missing", "mismatched"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "state.db"
+                store = Store(path)
+                try:
+                    store.set_auto_start_breaks(True, now_ms=100)
+                    settings = store.load()["settings"]
+                    start = store.queue_command(
+                        "start", None, "focus", settings["durationsMs"], now_ms=1_000
+                    )
+                    self.assertIsNotNone(start)
+                    assert start is not None
+                    running, _history = rebuild_optimistic(None, [], [start])
+                    finish = store.queue_command(
+                        "finish",
+                        running,
+                        "focus",
+                        settings["durationsMs"],
+                        now_ms=2_000,
+                    )
+                    self.assertIsNotNone(finish)
+                    assert finish is not None
+                    self.assertTrue(store.has_pending_auto_break())
+                    if corruption == "missing":
+                        store.connection.execute(
+                            "DELETE FROM pending_commands WHERE id = ?", (finish["id"],)
+                        )
+                    else:
+                        store.connection.execute(
+                            "UPDATE pending_auto_breaks SET finish_command_id = ? "
+                            "WHERE finish_command_id = ?",
+                            ("different-finish", finish["id"]),
+                        )
+                    store.connection.commit()
+                    before_state = json.dumps(
+                        store.load(), sort_keys=True, separators=(",", ":")
+                    ).encode()
+                    before_trigger = tuple(store.connection.execute(
+                        "SELECT finish_command_id, timer_id, finish_device_sequence "
+                        "FROM pending_auto_breaks"
+                    ).fetchone())
+                    before_heads = (
+                        store.get_meta("deviceSequence"),
+                        store.get_meta("hlc"),
+                        store.get_meta("lastUuidV7"),
+                    )
+                    before_database = _serialize_logical_database(store.connection)
+
+                    self.assertEqual(
+                        store.process_auto_break(require_canonical=False, now_ms=3_000),
+                        [],
+                    )
+
+                    self.assertEqual(_serialize_logical_database(store.connection), before_database)
+                    self.assertEqual(
+                        json.dumps(
+                            store.load(), sort_keys=True, separators=(",", ":")
+                        ).encode(),
+                        before_state,
+                    )
+                    self.assertEqual(
+                        tuple(store.connection.execute(
+                            "SELECT finish_command_id, timer_id, finish_device_sequence "
+                            "FROM pending_auto_breaks"
+                        ).fetchone()),
+                        before_trigger,
+                    )
+                    self.assertEqual(
+                        (
+                            store.get_meta("deviceSequence"),
+                            store.get_meta("hlc"),
+                            store.get_meta("lastUuidV7"),
+                        ),
+                        before_heads,
+                    )
+                finally:
+                    store.close()
+
     def test_sync_preflight_rejects_corruption_in_every_pending_queue(self) -> None:
         task = task_from_title("Corrupt queue")
         settings = self.store.load()["settings"]
@@ -5446,7 +5645,9 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(loaded["settings"]["selectedPhase"], "short_break")
         self.assertEqual(self.store.provisional_auto_break_timer_ids(), set())
 
-    def test_process_auto_break_does_not_resurrect_after_canonical_clear(self) -> None:
+    def test_process_auto_break_does_not_resurrect_and_preserves_retry_after_canonical_clear(
+        self,
+    ) -> None:
         self.store.set_auto_start_breaks(True, now_ms=100)
         settings = self.store.load()["settings"]
         self.store.queue_command(
@@ -5479,7 +5680,7 @@ class StorageTests(unittest.TestCase):
             self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
         )
         self.assertEqual(self.store.load()["pending"], [])
-        self.assertFalse(self.store.has_pending_auto_break())
+        self.assertTrue(self.store.has_pending_auto_break())
 
     def test_manual_start_remains_sendable_and_supersedes_withheld_auto_break(
         self,

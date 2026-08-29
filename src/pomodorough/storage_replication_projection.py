@@ -8,8 +8,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from .core import next_break_phase, parse_timestamp_ms, task_from_title
-from .shared_core import SharedCoreError, apply_projection_v2
+from .core import parse_timestamp_ms, task_from_title
+from .shared_core import (
+    SharedCoreError,
+    TimerCompletionPlanV1,
+    apply_projection_v2,
+    plan_timer_completion_v1,
+)
+from .storage_canonical_reconciliation import generated_break_day_bounds
 from .storage_model import _default_shared_core, utc_timestamp
 from .storage_workspace import WorkspacePersistence
 
@@ -29,52 +35,52 @@ class ProjectionDependencies:
     workspace: WorkspacePersistence
 
 
-@dataclass(frozen=True)
-class GeneratedBreakPlan:
-    expired: bool
-    selected_phase: str | None
-    auto_start_phase: str | None
-
-
 class GeneratedBreakPlanner:
-    @staticmethod
+    def __init__(self, shared_core: Callable[[], Any]) -> None:
+        self._shared_core = shared_core
+
     def plan(
+        self,
         before: Any,
         projection: dict[str, Any],
         settings: dict[str, Any],
         device_id: str,
-    ) -> GeneratedBreakPlan:
+    ) -> TimerCompletionPlanV1:
         timer = projection.get("canonicalTimer")
-        expired = bool(
-            isinstance(before, dict)
-            and before.get("status") == "running"
-            and isinstance(timer, dict)
-            and timer.get("id") == before.get("id")
-            and timer.get("status") == "completed"
-        )
-        selected_phase = None
-        if (
-            expired
-            and isinstance(timer, dict)
-            and settings["selectedPhase"] == timer.get("phase")
-        ):
-            selected_phase = (
-                next_break_phase(projection["history"], timer.get("anchorAt"))
-                if timer.get("phase") == "focus"
-                else "focus"
-            )
-        auto_start_phase = None
-        if (
-            expired
-            and isinstance(timer, dict)
-            and timer.get("phase") == "focus"
-            and timer.get("startedByDeviceId") == device_id
-            and projection["autoStartBreaks"]
-        ):
-            auto_start_phase = next_break_phase(
-                projection["history"], timer.get("anchorAt")
-            )
-        return GeneratedBreakPlan(expired, selected_phase, auto_start_phase)
+        day_start, day_end = self._day_bounds(timer)
+        input_value = {
+            "kind": "expiry",
+            "beforeTimer": before if isinstance(before, dict) else None,
+            "projectedTimer": timer if isinstance(timer, dict) else None,
+            "history": projection["history"],
+            "selectedPhase": settings["selectedPhase"],
+            "autoStartBreaks": projection["autoStartBreaks"],
+            "localDeviceId": device_id,
+            "ownership": self._ownership(timer),
+            "dayStart": day_start,
+            "dayEnd": day_end,
+        }
+        core = self._shared_core() or _default_shared_core()
+        try:
+            return plan_timer_completion_v1(core, input_value)
+        except SharedCoreError as error:
+            raise ValueError(str(error)) from error
+
+    @staticmethod
+    def _day_bounds(timer: Any) -> tuple[str, str]:
+        if not isinstance(timer, dict) or not isinstance(timer.get("anchorAt"), str):
+            return "", ""
+        return generated_break_day_bounds(parse_timestamp_ms(timer["anchorAt"]))
+
+    @staticmethod
+    def _ownership(timer: Any) -> dict[str, str] | None:
+        if not isinstance(timer, dict):
+            return None
+        timer_id = timer.get("id")
+        owner = timer.get("startedByDeviceId")
+        if not isinstance(timer_id, str) or not isinstance(owner, str):
+            return None
+        return {"timerId": timer_id, "ownerDeviceId": owner}
 
 
 class ReplicatedStateProjection:

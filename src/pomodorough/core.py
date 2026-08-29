@@ -365,10 +365,3 @@ def timer_for_display(
     if timer.get("status") == "completed":
         return empty_timer(selected_phase, int(durations_ms[selected_phase]))
     return timer
-
-
-def next_break_phase(
-    history: list[dict[str, Any]], now: datetime | str | None = None
-) -> str:
-    completed_focus = completed_focus_count_for_day(history, now)
-    return "long_break" if completed_focus > 0 and completed_focus % 4 == 0 else "short_break"

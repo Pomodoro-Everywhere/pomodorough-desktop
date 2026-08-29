@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from pomodorough.storage import Store
+from pomodorough.storage_generation import GenerationReservation
+from pomodorough.storage_completion import TimerCompletionPolicy
 from pomodorough.storage_canonical import CanonicalResponseStorage
 from pomodorough.storage_iroh_records import IrohRecordPersistence
 from pomodorough.storage_replication import ReplicationStorage
@@ -29,6 +31,19 @@ class StorageArchitectureTests(unittest.TestCase):
         self.assertIsInstance(self.store._iroh_record_storage, IrohRecordPersistence)
         self.assertIsInstance(self.store._sync_storage, SyncStorage)
         self.assertIsInstance(self.store._replication_storage, ReplicationStorage)
+        self.assertIsInstance(self.store._generation_storage, GenerationReservation)
+        self.assertIsInstance(self.store._completion_policy, TimerCompletionPolicy)
+        self.assertIsNot(self.store._sync_storage._dependencies, self.store)
+        self.assertIsNot(self.store._canonical_storage._dependencies, self.store)
+        for component_name in (
+            "_validation",
+            "_acknowledgements",
+            "_reconciliation",
+            "_installation",
+        ):
+            component = getattr(self.store._canonical_storage, component_name)
+            self.assertIs(component._dependencies, self.store._canonical_storage._dependencies)
+        self.assertNotIn("_completion_plan", Store.__dict__)
         for responsibility in (
             WorkspacePersistence,
             CanonicalResponseStorage,
@@ -41,6 +56,31 @@ class StorageArchitectureTests(unittest.TestCase):
         self.assertIn("apply_sync", CanonicalResponseStorage.__dict__)
         self.assertIn("inventory", IrohRecordPersistence.__dict__)
         self.assertNotIn("iroh_inventory", ReplicationStorage.__dict__)
+
+    def test_generation_reservation_delegates_each_hlc_tick_to_shared_core(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class ClockCore:
+            @staticmethod
+            def dispatch(operation: str, input_value: object) -> object:
+                calls.append((operation, input_value))
+                local = input_value["local"]  # type: ignore[index]
+                now_ms = input_value["physicalNowMs"]  # type: ignore[index]
+                wall_ms = max(local["wallMs"], now_ms)
+                counter = local["counter"] + 1 if wall_ms == local["wallMs"] else 0
+                return {"wallMs": wall_ms, "counter": counter}
+
+        database_path = self.store.path
+        self.store.close()
+        self.store = Store(database_path, shared_core=ClockCore())
+        reserved = self.store._reserve_generation(
+            100, clock_count=2, use_server_clock=False
+        )
+
+        self.assertEqual(reserved, (100, [], [(100, 0), (100, 1)]))
+        self.assertEqual([operation for operation, _input in calls], [
+            "hlc.tick.v1", "hlc.tick.v1",
+        ])
 
     def test_invalid_workspace_restore_rolls_back_all_changes(self) -> None:
         original_settings = self.store.load()["settings"]

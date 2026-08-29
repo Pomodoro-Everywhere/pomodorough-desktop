@@ -195,7 +195,7 @@ class ReplicationStorage:
         def shared_core() -> Any:
             return dependencies._shared_core
 
-        self._break_planner = GeneratedBreakPlanner()
+        self._break_planner = GeneratedBreakPlanner(shared_core)
         self._projection = _assemble_projection(
             dependencies,
             workspace_storage,

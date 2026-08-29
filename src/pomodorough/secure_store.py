@@ -8,8 +8,9 @@ import shutil
 import subprocess
 import tempfile
 from ctypes import wintypes
+from functools import lru_cache
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from platformdirs import user_config_path
 
@@ -71,13 +72,132 @@ class SecretMutationJournal:
         self._order.append(key)
 
 
+_MACOS_ITEM_NOT_FOUND = -25300
+
+
+@lru_cache(maxsize=1)
+def _macos_frameworks() -> tuple[Any, Any]:
+    security = ctypes.CDLL(
+        "/System/Library/Frameworks/Security.framework/Security"
+    )
+    core = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+    security.SecKeychainAddGenericPassword.restype = ctypes.c_int32
+    security.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
+    security.SecKeychainItemDelete.restype = ctypes.c_int32
+    security.SecKeychainItemFreeContent.restype = ctypes.c_int32
+    core.CFRelease.argtypes = [ctypes.c_void_p]
+    return security, core
+
+
+def _macos_find(service: str, key: str) -> tuple[int, bytes | None, ctypes.c_void_p]:
+    security, _core = _macos_frameworks()
+    service_bytes = service.encode("utf-8")
+    key_bytes = key.encode("utf-8")
+    length = ctypes.c_uint32()
+    data = ctypes.c_void_p()
+    item = ctypes.c_void_p()
+    status = security.SecKeychainFindGenericPassword(
+        None,
+        len(service_bytes),
+        service_bytes,
+        len(key_bytes),
+        key_bytes,
+        ctypes.byref(length),
+        ctypes.byref(data),
+        ctypes.byref(item),
+    )
+    value = ctypes.string_at(data, length.value) if status == 0 else None
+    if data.value:
+        security.SecKeychainItemFreeContent(None, data)
+    return status, value, item
+
+
+def _macos_release(item: ctypes.c_void_p) -> None:
+    if item.value:
+        _security, core = _macos_frameworks()
+        core.CFRelease(item)
+
+
+def _macos_require(operation: str, status: int) -> None:
+    if status != 0:
+        raise SecureStoreError(f"macOS Keychain {operation} failed with status {status}.")
+
+
+def _macos_load(service: str, key: str) -> bytes | None:
+    status, value, item = _macos_find(service, key)
+    try:
+        if status == _MACOS_ITEM_NOT_FOUND:
+            return None
+        _macos_require("lookup", status)
+        return value
+    finally:
+        _macos_release(item)
+
+
+def _macos_save(service: str, key: str, value: bytes) -> None:
+    status, _existing, item = _macos_find(service, key)
+    security, _core = _macos_frameworks()
+    buffer = ctypes.create_string_buffer(value)
+    try:
+        if status == 0:
+            result = security.SecKeychainItemModifyAttributesAndData(
+                item, None, len(value), ctypes.cast(buffer, ctypes.c_void_p)
+            )
+        elif status == _MACOS_ITEM_NOT_FOUND:
+            service_bytes = service.encode("utf-8")
+            key_bytes = key.encode("utf-8")
+            created = ctypes.c_void_p()
+            result = security.SecKeychainAddGenericPassword(
+                None,
+                len(service_bytes),
+                service_bytes,
+                len(key_bytes),
+                key_bytes,
+                len(value),
+                ctypes.cast(buffer, ctypes.c_void_p),
+                ctypes.byref(created),
+            )
+            _macos_release(created)
+        else:
+            _macos_require("lookup before save", status)
+            return
+        _macos_require("save", result)
+    finally:
+        _macos_release(item)
+
+
+def _macos_delete(service: str, key: str) -> None:
+    status, _value, item = _macos_find(service, key)
+    try:
+        if status == _MACOS_ITEM_NOT_FOUND:
+            return
+        _macos_require("lookup before delete", status)
+        security, _core = _macos_frameworks()
+        _macos_require("delete", security.SecKeychainItemDelete(item))
+    finally:
+        _macos_release(item)
+
+
 class PlatformSecretStore:
     _SERVICE = "me.egigoka.pomodorough.iroh"
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        service: str = _SERVICE,
+        kind: str = "iroh",
+        label: str = "Pomodorough Iroh",
+    ) -> None:
         self.root = root or user_config_path(
             "pomodorough", appauthor=False, roaming=True
         ) / "iroh-secrets-v1"
+        self.service = service
+        self.kind = kind
+        self.label = label
 
     def availability(self) -> tuple[bool, str]:
         if os.name == "nt":
@@ -85,7 +205,7 @@ class PlatformSecretStore:
         command = "security" if sys_platform() == "darwin" else "secret-tool"
         if shutil.which(command):
             return True, f"{command} secure storage ready"
-        return False, f"Iroh requires platform secure storage ({command} was not found)."
+        return False, f"{self.label} requires platform secure storage ({command} was not found)."
 
     def load(self, key: str) -> bytes | None:
         self._validate_key(key)
@@ -98,6 +218,8 @@ class PlatformSecretStore:
             except OSError as error:
                 raise SecureStoreError(f"Secure value could not be read: {error}") from error
             return self._windows_unprotect(encrypted)
+        if sys_platform() == "darwin":
+            return _macos_load(self.service, key)
         command = self._command("find")
         result = self._run(command)
         if result.returncode != 0:
@@ -125,16 +247,15 @@ class PlatformSecretStore:
         if os.name == "nt":
             self._write_private(self._windows_path(key), self._windows_protect(value))
             return
-        encoded = base64.b64encode(value).decode("ascii")
-        command = self._command("save")
-        input_text = encoded
         if sys_platform() == "darwin":
-            command.append(encoded)
-            input_text = None
-        result = self._run(command, input_text=input_text)
+            _macos_save(self.service, key, value)
+            return
+        encoded = base64.b64encode(value).decode("ascii")
+        result = self._run(self._command("save"), input_text=encoded)
         if result.returncode != 0:
             raise SecureStoreError(
-                result.stderr.strip() or "Platform secure storage rejected Iroh credentials."
+                result.stderr.strip()
+                or f"Platform secure storage rejected {self.label} credentials."
             )
 
     def delete(self, key: str) -> None:
@@ -146,6 +267,9 @@ class PlatformSecretStore:
                 pass
             except OSError as error:
                 raise SecureStoreError(f"Secure value could not be deleted: {error}") from error
+            return
+        if sys_platform() == "darwin":
+            _macos_delete(self.service, key)
             return
         available, reason = self.availability()
         if not available:
@@ -161,23 +285,23 @@ class PlatformSecretStore:
         if sys_platform() == "darwin":
             if operation == "find":
                 return [
-                    "security", "find-generic-password", "-s", self._SERVICE,
+                    "security", "find-generic-password", "-s", self.service,
                     "-a", self._active_key, "-w",
                 ]
             if operation == "save":
                 return [
-                    "security", "add-generic-password", "-U", "-s", self._SERVICE,
+                    "security", "add-generic-password", "-U", "-s", self.service,
                     "-a", self._active_key, "-w",
                 ]
             return [
-                "security", "delete-generic-password", "-s", self._SERVICE,
+                "security", "delete-generic-password", "-s", self.service,
                 "-a", self._active_key,
             ]
-        attributes = ["service", "pomodorough", "kind", "iroh", "key", self._active_key]
+        attributes = ["service", "pomodorough", "kind", self.kind, "key", self._active_key]
         if operation == "find":
             return ["secret-tool", "lookup", *attributes]
         if operation == "save":
-            return ["secret-tool", "store", "--label=Pomodorough Iroh", *attributes]
+            return ["secret-tool", "store", f"--label={self.label}", *attributes]
         return ["secret-tool", "clear", *attributes]
 
     @staticmethod
@@ -265,7 +389,7 @@ def _windows_crypt(value: bytes, *, protect: bool) -> bytes:
         ctypes.byref(target),
     )
     if not function(*arguments):
-        raise SecureStoreError("Windows Data Protection API rejected Iroh credentials.")
+        raise SecureStoreError("Windows Data Protection API rejected secure credentials.")
     try:
         return ctypes.string_at(target.pbData, target.cbData)
     finally:

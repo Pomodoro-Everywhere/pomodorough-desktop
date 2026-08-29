@@ -127,7 +127,7 @@ class StoreBranchMatrixTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
-    def test_public_mutation_validation_and_ownership_boundaries(self) -> None:
+    def test_public_mutation_validation_boundaries(self) -> None:
         for operation in (
             lambda: self.store.set_selected_phase("unknown"),
             lambda: self.store.set_auto_start_breaks(1),
@@ -137,10 +137,6 @@ class StoreBranchMatrixTests(unittest.TestCase):
         ):
             with self.subTest(operation=operation), self.assertRaises(ValueError):
                 operation()
-        self.assertFalse(self.store.owns_timer(None))
-        self.store._set_meta("replicationMode", "iroh")
-        self.assertFalse(self.store.owns_timer({"id": "timer", "startedByDeviceId": "other"}))
-
     def test_persisted_shape_and_clock_guards(self) -> None:
         self.store._set_meta("commandPhysicalTimes", [])
         with self.assertRaises(ValueError):

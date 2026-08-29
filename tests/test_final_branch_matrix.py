@@ -28,6 +28,7 @@ from pomodorough.network_account import (
 )
 from pomodorough.network_session import ApiError, SessionState
 from pomodorough.shared_core import (
+    CORE_COMMIT,
     ProjectionApplyV2,
     ProjectionWinningOperationIds,
     SharedCore,
@@ -35,14 +36,13 @@ from pomodorough.shared_core import (
     SharedCoreError,
     _DispatchBuffers,
     _exact_object,
-    _operation_winner,
     _read_packaged_wasm,
     _validated_duration_winners,
     _validated_scalar_winner,
     _validated_task_winners,
 )
 from pomodorough.storage import MAX_CLOCK_SKEW_MS, Store, utc_timestamp
-from pomodorough.storage_sync import SyncStorage
+from pomodorough.storage_sync import SyncStorage, SyncStorageDependencies
 from pomodorough.terminal import InvalidAction, LocalTimer
 
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
@@ -150,7 +150,23 @@ class SyncStoreStub:
 class SyncStorageBranchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = SyncStoreStub()
-        self.sync = SyncStorage(self.store)  # type: ignore[arg-type]
+        dependencies = SyncStorageDependencies(
+            connection=self.store.connection,
+            device_id=lambda: self.store.device_id,
+            shared_core=lambda: None,
+            validate_integer=self.store._bounded_integer,
+            response_clock_sample=Mock(),
+            transaction=Mock(),
+            preflight_pending_queues=Mock(),
+            project_operation=Mock(),
+            write_meta=self.store._set_meta,
+            set_trusted_time_anchor=Mock(),
+            validate_sync_response=Mock(),
+            read_meta=self.store.get_meta,
+            load_state=Mock(),
+            replace_meta=self.store.set_meta,
+        )
+        self.sync = SyncStorage(dependencies)
 
     def test_wire_preferences_strip_local_device_and_reject_corrupt_collections(self) -> None:
         operation = {"id": "operation-1", "deviceId": DEVICE_ID, "enabled": True}
@@ -387,7 +403,27 @@ class SharedCoreBoundaryTests(unittest.TestCase):
             _validated_duration_winners(
                 {"focus": "duration-operation"}, {"focus": [duration]}, {"focus": 120_000}
             )
-        self.assertIsNone(_operation_winner([], "empty"))
+
+    def test_winner_validation_accepts_core_selected_non_maximum_operation(self) -> None:
+        older = {
+            "id": "older", "taskId": "task-id", "type": "upsert",
+            "title": "Core choice", "hlcWallMs": 1, "hlcCounter": 0,
+            "deviceId": "device-a",
+        }
+        newer = {
+            "id": "newer", "taskId": "task-id", "type": "upsert",
+            "title": "Native maximum", "hlcWallMs": 2, "hlcCounter": 0,
+            "deviceId": "device-b",
+        }
+
+        self.assertEqual(
+            _validated_task_winners(
+                {"task-id": "older"},
+                {"task-id": [older, newer]},
+                {"task-id": {"id": "task-id", "title": "Core choice"}},
+            ),
+            {"task-id": "older"},
+        )
 
     def test_scalar_winner_rejects_wrong_winner_and_wrong_projected_value(self) -> None:
         operation = {
@@ -436,7 +472,7 @@ class SharedCoreBoundaryTests(unittest.TestCase):
             SharedCoreError, "commit mismatch"
         ):
             _read_packaged_wasm()
-        values["CORE_COMMIT"] = "8dc24486b38d87eb2c717e80b4315b31dd6a671d"
+        values["CORE_COMMIT"] = CORE_COMMIT
         with patch("pomodorough.shared_core.files", return_value=Resource(values)), self.assertRaisesRegex(
             SharedCoreError, "manifest is invalid"
         ):
