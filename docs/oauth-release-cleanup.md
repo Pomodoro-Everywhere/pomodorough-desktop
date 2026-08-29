@@ -37,7 +37,7 @@ Set the tag and download the published assets. The release workflow publishes th
 
 ```bash
 export REPOSITORY=Pomodoro-Everywhere/pomodorough-desktop
-export TAG=v0.4.5
+export TAG=v0.5.0
 export VERSION="${TAG#v}"
 export EXPECTED_OAUTH_CLIENT_ID='614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com'
 mkdir -p "scan-$VERSION"
