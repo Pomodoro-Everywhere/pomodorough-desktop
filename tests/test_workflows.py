@@ -19,6 +19,7 @@ HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
 CORE_COMMIT = "0d8603ddaa27f7cbafdeede8784c0a66b2ba959b"
+CORE_RELEASE_TAG = "v0.2.0"
 CORE_SHA256 = "8a9f7e5291bb6ddb09b1fe6d9f027ac9bf137814bfac1bf16a201bbb633cf235"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
 UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
@@ -96,15 +97,16 @@ class SharedCoreProvenanceTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
-    def test_ci_rebuilds_and_verifies_pinned_shared_core(self) -> None:
+    def test_ci_checks_portable_rebuild_and_exact_public_shared_core(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         quality_job = workflow.split("  quality:\n", 1)[1]
         rebuild_step = workflow.split(
-            "      - name: Rebuild and verify pinned shared core\n", 1
+            "      - name: Verify pinned source and released shared core\n", 1
         )[1].split("      - name:", 1)[0]
 
         self.assertIn("runs-on: macos-15", quality_job.split("  dependency-review:", 1)[0])
         self.assertIn(f'CORE_COMMIT: "{CORE_COMMIT}"', workflow)
+        self.assertIn(f'CORE_RELEASE_TAG: "{CORE_RELEASE_TAG}"', workflow)
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
         self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
         self.assertIn("ref: ${{ env.CORE_COMMIT }}", workflow)
@@ -123,18 +125,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "release/pomodorough_core.wasm",
             rebuild_step,
         )
-        invocation = """          python3 scripts/verify_shared_core_provenance.py \\
-            --sha256 "$CORE_SHA256" \\
-            "$rebuilt" \\
-            src/pomodorough/resources/pomodorough_core.wasm
-"""
-        self.assertEqual(rebuild_step.count(invocation), 1)
-        self.assertLess(
-            rebuild_step.index("verify_wasm_artifact.py"),
-            rebuild_step.index("verify_shared_core_provenance.py"),
+        self.assertIn(
+            "releases/download/$CORE_RELEASE_TAG/pomodorough_core.wasm",
+            rebuild_step,
+        )
+        self.assertIn(
+            'cmp "$released" src/pomodorough/resources/pomodorough_core.wasm',
+            rebuild_step,
         )
         self.assertLess(
-            rebuild_step.index("verify_shared_core_provenance.py"),
+            rebuild_step.index('verify_wasm_artifact.py \\\n            "$rebuilt"'),
+            rebuild_step.index('verify_wasm_artifact.py \\\n            "$released"'),
+        )
+        self.assertLess(
+            rebuild_step.index('cmp "$released"'),
             rebuild_step.index("grep -Fx"),
         )
 

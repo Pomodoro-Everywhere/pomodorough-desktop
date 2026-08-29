@@ -163,6 +163,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
         with (
             patch("pomodorough.secure_store.os.name", "posix"),
             patch("pomodorough.secure_store.sys_platform", return_value="darwin"),
+            patch.object(self.store, "availability", return_value=(True, "ready")),
             patch("pomodorough.secure_store._macos_save") as save,
             patch("pomodorough.secure_store.subprocess.run") as run,
         ):
