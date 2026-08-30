@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from concurrent.futures import CancelledError, Future
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Coroutine
 
@@ -91,6 +92,11 @@ class IrohService(QObject):
         self._invite_requested = False
         self._session_lock: asyncio.Lock | None = None
         self._authenticated_connections = 0
+        self.workspace_lock = threading.RLock()
+        self.join_allowed: Callable[[], bool] | None = None
+        self.join_pending = False
+        self.join_outcome: str | None = None
+        self._join_generation = 0
 
     @staticmethod
     def availability() -> tuple[bool, str]:
@@ -121,16 +127,84 @@ class IrohService(QObject):
         return self._endpoint is not None and not self._closing
 
     def start_room(self, room_id: str, *, emit_invite: bool = False) -> None:
+        self._invalidate_join()
         self._submit(
             self._serialized(self._start_room(room_id, emit_invite=emit_invite)),
             tracked=True,
         )
 
     def join_room(self, invite: RoomInvite) -> None:
-        self._submit(self._serialized(self._join_room(invite)), tracked=True)
+        self._submit_join(invite.room_id, invite)
 
     def resume_join(self, room_id: str) -> None:
-        self._submit(self._serialized(self._resume_join(room_id)), tracked=True)
+        self._submit_join(room_id, None)
+
+    def _invalidate_join(self) -> None:
+        with self.workspace_lock:
+            self._join_generation += 1
+            self.join_pending = False
+            self.join_outcome = None
+
+    def _submit_join(self, room_id: str, invite: RoomInvite | None) -> None:
+        with self.workspace_lock:
+            self._invalidate_join()
+            self.join_pending = True
+            generation = self._join_generation
+            allowed, self.join_allowed = self.join_allowed, None
+            operation = self._run_join(room_id, invite, generation, allowed)
+            try:
+                future = None if self._closing else self._submit(operation, tracked=True)
+            except Exception:
+                operation.close()
+                self.join_pending = False
+                self.join_outcome = "failed"
+                raise
+            if future is None:
+                operation.close()
+                self.join_pending = False
+                self.join_outcome = "failed"
+                self.failure.emit("Iroh room join could not start.")
+
+    async def _run_join(
+        self, room_id: str, invite: RoomInvite | None, generation: int,
+        allowed: Callable[[], bool] | None,
+    ) -> None:
+        operation = self._join_current(room_id, invite, generation, allowed)
+        try:
+            await self._serialized(operation)
+        except asyncio.CancelledError:
+            with self.workspace_lock:
+                if generation == self._join_generation:
+                    self.join_pending = False
+                    self.join_outcome = "cancelled"
+                    self.failure.emit("Iroh room join cancelled.")
+            raise
+        except Exception:
+            with self.workspace_lock:
+                if generation == self._join_generation:
+                    self.join_outcome = "failed"
+                    raise
+        finally:
+            operation.close()
+            with self.workspace_lock:
+                if generation == self._join_generation:
+                    self.join_pending = False
+
+    async def _join_current(
+        self, room_id: str, invite: RoomInvite | None, generation: int,
+        allowed: Callable[[], bool] | None,
+    ) -> None:
+        with self.workspace_lock:
+            if generation != self._join_generation or self._closing:
+                return
+        try:
+            if invite is None:
+                await self._resume_join(room_id, generation, allowed)
+            else:
+                await self._join_room(invite, generation, allowed)
+        except asyncio.CancelledError:
+            await self._stop_endpoint()
+            raise
 
     def refresh_invite(self) -> None:
         if self._room_id is None:
@@ -142,6 +216,7 @@ class IrohService(QObject):
         self._submit(self._serialized(self._sync_known_peers()), tracked=True)
 
     def stop(self) -> None:
+        self._invalidate_join()
         if self._loop is None:
             self.status_changed.emit("NOT CONNECTED")
             return
@@ -149,6 +224,8 @@ class IrohService(QObject):
         self._submit(self._stop_endpoint())
 
     def shutdown(self) -> None:
+        self._closing = True
+        self._invalidate_join()
         loop = self._loop
         thread = self._thread
         if loop is None or thread is None:
@@ -356,10 +433,15 @@ class IrohService(QObject):
             create_invite(secret, ticket, room.get("roomName"))
         )
 
-    async def _join_room(self, invite: RoomInvite) -> None:
+    async def _join_room(
+        self, invite: RoomInvite, generation: int | None = None,
+        allowed: Callable[[], bool] | None = None,
+    ) -> None:
         import iroh
 
         store = self._required_store()
+        generation = self._join_generation if generation is None else generation
+        origin = (store.replication_mode, store.active_iroh_room_id)
         try:
             await self._start_room(invite.room_id, emit_invite=False)
             endpoint = self._required_endpoint()
@@ -372,16 +454,36 @@ class IrohService(QObject):
                 connection.close(1, b"ticket identity mismatch")
                 raise IrohProtocolError("Connected endpoint does not match invite ticket.")
             await self._exchange(connection)
-            store.activate_joined_iroh_room(invite.room_id)
+            self._complete_join(invite.room_id, generation, allowed, origin)
         except Exception:
             await self._stop_endpoint()
             raise
-        self.projection_changed.emit()
-        self.joined.emit()
-        self._emit_details()
 
-    async def _resume_join(self, room_id: str) -> None:
+    def _complete_join(
+        self, room_id: str, generation: int, allowed: Callable[[], bool] | None,
+        origin: tuple[str, str | None],
+    ) -> None:
+        with self.workspace_lock:
+            if generation != self._join_generation or self._closing:
+                return
+            store = self._required_store()
+            if ((allowed is not None and not allowed())
+                    or origin != (store.replication_mode, store.active_iroh_room_id)):
+                raise IrohProtocolError("Iroh room join was superseded.")
+            store.activate_joined_iroh_room(room_id)
+            self.join_pending = False
+            self.join_outcome = "joined"
+            self.projection_changed.emit()
+            self.joined.emit()
+            self._emit_details()
+
+    async def _resume_join(
+        self, room_id: str, generation: int | None = None,
+        allowed: Callable[[], bool] | None = None,
+    ) -> None:
         store = self._required_store()
+        generation = self._join_generation if generation is None else generation
+        origin = (store.replication_mode, store.active_iroh_room_id)
         await self._start_room(room_id, emit_invite=False)
         peers = store.iroh_peers(room_id)
         if not peers:
@@ -399,10 +501,7 @@ class IrohService(QObject):
                 if str(connection.remote_id()) != peer["endpointId"]:
                     raise IrohProtocolError("Connected peer identity changed.")
                 await self._exchange(connection)
-                store.activate_joined_iroh_room(room_id)
-                self.projection_changed.emit()
-                self.joined.emit()
-                self._emit_details()
+                self._complete_join(room_id, generation, allowed, origin)
                 return
             except Exception as error:
                 last_error = error

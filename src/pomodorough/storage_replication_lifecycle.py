@@ -58,13 +58,13 @@ class RoomWorkspaceLifecycle:
                 "Room name must contain 1 through 64 Unicode scalar values."
             )
         room_id = room_id_for_secret(room_secret)
-        genesis = self._dependencies.projection.projected_local_genesis()
-        record, digest = self._validated_genesis(genesis)
-        return_workspace = self._dependencies.workspace.capture()
-        room_workspace = self._dependencies.projection.empty_workspace(genesis)
-        created_at = now_ms if now_ms is not None else int(time.time() * 1000)
         with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
             with self._dependencies.immediate_transaction():
+                genesis = self._dependencies.projection.projected_local_genesis()
+                record, digest = self._validated_genesis(genesis)
+                return_workspace = self._dependencies.workspace.capture()
+                room_workspace = self._dependencies.projection.empty_workspace(genesis)
+                created_at = now_ms if now_ms is not None else int(time.time() * 1000)
                 self._create_room_locked(
                     room_id,
                     room_secret,

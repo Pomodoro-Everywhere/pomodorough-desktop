@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -443,12 +445,51 @@ def _read_oauth_credentials() -> dict[str, str]:
     return implicit
 
 
+class _CallbackReader(io.RawIOBase):
+    def __init__(
+        self, connection: socket.socket, deadline: float, cancelled: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.connection = connection
+        self.deadline = deadline
+        self.cancelled = cancelled
+
+    def readable(self) -> bool:
+        return True
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if self.cancelled.is_set() or remaining <= 0:
+            raise TimeoutError("OAuth callback read interrupted")
+        return remaining
+
+    def readinto(self, buffer: Any) -> int:
+        while True:
+            self.connection.settimeout(min(0.05, self.remaining()))
+            try:
+                return self.connection.recv_into(buffer)
+            except TimeoutError:
+                continue
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     result_queue: queue.Queue[dict[str, str]]
+    deadline: float
+    cancelled: threading.Event
+
+    def setup(self) -> None:
+        super().setup()
+        self.rfile.close()
+        self.callback_reader = _CallbackReader(
+            self.connection, self.deadline, self.cancelled,
+        )
+        self.rfile = io.BufferedReader(self.callback_reader)
 
     def do_GET(self) -> None:  # noqa: N802 - HTTP handler API
+        self.callback_reader.remaining()
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         result = {key: values[0] for key, values in query.items() if values}
+        self.callback_reader.remaining()
         self.result_queue.put(result)
         ok = "code" in result
         title = _text(
@@ -503,10 +544,10 @@ class SystemOAuthBrowserTransport:
         handler = type(
             "CallbackHandler",
             (_CallbackHandler,),
-            {"result_queue": callback_results},
+            {"result_queue": callback_results, "cancelled": self._cancelled},
         )
         server = HTTPServer(("127.0.0.1", 0), handler)
-        deadline = time.monotonic() + self._callback_timeout
+        handler.deadline = deadline = time.monotonic() + self._callback_timeout
         redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
         try:
             opener = self._open_browser or webbrowser.open

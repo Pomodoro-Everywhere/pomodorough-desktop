@@ -266,11 +266,15 @@ class NetworkScreen(QFrame):
             available,
             unavailable_reason,
             invite,
+            joining=bool(iroh_details.get("joinPending")),
         )
         if room is None:
             self._render_without_room(available, unavailable_reason)
         else:
             self._render_room(room, iroh_details)
+        if iroh_details.get("joinPending"):
+            self.leave_room_button.setText(self.strings.text("action.cancel"))
+            self.leave_room_button.setAccessibleName(self.strings.text("action.cancel"))
 
     def _render_controls(
         self,
@@ -279,6 +283,7 @@ class NetworkScreen(QFrame):
         available: bool,
         unavailable_reason: str,
         invite: str,
+        *, joining: bool = False,
     ) -> None:
         active = replication_mode == "iroh" and room is not None
         self.network_unavailable.setText(unavailable_reason)
@@ -289,12 +294,14 @@ class NetworkScreen(QFrame):
             if available and room is None
             else ""
         )
-        self.iroh_panel.setEnabled(available)
-        self.create_room_button.setEnabled(available and not active)
-        self.join_room_button.setEnabled(available and not active)
-        self.refresh_invite_button.setEnabled(available and active)
-        self.sync_iroh_button.setEnabled(available and active)
-        self.leave_room_button.setEnabled(active)
+        self.iroh_panel.setEnabled(available or joining)
+        self.create_room_button.setEnabled(available and not active and not joining)
+        self.join_room_button.setEnabled(available and not active and not joining)
+        self.refresh_invite_button.setEnabled(available and active and not joining)
+        self.sync_iroh_button.setEnabled(available and active and not joining)
+        self.leave_room_button.setEnabled(active or joining)
+        self.leave_room_button.setText(self.strings.text("network.leave_room"))
+        self.leave_room_button.setAccessibleName(self.strings.text("network.leave_room"))
         self.copy_invite_button.setEnabled(bool(invite))
         if self.invite_output.toPlainText() != invite:
             self.invite_output.setPlainText(invite)
