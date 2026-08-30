@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from pomodorough import oauth_production_signoff as signoff
+
+
+class _SecretStore:
+    def __init__(self) -> None:
+        self.value: bytes | None = b"stored-refresh"
+
+    def load(self, _key: str) -> bytes | None:
+        return self.value
+
+
+class _TokenStore:
+    def __init__(self) -> None:
+        self.secret_store = _SecretStore()
+        self.secret_key = "oauth:test-device"
+
+
+class _Accounts:
+    def __init__(self, store: _TokenStore) -> None:
+        self.store = store
+        self.signed_out = False
+        self.revoked = False
+
+    def sign_out(self) -> object:
+        self.signed_out = True
+        self.store.secret_store.value = None
+        return object()
+
+    def revoke(self, _state: object) -> None:
+        self.revoked = True
+
+
+class _Service:
+    def __init__(self) -> None:
+        self.access_token = "access"
+        self.refresh_token = "refresh"
+        self.token_store = _TokenStore()
+        self._accounts = _Accounts(self.token_store)
+        self.shutdown_called = False
+
+    def _authorize_google(self) -> dict[str, str]:
+        return {"id": "private-account", "email": "private@example.test"}
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class ProductionOAuthSignoffTests(unittest.TestCase):
+    def test_receipt_hashes_account_and_excludes_private_profile(self) -> None:
+        fingerprint = signoff._account_fingerprint(
+            {"id": "private-account", "email": "private@example.test"}
+        )
+        receipt = signoff._receipt("wheel", "a" * 64, "public-client", fingerprint)
+        encoded = json.dumps(receipt)
+
+        self.assertTrue(fingerprint.startswith("sha256:"))
+        self.assertNotIn("private-account", encoded)
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("access", encoded)
+        self.assertNotIn("refresh", encoded)
+
+    def test_success_proves_restart_then_cleans_both_session_copies(self) -> None:
+        service = _Service()
+        with (
+            patch.object(signoff, "_new_service", return_value=service),
+            patch.object(signoff, "_restart_in_child", return_value=True) as restart,
+        ):
+            fingerprint = signoff._execute_signoff(Path("/tmp/signoff"), "device")
+
+        restart.assert_called_once_with(Path("/tmp/signoff"), "device", fingerprint)
+        self.assertTrue(service._accounts.signed_out)
+        self.assertTrue(service._accounts.revoked)
+        self.assertTrue(service.shutdown_called)
+
+    def test_restart_failure_still_removes_and_revokes_credentials(self) -> None:
+        service = _Service()
+        with (
+            patch.object(signoff, "_new_service", return_value=service),
+            patch.object(signoff, "_restart_in_child", return_value=False),
+            self.assertRaisesRegex(signoff.ProductionSignoffError, "restoration"),
+        ):
+            signoff._execute_signoff(Path("/tmp/signoff"), "device")
+
+        self.assertTrue(service._accounts.signed_out)
+        self.assertTrue(service._accounts.revoked)
+        self.assertTrue(service.shutdown_called)
+
+    def test_sign_in_failure_still_removes_and_revokes_partial_session(self) -> None:
+        service = _Service()
+        with (
+            patch.object(signoff, "_new_service", return_value=service),
+            patch.object(service, "_authorize_google", side_effect=RuntimeError),
+            self.assertRaisesRegex(signoff.ProductionSignoffError, "sign-in"),
+        ):
+            signoff._execute_signoff(Path("/tmp/signoff"), "device")
+
+        self.assertTrue(service._accounts.signed_out)
+        self.assertTrue(service._accounts.revoked)
+        self.assertTrue(service.shutdown_called)
+
+    def test_packaged_credentials_reject_active_override(self) -> None:
+        packaged = {"client_id": "packaged", "client_secret": ""}
+        active = {"client_id": "override", "client_secret": ""}
+        with (
+            patch.object(signoff, "_parse_oauth_credentials", return_value=packaged),
+            patch.object(signoff, "_read_oauth_credentials", return_value=active),
+            self.assertRaisesRegex(signoff.ProductionSignoffError, "differs"),
+        ):
+            signoff._packaged_oauth_credentials()
+
+    def test_run_rejects_invalid_digest_before_sign_in(self) -> None:
+        with (
+            patch.object(signoff, "_execute_signoff") as execute,
+            self.assertRaisesRegex(signoff.ProductionSignoffError, "SHA-256"),
+        ):
+            signoff.run_production_signoff("wheel", "not-a-digest")
+
+        execute.assert_not_called()
+
+    def test_receipt_file_is_private_and_never_overwritten(self) -> None:
+        receipt = {"schemaVersion": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            signoff._write_receipt(receipt, str(path))
+            mode = stat.S_IMODE(path.stat().st_mode)
+
+            self.assertEqual(json.loads(path.read_text()), receipt)
+            self.assertEqual(mode, 0o600)
+            with self.assertRaises(FileExistsError):
+                signoff._write_receipt(receipt, str(path))
+
+    def test_child_environment_drops_sensitive_operator_inputs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COMPROMISED_GOOGLE_CLIENT_SECRET": "secret",
+                "POMODOROUGH_GOOGLE_OAUTH_JSON": "/tmp/override.json",
+            },
+        ):
+            environment = signoff._child_environment()
+
+        self.assertNotIn("COMPROMISED_GOOGLE_CLIENT_SECRET", environment)
+        self.assertNotIn("POMODOROUGH_GOOGLE_OAUTH_JSON", environment)
+
+
+if __name__ == "__main__":
+    unittest.main()

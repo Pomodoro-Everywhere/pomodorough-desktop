@@ -159,6 +159,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         workflow = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn("--hidden-import pomodorough.shared_core", workflow)
+        self.assertIn(
+            "--hidden-import pomodorough.oauth_production_signoff", workflow
+        )
         self.assertIn("--collect-all wasmtime", workflow)
         self.assertIn("WaitForExit(120000)", workflow)
 
@@ -236,6 +239,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('main(["--platform-store-self-test"])', launcher)
         self.assertIn("--platform-store-verifier-child", launcher)
         self.assertIn('main(["--platform-store-child", *sys.argv[2:]])', launcher)
+
+    def test_windows_artifact_exposes_production_oauth_signoff(self) -> None:
+        launcher = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+
+        self.assertIn("POMODOROUGH_OAUTH_PRODUCTION_SIGNOFF", launcher)
+        self.assertIn("POMODOROUGH_OAUTH_SIGNOFF_RECEIPT", launcher)
+        self.assertIn("POMODOROUGH_OAUTH_ASSET_SHA256", launcher)
+        self.assertIn("--oauth-production-restart-child", launcher)
+        self.assertIn("oauth_production_signoff import main", launcher)
+        self.assertIn('"--artifact",\n                "windows"', launcher)
 
     def test_packaged_smoke_processes_never_receive_scan_secret(self) -> None:
         windows = WINDOWS_WORKFLOW.read_text(encoding="utf-8")

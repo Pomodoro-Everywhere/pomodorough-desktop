@@ -160,6 +160,68 @@ Remove-Item Env:POMODOROUGH_PLATFORM_STORE_SELF_TEST
 
 The second Windows mode verifies a DPAPI save followed by load and delete in a second packaged process, then confirms absence in the parent. Neither mode prints the value.
 
+## Record production sign-off receipts
+
+Run production sign-off only after the three downloaded assets pass checksum, attestation, unpacked-resource, and secret scans. Use the same dedicated Google test account for every artifact. The command opens the real Google authorization page, exchanges the result with `https://pomodorough.egigoka.me`, validates production `/api/v1/me`, starts a second packaged process to restore the same account from the platform secret store, deletes the local credential, and logs out the server session.
+
+Each successful command writes a receipt containing the release version, asset SHA-256, public OAuth client ID, production API origin, platform, completion time, boolean checks, and a one-way account-ID fingerprint. It never writes an access token, refresh token, Google token, email, name, avatar URL, client secret, or device ID. Keep receipts outside every repository: the fingerprint is credential-free but still correlates one account across runs.
+
+On Linux, create a private record directory outside the checkout. Install and verify the downloaded wheel itself:
+
+```bash
+export PRIVATE_RECORD="$HOME/pomodorough-private-release-$VERSION"
+mkdir -m 700 "$PRIVATE_RECORD"
+WHEEL="pomodorough_linux-$VERSION-py3-none-any.whl"
+WHEEL_SHA256="$(awk -v asset="$WHEEL" '$2 == asset { print $1 }' SHA256SUMS.txt)"
+test "${#WHEEL_SHA256}" -eq 64
+python3 -m venv wheel-signoff
+wheel-signoff/bin/python -m pip install "./$WHEEL"
+wheel-signoff/bin/python -m pomodorough.oauth_production_signoff \
+  --artifact wheel \
+  --asset-sha256 "$WHEEL_SHA256" \
+  --receipt - >"$PRIVATE_RECORD/wheel.json"
+chmod 600 "$PRIVATE_RECORD/wheel.json"
+```
+
+Install the downloaded Flatpak, then sign off from its packaged Python process. Shell redirection writes the receipt on the host, outside the Flatpak sandbox:
+
+```bash
+FLATPAK_ASSET="Pomodorough-$VERSION-x86_64.flatpak"
+FLATPAK_SHA256="$(awk -v asset="$FLATPAK_ASSET" '$2 == asset { print $1 }' SHA256SUMS.txt)"
+test "${#FLATPAK_SHA256}" -eq 64
+flatpak install --user "./$FLATPAK_ASSET"
+flatpak run --user --command=python3 \
+  me.egigoka.Pomodorough \
+  -m pomodorough.oauth_production_signoff \
+  --artifact flatpak \
+  --asset-sha256 "$FLATPAK_SHA256" \
+  --receipt - >"$PRIVATE_RECORD/flatpak.json"
+chmod 600 "$PRIVATE_RECORD/flatpak.json"
+```
+
+On Windows, create a private directory outside the checkout and launch the downloaded executable in production sign-off mode. The receipt path must not already exist:
+
+```powershell
+$Asset = ".\Pomodorough-$VERSION-windows-x86_64.exe"
+$PrivateRecord = Join-Path $HOME "pomodorough-private-release-$VERSION"
+$Receipt = Join-Path $PrivateRecord "windows.json"
+New-Item -ItemType Directory -Force $PrivateRecord | Out-Null
+if (Test-Path $Receipt) { throw "Receipt already exists: $Receipt" }
+$env:POMODOROUGH_OAUTH_PRODUCTION_SIGNOFF = "1"
+$env:POMODOROUGH_OAUTH_ASSET_SHA256 = (Get-FileHash $Asset -Algorithm SHA256).Hash
+$env:POMODOROUGH_OAUTH_SIGNOFF_RECEIPT = $Receipt
+try {
+  $signoff = Start-Process $Asset -PassThru -Wait
+  if ($signoff.ExitCode -ne 0) { throw "Production OAuth sign-off failed" }
+} finally {
+  Remove-Item Env:POMODOROUGH_OAUTH_PRODUCTION_SIGNOFF
+  Remove-Item Env:POMODOROUGH_OAUTH_ASSET_SHA256
+  Remove-Item Env:POMODOROUGH_OAUTH_SIGNOFF_RECEIPT
+}
+```
+
+Inspect the three private JSON receipts. Require the same `releaseTag`, `artifactVersion`, `production.apiBase`, `production.oauthClientId`, and `production.accountFingerprint`; require distinct `artifact` values; match every `assetSha256` to `SHA256SUMS.txt`; and require every `checks` value to be `true`. Any command failure attempts local credential deletion and production logout but emits no receipt. Resolve the failure and repeat with a new receipt path.
+
 ## Close the blocked external release cleanup
 
 Close the external OAuth release-cleanup item only when all of these facts are recorded in the private release record:
@@ -169,5 +231,6 @@ Close the external OAuth release-cleanup item only when all of these facts are r
 - A downloaded wheel, Flatpak, and Windows artifact each complete Google sign-in without a client secret.
 - Each artifact displays the authenticated account returned by production `/api/v1/me`.
 - Each artifact restores the account after the process exits and starts again.
+- Private sign-off receipts bind those checks to the same release assets and account fingerprint.
 - The downloaded wheel, Flatpak, and Windows assets match `SHA256SUMS.txt` and their GitHub attestations.
 - The unpacked Flatpak and PyInstaller payloads contain no non-empty `client_secret` and no byte sequence equal to the compromised secret.

@@ -65,6 +65,7 @@ jobs:
             --collect-data pomodorough `
             --hidden-import pomodorough.shared_core `
             --hidden-import pomodorough.oauth_artifact_verifier `
+            --hidden-import pomodorough.oauth_production_signoff `
             --collect-all wasmtime `
             deploy/windows/launcher.py
 
