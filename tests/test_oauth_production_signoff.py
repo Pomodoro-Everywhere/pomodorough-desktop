@@ -52,7 +52,7 @@ def restrict_windows_receipt_directory(path: Path) -> None:
 def windows_receipt_acl(path: Path) -> dict:
     return json.loads(windows_acl_command(path, """
         $operator = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = Get-Acl -LiteralPath $env:POMODOROUGH_TEST_ACL_PATH
+        $acl = [System.IO.File]::GetAccessControl($env:POMODOROUGH_TEST_ACL_PATH)
         $rules = @($acl.GetAccessRules($true, $true,
             [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
             @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited;
@@ -123,6 +123,32 @@ class WindowsReceiptAclFixtureTests(unittest.TestCase):
         self.assertIn("$acl.AddAccessRule($rule)", script)
         self.assertIn("[System.IO.Directory]::SetAccessControl($env:POMODOROUGH_TEST_ACL_PATH, $acl)", script)
         self.assertNotIn("Set-Acl", script)
+        self.assertNotIn(str(path), script)
+        self.assertEqual(run.call_args.kwargs["env"]["POMODOROUGH_TEST_ACL_PATH"], str(path))
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_fixture_reads_file_dacl_without_provider_get_acl(self) -> None:
+        path = Path("receipt directory's [literal] name") / "receipt.json"
+        expected = {"operator": "operator-sid", "rules": [
+            {"sid": "operator-sid", "inherited": True, "access": "Allow", "rights": "FullControl"},
+        ]}
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(expected))) as run:
+            actual = windows_receipt_acl(path)
+
+        self.assertEqual(actual, expected)
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        script = arguments[4]
+        self.assertNotIn("get-acl", script.lower())
+        self.assertIn("$ErrorActionPreference = 'Stop'", script)
+        self.assertIn("[System.Security.Principal.WindowsIdentity]::GetCurrent().User", script)
+        self.assertIn("[System.IO.File]::GetAccessControl($env:POMODOROUGH_TEST_ACL_PATH)", script)
+        self.assertIn("$acl.GetAccessRules($true, $true,", script)
+        self.assertIn("[System.Security.Principal.SecurityIdentifier]", script)
+        self.assertIn("sid = $_.IdentityReference.Value; inherited = $_.IsInherited", script)
+        self.assertIn("access = $_.AccessControlType.ToString(); rights = $_.FileSystemRights.ToString()", script)
+        self.assertIn("@{ operator = $operator.Value; rules = $rules }", script)
         self.assertNotIn(str(path), script)
         self.assertEqual(run.call_args.kwargs["env"]["POMODOROUGH_TEST_ACL_PATH"], str(path))
         self.assertTrue(run.call_args.kwargs["check"])
