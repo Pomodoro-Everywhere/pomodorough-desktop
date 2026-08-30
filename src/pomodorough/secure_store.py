@@ -7,6 +7,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
@@ -19,12 +22,64 @@ class SecureStoreError(OSError):
     pass
 
 
+class TokenCleanupPendingError(SecureStoreError):
+    pass
+
+
 class SecretStore(Protocol):
     def load(self, key: str) -> bytes | None: ...
 
     def save(self, key: str, value: bytes) -> None: ...
 
     def delete(self, key: str) -> None: ...
+
+
+_SECRET_MUTATION_LOCK = threading.RLock()
+
+
+@contextmanager
+def secret_store_lock(store: SecretStore | None, key: str) -> Iterator[None]:
+    with _SECRET_MUTATION_LOCK:
+        if isinstance(store, PlatformSecretStore):
+            with store.lock(key):
+                yield
+        else:
+            yield
+
+
+@contextmanager
+def token_store_lock(store: SecretStore | None, key: str, fallback: Path) -> Iterator[None]:
+    fallback = fallback.resolve()
+    with secret_store_lock(store, key), _file_lock(fallback.with_name(f".{fallback.name}.lock")):
+        yield
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "r+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class SecretMutationJournal:
@@ -199,6 +254,22 @@ class PlatformSecretStore:
         self.kind = kind
         self.label = label
 
+    def _lock_path(self, key: str) -> Path:
+        if os.name == "nt":
+            root, scope = self.root, key
+        else:
+            root = user_config_path("pomodorough", appauthor=False, roaming=True)
+            namespace = self.service if sys_platform() == "darwin" else self.kind
+            scope = f"{sys_platform()}\0{namespace}\0{key}"
+        name = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        return root / "secure-store-locks-v1" / f"{name}.lock"
+
+    @contextmanager
+    def lock(self, key: str) -> Iterator[None]:
+        self._validate_key(key)
+        with _file_lock(self._lock_path(key)):
+            yield
+
     def availability(self) -> tuple[bool, str]:
         if os.name == "nt":
             return True, "Windows Data Protection API ready"
@@ -220,7 +291,7 @@ class PlatformSecretStore:
             return self._windows_unprotect(encrypted)
         if sys_platform() == "darwin":
             return _macos_load(self.service, key)
-        command = self._command("find")
+        command = self._command("find", key)
         result = self._run(command)
         if result.returncode != 0:
             if self._lookup_not_found(result):
@@ -251,7 +322,7 @@ class PlatformSecretStore:
             _macos_save(self.service, key, value)
             return
         encoded = base64.b64encode(value).decode("ascii")
-        result = self._run(self._command("save"), input_text=encoded)
+        result = self._run(self._command("save", key), input_text=encoded)
         if result.returncode != 0:
             raise SecureStoreError(
                 result.stderr.strip()
@@ -274,30 +345,30 @@ class PlatformSecretStore:
         available, reason = self.availability()
         if not available:
             raise SecureStoreError(reason)
-        result = self._run(self._command("delete"))
+        result = self._run(self._command("delete", key))
         if result.returncode != 0:
             raise SecureStoreError(
                 result.stderr.strip()
                 or "Platform secure storage rejected credential deletion."
             )
 
-    def _command(self, operation: str) -> list[str]:
+    def _command(self, operation: str, key: str) -> list[str]:
         if sys_platform() == "darwin":
             if operation == "find":
                 return [
                     "security", "find-generic-password", "-s", self.service,
-                    "-a", self._active_key, "-w",
+                    "-a", key, "-w",
                 ]
             if operation == "save":
                 return [
                     "security", "add-generic-password", "-U", "-s", self.service,
-                    "-a", self._active_key, "-w",
+                    "-a", key, "-w",
                 ]
             return [
                 "security", "delete-generic-password", "-s", self.service,
-                "-a", self._active_key,
+                "-a", key,
             ]
-        attributes = ["service", "pomodorough", "kind", self.kind, "key", self._active_key]
+        attributes = ["service", "pomodorough", "kind", self.kind, "key", key]
         if operation == "find":
             return ["secret-tool", "lookup", *attributes]
         if operation == "save":
@@ -328,7 +399,6 @@ class PlatformSecretStore:
     def _validate_key(self, key: str) -> None:
         if not isinstance(key, str) or not key or len(key.encode("utf-8")) > 512:
             raise SecureStoreError("Secure storage key is invalid.")
-        self._active_key = key
 
     def _windows_path(self, key: str) -> Path:
         name = hashlib.sha256(key.encode("utf-8")).hexdigest()

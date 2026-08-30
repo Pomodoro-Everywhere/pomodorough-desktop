@@ -8,3 +8,7 @@ build/
 dist/
 google-oauth.json
 *.sqlite3
+.DS_Store
+.cache_ggshield
+.ruff_cache/
+/.audit/

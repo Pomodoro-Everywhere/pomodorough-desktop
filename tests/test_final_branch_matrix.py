@@ -42,8 +42,10 @@ from pomodorough.shared_core import (
     _validated_task_winners,
 )
 from pomodorough.storage import MAX_CLOCK_SKEW_MS, Store, utc_timestamp
+from pomodorough.storage_revocation import PendingSessionRevocations
 from pomodorough.storage_sync import SyncStorage, SyncStorageDependencies
 from pomodorough.terminal import InvalidAction, LocalTimer
+from test_secure_store import MemorySecretStore
 
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
 
@@ -60,23 +62,33 @@ class AccountLifecycleBranchTests(unittest.TestCase):
             self.request,
             lambda key: key,
             lambda: NOW,
+            PendingSessionRevocations(MemorySecretStore({}), "device-1"),
         )
 
     def test_deletion_uses_fresh_token_and_rejects_missing_refresh_or_invalid_response(self) -> None:
-        fresh = AccountDeletionCredentials("fresh", NOW + timedelta(minutes=2), "refresh")
-        self.assertEqual(self.lifecycle._deletion_access(fresh), "fresh")
+        from pomodorough.network_session import AuthenticatedSession
+
+        self.state.authenticated = self.state.deleting_account = True
+        self.state.refresh_token = "refresh"
+        session = AuthenticatedSession(
+            "https://example.test", self.state, self.tokens, self.request,
+            lambda key: key, lambda: NOW, lambda: 0, lambda: 0,
+        )
+        fresh = AccountDeletionCredentials("fresh", NOW + timedelta(minutes=2), "refresh", 0)
+        self.assertEqual(self.lifecycle._deletion_access(fresh, session.accept_tokens), "fresh")
         self.request.assert_not_called()
 
-        missing = AccountDeletionCredentials(None, NOW, None)
+        missing = AccountDeletionCredentials(None, NOW, None, 0)
         with self.assertRaisesRegex(ApiError, "sign_in_required"):
-            self.lifecycle._deletion_access(missing)
+            self.lifecycle._deletion_access(missing, session.accept_tokens)
 
-        expired = AccountDeletionCredentials("expired", NOW, "refresh")
+        expired = AccountDeletionCredentials("expired", NOW, "refresh", 0)
         for response in ({}, {"accessToken": "   "}):
             with self.subTest(response=response):
                 self.request.return_value = response
                 with self.assertRaisesRegex(ApiError, "invalid_token"):
-                    self.lifecycle.refresh_deletion_access(expired)
+                    self.lifecycle.refresh_deletion_access(expired, session.accept_tokens)
+        self.tokens.save.assert_not_called()
 
     def test_revocation_retries_unauthorized_access_with_rotated_refresh(self) -> None:
         revocation = RevocationState("expired", "refresh-one", True)

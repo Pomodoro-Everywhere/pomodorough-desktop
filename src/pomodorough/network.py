@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
@@ -30,16 +31,25 @@ from PySide6.QtNetwork import QNetworkReply
 from .localization import Strings
 from .network_account import (
     AccountLifecycle,
+    LogoutCredentials,
     RevocationState,
+    SignOutCleanupError,
 )
 from .network_revision import RevisionEventParser, RevisionStream
-from .secure_store import PlatformSecretStore, SecretStore, SecureStoreError
 from .network_session import (
     ApiError,
     AuthenticatedSession,
     SessionState,
     TimedDocument as TimedDocument,
 )
+from .secure_store import (
+    PlatformSecretStore,
+    SecretStore,
+    SecureStoreError,
+    TokenCleanupPendingError,
+    token_store_lock,
+)
+from .storage_revocation import PendingSessionRevocations, credential_api_base
 
 _RevisionEventParser = RevisionEventParser
 
@@ -121,6 +131,20 @@ def _config_root() -> Path:
     return user_config_path("pomodorough", appauthor=False, roaming=True)
 
 
+def _oauth_secret_store() -> PlatformSecretStore:
+    return PlatformSecretStore(
+        root=_config_root() / "oauth-secrets-v1",
+        service="me.egigoka.pomodorough.oauth",
+        kind="oauth",
+        label="Pomodorough OAuth",
+    )
+
+
+@dataclass
+class _FallbackCommit:
+    replaced: bool = False
+
+
 class TokenStore:
     def __init__(
         self,
@@ -131,17 +155,39 @@ class TokenStore:
         self.device_id = device_id
         self.fallback_path = fallback_path or (_config_root() / "session.json")
         if secret_store is _DEFAULT_SECRET_STORE:
-            self.secret_store: SecretStore | None = PlatformSecretStore(
-                root=_config_root() / "oauth-secrets-v1",
-                service="me.egigoka.pomodorough.oauth",
-                kind="oauth",
-                label="Pomodorough OAuth",
-            )
+            self.secret_store: SecretStore | None = _oauth_secret_store()
         else:
             self.secret_store = cast(SecretStore | None, secret_store)
         self.secret_key = f"oauth:{device_id}"
+        self.api_base: str | None = None
+        self.revocations = PendingSessionRevocations(
+            self.secret_store or _oauth_secret_store(), device_id
+        )
+
+    def bind_api(self, api_base: str) -> None:
+        api_base = credential_api_base(api_base)
+        if self.api_base is not None and self.api_base != api_base:
+            raise SecureStoreError("Token storage is already bound to another API origin.")
+        self.api_base = api_base
 
     def load(self) -> dict[str, Any] | None:
+        stored = self._load_stored()
+        if self.api_base is not None and stored and stored.get("apiBase") != self.api_base:
+            return None
+        return stored
+
+    def load_for_revocation(self) -> dict[str, Any] | None:
+        stored = self._load_stored()
+        if not stored or "apiBase" not in stored:
+            return None
+        credential_api_base(stored["apiBase"])
+        return stored
+
+    def _load_stored(self) -> dict[str, Any] | None:
+        with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+            return self._read_stored()
+
+    def _read_stored(self) -> dict[str, Any] | None:
         fallback = self._load_fallback()
         if fallback is not None:
             return None if fallback.get("signedOut") is True else fallback
@@ -213,10 +259,16 @@ class TokenStore:
         return document
 
     def save(self, token_response: dict[str, Any]) -> None:
+        with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+            self._save_locked(token_response)
+
+    def _save_locked(self, token_response: dict[str, Any]) -> None:
         stored = {
             "refreshToken": token_response["refreshToken"],
             "refreshTokenExpiresAt": token_response["refreshTokenExpiresAt"],
         }
+        if self.api_base is not None:
+            stored["apiBase"] = self.api_base
         encoded = json.dumps(stored, separators=(",", ":"))
         if self.secret_store is not None:
             self.secret_store.save(self.secret_key, encoded.encode("utf-8"))
@@ -254,7 +306,26 @@ class TokenStore:
                     return
 
     def clear(self) -> None:
-        self._write_fallback('{"signedOut":true}')
+        commit = _FallbackCommit()
+        try:
+            with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+                self._clear_locked(commit)
+        except (OSError, subprocess.SubprocessError):
+            if commit.replaced:
+                raise TokenCleanupPendingError("Secure credential cleanup is pending.") from None
+            raise
+
+    def clear_if_signed_out(self) -> None:
+        with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+            if self._load_cleanup_tombstone():
+                self._clear_locked()
+
+    def _load_cleanup_tombstone(self) -> bool:
+        document = self._load_fallback()
+        return document is not None and document.get("signedOut") is True
+
+    def _clear_locked(self, commit: _FallbackCommit | None = None) -> None:
+        self._write_fallback('{"signedOut":true}', commit=commit)
         if self.secret_store is not None:
             self.secret_store.delete(self.secret_key)
             return
@@ -273,11 +344,15 @@ class TokenStore:
     def _load_fallback(self) -> dict[str, Any] | None:
         try:
             document = json.loads(self.fallback_path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             return None
-        return document if isinstance(document, dict) else None
+        except (ValueError, UnicodeError):
+            raise SecureStoreError("Local sign-out state is malformed.") from None
+        if not isinstance(document, dict):
+            raise SecureStoreError("Local sign-out state is malformed.")
+        return document
 
-    def _write_fallback(self, encoded: str) -> None:
+    def _write_fallback(self, encoded: str, *, commit: _FallbackCommit | None = None) -> None:
         self.fallback_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{self.fallback_path.name}.",
@@ -293,6 +368,8 @@ class TokenStore:
                 fallback.flush()
                 os.fsync(fallback.fileno())
             os.replace(temporary_path, self.fallback_path)
+            if commit is not None:
+                commit.replaced = True
             if hasattr(os, "O_DIRECTORY"):
                 directory_descriptor = os.open(
                     self.fallback_path.parent,
@@ -592,9 +669,10 @@ class CloudService(QObject):
         super().__init__()
         self.strings = strings or Strings()
         self.device_id = device_id
-        self.api_base = api_base.rstrip("/")
+        self.api_base = credential_api_base(api_base)
         self._state = SessionState()
         self.token_store = token_store or TokenStore(device_id)
+        self.token_store.bind_api(self.api_base)
         self._request = request or (lambda *args, **kwargs: _request(*args, **kwargs))
         self._session = AuthenticatedSession(
             self.api_base,
@@ -612,10 +690,12 @@ class CloudService(QObject):
             self._request,
             _text,
             lambda: datetime.now(timezone.utc),
+            self.token_store.revocations,
         )
         self._workers: set[Worker] = set()
         self._worker_generations: dict[Worker, int] = {}
         self._revocation_workers: set[Worker] = set()
+        self._configure_revocation_restore()
         self._revisions = RevisionStream(
             self,
             self.api_base,
@@ -624,6 +704,7 @@ class CloudService(QObject):
         )
         self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
         self._token_urlsafe = token_urlsafe
+        self._configure_sign_out_cleanup()
 
     # Compatibility methods remain patchable, but resolve the current collaborator
     # on every call instead of retaining construction-time bound method aliases.
@@ -664,10 +745,10 @@ class CloudService(QObject):
         return self._accounts.begin_deletion(confirmation)
 
     def _delete_captured_account(self, credentials: Any) -> dict[str, Any]:
-        return self._accounts.delete_account(credentials)
+        return self._accounts.delete_account(credentials, self._accept_tokens)
 
     def _refresh_deletion_access(self, credentials: Any) -> str:
-        return self._accounts.refresh_deletion_access(credentials)
+        return self._accounts.refresh_deletion_access(credentials, self._accept_tokens)
 
     def _revoke_credentials(self, revocation: RevocationState) -> None:
         self._accounts.revoke(revocation)
@@ -997,10 +1078,27 @@ class CloudService(QObject):
         self._state.deleting_account = False
         self._state.sync_queued = None
         self._oauth_browser.cancel()
+        self._revocation_restore_timer.stop()
+        self._sign_out_cleanup_timer.stop()
         self.stop_revision_stream()
 
     def logout(self) -> None:
-        credentials = self._accounts.sign_out()
+        try:
+            credentials = self._accounts.sign_out()
+        except SignOutCleanupError as error:
+            QTimer.singleShot(
+                1000, lambda generation=error.generation: self._retry_sign_out_cleanup(generation)
+            )
+            self._publish_sign_out(error.credentials)
+            self.failure.emit(str(error))
+            raise
+        except (OSError, subprocess.SubprocessError):
+            message = "Sign out could not be persisted. Session retained; retry sign out."
+            self.failure.emit(message)
+            raise SecureStoreError(message) from None
+        self._publish_sign_out(credentials)
+
+    def _publish_sign_out(self, credentials: LogoutCredentials) -> None:
         self.stop_revision_stream()
         self.signed_out.emit()
         self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
@@ -1009,6 +1107,28 @@ class CloudService(QObject):
                 credentials.access_token,
                 refresh_token=credentials.refresh_token,
                 access_token_is_fresh=credentials.access_token_is_fresh,
+                identifier=credentials.identifier,
+                api_base=credentials.api_base,
+            )
+
+    def _configure_sign_out_cleanup(self) -> None:
+        generation = self._state.account_generation
+        self._sign_out_cleanup_timer = QTimer(self)
+        self._sign_out_cleanup_timer.setSingleShot(True)
+        self._sign_out_cleanup_timer.timeout.connect(
+            lambda: self._retry_sign_out_cleanup(generation)
+        )
+        self._sign_out_cleanup_timer.start(0)
+
+    def _retry_sign_out_cleanup(self, generation: int, attempt: int = 1) -> None:
+        try:
+            self._accounts.retry_sign_out_cleanup(generation)
+        except SecureStoreError as error:
+            self.failure.emit(str(error))
+            attempt = min(attempt + 1, 6)
+            QTimer.singleShot(
+                min(30_000, 1000 * 2 ** (attempt - 1)),
+                lambda: self._retry_sign_out_cleanup(generation, attempt),
             )
 
     def delete_account(self, confirmation: str) -> None:
@@ -1019,18 +1139,20 @@ class CloudService(QObject):
         self.status_changed.emit(self.strings.text("cloud.status.syncing"))
         self._start(
             lambda: self._delete_captured_account(credentials),
-            self._account_deleted,
-            self._account_deletion_failed,
+            lambda response: self._account_deleted(response, credentials),
+            lambda error: self._account_deletion_failed(error, credentials),
         )
 
-    def _account_deleted(self, _response: dict[str, Any]) -> None:
+    def _account_deleted(self, _response: dict[str, Any], credentials: Any) -> None:
         # Invalidate every callback tied to deleted account before notifying UI.
-        self._accounts.complete_deletion()
+        if not self._accounts.complete_deletion(credentials):
+            return
         self.account_deleted.emit()
         self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
 
-    def _account_deletion_failed(self, error: Exception) -> None:
-        self._accounts.fail_deletion()
+    def _account_deletion_failed(self, error: Exception, credentials: Any) -> None:
+        if not self._accounts.fail_deletion(credentials):
+            return
         self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
         self.account_deletion_failed.emit(str(error))
         self.start_revision_stream()
@@ -1043,6 +1165,8 @@ class CloudService(QObject):
         access_token_is_fresh: bool = True,
         attempt: int = 0,
         state: RevocationState | None = None,
+        identifier: str | None = None,
+        api_base: str | None = None,
     ) -> None:
         # Revocation owns a detached copy of the signed-out account's credentials.
         # It must never use or persist credentials from the current account generation.
@@ -1050,12 +1174,20 @@ class CloudService(QObject):
             access_token,
             refresh_token,
             access_token_is_fresh,
+            identifier,
+            api_base,
         )
+        identity = (revocation.api_base, revocation.identifier)
+        if self._state.shutting_down or identity in self._revocation_ids:
+            return
+        self._revocation_ids.add(identity)
         self._launch_revocation(revocation, attempt)
 
     def _launch_revocation(
         self, revocation: RevocationState, attempt: int
     ) -> None:
+        if self._state.shutting_down:
+            return
         worker = Worker(lambda: self._revoke_credentials(revocation))
         self._revocation_workers.add(worker)
         worker.signals.error.connect(
@@ -1067,14 +1199,44 @@ class CloudService(QObject):
         QThreadPool.globalInstance().start(worker)
 
     def _retry_revocation(self, state: RevocationState, attempt: int) -> None:
-        if self._state.shutting_down or attempt >= 3:
+        if self._state.shutting_down:
             return
+        attempt = min(attempt, 6)
         delay_ms = min(30_000, 1_000 * (2 ** (attempt - 1)))
         QTimer.singleShot(
             delay_ms,
-            lambda: self._start_revocation(
-                None,
-                attempt=attempt,
-                state=state,
-            ),
+            lambda: self._launch_revocation(state, attempt),
+        )
+
+    def _configure_revocation_restore(self) -> None:
+        self._revocation_ids: set[tuple[str, str]] = set()
+        self._revocation_restore_attempt = 0
+        self._revocation_restore_timer = QTimer(self)
+        self._revocation_restore_timer.setSingleShot(True)
+        self._revocation_restore_timer.timeout.connect(self._restore_revocations)
+        self._revocation_restore_timer.start(0)
+
+    def _restore_revocations(self) -> None:
+        if self._state.shutting_down:
+            return
+        worker = Worker(self._accounts.pending_revocations)
+        self._revocation_workers.add(worker)
+        worker.signals.result.connect(self._resume_revocations)
+        worker.signals.error.connect(self._retry_revocation_restore)
+        worker.signals.finished.connect(
+            lambda: self._revocation_workers.discard(worker)
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _resume_revocations(self, pending: list[RevocationState]) -> None:
+        self._revocation_restore_attempt = 0
+        for revocation in pending:
+            self._start_revocation(None, state=revocation)
+
+    def _retry_revocation_restore(self, _error: Exception) -> None:
+        if self._state.shutting_down:
+            return
+        self._revocation_restore_attempt = min(self._revocation_restore_attempt + 1, 6)
+        self._revocation_restore_timer.start(
+            min(30_000, 1_000 * 2 ** (self._revocation_restore_attempt - 1))
         )

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -969,6 +969,12 @@ class HTTPRequestTests(unittest.TestCase):
 
 
 class AuthenticationNetworkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        secure_store = _MemorySecretStore()
+        root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(patch("pomodorough.network._config_root", return_value=root))
+        self.enterContext(patch("pomodorough.network._oauth_secret_store", return_value=secure_store))
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -2110,7 +2116,14 @@ class CloudOrchestrationTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def cloud(self) -> CloudService:
-        cloud = CloudService("device-1", "https://example.test")
+        root = Path(self.enterContext(TemporaryDirectory()))
+        cloud = CloudService(
+            "device-1", "https://example.test",
+            token_store=TokenStore(
+                "device-1", secret_store=_MemorySecretStore(),
+                fallback_path=root / "session.json",
+            ),
+        )
         self.addCleanup(cloud.shutdown)
         return cloud
 
@@ -2316,6 +2329,8 @@ class CloudOrchestrationTests(unittest.TestCase):
             "logout-access",
             refresh_token=None,
             access_token_is_fresh=False,
+            identifier=ANY,
+            api_base="https://example.test",
         )
         self.assertFalse(cloud.authenticated)
         self.assertFalse(cloud.busy)
@@ -2392,6 +2407,8 @@ class CloudOrchestrationTests(unittest.TestCase):
             "logout-access",
             refresh_token=None,
             access_token_is_fresh=False,
+            identifier=ANY,
+            api_base="https://example.test",
         )
         self.assertFalse(cloud.authenticated)
         self.assertIsNone(cloud.access_token)
@@ -2567,16 +2584,13 @@ class CloudOrchestrationTests(unittest.TestCase):
                 cloud.logout()
             cloud.authenticated = True
             cloud.access_token = "account-b"
-            response = deletion_worker.function()
-            deletion_worker.signals.result.emit(response)
+            with self.assertRaisesRegex(ApiError, "cancelled") as cancelled:
+                deletion_worker.function()
+            deletion_worker.signals.error.emit(cancelled.exception)
+            deletion_worker.signals.result.emit({})
             deletion_worker.signals.finished.emit()
 
-        request.assert_called_once_with(
-            "DELETE",
-            "https://example.test/api/v1/account",
-            {"confirmation": "DELETE"},
-            access_token="account-a",
-        )
+        request.assert_not_called()
         self.assertEqual(deleted, [])
         self.assertTrue(cloud.authenticated)
         self.assertEqual(cloud.access_token, "account-b")

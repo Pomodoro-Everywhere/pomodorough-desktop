@@ -13,8 +13,8 @@ from typing import Any, Final, Protocol, Self
 
 from wasmtime import Engine, Func, Instance, Memory, Module, Store, WasmtimeError
 
-CORE_COMMIT: Final = "dda034612bd9a8b3d0f56959d9eef888980acc7b"
-CORE_SHA256: Final = "33cb3bc7477a8075a9613e45b309495e44d28f794e6b88362a8073d505309f5a"
+CORE_COMMIT: Final = "440f5364f036d02d46abca048f09b893b0134791"
+CORE_SHA256: Final = "4a58bd2b702e0d43d6f2262d21f7e940dfdf05cc911d6519b67c1b5e988d8b0b"
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
 _MAX_OPERATION_BYTES: Final = 256

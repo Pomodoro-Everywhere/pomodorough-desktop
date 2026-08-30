@@ -174,6 +174,21 @@ class PlatformSecretStoreTests(unittest.TestCase):
         )
         run.assert_not_called()
 
+    def test_interleaved_lookup_cannot_redirect_another_secret_save(self) -> None:
+        def availability():
+            self.store.load("active-session")
+            return True, "ready"
+
+        with (
+            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            patch.object(self.store, "availability", side_effect=availability),
+            patch.object(self.store, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+        ):
+            self.store.save("pending-revocations", b"captured-session")
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "active-session")
+        self.assertEqual(run.call_args_list[1].args[0][-1], "pending-revocations")
+
 
 class MemorySecretStore:
     def __init__(self, values: dict[str, bytes]) -> None:

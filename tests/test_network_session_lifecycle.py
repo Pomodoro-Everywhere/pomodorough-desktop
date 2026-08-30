@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from PySide6.QtWidgets import QApplication
 
-from pomodorough.network import ApiError, CloudService
+from pomodorough.network import ApiError, CloudService, TokenStore
+from test_secure_store import MemorySecretStore
 
 
 class AuthenticatedSessionLifecycleTests(unittest.TestCase):
@@ -15,7 +16,10 @@ class AuthenticatedSessionLifecycleTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_logout_during_401_refresh_prevents_request_replay(self) -> None:
-        cloud = CloudService("device-1", "https://example.test")
+        cloud = CloudService(
+            "device-1", "https://example.test",
+            token_store=TokenStore("device-1", secret_store=MemorySecretStore({})),
+        )
         self.addCleanup(cloud.shutdown)
         cloud.authenticated = True
         cloud.access_token = "expired-access"
