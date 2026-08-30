@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from test_network import _FakeRevisionReply
 from test_network_account_lifecycle import _run_immediately
 from test_network_revocation import PlatformKeyring, token_response
+from test_secure_store import linux_secret_store
 
 from pomodorough.network import ApiError, CloudService, TokenStore
 from pomodorough.network_account import SignOutCleanupError
@@ -29,8 +30,6 @@ def signout(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     keyring = PlatformKeyring()
     workers, retries, services = deque(), deque(), []
-    monkeypatch.setattr("pomodorough.secure_store.sys_platform", lambda: "linux")
-    monkeypatch.setattr("pomodorough.secure_store.user_config_path", lambda *args, **kwargs: tmp_path)
     monkeypatch.setattr("pomodorough.secure_store.shutil.which", lambda _: "/bin/secret-tool")
     monkeypatch.setattr(PlatformSecretStore, "_run", staticmethod(keyring.run))
     monkeypatch.setattr(QThreadPool.globalInstance(), "start", workers.append)
@@ -43,11 +42,12 @@ def signout(tmp_path, monkeypatch):
         services.append(cloud)
         return cloud
 
-    yield SimpleNamespace(
-        create=create, keyring=keyring, workers=workers, retries=retries, app=app,
-    )
-    for cloud in services:
-        cloud.shutdown()
+    with linux_secret_store(tmp_path):
+        yield SimpleNamespace(
+            create=create, keyring=keyring, workers=workers, retries=retries, app=app,
+        )
+        for cloud in services:
+            cloud.shutdown()
 
 
 def sign_in(cloud, session="captured"):

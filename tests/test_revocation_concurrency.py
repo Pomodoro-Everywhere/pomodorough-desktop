@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import multiprocessing
+import os
 import sqlite3
 import subprocess
 import threading
@@ -10,11 +11,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from test_network_revocation import PlatformKeyring
-from test_secure_store import MemorySecretStore
+from test_secure_store import MemorySecretStore, linux_secret_store
 from test_storage_revocation import credentials
 
 from pomodorough.network import ApiError, TokenStore
@@ -29,11 +31,10 @@ API = "https://origin.example.test"
 @pytest.fixture
 def native_vault(tmp_path, monkeypatch):
     vault = PlatformKeyring()
-    monkeypatch.setattr("pomodorough.secure_store.sys_platform", lambda: "linux")
     monkeypatch.setattr("pomodorough.secure_store.shutil.which", lambda _: "/bin/secret-tool")
-    monkeypatch.setattr("pomodorough.secure_store.user_config_path", lambda *args, **kwargs: tmp_path)
     monkeypatch.setattr(PlatformSecretStore, "_run", staticmethod(vault.run))
-    return vault
+    with linux_secret_store(tmp_path):
+        yield vault
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["serialized-control", "racing-instances"])
@@ -132,8 +133,7 @@ def _process_vault(root, ready, release):
 def _process_mutation(root_text, operation, ready, release, completed):
     root = Path(root_text)
     with (
-        patch("pomodorough.secure_store.sys_platform", return_value="linux"),
-        patch("pomodorough.secure_store.user_config_path", return_value=root),
+        linux_secret_store(root),
         patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
         patch.object(PlatformSecretStore, "_run", staticmethod(_process_vault(root, ready, release))),
     ):
@@ -183,7 +183,7 @@ def test_platform_lock_releases_after_exception(tmp_path, native_vault):
     with PlatformSecretStore(tmp_path).lock("test-key"):
         pass
     for path in tmp_path.rglob("*.lock"):
-        assert path.read_bytes() == b""
+        assert path.read_bytes() == (b"\0" if os.name == "nt" else b"")
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
@@ -199,7 +199,8 @@ def test_native_lock_scope_matches_vault_namespace_not_adapter_root(tmp_path, na
 def test_windows_lock_uses_only_nonsecret_byte_and_unlocks(tmp_path):
     store = PlatformSecretStore(tmp_path)
     locking = Mock(LK_LOCK=1, LK_UNLCK=2)
-    with patch("pomodorough.secure_store.os.name", "nt"), patch.dict("sys.modules", msvcrt=locking):
+    windows_os = SimpleNamespace(**{**vars(os), "name": "nt"})
+    with patch("pomodorough.secure_store.os", windows_os), patch.dict("sys.modules", msvcrt=locking):
         with store.lock("device"):
             assert store._lock_path("device").read_bytes() == b"\0"
         with store.lock("device"):
@@ -324,8 +325,7 @@ def _process_replay(root_text, role, outcome, restored, start, at_logout, releas
         return {}
 
     with (
-        patch("pomodorough.secure_store.sys_platform", return_value="linux"),
-        patch("pomodorough.secure_store.user_config_path", return_value=root),
+        linux_secret_store(root),
         patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
         patch.object(PlatformSecretStore, "_run", staticmethod(_process_vault(root, at_logout, release))),
     ):

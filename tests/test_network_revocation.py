@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
+from test_secure_store import linux_secret_store
 
 from pomodorough.network import ApiError, CloudService, TokenStore, _request
 from pomodorough.secure_store import PlatformSecretStore, SecureStoreError
@@ -60,7 +61,7 @@ class DurableRevocationTests(unittest.TestCase):
         self.workers = deque()
         self.retries = deque()
         self.request = Mock(return_value={})
-        self.enterContext(patch("pomodorough.secure_store.sys_platform", return_value="linux"))
+        self.enterContext(linux_secret_store(self.root))
         self.enterContext(patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"))
         self.enterContext(patch.object(PlatformSecretStore, "_run", side_effect=self.keyring.run))
         self.enterContext(patch.object(QThreadPool.globalInstance(), "start", side_effect=self.workers.append))

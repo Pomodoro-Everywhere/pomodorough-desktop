@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from threading import Event
-from unittest.mock import Mock, call, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch, sentinel
 
 import pytest
 from PySide6.QtWidgets import QApplication
@@ -172,8 +174,23 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
     cloud._request.return_value = _tokens("rotated")
     failures = []
     cloud.account_deletion_failed.connect(failures.append)
-    with patch("pomodorough.network.os.fsync", side_effect=[None, OSError("directory sync failed")]):
+    file_sync = Mock(wraps=os.fsync)
+
+    def sync(descriptor):
+        if descriptor is sentinel.directory_descriptor:
+            raise OSError("directory sync failed")
+        return file_sync(descriptor)
+
+    directory_open = Mock(return_value=sentinel.directory_descriptor)
+    directory_close = Mock()
+    filesystem = SimpleNamespace(**{**vars(os), "O_DIRECTORY": getattr(os, "O_DIRECTORY", 1 << 30),
+                                   "open": directory_open, "close": directory_close, "fsync": sync})
+    with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
+    file_sync.assert_called_once()
+    directory_open.assert_called_once_with(cloud.token_store.fallback_path.parent,
+                                           os.O_RDONLY | filesystem.O_DIRECTORY)
+    directory_close.assert_called_once_with(sentinel.directory_descriptor)
     assert failures == ["directory sync failed"]
     assert cloud._request.call_count == 1
     assert cloud.refresh_token == "original-refresh"
@@ -181,6 +198,44 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
     assert restarted.token_store.load()["refreshToken"] == "rotated-refresh"
     restarted._request.side_effect = [_tokens("restored"), {"user": {"id": "original"}}]
     restarted.restore()
+    assert restarted.authenticated and restarted.refresh_token == "restored-refresh"
+
+
+def test_rotation_without_directory_sync_persists_before_delete_and_restart(cloud_factory):
+    cloud = cloud_factory()
+    _install(cloud)
+
+    def request(method, *_args, **_kwargs):
+        if method == "POST":
+            return _tokens("rotated")
+        assert cloud.token_store.load()["refreshToken"] == "rotated-refresh"
+        raise ApiError("unavailable", 503)
+
+    cloud._request.side_effect = request
+    failures = []
+    cloud.account_deletion_failed.connect(failures.append)
+    filesystem = SimpleNamespace(**{name: value for name, value in vars(os).items() if name != "O_DIRECTORY"})
+    filesystem.fsync = Mock(wraps=os.fsync)
+    filesystem.open = Mock(side_effect=AssertionError("Directory descriptors are unavailable"))
+    with patch("pomodorough.network.os", filesystem):
+        cloud.delete_account("DELETE")
+    filesystem.fsync.assert_called_once()
+    filesystem.open.assert_not_called()
+    assert failures == ["unavailable"]
+    assert cloud._request.call_args_list == [
+        call("POST", "https://example.test/api/v1/auth/refresh", {"refreshToken": "original-refresh"}),
+        call("DELETE", "https://example.test/api/v1/account", {"confirmation": "DELETE"},
+             access_token="rotated-access"),
+    ]
+    assert cloud.authenticated and not cloud.deleting_account
+    assert cloud.refresh_token == "rotated-refresh"
+    restarted = cloud_factory()
+    assert restarted.token_store.load()["refreshToken"] == "rotated-refresh"
+    restarted._request.side_effect = [_tokens("restored"), {"user": {"id": "original"}}]
+    restarted.restore()
+    assert restarted._request.call_args_list[0] == call(
+        "POST", "https://example.test/api/v1/auth/refresh", {"refreshToken": "rotated-refresh"},
+    )
     assert restarted.authenticated and restarted.refresh_token == "restored-refresh"
 
 

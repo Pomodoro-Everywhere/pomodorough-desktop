@@ -205,12 +205,12 @@ jobs:
       - name: Install and test wheel
         run: |
           python -m venv .release-wheel
-          .release-wheel/bin/python -m pip install dist/*.whl
+          .release-wheel/bin/python -m pip install dist/*.whl pytest==9.1.1
           .release-wheel/bin/python -m pip check
           QT_QPA_PLATFORM=offscreen \
             .release-wheel/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-wheel/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
-          QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m unittest discover -s tests -v
+          QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m pytest tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
             timeout 30s .release-wheel/bin/pomodorough \
@@ -224,12 +224,12 @@ jobs:
       - name: Install and test source distribution
         run: |
           python -m venv .release-sdist
-          .release-sdist/bin/python -m pip install dist/*.tar.gz
+          .release-sdist/bin/python -m pip install dist/*.tar.gz pytest==9.1.1
           .release-sdist/bin/python -m pip check
           QT_QPA_PLATFORM=offscreen \
             .release-sdist/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-sdist/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
-          QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m unittest discover -s tests -v
+          QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m pytest tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
             timeout 30s .release-sdist/bin/pomodorough \

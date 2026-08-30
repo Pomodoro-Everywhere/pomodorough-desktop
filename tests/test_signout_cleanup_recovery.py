@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 import pytest
 from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
+from test_secure_store import linux_secret_store
 
 from pomodorough.network import CloudService, TokenStore
 from pomodorough.network_account import AccountLifecycle, SignOutCleanupError
@@ -74,8 +75,7 @@ def forbidden(*_args, **_kwargs):
 @contextmanager
 def fixture_environment(root):
     with (
-        patch("pomodorough.secure_store.user_config_path", return_value=root),
-        patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+        linux_secret_store(root),
         patch("pomodorough.network.shutil.which", return_value=None),
         patch("pomodorough.secure_store._macos_load", side_effect=forbidden),
         patch("pomodorough.secure_store._macos_save", side_effect=forbidden),

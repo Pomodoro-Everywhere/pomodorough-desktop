@@ -8,6 +8,7 @@ import pytest
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 from test_network_revocation import PlatformKeyring, token_response
+from test_secure_store import linux_secret_store
 from test_storage_revocation import credentials
 
 from pomodorough.network import ApiError, CloudService, TokenStore
@@ -23,8 +24,6 @@ OTHER_API = "https://replacement.example.test"
 def clouds(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     vault = PlatformKeyring()
-    monkeypatch.setattr("pomodorough.secure_store.sys_platform", lambda: "linux")
-    monkeypatch.setattr("pomodorough.secure_store.user_config_path", lambda *args, **kwargs: tmp_path)
     monkeypatch.setattr("pomodorough.secure_store.shutil.which", lambda _: "/bin/secret-tool")
     monkeypatch.setattr(PlatformSecretStore, "_run", staticmethod(vault.run))
     services = []
@@ -35,10 +34,11 @@ def clouds(tmp_path, monkeypatch):
         services.append(service)
         return service
 
-    yield create, app, vault
-    for service in services:
-        service.shutdown()
-    assert QThreadPool.globalInstance().waitForDone(3000)
+    with linux_secret_store(tmp_path):
+        yield create, app, vault
+        for service in services:
+            service.shutdown()
+        assert QThreadPool.globalInstance().waitForDone(3000)
 
 
 def wait_for_workers(app, service, request):

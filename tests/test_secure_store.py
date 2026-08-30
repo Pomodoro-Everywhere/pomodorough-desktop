@@ -6,14 +6,35 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from types import FunctionType, SimpleNamespace
+from unittest.mock import ANY, Mock, call, patch
 
+from pomodorough import secure_store
 from pomodorough.secure_store import (
     PlatformSecretStore,
     SecretMutationJournal,
     SecureStoreError,
 )
+
+
+@contextmanager
+def linux_secret_store(root):
+    """Select the Linux vault without changing pathlib or native file locking."""
+    lock_function = secure_store._file_lock.__wrapped__
+    native_lock = FunctionType(lock_function.__code__, {**lock_function.__globals__, "os": os})
+    adapter_os = SimpleNamespace(**{**vars(os), "name": "posix"})
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(secure_store, "os", adapter_os))
+        stack.enter_context(patch.object(secure_store, "_file_lock", contextmanager(native_lock)))
+        stack.enter_context(patch.object(secure_store, "sys_platform", return_value="linux"))
+        stack.enter_context(patch.object(secure_store, "user_config_path", return_value=root))
+        for name in ("_macos_load", "_macos_save", "_macos_delete"):
+            stack.enter_context(patch.object(secure_store, name, side_effect=AssertionError("Native Keychain access")))
+        for name in ("_windows_path", "_windows_protect", "_windows_unprotect"):
+            stack.enter_context(patch.object(PlatformSecretStore, name, side_effect=AssertionError("Native DPAPI access")))
+        yield
 
 
 class PlatformSecretStoreTests(unittest.TestCase):
@@ -33,8 +54,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "", ""),
         ]
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", side_effect=responses) as run,
         ):
@@ -52,8 +72,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_malformed_platform_value_fails_closed(self) -> None:
         response = subprocess.CompletedProcess([], 0, "not base64!", "")
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
             self.assertRaisesRegex(SecureStoreError, "malformed data"),
         ):
@@ -62,8 +81,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_missing_platform_value_returns_none(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "")
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
         ):
             self.assertIsNone(self.store.load("endpoint-key"))
@@ -71,8 +89,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_failed_journal_lookup_aborts_before_mutating_existing_secret(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response) as run,
             self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
@@ -86,8 +103,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_rejected_save_preserves_platform_error(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
             self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
@@ -97,8 +113,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
     def test_rejected_delete_preserves_platform_error(self) -> None:
         response = subprocess.CompletedProcess([], 1, "", "keyring is locked")
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"),
             patch("pomodorough.secure_store.subprocess.run", return_value=response),
             self.assertRaisesRegex(SecureStoreError, "keyring is locked"),
@@ -107,8 +122,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
     def test_unavailable_store_rejects_save_without_spawning_process(self) -> None:
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value=None),
             patch("pomodorough.secure_store.subprocess.run") as run,
         ):
@@ -122,8 +136,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
     def test_unavailable_store_rejects_delete_without_spawning_process(self) -> None:
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch("pomodorough.secure_store.shutil.which", return_value=None),
             patch("pomodorough.secure_store.subprocess.run") as run,
             self.assertRaisesRegex(SecureStoreError, "secret-tool was not found"),
@@ -161,7 +174,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
     def test_macos_save_uses_in_process_keychain_api(self) -> None:
         with (
-            patch("pomodorough.secure_store.os.name", "posix"),
+            patch.object(secure_store, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
             patch("pomodorough.secure_store.sys_platform", return_value="darwin"),
             patch.object(self.store, "availability", return_value=(True, "ready")),
             patch("pomodorough.secure_store._macos_save") as save,
@@ -180,7 +193,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
             return True, "ready"
 
         with (
-            patch("pomodorough.secure_store.sys_platform", return_value="linux"),
+            linux_secret_store(self.root),
             patch.object(self.store, "availability", side_effect=availability),
             patch.object(self.store, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
         ):
@@ -188,6 +201,44 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
         self.assertEqual(run.call_args_list[0].args[0][-1], "active-session")
         self.assertEqual(run.call_args_list[1].args[0][-1], "pending-revocations")
+
+
+class LinuxSecretStoreFixtureTests(unittest.TestCase):
+    def test_adapter_isolation_preserves_paths_and_each_host_lock_branch(self) -> None:
+        real_name = os.name
+        real_path_type = type(Path())
+        for host in ("posix", "nt"):
+            windows = SimpleNamespace(locking=Mock(), LK_LOCK=1, LK_UNLCK=0)
+            posix = SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_UN=8)
+            host_os = SimpleNamespace(**{**vars(os), "name": host})
+            with (
+                self.subTest(host=host),
+                tempfile.TemporaryDirectory() as directory,
+                patch(f"{__name__}.os", host_os),
+                patch.object(secure_store, "os", host_os),
+                patch.dict("sys.modules", {"msvcrt": windows, "fcntl": posix}),
+                linux_secret_store(Path(directory)),
+                patch.object(secure_store.shutil, "which", return_value="secret-tool"),
+                patch.object(PlatformSecretStore, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+            ):
+                store = PlatformSecretStore(Path(directory))
+                self.assertIs(type(Path(directory)), real_path_type)
+                self.assertEqual(__import__("os").name, real_name)
+                with store.lock("session"):
+                    store.save("session", b"synthetic")
+                    self.assertIsNone(store.load("session"))
+                    store.delete("session")
+                self.assertEqual([entry.args[0][1] for entry in run.call_args_list], ["store", "lookup", "clear"])
+                primitive = windows.locking if host == "nt" else posix.flock
+                expected = [call(ANY, 1, 1), call(ANY, 0, 1)] if host == "nt" else [call(ANY, 2), call(ANY, 8)]
+                self.assertEqual(primitive.call_args_list, expected)
+                (posix.flock if host == "nt" else windows.locking).assert_not_called()
+                self.assertEqual(store._lock_path("session").read_bytes(), b"\0" if host == "nt" else b"")
+                run.return_value = subprocess.CompletedProcess([], 1, "", "keyring is locked")
+                for operation, arguments in ((store.save, ("session", b"synthetic")),
+                                             (store.load, ("session",)), (store.delete, ("session",))):
+                    with self.assertRaisesRegex(SecureStoreError, "keyring is locked"):
+                        operation(*arguments)
 
 
 class MemorySecretStore:

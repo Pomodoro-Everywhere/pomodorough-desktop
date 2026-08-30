@@ -262,7 +262,7 @@ validated through the adapter.
 ## Testing
 
 ```sh
-python3 -m unittest discover -s tests -v
+uv run --frozen --with pytest==9.1.1 python -m pytest tests -v
 python3 -m compileall -q src tests
 uvx ruff check .
 sh -n deploy/install.sh
