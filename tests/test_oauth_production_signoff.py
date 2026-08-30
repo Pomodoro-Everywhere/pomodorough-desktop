@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -14,12 +15,25 @@ from pomodorough import oauth_production_signoff as signoff
 
 
 def windows_acl_command(path: Path, command: str) -> str:
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-         "$ErrorActionPreference = 'Stop'; " + command],
-        env={**os.environ, "POMODOROUGH_TEST_ACL_PATH": str(path)},
-        capture_output=True, text=True, check=True, timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "$ErrorActionPreference = 'Stop'; " + command],
+            env={**os.environ, "POMODOROUGH_TEST_ACL_PATH": str(path)},
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except subprocess.CalledProcessError as error:
+        diagnostic = error.stderr or "<empty stderr>"
+        for value in (str(path), os.environ.get("USERPROFILE"),
+                      os.environ.get("USERNAME"), os.environ.get("USERDOMAIN")):
+            if value:
+                diagnostic = re.sub(re.escape(value), "<redacted>", diagnostic,
+                                    flags=re.IGNORECASE)
+        diagnostic = re.sub(r"\bS-\d+(?:-\d+)+\b", "<sid>", diagnostic, flags=re.IGNORECASE)
+        raise AssertionError(
+            f"Windows receipt ACL command failed (exit {error.returncode}): "
+            f"{diagnostic.strip()[:2000]}"
+        ) from None
     return result.stdout
 
 
@@ -31,7 +45,7 @@ def restrict_windows_receipt_directory(path: Path) -> None:
         $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
             $operator, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $env:POMODOROUGH_TEST_ACL_PATH -AclObject $acl
+        [System.IO.Directory]::SetAccessControl($env:POMODOROUGH_TEST_ACL_PATH, $acl)
     """)
 
 
@@ -90,6 +104,59 @@ class _Service:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+class WindowsReceiptAclFixtureTests(unittest.TestCase):
+    def test_fixture_persists_operator_dacl_without_provider_set_acl(self) -> None:
+        path = Path("receipt directory's [literal] name")
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="")) as run:
+            restrict_windows_receipt_directory(path)
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        script = arguments[4]
+        self.assertIn("$ErrorActionPreference = 'Stop'", script)
+        self.assertIn("[System.Security.Principal.WindowsIdentity]::GetCurrent().User", script)
+        self.assertIn("[System.Security.AccessControl.DirectorySecurity]::new()", script)
+        self.assertIn("$acl.SetAccessRuleProtection($true, $false)", script)
+        self.assertIn("$operator, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'", script)
+        self.assertIn("$acl.AddAccessRule($rule)", script)
+        self.assertIn("[System.IO.Directory]::SetAccessControl($env:POMODOROUGH_TEST_ACL_PATH, $acl)", script)
+        self.assertNotIn("Set-Acl", script)
+        self.assertNotIn(str(path), script)
+        self.assertEqual(run.call_args.kwargs["env"]["POMODOROUGH_TEST_ACL_PATH"], str(path))
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_command_reports_stderr_without_operator_identifiers_or_stdout(self) -> None:
+        path = Path("receipt directory's [literal] name")
+        environment = {"USERPROFILE": r"C:\Users\private-user", "USERNAME": "private-user",
+                       "USERDOMAIN": "private-host"}
+        failure = subprocess.CalledProcessError(
+            1, ["powershell.exe"], output="private-stdout",
+            stderr=f"Access denied: {str(path).upper()} C:\\Users\\private-user "
+                   "PRIVATE-HOST\\PRIVATE-USER S-1-5-21-123-456-789-1001",
+        )
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(subprocess, "run", side_effect=failure),
+            self.assertRaises(AssertionError) as raised,
+        ):
+            windows_acl_command(path, "fixture command")
+
+        self.assertEqual(str(raised.exception), "Windows receipt ACL command failed (exit 1): "
+                         "Access denied: <redacted> <redacted> <redacted>\\<redacted> <sid>")
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_command_reports_empty_stderr(self) -> None:
+        for stderr in (None, ""):
+            failure = subprocess.CalledProcessError(1, ["powershell.exe"], stderr=stderr)
+            with (
+                self.subTest(stderr=stderr),
+                patch.object(subprocess, "run", side_effect=failure),
+                self.assertRaisesRegex(AssertionError, "exit 1.*<empty stderr>"),
+            ):
+                windows_acl_command(Path("receipt.json"), "fixture command")
 
 
 class ProductionOAuthSignoffTests(unittest.TestCase):
