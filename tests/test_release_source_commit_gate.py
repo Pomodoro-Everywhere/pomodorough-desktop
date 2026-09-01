@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -20,6 +21,23 @@ def release_source_commit_gate() -> str:
     )[1].split("      - name: Validate tag and version metadata\n", 1)[0]
     script = step.split("        run: |\n", 1)[1]
     return textwrap.dedent(script)
+
+
+def release_gate_shell(platform_name: str, git_executable: str | None) -> str:
+    if platform_name != "nt":
+        return "bash"
+    if git_executable is None:
+        raise RuntimeError("Git for Windows executable is unavailable")
+    git_path = Path(git_executable)
+    candidates = (
+        git_path.with_name("bash.exe"),
+        git_path.parent.parent / "bin" / "bash.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    locations = ", ".join(str(candidate) for candidate in candidates)
+    raise RuntimeError(f"Git for Windows bash.exe is unavailable: checked {locations}")
 
 
 class ReleaseSourceCommitGateTests(unittest.TestCase):
@@ -55,7 +73,7 @@ class ReleaseSourceCommitGateTests(unittest.TestCase):
     def run_gate(self, github_sha: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(GITHUB_SHA=github_sha, RELEASE_TAG=RELEASE_TAG)
-        shell = "gitbash" if os.name == "nt" else "bash"
+        shell = release_gate_shell(os.name, shutil.which("git"))
         return subprocess.run(
             [shell, "-c", release_source_commit_gate()],
             cwd=self.repository,
@@ -84,6 +102,38 @@ class ReleaseSourceCommitGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(descendant_commit, result.stderr)
         self.assertIn(self.tag_commit, result.stderr)
+
+    def test_windows_shell_resolves_sibling_of_git_cmd_directory(self) -> None:
+        git_root = self.repository / "Git"
+        git_executable = git_root / "cmd" / "git.exe"
+        git_executable.parent.mkdir(parents=True)
+        git_executable.touch()
+        bash_executable = git_root / "bin" / "bash.exe"
+        bash_executable.parent.mkdir()
+        bash_executable.touch()
+
+        self.assertEqual(
+            release_gate_shell("nt", str(git_executable)), str(bash_executable)
+        )
+
+    def test_windows_shell_resolves_bash_beside_git(self) -> None:
+        git_executable = self.repository / "Git" / "bin" / "git.exe"
+        git_executable.parent.mkdir(parents=True)
+        git_executable.touch()
+        bash_executable = git_executable.with_name("bash.exe")
+        bash_executable.touch()
+
+        self.assertEqual(
+            release_gate_shell("nt", str(git_executable)), str(bash_executable)
+        )
+
+    def test_windows_shell_fails_clearly_without_git_bash(self) -> None:
+        git_executable = self.repository / "Git" / "cmd" / "git.exe"
+        git_executable.parent.mkdir(parents=True)
+        git_executable.touch()
+
+        with self.assertRaisesRegex(RuntimeError, "bash.exe is unavailable"):
+            release_gate_shell("nt", str(git_executable))
 
 
 if __name__ == "__main__":
