@@ -32,20 +32,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify manual release source
+      - name: Verify manual release source commit
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
-          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
-          git merge-base --is-ancestor "$RELEASE_TAG" HEAD
-          unexpected_changes="$(git diff --name-only "$RELEASE_TAG" HEAD -- . \
-            ':(exclude).github/**' \
-            ':(exclude).gitattributes' \
-            ':(exclude)tests/**')"
-          if [[ -n "$unexpected_changes" ]]; then
-            echo "Manual release source differs from $RELEASE_TAG outside CI and test files:" >&2
-            printf '%s\n' "$unexpected_changes" >&2
+          tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          if [[ "$GITHUB_SHA" != "$tag_commit" ]]; then
+            echo "Release source $GITHUB_SHA must equal $RELEASE_TAG commit $tag_commit" >&2
             exit 1
           fi
 

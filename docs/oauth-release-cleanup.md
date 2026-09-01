@@ -4,7 +4,7 @@ Use this checklist after an operator can access both Google Cloud Console and th
 
 ## P2.2 acceptance status: open
 
-The target is suite **0.8.0** (`v0.8.0`). These commands apply only after the Desktop release is published and its downloaded assets are independently verified. Previously reviewed sign-off implementation and automated tests are not production acceptance evidence for this candidate. Source tests, deterministic artifact self-tests, and this checklist cannot close P2.2.
+The target is suite **0.9.0** (`v0.9.0`). These commands apply only after the Desktop release is published and its downloaded assets are independently verified. Previously reviewed sign-off implementation and automated tests are not production acceptance evidence for this candidate. Source tests, deterministic artifact self-tests, and this checklist cannot close P2.2.
 
 Remaining external work: obtain the three assets from one immutable release revision, verify provenance and payloads, run real production OAuth and secure restoration on each required platform, then retain private receipts and rollout/revocation evidence. No Google, account, Linux, or Windows production sign-off is recorded by this preparation. Do not reuse older-release receipts.
 
@@ -43,7 +43,7 @@ After the release exists, set the tag and download the published assets. Run Bas
 
 ```bash
 export REPOSITORY=Pomodoro-Everywhere/pomodorough-desktop
-export TAG=v0.8.0
+export TAG=v0.9.0
 export VERSION="${TAG#v}"
 export EXPECTED_OAUTH_CLIENT_ID='614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com'
 mkdir -p "scan-$VERSION"
@@ -156,7 +156,7 @@ The second Flatpak command writes random bytes through Secret Service, launches 
 For the Windows executable, run both packaged modes in PowerShell:
 
 ```powershell
-$VERSION = "0.8.0"
+$VERSION = "0.9.0"
 $env:POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST = "1"
 $oauth = Start-Process ".\Pomodorough-$VERSION-windows-x86_64.exe" -PassThru -Wait
 if ($oauth.ExitCode -ne 0) { throw "OAuth artifact self-test failed" }
@@ -182,9 +182,9 @@ Required acceptance cells (all pending until independently evidenced):
 
 | Receipt `artifact` | Downloaded asset | Execution host and receipt `platform` |
 | --- | --- | --- |
-| `wheel` | `pomodorough_linux-0.8.0-py3-none-any.whl` | Linux desktop; `system=Linux`, `machine` matches the recorded host architecture |
-| `flatpak` | `Pomodorough-0.8.0-x86_64.flatpak` | Linux x86_64, installed bundle with Secret Service; `system=Linux`, `machine=x86_64` |
-| `windows` | `Pomodorough-0.8.0-windows-x86_64.exe` | Windows x86_64 with DPAPI; `system=Windows`, `machine=AMD64` |
+| `wheel` | `pomodorough_linux-0.9.0-py3-none-any.whl` | Linux desktop; `system=Linux`, `machine` matches the recorded host architecture |
+| `flatpak` | `Pomodorough-0.9.0-x86_64.flatpak` | Linux x86_64, installed bundle with Secret Service; `system=Linux`, `machine=x86_64` |
+| `windows` | `Pomodorough-0.9.0-windows-x86_64.exe` | Windows x86_64 with DPAPI; `system=Windows`, `machine=AMD64` |
 
 A macOS wheel run is not Linux evidence. One wheel host does not certify another architecture; record each additional supported release acceptance host separately. The source archive is a payload-scan target, not a replacement for any of these three cells.
 
@@ -232,7 +232,7 @@ chmod 600 "$PRIVATE_RECORD/flatpak.json"
 On Windows, verify the transferred/downloaded executable against the same authenticated checksum manifest and attestation, then run both Windows self-tests above. Create a private directory outside the checkout, restrict its ACL to the operator, and launch that executable in production sign-off mode. The receipt path must not already exist:
 
 ```powershell
-$VERSION = "0.8.0"
+$VERSION = "0.9.0"
 $Asset = ".\Pomodorough-$VERSION-windows-x86_64.exe"
 $PrivateRecord = Join-Path $HOME "pomodorough-private-release-$VERSION"
 $Receipt = Join-Path $PrivateRecord "windows.json"
@@ -251,7 +251,7 @@ try {
 }
 ```
 
-Stop on any failed command; shell snippets are not an unattended acceptance runner. Inspect the three private JSON receipts. Require `schemaVersion=1`, `releaseTag=v0.8.0`, `artifactVersion=0.8.0`, `production.apiBase=https://pomodorough.egigoka.me`, the release's `production.oauthClientId`, and the same nonempty `production.accountFingerprint`. Require the exact artifact/platform cells above, match each `assetSha256` to its corresponding filename in `SHA256SUMS.txt`, and check `completedAt` against the recorded run time. All five named checks must be present and `true`: `googleSignIn`, `productionAccount`, `secureRestoration`, `serverLogout`, and `localCredentialRemoval`.
+Stop on any failed command; shell snippets are not an unattended acceptance runner. Inspect the three private JSON receipts. Require `schemaVersion=1`, `releaseTag=v0.9.0`, `artifactVersion=0.9.0`, `production.apiBase=https://pomodorough.egigoka.me`, the release's `production.oauthClientId`, and the same nonempty `production.accountFingerprint`. Require the exact artifact/platform cells above, match each `assetSha256` to its corresponding filename in `SHA256SUMS.txt`, and check `completedAt` against the recorded run time. All five named checks must be present and `true`: `googleSignIn`, `productionAccount`, `secureRestoration`, `serverLogout`, and `localCredentialRemoval`.
 
 On sign-off failure, cleanup is attempted but not guaranteed. No successful receipt is produced; stdout redirection may leave an empty file, and a file's existence alone proves nothing. Record the sanitized failure privately, resolve cleanup, and repeat with a new receipt path. Session logout in a receipt is not evidence that Google revoked the old OAuth client or that the production allowlist was updated.
 
