@@ -22,6 +22,31 @@ PARTIAL_REQUESTS = (
 )
 
 
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class DripConnection:
+    def __init__(self, clock: ManualClock, interval: float) -> None:
+        self.clock = clock
+        self.interval = interval
+        self.sent = 0
+        self.timeouts = []
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def recv_into(self, buffer: bytearray) -> int:
+        self.clock.now += self.interval
+        buffer[0] = ord("x")
+        self.sent += 1
+        return 1
+
+
 class UnboundCallbackServer(HTTPServer):
     def __init__(self, handler, connections, entered):
         super().__init__(("127.0.0.1", 0), handler, bind_and_activate=False)
@@ -166,31 +191,24 @@ def test_partial_reads_stop_without_peer_completion(callback_flow, partial, stop
     assert flow.pairs[0][0].fileno() == -1
 
 
-@pytest.mark.parametrize("partial", PARTIAL_REQUESTS, ids=["partial-line", "partial-headers"])
-def test_slow_drip_cannot_extend_absolute_deadline(callback_flow, partial):
-    flow = callback_flow([partial], timeout=0.16)
-    start_drip = threading.Event()
-    sent = 0
+@pytest.mark.parametrize(("interval", "expected"), [(1 / 32, 4), (1 / 64, 8)])
+def test_slow_drip_cannot_extend_absolute_deadline(monkeypatch, interval, expected):
+    clock = ManualClock()
+    connection = DripConnection(clock, interval)
+    monkeypatch.setattr(network, "time", clock)
+    reader = network._CallbackReader(connection, interval * expected, threading.Event())
+    buffer = bytearray(1)
 
-    def drip() -> None:
-        nonlocal sent
-        assert start_drip.wait(1)
-        while not flow.finished.wait(0.01):
-            try:
-                flow.pairs[0][1].sendall(b"x")
-                sent += 1
-            except BrokenPipeError:
-                return
+    for _ in range(expected):
+        assert reader.readinto(buffer) == 1
+    with pytest.raises(TimeoutError):
+        reader.readinto(buffer)
 
-    dripper = threading.Thread(target=drip, daemon=True)
-    dripper.start()
-    started = time.monotonic()
-    flow.start(start_drip.set)
-    flow.assert_finished("timed out")
-    dripper.join(1)
-    assert not dripper.is_alive()
-    assert sent >= 3
-    assert time.monotonic() - started < 0.4
+    assert connection.sent == expected
+    assert connection.sent >= 3
+    assert len(connection.timeouts) == expected
+    assert connection.timeouts[-1] == interval
+    assert all(0 < timeout <= 0.05 for timeout in connection.timeouts)
 
 
 @pytest.mark.parametrize("partial", PARTIAL_REQUESTS, ids=["partial-line", "partial-headers"])

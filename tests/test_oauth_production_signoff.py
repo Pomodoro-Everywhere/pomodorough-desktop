@@ -14,6 +14,27 @@ from unittest.mock import Mock, patch
 from pomodorough import oauth_production_signoff as signoff
 
 
+def windows_acl_failure(
+    path: Path, error: subprocess.CalledProcessError | subprocess.TimeoutExpired,
+) -> AssertionError:
+    diagnostic = error.stderr or "<empty stderr>"
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode(errors="replace")
+    for value in (str(path), os.environ.get("USERPROFILE"),
+                  os.environ.get("USERNAME"), os.environ.get("USERDOMAIN")):
+        if value:
+            diagnostic = re.sub(re.escape(value), "<redacted>", diagnostic,
+                                flags=re.IGNORECASE)
+    diagnostic = re.sub(r"\bS-\d+(?:-\d+)+\b", "<sid>", diagnostic, flags=re.IGNORECASE)
+    if isinstance(error, subprocess.TimeoutExpired):
+        outcome = f"timed out after {error.timeout} seconds"
+    else:
+        outcome = f"failed (exit {error.returncode})"
+    return AssertionError(
+        f"Windows receipt ACL command {outcome}: {diagnostic.strip()[:2000]}"
+    )
+
+
 def windows_acl_command(path: Path, command: str) -> str:
     try:
         result = subprocess.run(
@@ -22,31 +43,25 @@ def windows_acl_command(path: Path, command: str) -> str:
             env={**os.environ, "POMODOROUGH_TEST_ACL_PATH": str(path)},
             capture_output=True, text=True, check=True, timeout=30,
         )
-    except subprocess.CalledProcessError as error:
-        diagnostic = error.stderr or "<empty stderr>"
-        for value in (str(path), os.environ.get("USERPROFILE"),
-                      os.environ.get("USERNAME"), os.environ.get("USERDOMAIN")):
-            if value:
-                diagnostic = re.sub(re.escape(value), "<redacted>", diagnostic,
-                                    flags=re.IGNORECASE)
-        diagnostic = re.sub(r"\bS-\d+(?:-\d+)+\b", "<sid>", diagnostic, flags=re.IGNORECASE)
-        raise AssertionError(
-            f"Windows receipt ACL command failed (exit {error.returncode}): "
-            f"{diagnostic.strip()[:2000]}"
-        ) from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise windows_acl_failure(path, error) from None
     return result.stdout
 
 
 def restrict_windows_receipt_directory(path: Path) -> None:
-    windows_acl_command(path, """
-        $operator = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-        $acl.SetAccessRuleProtection($true, $false)
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $operator, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-        [System.IO.Directory]::SetAccessControl($env:POMODOROUGH_TEST_ACL_PATH, $acl)
-    """)
+    username = os.environ.get("USERNAME")
+    if not username:
+        raise AssertionError("Windows receipt ACL fixture requires USERNAME")
+    domain = os.environ.get("USERDOMAIN")
+    operator = f"{domain}\\{username}" if domain else username
+    try:
+        subprocess.run(
+            ["icacls.exe", str(path), "/inheritance:r", "/grant:r",
+             f"{operator}:(OI)(CI)F"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise windows_acl_failure(path, error) from None
 
 
 def windows_receipt_acl(path: Path) -> dict:
@@ -109,24 +124,53 @@ class _Service:
 class WindowsReceiptAclFixtureTests(unittest.TestCase):
     def test_fixture_persists_operator_dacl_without_provider_set_acl(self) -> None:
         path = Path("receipt directory's [literal] name")
-        with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="")) as run:
+        environment = {"USERNAME": "private-user", "USERDOMAIN": "private-host"}
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="")) as run,
+        ):
             restrict_windows_receipt_directory(path)
 
         arguments = run.call_args.args[0]
-        self.assertEqual(arguments[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
-        script = arguments[4]
-        self.assertIn("$ErrorActionPreference = 'Stop'", script)
-        self.assertIn("[System.Security.Principal.WindowsIdentity]::GetCurrent().User", script)
-        self.assertIn("[System.Security.AccessControl.DirectorySecurity]::new()", script)
-        self.assertIn("$acl.SetAccessRuleProtection($true, $false)", script)
-        self.assertIn("$operator, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'", script)
-        self.assertIn("$acl.AddAccessRule($rule)", script)
-        self.assertIn("[System.IO.Directory]::SetAccessControl($env:POMODOROUGH_TEST_ACL_PATH, $acl)", script)
-        self.assertNotIn("Set-Acl", script)
-        self.assertNotIn(str(path), script)
-        self.assertEqual(run.call_args.kwargs["env"]["POMODOROUGH_TEST_ACL_PATH"], str(path))
+        self.assertEqual(arguments, [
+            "icacls.exe", str(path), "/inheritance:r", "/grant:r",
+            r"private-host\private-user:(OI)(CI)F",
+        ])
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertTrue(run.call_args.kwargs["text"])
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_fixture_fails_closed_without_windows_operator(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(subprocess, "run") as run,
+            self.assertRaisesRegex(AssertionError, "requires USERNAME"),
+        ):
+            restrict_windows_receipt_directory(Path("receipt directory"))
+
+        run.assert_not_called()
+
+    def test_fixture_reports_timeout_without_operator_identifiers(self) -> None:
+        path = Path("receipt directory's [literal] name")
+        environment = {"USERNAME": "private-user", "USERDOMAIN": "private-host"}
+        failure = subprocess.TimeoutExpired(
+            ["icacls.exe"], 30, stderr=b"PRIVATE-HOST\\PRIVATE-USER timed out",
+        )
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(subprocess, "run", side_effect=failure),
+            self.assertRaises(AssertionError) as raised,
+        ):
+            restrict_windows_receipt_directory(path)
+
+        self.assertEqual(
+            str(raised.exception),
+            "Windows receipt ACL command timed out after 30 seconds: "
+            "<redacted>\\<redacted> timed out",
+        )
+        self.assertTrue(raised.exception.__suppress_context__)
 
     def test_fixture_reads_file_dacl_without_provider_get_acl(self) -> None:
         path = Path("receipt directory's [literal] name") / "receipt.json"
