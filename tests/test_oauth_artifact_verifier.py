@@ -14,12 +14,15 @@ from unittest.mock import patch
 from pomodorough.oauth_artifact_verifier import (
     TOKENS,
     _PrivateFileSecretStore,
+    _RestoredSessionRequest,
+    _child_environment,
+    _restart_command,
     _restart_in_child,
     _verify_restored_process,
     main,
     run_platform_store_test,
 )
-from pomodorough.network import TokenStore
+from pomodorough.network import ApiError, TokenStore
 
 
 ROOT = Path(__file__).parents[1]
@@ -135,6 +138,15 @@ class OAuthArtifactVerifierTests(unittest.TestCase):
                     _restart_in_child(Path("controlled-state")), expected
                 )
 
+    def test_windowed_restart_child_fails_closed_at_timeout(self) -> None:
+        with patch(
+            "pomodorough.oauth_artifact_verifier.subprocess.run",
+            side_effect=subprocess.TimeoutExpired([], 30),
+        ) as run:
+            self.assertFalse(_restart_in_child(Path("controlled-state")))
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
     def test_restart_verifier_avoids_qt_service_lifecycle(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -148,8 +160,66 @@ class OAuthArtifactVerifierTests(unittest.TestCase):
             with patch(
                 "pomodorough.oauth_artifact_verifier.CloudService",
                 side_effect=AssertionError("restart child constructed Qt service"),
+            ), patch(
+                "pomodorough.oauth_artifact_verifier._ScenarioTransport",
+                side_effect=AssertionError("restart child started loopback server"),
             ):
                 self.assertTrue(_verify_restored_process(root))
+
+    def test_restored_session_transport_rejects_unexpected_requests(self) -> None:
+        request = _RestoredSessionRequest()
+        cases = (
+            ("GET", "https://api.example.test/api/v1/me", None, None, False),
+            (
+                "POST",
+                "https://api.example.test/api/v1/auth/refresh",
+                {"refreshToken": "wrong-token"},
+                None,
+                False,
+            ),
+            (
+                "POST",
+                "https://other.example.test/api/v1/auth/refresh",
+                {"refreshToken": TOKENS["refreshToken"]},
+                None,
+                False,
+            ),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), self.assertRaises(ApiError):
+                request(*arguments)
+
+    def test_restart_child_reads_persisted_session_in_separate_process(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = TokenStore(
+                "artifact-verifier",
+                secret_store=_PrivateFileSecretStore(root / "secure"),
+                fallback_path=root / "session-tombstone.json",
+            )
+            store.bind_api("https://api.example.test")
+            store.save(TOKENS)
+
+            result = subprocess.run(
+                _restart_command(root),
+                capture_output=True,
+                check=False,
+                env=_child_environment(),
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout), {"restart_process_verified": True}
+            )
+            restored = store.load()
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored["refreshToken"], TOKENS["refreshToken"])
+            self.assertNotIn("accessToken", restored)
+            combined_output = result.stdout + result.stderr
+            self.assertNotIn("access-token", combined_output)
+            self.assertNotIn("refresh-token", combined_output)
 
     def test_packaged_self_test_covers_success_restart_and_negative_contracts(self) -> None:
         result = subprocess.run(

@@ -201,6 +201,41 @@ class _ScenarioTransport:
         self.thread.join(timeout=5)
 
 
+class _RestoredSessionRequest:
+    def __init__(self) -> None:
+        self.refreshes = 0
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None = None,
+        access_token: str | None = None,
+        form: bool = False,
+    ) -> dict[str, Any]:
+        arguments = method, url, payload, access_token, form
+        refresh_request = (
+            "POST",
+            "https://api.example.test/api/v1/auth/refresh",
+            {"refreshToken": TOKENS["refreshToken"]},
+            None,
+            False,
+        )
+        if arguments == refresh_request:
+            self.refreshes += 1
+            return dict(TOKENS, accessToken="access-token-2")
+        profile_request = (
+            "GET",
+            "https://api.example.test/api/v1/me",
+            None,
+            "access-token-2",
+            False,
+        )
+        if arguments == profile_request:
+            return {"user": {"id": "controlled-user"}}
+        raise ApiError("unexpected restored-session request", 404)
+
+
 def _credentials_file(root: Path) -> Path:
     path = root / "oauth.json"
     path.write_text(
@@ -261,19 +296,22 @@ def _child_environment() -> dict[str, str]:
 
 
 def _restart_in_child(root: Path) -> bool:
-    result = subprocess.run(
-        _restart_command(root),
-        capture_output=True,
-        check=False,
-        env=_child_environment(),
-        text=True,
-        timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            _restart_command(root),
+            capture_output=True,
+            check=False,
+            env=_child_environment(),
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return result.returncode == 0
 
 
 def _verify_restored_process(root: Path) -> bool:
-    request = _ScenarioTransport("success")
+    request = _RestoredSessionRequest()
     store = _PrivateFileSecretStore(root / "secure")
     token_store = TokenStore(
         "artifact-verifier",
@@ -299,8 +337,6 @@ def _verify_restored_process(root: Path) -> bool:
         )
     except (ApiError, SecureStoreError, OSError, ValueError):
         return False
-    finally:
-        request.close()
 
 
 def _success_and_restart(root: Path) -> tuple[bool, bool, bool, bool]:
