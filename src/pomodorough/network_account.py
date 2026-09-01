@@ -1,15 +1,131 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import os
 import subprocess
+import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 from .network_session import ApiError, Request, SessionState, Text, TokenStorePort
-from .secure_store import SecureStoreError, TokenCleanupPendingError
+from .secure_store import SecureStoreError, TokenCleanupPendingError, token_store_lock
 from .storage_revocation import PendingSessionRevocations, credential_api_base
+
+_CLEARED_DELETION_CLEANUP = {"version": 1, "cleanupState": "cleared"}
+_MOVEFILE_REPLACE_EXISTING = 0x1
+_MOVEFILE_WRITE_THROUGH = 0x8
+
+
+def _platform_name(filesystem: Any = os) -> str:
+    return str(getattr(filesystem, "name", ""))
+
+
+def _load_windows_kernel32() -> Any:
+    import ctypes
+
+    try:
+        return ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        raise SecureStoreError(
+            "Windows durable file replacement is unsupported."
+        ) from error
+
+
+def _last_windows_error() -> int:
+    import ctypes
+
+    return ctypes.get_last_error()
+
+
+def _replace_windows_write_through(source: Path, destination: Path) -> None:
+    import ctypes
+
+    move_file = _load_windows_kernel32().MoveFileExW
+    move_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    move_file.restype = ctypes.c_int
+    flags = _MOVEFILE_REPLACE_EXISTING | _MOVEFILE_WRITE_THROUGH
+    if move_file(str(source.absolute()), str(destination.absolute()), flags):
+        return
+    error_code = _last_windows_error()
+    raise OSError(
+        error_code,
+        "Atomic write-through file replacement failed.",
+        str(destination),
+    )
+
+
+def _replace_file_for_durable_commit(
+    source: Path, destination: Path, filesystem: Any = os
+) -> None:
+    platform = _platform_name(filesystem)
+    if platform == "nt":
+        _replace_windows_write_through(source, destination)
+        return
+    if platform != "posix":
+        raise SecureStoreError("Durable file replacement is unsupported.")
+    filesystem.replace(source, destination)
+
+
+def _sync_replaced_file_directory(path: Path, filesystem: Any = os) -> None:
+    platform = _platform_name(filesystem)
+    if platform == "nt":
+        return
+    if platform != "posix":
+        raise SecureStoreError("Directory durability is unsupported.")
+    if not hasattr(filesystem, "O_DIRECTORY"):
+        if filesystem is not os:
+            _sync_replaced_file_directory(path)
+            return
+        raise SecureStoreError("Directory durability is unsupported.")
+    descriptor = filesystem.open(
+        path.parent, filesystem.O_RDONLY | filesystem.O_DIRECTORY
+    )
+    try:
+        filesystem.fsync(descriptor)
+    finally:
+        filesystem.close(descriptor)
+
+
+def _account_deletion_cleanup_blocks_authentication(path: Path) -> bool:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, UnicodeError):
+        raise SecureStoreError(
+            "Account deletion cleanup obligation is unreadable or malformed."
+        ) from None
+    if document == _CLEARED_DELETION_CLEANUP:
+        return False
+    if not isinstance(document, dict):
+        raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+    return True
+
+
+@contextmanager
+def _account_deletion_cleanup_lock(path: Path) -> Iterator[None]:
+    acquired = False
+    try:
+        with token_store_lock(None, "account-deletion-cleanup", path):
+            acquired = True
+            yield
+    except ImportError as error:
+        raise SecureStoreError(
+            "Account deletion cleanup locking is unsupported."
+        ) from error
+    except OSError as error:
+        if not acquired:
+            raise SecureStoreError(
+                "Account deletion cleanup lock is unavailable."
+            ) from error
+        raise
 
 
 class AccountTokenStorePort(TokenStorePort, Protocol):
@@ -17,13 +133,136 @@ class AccountTokenStorePort(TokenStorePort, Protocol):
 
     def clear_if_signed_out(self) -> None: ...
 
+    def account_deletion_cleanup_path(self) -> Path: ...
+
+    def account_deletion_credential_identity(
+        self,
+    ) -> AbstractContextManager[_DeletionCredentialIdentity | None]: ...
+
+    def account_deletion_credentials_locked(
+        self,
+    ) -> AbstractContextManager[None]: ...
+
+    def account_deletion_credential_identity_locked(
+        self,
+    ) -> _DeletionCredentialIdentity | None: ...
+
+    def account_deletion_confirmed_generation_locked(
+        self,
+    ) -> int | None: ...
+
+    def confirm_account_deletion_locked(
+        self,
+        api_base: str,
+        generation: int,
+        identity: _DeletionCredentialIdentity,
+    ) -> bool: ...
+
+    def account_deletion_refresh(
+        self, identity: _DeletionCredentialIdentity
+    ) -> AbstractContextManager[None]: ...
+
+    def clear_account_deletion_credentials(
+        self,
+        api_base: str,
+        identity: _DeletionCredentialIdentity,
+    ) -> bool: ...
+
+    def clear_account_deletion_credentials_locked(
+        self,
+        api_base: str,
+        identity: _DeletionCredentialIdentity,
+    ) -> bool: ...
+
 
 @dataclass(frozen=True)
+class _DeletionCredentialIdentity:
+    api_base: str
+    access_token_hash: str
+    refresh_token_hash: str
+
+    @classmethod
+    def from_tokens(
+        cls, api_base: str, access_token: str, refresh_token: str
+    ) -> _DeletionCredentialIdentity:
+        return cls(
+            credential_api_base(api_base),
+            AccountLifecycle._token_hash(access_token),
+            AccountLifecycle._token_hash(refresh_token),
+        )
+
+    def matches(self, other: _DeletionCredentialIdentity) -> bool:
+        return bool(
+            self.api_base == other.api_base
+            and hmac.compare_digest(
+                self.access_token_hash, other.access_token_hash
+            )
+            and hmac.compare_digest(
+                self.refresh_token_hash, other.refresh_token_hash
+            )
+        )
+
+    def matches_session(
+        self,
+        api_base: str,
+        access_token: str | None,
+        refresh_token: str | None,
+    ) -> bool:
+        if access_token is None or credential_api_base(api_base) != self.api_base:
+            return False
+        if not hmac.compare_digest(
+            AccountLifecycle._token_hash(access_token), self.access_token_hash
+        ):
+            return False
+        return refresh_token is None or hmac.compare_digest(
+            AccountLifecycle._token_hash(refresh_token), self.refresh_token_hash
+        )
+
+
+@dataclass
 class AccountDeletionCredentials:
     access_token: str | None = field(repr=False)
     access_expires_at: datetime
     refresh_token: str | None = field(repr=False)
     generation: int
+    identity: _DeletionCredentialIdentity | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class _DeletionCleanup:
+    api_base: str
+    generation: int
+    identity: _DeletionCredentialIdentity
+
+    @property
+    def refresh_token_hash(self) -> str:
+        return self.identity.refresh_token_hash
+
+    @property
+    def access_token_hash(self) -> str:
+        return self.identity.access_token_hash
+
+    @property
+    def bound_credential_api_base(self) -> str:
+        return self.identity.api_base
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "cleanupState": "pending",
+            "apiBase": self.api_base,
+            "generation": self.generation,
+            "credentialApiBase": self.identity.api_base,
+            "accessTokenHash": self.identity.access_token_hash,
+            "refreshTokenHash": self.identity.refresh_token_hash,
+        }
+
+
+@dataclass(frozen=True)
+class _LegacyDeletionCleanup:
+    api_base: str
+    generation: int
+    refresh_token_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -73,12 +312,14 @@ class AccountLifecycle:
         self.text = text
         self.now = now
         self.revocations = revocations
+        self._pending_deletion_cleanup: set[int] = set()
 
     def begin_deletion(
         self,
         confirmation: str,
     ) -> AccountDeletionCredentials | None:
         with self.state.lock:
+            self._retry_deletion_cleanup_locked()
             if (
                 confirmation != "DELETE"
                 or not self.state.authenticated
@@ -86,15 +327,27 @@ class AccountLifecycle:
                 or self.state.shutting_down
             ):
                 return None
+            identity = self._capture_deletion_identity_locked()
             self.state.account_generation += 1
             credentials = AccountDeletionCredentials(
                 self.state.access_token,
                 self.state.access_expires_at,
                 self.state.refresh_token,
                 self.state.account_generation,
+                identity,
             )
             self.state.deleting_account = True
             return credentials
+
+    def _capture_deletion_identity_locked(self) -> _DeletionCredentialIdentity:
+        with self.token_store.account_deletion_credential_identity() as identity:
+            if identity is not None and identity.matches_session(
+                self.api_base,
+                self.state.access_token,
+                self.state.refresh_token,
+            ):
+                return identity
+        raise ApiError(self.text("network.error.sign_in_cancelled"))
 
     def delete_account(
         self,
@@ -128,12 +381,115 @@ class AccountLifecycle:
     ) -> dict[str, Any]:
         with self.state.lock:
             self._assert_deletion_current_locked(credentials)
-        return self.request(
-            "DELETE",
-            f"{self.api_base}/api/v1/account",
-            {"confirmation": "DELETE"},
-            access_token=access_token,
-        )
+            cleanup = self._prepare_deletion_cleanup_locked(credentials)
+        try:
+            response = self.request(
+                "DELETE",
+                f"{self.api_base}/api/v1/account",
+                {"confirmation": "DELETE"},
+                access_token=access_token,
+            )
+        except ApiError as error:
+            self._handle_deletion_request_error(error, credentials, cleanup)
+            raise
+        except Exception:
+            self._secure_uncertain_deletion(credentials, cleanup)
+            raise
+        self._finish_remote_deletion(credentials, cleanup)
+        return response
+
+    def _prepare_deletion_cleanup_locked(
+        self, credentials: AccountDeletionCredentials
+    ) -> _DeletionCleanup:
+        expected = credentials.identity
+        if expected is None:
+            raise ApiError(self.text("network.error.sign_in_cancelled"))
+        path = self._deletion_cleanup_path()
+        try:
+            with (
+                _account_deletion_cleanup_lock(path),
+                self.token_store.account_deletion_credential_identity() as identity,
+            ):
+                if identity is None or not expected.matches(identity):
+                    raise ApiError(self.text("network.error.sign_in_cancelled"))
+                cleanup = _DeletionCleanup(self.api_base, credentials.generation, expected)
+                self._write_deletion_cleanup_locked(path, cleanup)
+        except (OSError, subprocess.SubprocessError):
+            if self._deletion_cleanup_exists_safely():
+                self._pending_deletion_cleanup.add(credentials.generation)
+            raise
+        return cleanup
+
+    def _handle_deletion_request_error(
+        self,
+        error: ApiError,
+        credentials: AccountDeletionCredentials,
+        cleanup: _DeletionCleanup | None,
+    ) -> None:
+        if error.status is None:
+            self._secure_uncertain_deletion(credentials, cleanup)
+            return
+        try:
+            self._remove_deletion_cleanup(cleanup)
+        except (OSError, subprocess.SubprocessError):
+            self._pending_deletion_cleanup.add(credentials.generation)
+            raise TokenCleanupPendingError(
+                "Account deletion failed and local cleanup is pending."
+            ) from None
+
+    def _secure_uncertain_deletion(
+        self,
+        credentials: AccountDeletionCredentials,
+        cleanup: _DeletionCleanup | None,
+    ) -> None:
+        with self.state.lock:
+            if not self._deletion_current_locked(credentials):
+                self._settle_stale_deletion_cleanup_locked(credentials, cleanup)
+                return
+            try:
+                resolved = self._resolve_deletion_cleanup_locked(cleanup)
+            except (OSError, subprocess.SubprocessError):
+                resolved = False
+            if cleanup is not None or not resolved or self._deletion_cleanup_exists_safely():
+                self._pending_deletion_cleanup.add(credentials.generation)
+
+    def _finish_remote_deletion(
+        self,
+        credentials: AccountDeletionCredentials,
+        cleanup: _DeletionCleanup | None,
+    ) -> None:
+        with self.state.lock:
+            if not self._deletion_current_locked(credentials):
+                self._settle_stale_deletion_cleanup_locked(credentials, cleanup)
+                raise ApiError(self.text("network.error.sign_in_cancelled"))
+            self._pending_deletion_cleanup.add(credentials.generation)
+            try:
+                resolved = self._resolve_deletion_cleanup_locked(cleanup)
+            except (OSError, subprocess.SubprocessError):
+                raise TokenCleanupPendingError(
+                    "Remote account deleted. Local credential cleanup will be retried."
+                ) from None
+            if not resolved:
+                raise TokenCleanupPendingError(
+                    "Remote account deleted. Local credential cleanup will be retried."
+                )
+
+    def _settle_stale_deletion_cleanup_locked(
+        self,
+        credentials: AccountDeletionCredentials,
+        cleanup: _DeletionCleanup | None,
+    ) -> None:
+        if credentials.generation != self.state.account_generation:
+            self._pending_deletion_cleanup.discard(credentials.generation)
+            try:
+                self._remove_deletion_cleanup(cleanup)
+            except (OSError, subprocess.SubprocessError):
+                self._pending_deletion_cleanup.add(credentials.generation)
+            return
+        try:
+            self._resolve_deletion_cleanup_locked(cleanup)
+        except (OSError, subprocess.SubprocessError):
+            self._pending_deletion_cleanup.add(credentials.generation)
 
     def refresh_deletion_access(
         self,
@@ -155,8 +511,26 @@ class AccountLifecycle:
             self._assert_deletion_current_locked(credentials)
             if credentials.refresh_token != self.state.refresh_token:
                 raise ApiError(self.text("network.error.sign_in_cancelled"))
-            accept_tokens(response)
+            identity = credentials.identity
+            if identity is None:
+                accept_tokens(response)
+            else:
+                with self.token_store.account_deletion_refresh(identity):
+                    accept_tokens(response)
+                credentials.identity = self._current_deletion_identity_locked()
+                credentials.access_token = self.state.access_token
+                credentials.access_expires_at = self.state.access_expires_at
+                credentials.refresh_token = self.state.refresh_token
             return self.state.access_token or ""
+
+    def _current_deletion_identity_locked(self) -> _DeletionCredentialIdentity:
+        access_token = self.state.access_token
+        refresh_token = self.state.refresh_token
+        if not access_token or not refresh_token:
+            raise ApiError(self.text("network.error.sign_in_cancelled"))
+        return _DeletionCredentialIdentity.from_tokens(
+            self.api_base, access_token, refresh_token
+        )
 
     def _deletion_current_locked(self, credentials: AccountDeletionCredentials) -> bool:
         return bool(
@@ -178,19 +552,28 @@ class AccountLifecycle:
             self.state.busy = False
             self.state.deleting_account = False
             self.state.sync_queued = None
-            self._clear_store_safely()
             self._clear_session()
+            self._pending_deletion_cleanup.discard(credentials.generation)
             return True
 
     def fail_deletion(self, credentials: AccountDeletionCredentials) -> bool:
         with self.state.lock:
             if not self._deletion_current_locked(credentials):
                 return False
+            if self._deletion_cleanup_pending_locked(credentials):
+                self.state.account_generation += 1
+                self.state.busy = False
+                self.state.deleting_account = False
+                self.state.sync_queued = None
+                self._clear_session()
+                self._pending_deletion_cleanup.discard(credentials.generation)
+                return True
             self.state.deleting_account = False
             return True
 
     def sign_out(self) -> LogoutCredentials:
         with self.state.lock:
+            self._retry_deletion_cleanup_locked()
             credentials = self._logout_credentials()
             if credentials.access_token or credentials.refresh_token:
                 self.enqueue_revocation(RevocationState(
@@ -221,9 +604,15 @@ class AccountLifecycle:
 
     def retry_sign_out_cleanup(self, generation: int) -> None:
         with self.state.lock:
+            self._retry_deletion_cleanup_locked()
+            if self._has_deletion_cleanup():
+                return
             if (
-                self.state.shutting_down or generation != self.state.account_generation
-                or self.state.authenticated or self.state.access_token or self.state.refresh_token
+                self.state.shutting_down
+                or generation != self.state.account_generation
+                or self.state.authenticated
+                or self.state.access_token
+                or self.state.refresh_token
             ):
                 return
             try:
@@ -232,6 +621,354 @@ class AccountLifecycle:
                 raise SecureStoreError(
                     "Signed out locally. Secure credential cleanup failed and will be retried."
                 ) from None
+
+    def require_authentication_ready(self) -> None:
+        with self.state.lock:
+            self._retry_deletion_cleanup_locked()
+
+    def _retry_deletion_cleanup_locked(self) -> None:
+        try:
+            cleanup = self._resolve_pending_deletion_cleanup()
+        except TokenCleanupPendingError:
+            raise SecureStoreError(
+                "Account deletion credential cleanup failed and will be retried."
+            ) from None
+        except SecureStoreError:
+            raise
+        except (OSError, subprocess.SubprocessError):
+            raise SecureStoreError(
+                "Account deletion credential cleanup failed and will be retried."
+            ) from None
+        if cleanup is not None:
+            self._clear_deletion_session_locked(cleanup)
+
+    def _resolve_deletion_cleanup_locked(
+        self,
+        cleanup: _DeletionCleanup | None,
+    ) -> bool:
+        if cleanup is None:
+            return True
+        path = self._deletion_cleanup_path(required=False)
+        if path is None:
+            return True
+        with (
+            _account_deletion_cleanup_lock(path),
+            self.token_store.account_deletion_credentials_locked(),
+        ):
+            identity = self.token_store.account_deletion_credential_identity_locked()
+            if identity is None:
+                return self._settle_absent_deletion_credentials_locked(path, cleanup)
+            if not cleanup.identity.matches(identity):
+                return False
+            if not self.token_store.confirm_account_deletion_locked(
+                cleanup.api_base, cleanup.generation, cleanup.identity
+            ):
+                return False
+            self._rearm_deletion_cleanup_locked(path, cleanup)
+            if not self._clear_deletion_credentials_locked(cleanup):
+                return False
+            self._clear_deletion_cleanup_marker_locked(path)
+            return True
+
+    def _settle_absent_deletion_credentials_locked(
+        self, path: Path, cleanup: _DeletionCleanup
+    ) -> bool:
+        current = self._read_deletion_cleanup_locked(path)
+        if current is None:
+            return True
+        if current != cleanup:
+            return False
+        self._clear_deletion_cleanup_marker_locked(path)
+        return True
+
+    def _rearm_deletion_cleanup_locked(
+        self, path: Path, cleanup: _DeletionCleanup
+    ) -> None:
+        try:
+            current = self._read_deletion_cleanup_locked(path)
+        except SecureStoreError:
+            current = None
+        if current != cleanup:
+            self._replace_deletion_cleanup_locked(path, cleanup.document())
+
+    def _resolve_pending_deletion_cleanup(self) -> _DeletionCleanup | None:
+        path = self._deletion_cleanup_path(required=False)
+        if path is None:
+            return None
+        with (
+            _account_deletion_cleanup_lock(path),
+            self.token_store.account_deletion_credentials_locked(),
+        ):
+            cleanup = self._pending_or_confirmed_cleanup_locked(path)
+            if cleanup is None:
+                return None
+            if isinstance(cleanup, _LegacyDeletionCleanup):
+                self._retire_legacy_deletion_cleanup_locked(path)
+                return None
+            if not self._clear_deletion_credentials_locked(cleanup):
+                raise TokenCleanupPendingError(
+                    "Account deletion credential cleanup is pending."
+                )
+            self._clear_deletion_cleanup_marker_locked(path)
+            return cleanup
+
+    def _pending_or_confirmed_cleanup_locked(
+        self, path: Path
+    ) -> _DeletionCleanup | _LegacyDeletionCleanup | None:
+        marker_error: SecureStoreError | None = None
+        try:
+            cleanup = self._read_deletion_cleanup_locked(path)
+        except SecureStoreError as error:
+            cleanup = None
+            marker_error = error
+        generation = self.token_store.account_deletion_confirmed_generation_locked()
+        if generation is None:
+            if marker_error is not None:
+                raise marker_error
+            return cleanup
+        identity = self.token_store.account_deletion_credential_identity_locked()
+        if identity is None:
+            raise TokenCleanupPendingError(
+                "Confirmed account deletion identity is unavailable."
+            )
+        confirmed = _DeletionCleanup(identity.api_base, generation, identity)
+        if cleanup != confirmed:
+            self._replace_deletion_cleanup_locked(path, confirmed.document())
+        return confirmed
+
+    def _retire_legacy_deletion_cleanup_locked(self, path: Path) -> None:
+        identity = self.token_store.account_deletion_credential_identity_locked()
+        if identity is not None:
+            raise TokenCleanupPendingError(
+                "Legacy account deletion cleanup requires account recovery."
+            )
+        self._clear_deletion_cleanup_marker_locked(path)
+
+    def _clear_deletion_credentials_locked(
+        self,
+        cleanup: _DeletionCleanup,
+    ) -> bool:
+        return self.token_store.clear_account_deletion_credentials_locked(
+            cleanup.api_base, cleanup.identity
+        )
+
+    def _clear_deletion_session_locked(self, cleanup: _DeletionCleanup) -> None:
+        access_token = self.state.access_token
+        refresh_token = self.state.refresh_token
+        if access_token and not hmac.compare_digest(
+            self._token_hash(access_token), cleanup.access_token_hash
+        ):
+            return
+        if refresh_token and not hmac.compare_digest(
+            self._token_hash(refresh_token), cleanup.refresh_token_hash
+        ):
+            return
+        if self.state.authenticated or self.state.access_token or refresh_token:
+            self.state.account_generation += 1
+            self.state.busy = False
+            self.state.deleting_account = False
+            self.state.sync_queued = None
+            self._clear_session()
+
+    def _deletion_cleanup_pending_locked(
+        self, credentials: AccountDeletionCredentials
+    ) -> bool:
+        return bool(
+            credentials.generation in self._pending_deletion_cleanup
+            or self._deletion_cleanup_exists_safely()
+        )
+
+    def _has_deletion_cleanup(self) -> bool:
+        path = self._deletion_cleanup_path(required=False)
+        if path is None:
+            return False
+        with _account_deletion_cleanup_lock(path):
+            return self._read_deletion_cleanup_locked(path) is not None
+
+    def _deletion_cleanup_exists_safely(self) -> bool:
+        try:
+            return self._has_deletion_cleanup()
+        except OSError:
+            return True
+
+    def _read_deletion_cleanup(
+        self,
+    ) -> _DeletionCleanup | _LegacyDeletionCleanup | None:
+        path = self._deletion_cleanup_path(required=False)
+        if path is None:
+            return None
+        with _account_deletion_cleanup_lock(path):
+            return self._read_deletion_cleanup_locked(path)
+
+    def _read_deletion_cleanup_locked(
+        self, path: Path
+    ) -> _DeletionCleanup | _LegacyDeletionCleanup | None:
+        if not self._path_exists(path):
+            return None
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeError):
+            raise SecureStoreError(
+                "Account deletion cleanup obligation is unreadable or malformed."
+            ) from None
+        if document == _CLEARED_DELETION_CLEANUP:
+            return None
+        return self._parse_deletion_cleanup(document)
+
+    @staticmethod
+    def _parse_deletion_cleanup(
+        document: Any,
+    ) -> _DeletionCleanup | _LegacyDeletionCleanup:
+        if not isinstance(document, dict):
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        if document.get("version") == 1:
+            return AccountLifecycle._parse_legacy_deletion_cleanup(document)
+        if document.get("version") != 2:
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        if document.get("cleanupState") != "pending":
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        api_base = credential_api_base(document.get("apiBase"))
+        generation = document.get("generation")
+        valid_generation = isinstance(generation, int) and not isinstance(
+            generation, bool
+        )
+        if not valid_generation:
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        identity = _DeletionCredentialIdentity(
+            credential_api_base(document.get("credentialApiBase")),
+            AccountLifecycle._parse_deletion_hash(document, "accessTokenHash"),
+            AccountLifecycle._parse_deletion_hash(document, "refreshTokenHash"),
+        )
+        if identity.api_base != api_base:
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        return _DeletionCleanup(api_base, generation, identity)
+
+    @staticmethod
+    def _parse_legacy_deletion_cleanup(document: dict[str, Any]) -> _LegacyDeletionCleanup:
+        state = document.get("credentialState")
+        expected = {"version", "cleanupState", "apiBase", "generation", "credentialState"}
+        if state == "refresh":
+            expected.add("refreshTokenHash")
+        if document.get("cleanupState") != "pending" or set(document) != expected:
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        generation = document.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        if state == "refresh":
+            token_hash = AccountLifecycle._parse_deletion_hash(
+                document, "refreshTokenHash"
+            )
+        elif state == "absent":
+            token_hash = None
+        else:
+            raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+        return _LegacyDeletionCleanup(
+            credential_api_base(document.get("apiBase")), generation, token_hash
+        )
+
+    @staticmethod
+    def _parse_deletion_hash(document: dict[str, Any], name: str) -> str:
+        token_hash = document.get(name)
+        if (
+            isinstance(token_hash, str)
+            and len(token_hash) == 64
+            and all(character in "0123456789abcdef" for character in token_hash)
+        ):
+            return token_hash
+        raise SecureStoreError("Account deletion cleanup obligation is malformed.")
+
+    def _write_deletion_cleanup(self, obligation: _DeletionCleanup) -> None:
+        path = self._deletion_cleanup_path()
+        with _account_deletion_cleanup_lock(path):
+            self._write_deletion_cleanup_locked(path, obligation)
+
+    def _write_deletion_cleanup_locked(
+        self, path: Path, obligation: _DeletionCleanup
+    ) -> None:
+        existing = self._read_deletion_cleanup_locked(path)
+        if existing == obligation:
+            return
+        if existing is not None:
+            raise SecureStoreError("Another account deletion cleanup is pending.")
+        self._replace_deletion_cleanup_locked(path, obligation.document())
+
+    def _replace_deletion_cleanup_locked(
+        self, path: Path, document: dict[str, Any]
+    ) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as cleanup_file:
+                descriptor = -1
+                json.dump(
+                    document,
+                    cleanup_file,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                cleanup_file.flush()
+                os.fsync(cleanup_file.fileno())
+            _replace_file_for_durable_commit(temporary_path, path)
+            self._sync_deletion_cleanup_directory(path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary_path.unlink(missing_ok=True)
+
+    def _remove_deletion_cleanup(
+        self, cleanup: _DeletionCleanup | None
+    ) -> None:
+        if cleanup is None:
+            return
+        path = self._deletion_cleanup_path(required=False)
+        if path is None:
+            return
+        with _account_deletion_cleanup_lock(path):
+            if self._read_deletion_cleanup_locked(path) != cleanup:
+                return
+            self._clear_deletion_cleanup_marker_locked(path)
+
+    def _clear_deletion_cleanup_marker_locked(self, path: Path) -> None:
+        if _platform_name() == "nt":
+            self._replace_deletion_cleanup_locked(
+                path, _CLEARED_DELETION_CLEANUP
+            )
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        self._sync_deletion_cleanup_directory(path)
+
+    @staticmethod
+    def _sync_deletion_cleanup_directory(path: Path) -> None:
+        _sync_replaced_file_directory(path)
+
+    def _deletion_cleanup_path(self, *, required: bool = True) -> Path | None:
+        cleanup_path = getattr(self.token_store, "account_deletion_cleanup_path", None)
+        if callable(cleanup_path):
+            return cleanup_path()
+        if required:
+            raise SecureStoreError("Account deletion cleanup cannot be persisted.")
+        return None
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    @staticmethod
+    def _token_hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def _logout_credentials(self) -> LogoutCredentials:
         token, refresh = self.state.access_token, self.state.refresh_token

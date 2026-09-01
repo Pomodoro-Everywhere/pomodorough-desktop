@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import call, patch
 
 from PySide6.QtWidgets import QApplication
 
-from pomodorough.network import ApiError, CloudService
+from pomodorough.network import ApiError, CloudService, TokenStore
 
 
 def _run_immediately(function, on_result, on_error=None) -> None:
@@ -30,10 +32,22 @@ class AccountLifecycleTests(unittest.TestCase):
             "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
         }
         for refreshed in ({"accessToken": "deletion-access"}, complete):
-            cloud = CloudService("device-1", "https://example.test")
+            root = Path(self.enterContext(TemporaryDirectory()))
+            store = TokenStore(
+                "device-1", secret_store=None, fallback_path=root / "session.json"
+            )
+            cloud = CloudService(
+                "device-1", "https://example.test", token_store=store
+            )
             self.addCleanup(cloud.shutdown)
+            with patch("pomodorough.network.shutil.which", return_value=None):
+                cloud._accept_tokens({
+                    "accessToken": "expired-access",
+                    "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+                    "refreshToken": "captured-refresh",
+                    "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+                })
             cloud.authenticated = True
-            cloud.access_token, cloud.refresh_token = "expired-access", "captured-refresh"
             cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
             def request(method, _url, _payload, **kwargs):
@@ -50,7 +64,10 @@ class AccountLifecycleTests(unittest.TestCase):
                 patch.object(cloud, "stop_revision_stream"),
                 patch.object(cloud, "start_revision_stream"),
                 patch.object(cloud.token_store, "clear"),
-                patch.object(cloud.token_store, "save") as save,
+                patch.object(
+                    cloud.token_store, "save", wraps=cloud.token_store.save
+                ) as save,
+                patch("pomodorough.network.shutil.which", return_value=None),
                 patch("pomodorough.network._request", side_effect=request) as transport,
                 self.subTest(complete=refreshed is complete),
             ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import hmac
 import io
@@ -19,30 +20,38 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from typing import Any, Protocol, cast
 
 from platformdirs import user_config_path
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtNetwork import QNetworkReply
 
+from . import __version__
 from .localization import Strings
 from .network_account import (
     AccountLifecycle,
     LogoutCredentials,
     RevocationState,
     SignOutCleanupError,
+    _account_deletion_cleanup_blocks_authentication,
+    _account_deletion_cleanup_lock,
+    _DeletionCredentialIdentity,
+    _replace_file_for_durable_commit,
+    _sync_replaced_file_directory,
 )
 from .network_revision import RevisionEventParser, RevisionStream
 from .network_session import (
     ApiError,
     AuthenticatedSession,
     SessionState,
-    TimedDocument as TimedDocument,
+    TimedDocument,
 )
 from .secure_store import (
     PlatformSecretStore,
@@ -56,16 +65,44 @@ from .storage_revocation import PendingSessionRevocations, credential_api_base
 _RevisionEventParser = RevisionEventParser
 
 API_BASE = "https://pomodorough.egigoka.me"
+USER_AGENT = f"Pomodorough-Desktop/{__version__}"
 RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS = frozenset(
     {
         "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com",
     }
 )
 _DEFAULT_SECRET_STORE = object()
+_HTTP_RESPONSE_BODY_LIMIT = 1024 * 1024
+
+
+class _ResponseBodyTooLarge(Exception):
+    pass
+
+
+class _ReadableResponse(Protocol):
+    def read(self, amount: int = -1) -> bytes: ...
 
 
 def _text(key: str, **values: Any) -> str:
     return Strings().text(key, **values)
+
+
+def _desktop_oauth_platform(platform: str) -> str:
+    supported = {
+        "darwin": "macos",
+        "linux": "linux",
+        "win32": "windows",
+    }
+    try:
+        return supported[platform]
+    except KeyError as error:
+        raise ApiError(
+            f"{os.strerror(errno.ENOTSUP)}: {platform!r}",
+            document={
+                "platform": platform,
+                "supportedPlatforms": sorted(supported),
+            },
+        ) from error
 
 
 def _decode_success_document(body: bytes) -> dict[str, Any]:
@@ -80,6 +117,40 @@ def _decode_success_document(body: bytes) -> dict[str, Any]:
     return document
 
 
+def _read_bounded_response_body(response: _ReadableResponse) -> bytes:
+    """Read through short chunks while retaining at most limit-plus-one bytes."""
+    body = bytearray()
+    remaining = _HTTP_RESPONSE_BODY_LIMIT + 1
+    while remaining > 0:
+        chunk = response.read(remaining)
+        if not chunk:
+            break
+        retained = chunk[:remaining]
+        body.extend(retained)
+        remaining -= len(retained)
+    if len(body) > _HTTP_RESPONSE_BODY_LIMIT:
+        raise _ResponseBodyTooLarge
+    return bytes(body)
+
+
+def _decode_http_error(body: bytes, status: int) -> ApiError:
+    try:
+        document = json.loads(body)
+        message = (
+            document.get("error_description") or document.get("error")
+            if isinstance(document, dict)
+            else None
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        document = None
+        message = None
+    return ApiError(
+        message or _text("network.error.http", status=status),
+        status,
+        document if isinstance(document, dict) else None,
+    )
+
+
 def _request(
     method: str,
     url: str,
@@ -87,7 +158,7 @@ def _request(
     access_token: str | None = None,
     form: bool = False,
 ) -> dict[str, Any]:
-    headers = {"Accept": "application/json", "User-Agent": "Pomodorough-Desktop/0.1"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     data = None
     if payload is not None:
         if form:
@@ -101,25 +172,17 @@ def _request(
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            body = response.read()
+            body = _read_bounded_response_body(response)
             return _decode_success_document(body)
     except urllib.error.HTTPError as error:
-        body = error.read()
-        document = None
-        try:
-            document = json.loads(body)
-            message = (
-                document.get("error_description") or document.get("error")
-                if isinstance(document, dict)
-                else None
-            )
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            message = None
-        raise ApiError(
-            message or _text("network.error.http", status=error.code),
-            error.code,
-            document if isinstance(document, dict) else None,
-        ) from error
+        with error:
+            try:
+                body = _read_bounded_response_body(error)
+            except _ResponseBodyTooLarge:
+                body = b""
+        raise _decode_http_error(body, error.code) from error
+    except _ResponseBodyTooLarge as error:
+        raise ApiError(_text("network.error.invalid_response")) from error
     except (urllib.error.URLError, TimeoutError) as error:
         raise ApiError(
             _text(
@@ -162,6 +225,7 @@ class TokenStore:
             self.secret_store = cast(SecretStore | None, secret_store)
         self.secret_key = f"oauth:{device_id}"
         self.api_base: str | None = None
+        self._deletion_refresh_identity = threading.local()
         self.revocations = PendingSessionRevocations(
             self.secret_store or _oauth_secret_store(), device_id
         )
@@ -201,7 +265,9 @@ class TokenStore:
             return document if isinstance(document, dict) else None
         return self._load_legacy_secret_tool()
 
-    def _load_legacy_secret_tool(self) -> dict[str, Any] | None:
+    def _load_legacy_secret_tool(
+        self, *, strict: bool = False
+    ) -> dict[str, Any] | None:
         if not shutil.which("secret-tool"):
             return None
         try:
@@ -219,8 +285,14 @@ class TokenStore:
         try:
             document = json.loads(result.stdout)
         except json.JSONDecodeError:
+            if strict:
+                raise SecureStoreError("Stored OAuth credentials are malformed.") from None
             return None
-        return document if isinstance(document, dict) else None
+        if isinstance(document, dict):
+            return document
+        if strict:
+            raise SecureStoreError("Stored OAuth credentials are malformed.")
+        return None
 
     def _clear_legacy_secret_tool(self) -> None:
         if not shutil.which("secret-tool"):
@@ -261,8 +333,39 @@ class TokenStore:
         return document
 
     def save(self, token_response: dict[str, Any]) -> None:
-        with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+        cleanup_path = self.account_deletion_cleanup_path()
+        with _account_deletion_cleanup_lock(cleanup_path), token_store_lock(
+            self.secret_store, self.secret_key, self.fallback_path
+        ):
+            self._assert_account_deletion_unblocked_locked()
+            self._assert_account_deletion_refresh_current_locked()
             self._save_locked(token_response)
+
+    def _assert_account_deletion_unblocked_locked(self) -> None:
+        marker_blocks = _account_deletion_cleanup_blocks_authentication(
+            self.account_deletion_cleanup_path()
+        )
+        if marker_blocks:
+            raise SecureStoreError(
+                "Account deletion credential cleanup must finish before authentication."
+            )
+        if self.account_deletion_confirmed_generation_locked() is None:
+            return
+        raise SecureStoreError(
+            "Account deletion credential cleanup must finish before authentication."
+        )
+
+    def account_deletion_cleanup_path(self) -> Path:
+        identity = hashlib.sha256(self.secret_key.encode("utf-8")).hexdigest()[:16]
+        return self.fallback_path.with_name(
+            f".{self.fallback_path.name}.account-deletion-{identity}"
+        )
+
+    def _account_deletion_identity_path(self) -> Path:
+        identity = hashlib.sha256(self.secret_key.encode("utf-8")).hexdigest()[:16]
+        return self.fallback_path.with_name(
+            f".{self.fallback_path.name}.account-identity-{identity}"
+        )
 
     def _save_locked(self, token_response: dict[str, Any]) -> None:
         stored = {
@@ -278,34 +381,53 @@ class TokenStore:
                 self.fallback_path.unlink()
             except FileNotFoundError:
                 pass
-            return
+        else:
+            self._save_legacy_token_locked(encoded)
+        self._save_account_deletion_identity_locked(token_response)
+
+    def _save_legacy_token_locked(self, encoded: str) -> None:
         self._write_fallback(encoded)
-        if shutil.which("secret-tool"):
-            try:
-                result = subprocess.run(
-                    [
-                        "secret-tool",
-                        "store",
-                        "--label=Pomodorough",
-                        "service",
-                        "pomodorough",
-                        "device",
-                        self.device_id,
-                    ],
-                    input=encoded,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            else:
-                if result.returncode == 0:
-                    try:
-                        self.fallback_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    return
+        if not shutil.which("secret-tool"):
+            return
+        try:
+            result = subprocess.run(
+                [
+                    "secret-tool", "store", "--label=Pomodorough",
+                    "service", "pomodorough", "device", self.device_id,
+                ],
+                input=encoded, text=True, timeout=15, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        if result.returncode == 0:
+            self.fallback_path.unlink(missing_ok=True)
+
+    def _save_account_deletion_identity_locked(
+        self, token_response: dict[str, Any]
+    ) -> None:
+        if self.api_base is None:
+            return
+        access_token = token_response.get("accessToken")
+        refresh_token = token_response.get("refreshToken")
+        if not isinstance(access_token, str) or not access_token:
+            self._clear_account_deletion_identity_locked()
+            return
+        if not isinstance(refresh_token, str) or not refresh_token:
+            self._clear_account_deletion_identity_locked()
+            return
+        identity = _DeletionCredentialIdentity.from_tokens(
+            self.api_base, access_token, refresh_token
+        )
+        document = {
+            "version": 1,
+            "apiBase": identity.api_base,
+            "accessTokenHash": identity.access_token_hash,
+            "refreshTokenHash": identity.refresh_token_hash,
+        }
+        self._write_private_file(
+            self._account_deletion_identity_path(),
+            json.dumps(document, separators=(",", ":"), sort_keys=True),
+        )
 
     def clear(self) -> None:
         commit = _FallbackCommit()
@@ -316,6 +438,244 @@ class TokenStore:
             if commit.replaced:
                 raise TokenCleanupPendingError("Secure credential cleanup is pending.") from None
             raise
+
+    def clear_account_deletion_credentials(
+        self,
+        api_base: str,
+        identity: _DeletionCredentialIdentity,
+    ) -> bool:
+        commit = _FallbackCommit()
+        try:
+            with self.account_deletion_credentials_locked():
+                return self.clear_account_deletion_credentials_locked(
+                    api_base, identity, commit=commit
+                )
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            raise SecureStoreError("Stored OAuth credentials are malformed.") from None
+        except (OSError, subprocess.SubprocessError):
+            if commit.replaced:
+                raise TokenCleanupPendingError(
+                    "Secure credential cleanup is pending."
+                ) from None
+            raise
+
+    def clear_account_deletion_credentials_locked(
+        self,
+        api_base: str,
+        identity: _DeletionCredentialIdentity,
+        *,
+        commit: _FallbackCommit | None = None,
+    ) -> bool:
+        stored_identity = self._account_deletion_identity_locked()
+        if stored_identity is None:
+            return True
+        if not identity.matches(stored_identity):
+            return False
+        if identity.api_base != credential_api_base(api_base):
+            return False
+        self._clear_locked(commit)
+        return True
+
+    @contextmanager
+    def account_deletion_credentials_locked(self) -> Iterator[None]:
+        with token_store_lock(
+            self.secret_store, self.secret_key, self.fallback_path
+        ):
+            yield
+
+    @contextmanager
+    def account_deletion_credential_identity(
+        self,
+    ) -> Iterator[_DeletionCredentialIdentity | None]:
+        with self.account_deletion_credentials_locked():
+            yield self._account_deletion_identity_locked()
+
+    def account_deletion_credential_identity_locked(
+        self,
+    ) -> _DeletionCredentialIdentity | None:
+        return self._account_deletion_identity_locked()
+
+    def account_deletion_confirmed_generation_locked(self) -> int | None:
+        identity, generation = self._load_account_deletion_record_locked()
+        if generation is None:
+            return None
+        stored = self._account_deletion_candidate_locked()
+        if stored is None:
+            return generation
+        if identity is None or not self._stored_credentials_match_identity(
+            stored, identity
+        ):
+            raise SecureStoreError("Stored OAuth credential identity is unavailable.")
+        return generation
+
+    def confirm_account_deletion_locked(
+        self,
+        api_base: str,
+        generation: int,
+        identity: _DeletionCredentialIdentity,
+    ) -> bool:
+        current = self._account_deletion_identity_locked()
+        if current is None or not identity.matches(current):
+            return False
+        if identity.api_base != credential_api_base(api_base):
+            return False
+        document = {
+            "version": 2,
+            "credentialState": "remoteDeletionConfirmed",
+            "apiBase": identity.api_base,
+            "generation": generation,
+            "accessTokenHash": identity.access_token_hash,
+            "refreshTokenHash": identity.refresh_token_hash,
+        }
+        self._write_private_file(
+            self._account_deletion_identity_path(),
+            json.dumps(document, separators=(",", ":"), sort_keys=True),
+        )
+        return True
+
+    @contextmanager
+    def account_deletion_refresh(
+        self, identity: _DeletionCredentialIdentity
+    ) -> Iterator[None]:
+        if getattr(self._deletion_refresh_identity, "expected", None) is not None:
+            raise SecureStoreError("Account deletion refresh is already active.")
+        self._deletion_refresh_identity.expected = identity
+        try:
+            yield
+        finally:
+            del self._deletion_refresh_identity.expected
+
+    def _assert_account_deletion_refresh_current_locked(self) -> None:
+        expected = getattr(self._deletion_refresh_identity, "expected", None)
+        if expected is None:
+            return
+        current = self._account_deletion_identity_locked()
+        if current is not None and expected.matches(current):
+            return
+        raise SecureStoreError("Authenticated account changed before deletion.")
+
+    def _account_deletion_candidate_locked(self) -> dict[str, Any] | None:
+        fallback = self._load_fallback()
+        if fallback is None:
+            return self._read_stored()
+        if fallback.get("signedOut") is not True:
+            return fallback
+        if self.secret_store is None:
+            return self._load_legacy_secret_tool(strict=True)
+        encoded = self.secret_store.load(self.secret_key)
+        if encoded is None:
+            return None
+        document = json.loads(encoded)
+        if not isinstance(document, dict):
+            raise SecureStoreError("Stored OAuth credentials are malformed.")
+        return document
+
+    def _account_deletion_identity_locked(
+        self,
+    ) -> _DeletionCredentialIdentity | None:
+        identity, _generation = self._account_deletion_record_locked()
+        return identity
+
+    def _account_deletion_record_locked(
+        self,
+    ) -> tuple[_DeletionCredentialIdentity | None, int | None]:
+        stored = self._account_deletion_candidate_locked()
+        identity, generation = self._load_account_deletion_record_locked()
+        if stored is None:
+            return identity, generation
+        if identity is None or not self._stored_credentials_match_identity(
+            stored, identity
+        ):
+            raise SecureStoreError("Stored OAuth credential identity is unavailable.")
+        return identity, generation
+
+    @staticmethod
+    def _stored_credentials_match_identity(
+        stored: dict[str, Any], identity: _DeletionCredentialIdentity
+    ) -> bool:
+        refresh_token = stored.get("refreshToken")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return False
+        try:
+            api_base = credential_api_base(stored.get("apiBase"))
+        except SecureStoreError:
+            return False
+        return bool(
+            api_base == identity.api_base
+            and hmac.compare_digest(
+                hashlib.sha256(refresh_token.encode("utf-8")).hexdigest(),
+                identity.refresh_token_hash,
+            )
+        )
+
+    def _load_account_deletion_identity_locked(
+        self,
+    ) -> _DeletionCredentialIdentity | None:
+        identity, _generation = self._load_account_deletion_record_locked()
+        return identity
+
+    def _load_account_deletion_record_locked(
+        self,
+    ) -> tuple[_DeletionCredentialIdentity | None, int | None]:
+        path = self._account_deletion_identity_path()
+        try:
+            with path.open(encoding="utf-8") as identity_file:
+                document = json.load(identity_file)
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError, UnicodeError):
+            raise SecureStoreError("Stored OAuth credential identity is malformed.") from None
+        if document == {"version": 1, "credentialState": "cleared"}:
+            return None, None
+        if isinstance(document, dict) and document.get("version") == 2:
+            return self._parse_confirmed_account_deletion_identity(document)
+        return self._parse_account_deletion_identity(document), None
+
+    @staticmethod
+    def _parse_confirmed_account_deletion_identity(
+        document: dict[str, Any],
+    ) -> tuple[_DeletionCredentialIdentity, int]:
+        expected = {
+            "version", "credentialState", "apiBase", "generation",
+            "accessTokenHash", "refreshTokenHash",
+        }
+        generation = document.get("generation")
+        valid_generation = isinstance(generation, int) and not isinstance(
+            generation, bool
+        )
+        if (
+            set(document) != expected
+            or document.get("credentialState") != "remoteDeletionConfirmed"
+            or not valid_generation
+        ):
+            raise SecureStoreError("Stored OAuth credential identity is malformed.")
+        active = dict(document)
+        active.pop("credentialState")
+        active.pop("generation")
+        active["version"] = 1
+        return TokenStore._parse_account_deletion_identity(active), generation
+
+    @staticmethod
+    def _parse_account_deletion_identity(document: Any) -> _DeletionCredentialIdentity:
+        expected = {"version", "apiBase", "accessTokenHash", "refreshTokenHash"}
+        if not isinstance(document, dict) or set(document) != expected:
+            raise SecureStoreError("Stored OAuth credential identity is malformed.")
+        if document.get("version") != 1:
+            raise SecureStoreError("Stored OAuth credential identity is malformed.")
+        hashes = (document.get("accessTokenHash"), document.get("refreshTokenHash"))
+        if not all(TokenStore._valid_deletion_hash(value) for value in hashes):
+            raise SecureStoreError("Stored OAuth credential identity is malformed.")
+        return _DeletionCredentialIdentity(
+            credential_api_base(document.get("apiBase")), hashes[0], hashes[1]
+        )
+
+    @staticmethod
+    def _valid_deletion_hash(value: Any) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
 
     def clear_if_signed_out(self) -> None:
         with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
@@ -330,8 +690,7 @@ class TokenStore:
         self._write_fallback('{"signedOut":true}', commit=commit)
         if self.secret_store is not None:
             self.secret_store.delete(self.secret_key)
-            return
-        if shutil.which("secret-tool"):
+        elif shutil.which("secret-tool"):
             try:
                 subprocess.run(
                     ["secret-tool", "clear", "service", "pomodorough", "device", self.device_id],
@@ -340,8 +699,15 @@ class TokenStore:
                 )
             except (OSError, subprocess.SubprocessError):
                 pass
+        self._clear_account_deletion_identity_locked()
         # The tombstone remains authoritative until a later successful sign-in.
         # This keeps a stale keyring token from reviving a signed-out session.
+
+    def _clear_account_deletion_identity_locked(self) -> None:
+        path = self._account_deletion_identity_path()
+        if self.api_base is None and not path.exists():
+            return
+        self._write_private_file(path, '{"credentialState":"cleared","version":1}')
 
     def _load_fallback(self) -> dict[str, Any] | None:
         try:
@@ -355,10 +721,16 @@ class TokenStore:
         return document
 
     def _write_fallback(self, encoded: str, *, commit: _FallbackCommit | None = None) -> None:
-        self.fallback_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._write_private_file(self.fallback_path, encoded, commit=commit)
+
+    @staticmethod
+    def _write_private_file(
+        path: Path, encoded: str, *, commit: _FallbackCommit | None = None
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self.fallback_path.name}.",
-            dir=self.fallback_path.parent,
+            prefix=f".{path.name}.",
+            dir=path.parent,
         )
         temporary_path = Path(temporary_name)
         try:
@@ -369,18 +741,12 @@ class TokenStore:
                 fallback.write(encoded)
                 fallback.flush()
                 os.fsync(fallback.fileno())
-            os.replace(temporary_path, self.fallback_path)
+            _replace_file_for_durable_commit(
+                temporary_path, path, os
+            )
             if commit is not None:
                 commit.replaced = True
-            if hasattr(os, "O_DIRECTORY"):
-                directory_descriptor = os.open(
-                    self.fallback_path.parent,
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-                try:
-                    os.fsync(directory_descriptor)
-                finally:
-                    os.close(directory_descriptor)
+            _sync_replaced_file_directory(path, os)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -406,7 +772,7 @@ class Worker(QRunnable):
     def run(self) -> None:
         try:
             self.signals.result.emit(self.function())
-        except Exception as error:  # Background boundary reports failures to UI.
+        except Exception as error:  # noqa: BLE001 - Reports boundary failures to UI.
             self.signals.error.emit(error)
         finally:
             self.signals.finished.emit()
@@ -485,7 +851,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         )
         self.rfile = io.BufferedReader(self.callback_reader)
 
-    def do_GET(self) -> None:  # noqa: N802 - HTTP handler API
+    def do_GET(self) -> None:
         self.callback_reader.remaining()
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         result = {key: values[0] for key, values in query.items() if values}
@@ -721,7 +1087,7 @@ class CloudService(QObject):
             self.token_store,
             self._request,
             _text,
-            lambda: datetime.now(timezone.utc),
+            lambda: datetime.now(UTC),
             lambda: time.time(), lambda: time.monotonic_ns(),
         )
         self._accounts = AccountLifecycle(
@@ -730,7 +1096,7 @@ class CloudService(QObject):
             self.token_store,
             self._request,
             _text,
-            lambda: datetime.now(timezone.utc),
+            lambda: datetime.now(UTC),
             self.token_store.revocations,
         )
         self._workers: set[Worker] = set()
@@ -757,9 +1123,11 @@ class CloudService(QObject):
         response: dict[str, Any],
         expected_generation: int | None = None,
     ) -> None:
+        self._accounts.require_authentication_ready()
         self._session.accept_login_tokens(response, expected_generation)
 
     def _ensure_access(self, generation: int | None = None) -> str:
+        self._accounts.require_authentication_ready()
         return self._session.ensure_access(generation)
 
     def _authorized_request(
@@ -768,6 +1136,7 @@ class CloudService(QObject):
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._accounts.require_authentication_ready()
         return self._session.authorized_request(method, path, payload)
 
     def _timed_request(
@@ -778,6 +1147,7 @@ class CloudService(QObject):
         *,
         access_token: str,
     ) -> TimedDocument:
+        self._accounts.require_authentication_ready()
         return self._session.timed_request(
             method, path, payload, access_token=access_token
         )
@@ -845,6 +1215,7 @@ class CloudService(QObject):
         self.status_changed.emit(self.strings.text("cloud.status.connecting"))
 
         def restore_session() -> dict[str, Any] | None:
+            self._accounts.require_authentication_ready()
             if not self.token_store.load():
                 return None
             token = self._ensure_access()
@@ -874,6 +1245,12 @@ class CloudService(QObject):
 
     def login(self) -> None:
         if self._state.busy:
+            return
+        try:
+            self._accounts.require_authentication_ready()
+        except SecureStoreError as error:
+            self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
+            self.failure.emit(str(error))
             return
         self.status_changed.emit(self.strings.text("cloud.status.waiting_google"))
 
@@ -976,7 +1353,7 @@ class CloudService(QObject):
                 "idToken": identity_token,
                 "challenge": challenge["challenge"],
                 "deviceId": self.device_id,
-                "platform": "windows" if sys.platform == "win32" else "linux",
+                "platform": _desktop_oauth_platform(sys.platform),
             },
         )
 
@@ -1072,6 +1449,11 @@ class CloudService(QObject):
             or not self._state.access_token
             or self._revisions.state.reply is not None
         ):
+            return
+        try:
+            self._accounts.require_authentication_ready()
+        except SecureStoreError as error:
+            self.failure.emit(str(error))
             return
         self._revisions.start(
             self._state.access_token,

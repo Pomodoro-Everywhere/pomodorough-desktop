@@ -82,8 +82,20 @@ class CallbackFlow:
         self.worker.start()
         for (_, client), request in zip(self.pairs, self.requests):
             if request:
-                client.sendall(request)
+                try:
+                    client.sendall(request)
+                except (BrokenPipeError, TimeoutError):
+                    if not self.callback_timed_out():
+                        raise
         assert self.entered.wait(1)
+
+    def callback_timed_out(self):
+        self.worker.join(0.4)
+        return (
+            len(self.errors) == 1
+            and isinstance(self.errors[0], network.ApiError)
+            and str(self.errors[0]) == network._text("network.error.sign_in_timeout")
+        )
 
     def assert_finished(self, message=None):
         assert self.finished.wait(0.4), "Callback handling did not stop independently"
@@ -101,13 +113,13 @@ class CallbackFlow:
 
     def close(self):
         self.transport.cancel()
-        for _, client in self.pairs:
-            client.close()
         if self.worker.ident is not None:
             self.worker.join(1)
-        for accepted, _ in self.pairs:
+        worker_is_alive = self.worker.is_alive()
+        for accepted, client in self.pairs:
+            client.close()
             accepted.close()
-        assert not self.worker.is_alive()
+        assert not worker_is_alive
 
 
 @pytest.fixture
@@ -122,6 +134,22 @@ def callback_flow(monkeypatch):
     yield create
     for flow in reversed(flows):
         flow.close()
+
+
+def test_flow_surfaces_write_failure_before_callback_timeout(callback_flow):
+    flow = callback_flow(timeout=10)
+    accepted, client = flow.pairs[0]
+
+    class FailedClient:
+        def sendall(self, _request):
+            raise BrokenPipeError("fixture write failed")
+
+        def close(self):
+            client.close()
+
+    flow.pairs[0] = accepted, FailedClient()
+    with pytest.raises(BrokenPipeError, match="fixture write failed"):
+        flow.start()
 
 
 @pytest.mark.parametrize("partial", PARTIAL_REQUESTS, ids=["partial-line", "partial-headers"])

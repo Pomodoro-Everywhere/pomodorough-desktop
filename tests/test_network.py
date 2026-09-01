@@ -31,6 +31,7 @@ from pomodorough.network import (
     SystemOAuthBrowserTransport,
     TokenStore,
     _config_root,
+    _desktop_oauth_platform,
     _read_oauth_credentials,
     _request,
     _RevisionEventParser,
@@ -47,8 +48,12 @@ class _FakeHTTPResponse:
     def __exit__(self, *_args) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, amount: int = -1) -> bytes:
+        if amount < 0:
+            body, self.body = self.body, b""
+            return body
+        body, self.body = self.body[:amount], self.body[amount:]
+        return body
 
 
 class _FakeSignal:
@@ -599,7 +604,7 @@ class DesktopOAuthTransactionTests(unittest.TestCase):
                         "idToken": "google-id-token",
                         "challenge": "native-challenge",
                         "deviceId": "device-1",
-                        "platform": "windows" if sys.platform == "win32" else "linux",
+                        "platform": _desktop_oauth_platform(sys.platform),
                     },
                     None,
                     False,
@@ -878,6 +883,8 @@ class DesktopOAuthTransactionTests(unittest.TestCase):
 
 class HTTPRequestTests(unittest.TestCase):
     def test_request_encodes_json_headers_bearer_and_timeout(self) -> None:
+        from pomodorough import __version__
+
         response = _FakeHTTPResponse(b'{"ok":true}')
         with patch("urllib.request.urlopen", return_value=response) as urlopen:
             result = _request(
@@ -895,7 +902,10 @@ class HTTPRequestTests(unittest.TestCase):
         self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertEqual(request.get_header("Content-type"), "application/json")
         self.assertEqual(request.get_header("Authorization"), "Bearer access-token")
-        self.assertEqual(request.get_header("User-agent"), "Pomodorough-Desktop/0.1")
+        self.assertEqual(
+            request.get_header("User-agent"),
+            f"Pomodorough-Desktop/{__version__}",
+        )
 
     def test_request_form_encodes_and_empty_success_returns_object(self) -> None:
         response = _FakeHTTPResponse(b"")
@@ -1109,10 +1119,20 @@ class AuthenticationNetworkTests(unittest.TestCase):
         self.assertEqual(cloud.refresh_token, "account-b-refresh")
 
     def test_stale_refresh_cannot_persist_after_account_deletion_starts(self) -> None:
-        cloud = CloudService("device-1", "https://example.test")
+        root = Path(self.enterContext(TemporaryDirectory()))
+        store = TokenStore(
+            "device-1", secret_store=_MemorySecretStore(),
+            fallback_path=root / "session.json",
+        )
+        cloud = CloudService("device-1", "https://example.test", token_store=store)
         self.addCleanup(cloud.shutdown)
+        cloud._accept_tokens({
+            "accessToken": "account-access",
+            "accessTokenExpiresAt": "2000-01-01T00:00:00Z",
+            "refreshToken": "account-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        })
         cloud.authenticated = True
-        cloud.refresh_token = "account-refresh"
         response = {
             "accessToken": "stale-access",
             "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
@@ -1125,7 +1145,6 @@ class AuthenticationNetworkTests(unittest.TestCase):
             return response
 
         with (
-            patch.object(cloud.token_store, "load", return_value={"refreshToken": "account-refresh"}),
             patch.object(cloud.token_store, "save") as save,
             patch.object(cloud, "stop_revision_stream"),
             patch.object(QThreadPool.globalInstance(), "start"),
@@ -2504,16 +2523,26 @@ class CloudOrchestrationTests(unittest.TestCase):
 
     def test_delete_account_requires_exact_confirmation_and_success_clears_session(self) -> None:
         cloud = self.cloud()
+        cloud._accept_tokens({
+            "accessToken": "delete-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "delete-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        })
         cloud.authenticated = True
-        cloud.access_token = "delete-access"
         cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         deleted = []
         cloud.account_deleted.connect(lambda: deleted.append(True))
+        exact_clear = cloud.token_store.clear_account_deletion_credentials_locked
 
         with (
             patch.object(cloud, "_start", side_effect=_run_immediately),
             patch.object(cloud, "stop_revision_stream") as stop,
-            patch.object(cloud.token_store, "clear") as clear,
+            patch.object(
+                cloud.token_store,
+                "clear_account_deletion_credentials_locked",
+                wraps=exact_clear,
+            ) as clear,
             patch("pomodorough.network._request", return_value={}) as request,
         ):
             for confirmation in ("", "delete", "DELETE "):
@@ -2528,7 +2557,7 @@ class CloudOrchestrationTests(unittest.TestCase):
             access_token="delete-access",
         )
         stop.assert_called_once_with()
-        clear.assert_called_once_with()
+        clear.assert_called_once()
         self.assertEqual(deleted, [True])
         self.assertFalse(cloud.authenticated)
         self.assertFalse(cloud.deleting_account)
@@ -2536,8 +2565,13 @@ class CloudOrchestrationTests(unittest.TestCase):
 
     def test_delete_account_failure_preserves_session_and_resumes_stream(self) -> None:
         cloud = self.cloud()
+        cloud._accept_tokens({
+            "accessToken": "preserved-access",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "preserved-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        })
         cloud.authenticated = True
-        cloud.access_token = "preserved-access"
         cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         failures = []
         cloud.account_deletion_failed.connect(failures.append)
@@ -2547,7 +2581,10 @@ class CloudOrchestrationTests(unittest.TestCase):
             patch.object(cloud, "stop_revision_stream"),
             patch.object(cloud, "start_revision_stream") as start_stream,
             patch.object(cloud.token_store, "clear") as clear,
-            patch("pomodorough.network._request", side_effect=ApiError("offline")),
+            patch(
+                "pomodorough.network._request",
+                side_effect=ApiError("offline", 503),
+            ),
         ):
             cloud.delete_account("DELETE")
 
@@ -2560,8 +2597,13 @@ class CloudOrchestrationTests(unittest.TestCase):
 
     def test_stale_account_a_delete_success_cannot_clear_account_b(self) -> None:
         cloud = self.cloud()
+        cloud._accept_tokens({
+            "accessToken": "account-a",
+            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+            "refreshToken": "account-a-refresh",
+            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+        })
         cloud.authenticated = True
-        cloud.access_token = "account-a"
         cloud.access_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         deleted = []
         cloud.account_deleted.connect(lambda: deleted.append(True))

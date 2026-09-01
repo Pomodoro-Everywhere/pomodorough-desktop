@@ -7,6 +7,8 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
+from . import __version__
+
 
 class RevisionEventParser:
     def __init__(self) -> None:
@@ -93,6 +95,9 @@ class RevisionStream:
         self.reconnect_timer.stop()
         request = QNetworkRequest(QUrl(f"{self.api_base}/api/v1/stream"))
         request.setRawHeader(b"Accept", b"text/event-stream")
+        request.setRawHeader(
+            b"User-Agent", f"Pomodorough-Desktop/{__version__}".encode("ascii")
+        )
         request.setRawHeader(b"Authorization", f"Bearer {access_token}".encode())
         reply = self.network.get(request)
         self.state.reply = reply

@@ -175,10 +175,15 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
     failures = []
     cloud.account_deletion_failed.connect(failures.append)
     file_sync = Mock(wraps=os.fsync)
+    directory_syncs = 0
 
     def sync(descriptor):
+        nonlocal directory_syncs
         if descriptor is sentinel.directory_descriptor:
-            raise OSError("directory sync failed")
+            directory_syncs += 1
+            if directory_syncs == 2:
+                raise OSError("directory sync failed")
+            return None
         return file_sync(descriptor)
 
     directory_open = Mock(return_value=sentinel.directory_descriptor)
@@ -187,10 +192,12 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
                                    "open": directory_open, "close": directory_close, "fsync": sync})
     with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
-    file_sync.assert_called_once()
-    directory_open.assert_called_once_with(cloud.token_store.fallback_path.parent,
-                                           os.O_RDONLY | filesystem.O_DIRECTORY)
-    directory_close.assert_called_once_with(sentinel.directory_descriptor)
+    assert file_sync.call_count == 2
+    assert directory_open.call_count == 2
+    directory_open.assert_called_with(cloud.token_store.fallback_path.parent,
+                                      os.O_RDONLY | filesystem.O_DIRECTORY)
+    assert directory_close.call_count == 2
+    directory_close.assert_called_with(sentinel.directory_descriptor)
     assert failures == ["directory sync failed"]
     assert cloud._request.call_count == 1
     assert cloud.refresh_token == "original-refresh"
@@ -219,7 +226,7 @@ def test_rotation_without_directory_sync_persists_before_delete_and_restart(clou
     filesystem.open = Mock(side_effect=AssertionError("Directory descriptors are unavailable"))
     with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
-    filesystem.fsync.assert_called_once()
+    assert filesystem.fsync.call_count == 2
     filesystem.open.assert_not_called()
     assert failures == ["unavailable"]
     assert cloud._request.call_args_list == [

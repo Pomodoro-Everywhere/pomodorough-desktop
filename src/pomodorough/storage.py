@@ -198,10 +198,11 @@ class Store:
     ) -> None:
         self._trusted_time_anchor: dict[str, int] | None = None
         self._timer_time_anchor: dict[str, Any] | None = None
-        self.path = path or default_data_path()
+        uses_default_path = path is None
+        self.path = default_data_path() if uses_default_path else path
         self._iroh_secret_store = iroh_secret_store or PlatformSecretStore()
         self._shared_core = shared_core
-        self._open_database()
+        self._open_database(restrict_existing_parent=uses_default_path)
         self._create_local_schema()
         self._migrate_local_schema()
         if self._migrated_iroh_capabilities:
@@ -293,12 +294,13 @@ class Store:
             _validated_projection_state=self._validated_projection_state,
         )
 
-    def _open_database(self) -> None:
+    def _open_database(self, *, restrict_existing_parent: bool) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            self.path.parent.chmod(0o700)
-        except OSError:
-            pass
+        if restrict_existing_parent:
+            try:
+                self.path.parent.chmod(0o700)
+            except OSError:
+                pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")

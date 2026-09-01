@@ -21,4 +21,10 @@ google-oauth.json
 .DS_Store
 .cache_ggshield
 .ruff_cache/
+/.coverage
+/.coverage.*
+/coverage.json
+/coverage.lcov
+/coverage.xml
+/htmlcov/
 /.audit/

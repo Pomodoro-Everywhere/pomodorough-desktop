@@ -28,9 +28,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CORE_COMMIT: "44ff36e125cf653c1761dfb5951f6e77e41a2c82"
-  CORE_RELEASE_TAG: "v0.9.0"
-  CORE_SHA256: "f34fe57b5e080dd69afa5c7f28b60bc77851c7f874db99744eab72b4e1858877"
+  CORE_COMMIT: "542aca9a322a1b04c3e53d4a76152f385675d0a1"
+  CORE_RELEASE_TAG: "v0.10.0"
+  CORE_SHA256: "f735303cbd13a1671090b7ecd1e9c96a210ca007d8a35244bdf8028772c66eb6"
 
 jobs:
   candidate-source:
@@ -86,7 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: [ubuntu-24.04, macos-15, windows-2025]
         python-version: ["3.11", "3.14"]
     steps:
       - name: Check out source
@@ -119,6 +119,15 @@ jobs:
       - name: Import application entry points
         run: python -c "import pomodorough.app, pomodorough.cli, pomodorough.tui"
 
+      - name: Smoke installed macOS package
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip check
+          python -c 'from importlib.metadata import distribution; from inspect import signature; expected = {"pomodorough": "pomodorough.app:main", "pomodorough-cli": "pomodorough.cli:main", "pomodorough-tui": "pomodorough.tui:main"}; entries = {entry.name: entry for entry in distribution("pomodorough-linux").entry_points if entry.group == "console_scripts"}; assert set(entries) == set(expected); assert all(entries[name].value == target for name, target in expected.items()); loaded = {name: entries[name].load() for name in expected}; assert all(callable(target) and signature(target).bind() is not None for target in loaded.values())'
+          python -c 'import os; from contextlib import ExitStack; from importlib.metadata import distribution; from unittest.mock import patch; entry = next(entry for entry in distribution("pomodorough-linux").entry_points if entry.group == "console_scripts" and entry.name == "pomodorough"); target = entry.load(); stack = ExitStack(); application = stack.enter_context(patch("pomodorough.app.QApplication")); stack.enter_context(patch("pomodorough.app.QIcon")); lock = stack.enter_context(patch("pomodorough.app._instance_lock")); stack.enter_context(patch("pomodorough.app.Store")); stack.enter_context(patch("pomodorough.app.CloudService")); stack.enter_context(patch("pomodorough.app._iroh_service")); stack.enter_context(patch("pomodorough.app.MainWindow")); stack.enter_context(patch("pomodorough.app.QTimer")); stack.enter_context(patch("pomodorough.app.signal.signal")); os.environ.pop("POMODOROUGH_SCREENSHOT", None); lock.return_value.tryLock.return_value = True; application.return_value.exec.return_value = 0; assert target() == 0; application.return_value.exec.assert_called_once_with(); stack.close()'
+          pomodorough-cli --help
+          pomodorough-tui --help
+
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen
@@ -137,6 +146,13 @@ jobs:
       - name: Test optional Iroh runtime
         if: runner.os == 'Linux' || runner.os == 'Windows'
         shell: bash
+        run: |
+          python -m pip install ".[iroh]"
+          python -c "import iroh; assert len(iroh.SecretKey.generate().to_bytes()) == 32"
+          QT_QPA_PLATFORM=offscreen python -m unittest tests.test_iroh_network -v
+
+      - name: Test optional Iroh runtime on macOS
+        if: runner.os == 'macOS'
         run: |
           python -m pip install ".[iroh]"
           python -c "import iroh; assert len(iroh.SecretKey.generate().to_bytes()) == 32"
