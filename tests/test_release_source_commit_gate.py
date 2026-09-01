@@ -55,8 +55,9 @@ class ReleaseSourceCommitGateTests(unittest.TestCase):
     def run_gate(self, github_sha: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(GITHUB_SHA=github_sha, RELEASE_TAG=RELEASE_TAG)
+        shell = "gitbash" if os.name == "nt" else "bash"
         return subprocess.run(
-            ["bash", "-c", release_source_commit_gate()],
+            [shell, "-c", release_source_commit_gate()],
             cwd=self.repository,
             env=environment,
             capture_output=True,
