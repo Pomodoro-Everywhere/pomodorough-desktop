@@ -9,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ from .network import (
     _request,
 )
 from .secure_store import PlatformSecretStore, SecureStoreError
+from .network_session import AuthenticatedSession, SessionState
 
 
 TOKENS = {
@@ -272,9 +275,24 @@ def _restart_in_child(root: Path) -> bool:
 def _verify_restored_process(root: Path) -> bool:
     request = _ScenarioTransport("success")
     store = _PrivateFileSecretStore(root / "secure")
-    service, _opener = _service(request, store, root)
+    token_store = TokenStore(
+        "artifact-verifier",
+        secret_store=store,
+        fallback_path=root / "session-tombstone.json",
+    )
+    token_store.bind_api("https://api.example.test")
+    session = AuthenticatedSession(
+        "https://api.example.test",
+        SessionState(),
+        token_store,
+        request,
+        lambda key, **_values: key,
+        lambda: datetime.now(UTC),
+        time.time,
+        time.monotonic_ns,
+    )
     try:
-        profile = service._authorized_request("GET", "/api/v1/me")
+        profile = session.authorized_request("GET", "/api/v1/me")
         return (
             profile.get("user", {}).get("id") == "controlled-user"
             and request.refreshes == 1
@@ -282,7 +300,6 @@ def _verify_restored_process(root: Path) -> bool:
     except (ApiError, SecureStoreError, OSError, ValueError):
         return False
     finally:
-        service.shutdown()
         request.close()
 
 
@@ -469,7 +486,6 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"platform_secure_store_child": passed}, sort_keys=True))
         return 0 if passed else 1
     if args.restart_child is not None:
-        QCoreApplication.instance() or QCoreApplication([])
         passed = _verify_restored_process(args.restart_child)
         print(json.dumps({"restart_process_verified": passed}, sort_keys=True))
         return 0 if passed else 1

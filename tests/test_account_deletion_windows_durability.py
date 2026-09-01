@@ -365,8 +365,12 @@ def test_windows_marker_stream_failure_has_no_silent_success(
     move_file = MoveFileEx()
     real_fdopen = os.fdopen
 
-    def faulty_fdopen(*args: object, **kwargs: object) -> FaultyCleanupFile:
-        return FaultyCleanupFile(real_fdopen(*args, **kwargs), failure)
+    def faulty_fdopen(*args: object, **kwargs: object) -> object:
+        cleanup_file = real_fdopen(*args, **kwargs)
+        mode = args[1] if len(args) > 1 else kwargs.get("mode", "r")
+        if mode != "w":
+            return cleanup_file
+        return FaultyCleanupFile(cleanup_file, failure)
 
     with (
         windows_adapter(move_file),
@@ -408,7 +412,7 @@ def test_unknown_platform_fails_closed_before_replace(tmp_path: Path) -> None:
 def test_real_windows_write_through_replace(tmp_path: Path) -> None:
     source, destination = tmp_path / "source", tmp_path / "destination"
     source.write_text("new", encoding="utf-8")
-    with source.open("rb") as source_file:
+    with source.open("r+b") as source_file:
         os.fsync(source_file.fileno())
     destination.write_text("old", encoding="utf-8")
     network_account._replace_windows_write_through(source, destination)

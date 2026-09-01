@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections.abc import Callable
 from http.server import HTTPServer
 from unittest.mock import Mock
 
@@ -78,7 +79,7 @@ class CallbackFlow:
         finally:
             self.finished.set()
 
-    def start(self):
+    def start(self, after_send: Callable[[], None] | None = None):
         self.worker.start()
         for (_, client), request in zip(self.pairs, self.requests):
             if request:
@@ -87,6 +88,8 @@ class CallbackFlow:
                 except (BrokenPipeError, TimeoutError):
                     if not self.callback_timed_out():
                         raise
+        if after_send is not None:
+            after_send()
         assert self.entered.wait(1)
 
     def callback_timed_out(self):
@@ -166,16 +169,26 @@ def test_partial_reads_stop_without_peer_completion(callback_flow, partial, stop
 @pytest.mark.parametrize("partial", PARTIAL_REQUESTS, ids=["partial-line", "partial-headers"])
 def test_slow_drip_cannot_extend_absolute_deadline(callback_flow, partial):
     flow = callback_flow([partial], timeout=0.16)
-    started = time.monotonic()
-    flow.start()
+    start_drip = threading.Event()
     sent = 0
-    while not flow.finished.wait(0.01) and time.monotonic() - started < 0.5:
-        try:
-            flow.pairs[0][1].sendall(b"x")
-            sent += 1
-        except BrokenPipeError:
-            break
+
+    def drip() -> None:
+        nonlocal sent
+        assert start_drip.wait(1)
+        while not flow.finished.wait(0.01):
+            try:
+                flow.pairs[0][1].sendall(b"x")
+                sent += 1
+            except BrokenPipeError:
+                return
+
+    dripper = threading.Thread(target=drip, daemon=True)
+    dripper.start()
+    started = time.monotonic()
+    flow.start(start_drip.set)
     flow.assert_finished("timed out")
+    dripper.join(1)
+    assert not dripper.is_alive()
     assert sent >= 3
     assert time.monotonic() - started < 0.4
 

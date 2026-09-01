@@ -156,7 +156,11 @@ def test_rotation_persistence_failure_prevents_delete_and_memory_acceptance(clou
     failures = []
     cloud.account_deletion_failed.connect(failures.append)
     cloud._request.return_value = _tokens("rotated")
-    target = {"write": "tempfile.mkstemp", "replace": "os.replace", "sync": "os.fsync"}[boundary]
+    target = {
+        "write": "tempfile.mkstemp",
+        "replace": "_replace_file_for_durable_commit",
+        "sync": "os.fsync",
+    }[boundary]
     with patch(f"pomodorough.network.{target}", side_effect=OSError("storage unavailable")):
         cloud.delete_account("DELETE")
     assert failures == ["storage unavailable"]
@@ -188,8 +192,16 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
 
     directory_open = Mock(return_value=sentinel.directory_descriptor)
     directory_close = Mock()
-    filesystem = SimpleNamespace(**{**vars(os), "O_DIRECTORY": getattr(os, "O_DIRECTORY", 1 << 30),
-                                   "open": directory_open, "close": directory_close, "fsync": sync})
+    filesystem = SimpleNamespace(
+        **{
+            **vars(os),
+            "name": "posix",
+            "O_DIRECTORY": getattr(os, "O_DIRECTORY", 1 << 30),
+            "open": directory_open,
+            "close": directory_close,
+            "fsync": sync,
+        }
+    )
     with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
     assert file_sync.call_count == 2

@@ -88,6 +88,7 @@ def failing_tombstone_step(tokens, boundary):
         target = {
             "mkdir": "Path.mkdir", "mkstemp": "tempfile.mkstemp",
             "write": "os.fdopen", "flush": "os.fdopen",
+            "replace": "_replace_file_for_durable_commit",
         }.get(boundary, f"os.{boundary}")
         failure = failing_file if boundary in {"write", "flush"} else OSError("disk failure")
         with patch(f"pomodorough.network.{target}", side_effect=failure):

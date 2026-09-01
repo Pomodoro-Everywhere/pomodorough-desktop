@@ -33,6 +33,7 @@ from pomodorough.network import (
     _config_root,
     _desktop_oauth_platform,
     _read_oauth_credentials,
+    _replace_file_for_durable_commit,
     _request,
     _RevisionEventParser,
 )
@@ -1407,6 +1408,43 @@ class _MemorySecretStore:
         self.values.pop(key, None)
 
 
+_FULL_TOKEN_RESPONSE = {
+    "accessToken": "access-secret",
+    "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
+    "refreshToken": "refresh-secret",
+    "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+}
+_PERSISTED_REFRESH_CREDENTIAL = {
+    "refreshToken": "refresh-secret",
+    "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
+}
+
+
+def _private_replace_observer(replacements: list, fallback_path: Path):
+    def observe(source: str | Path, destination: str | Path, filesystem: object) -> None:
+        source_path = Path(source)
+        previous = fallback_path.read_text() if fallback_path.exists() else None
+        replacements.append(
+            (
+                source_path.stat().st_mode & 0o777,
+                json.loads(source_path.read_text()),
+                previous,
+            )
+        )
+        _replace_file_for_durable_commit(source_path, Path(destination), filesystem)
+
+    return observe
+
+
+def _json_replace_observer(replacements: list[dict]):
+    def observe(source: str | Path, destination: str | Path, filesystem: object) -> None:
+        source_path = Path(source)
+        replacements.append(json.loads(source_path.read_text()))
+        _replace_file_for_durable_commit(source_path, Path(destination), filesystem)
+
+    return observe
+
+
 class TokenStoreTests(unittest.TestCase):
     def test_secure_store_roundtrip_survives_restart_without_plaintext_fallback(self) -> None:
         response = {
@@ -1595,7 +1633,6 @@ class TokenStoreTests(unittest.TestCase):
             "refreshToken": "refresh-secret",
             "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
         }
-        real_replace = os.replace
 
         for existing_mode in (None, 0o644):
             with self.subTest(existing_mode=existing_mode), TemporaryDirectory() as directory:
@@ -1609,22 +1646,14 @@ class TokenStoreTests(unittest.TestCase):
                     store.fallback_path.chmod(existing_mode)
                 replacements = []
 
-                def checked_replace(source: str | Path, destination: str | Path) -> None:
-                    source_path = Path(source)
-                    replacements.append(
-                        (
-                            source_path.stat().st_mode & 0o777,
-                            json.loads(source_path.read_text()),
-                            store.fallback_path.read_text()
-                            if store.fallback_path.exists()
-                            else None,
-                        )
-                    )
-                    real_replace(source, destination)
-
                 with (
                     patch("pomodorough.network.shutil.which", return_value=None),
-                    patch("pomodorough.network.os.replace", side_effect=checked_replace),
+                    patch(
+                        "pomodorough.network._replace_file_for_durable_commit",
+                        side_effect=_private_replace_observer(
+                            replacements, store.fallback_path
+                        ),
+                    ),
                 ):
                     store.save(response)
 
@@ -1826,16 +1855,8 @@ class TokenStoreTests(unittest.TestCase):
                 self.assertEqual(json.loads(store.fallback_path.read_text()), response)
 
     def test_successful_keyring_store_replaces_then_removes_stale_fallback(self) -> None:
-        response = {
-            "accessToken": "access-secret",
-            "accessTokenExpiresAt": "2099-01-02T03:04:05Z",
-            "refreshToken": "refresh-secret",
-            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
-        }
-        expected = {
-            "refreshToken": "refresh-secret",
-            "refreshTokenExpiresAt": "2099-02-03T04:05:06Z",
-        }
+        response = _FULL_TOKEN_RESPONSE
+        expected = _PERSISTED_REFRESH_CREDENTIAL
 
         with TemporaryDirectory() as directory:
             with patch(
@@ -1845,18 +1866,16 @@ class TokenStoreTests(unittest.TestCase):
             store.fallback_path.parent.mkdir(parents=True, exist_ok=True)
             store.fallback_path.write_text("stale")
             replacements = []
-            real_replace = os.replace
-
-            def checked_replace(source: str | Path, destination: str | Path) -> None:
-                replacements.append(json.loads(Path(source).read_text()))
-                real_replace(source, destination)
 
             with (
                 patch(
                     "pomodorough.network.shutil.which",
                     return_value="/usr/bin/secret-tool",
                 ),
-                patch("pomodorough.network.os.replace", side_effect=checked_replace),
+                patch(
+                    "pomodorough.network._replace_file_for_durable_commit",
+                    side_effect=_json_replace_observer(replacements),
+                ),
                 patch(
                     "pomodorough.network.subprocess.run",
                     return_value=Mock(returncode=0),

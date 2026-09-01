@@ -8,13 +8,18 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from pomodorough.oauth_artifact_verifier import (
+    TOKENS,
+    _PrivateFileSecretStore,
     _restart_in_child,
+    _verify_restored_process,
     main,
     run_platform_store_test,
 )
+from pomodorough.network import TokenStore
 
 
 ROOT = Path(__file__).parents[1]
@@ -129,6 +134,22 @@ class OAuthArtifactVerifierTests(unittest.TestCase):
                 self.assertEqual(
                     _restart_in_child(Path("controlled-state")), expected
                 )
+
+    def test_restart_verifier_avoids_qt_service_lifecycle(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = TokenStore(
+                "artifact-verifier",
+                secret_store=_PrivateFileSecretStore(root / "secure"),
+                fallback_path=root / "session-tombstone.json",
+            )
+            store.bind_api("https://api.example.test")
+            store.save(TOKENS)
+            with patch(
+                "pomodorough.oauth_artifact_verifier.CloudService",
+                side_effect=AssertionError("restart child constructed Qt service"),
+            ):
+                self.assertTrue(_verify_restored_process(root))
 
     def test_packaged_self_test_covers_success_restart_and_negative_contracts(self) -> None:
         result = subprocess.run(

@@ -365,14 +365,18 @@ def test_restart_rearms_unreadable_obligation_before_cleanup(tmp_path):
     )
     cleanup_path = restarted._deletion_cleanup_path()
     original_read_text = Path.read_text
+    unreadable_reads = 1
 
     def read_text(path, *args, **kwargs):
-        if path == cleanup_path:
+        nonlocal unreadable_reads
+        if path == cleanup_path and unreadable_reads:
+            unreadable_reads -= 1
             raise PermissionError("temporarily unreadable")
         return original_read_text(path, *args, **kwargs)
 
     with patch.object(Path, "read_text", read_text):
         restarted.retry_sign_out_cleanup(0)
+    assert unreadable_reads == 0
     assert restarted_store.secret_key not in vault.values
     assert restarted_store.load() is None
     assert_cleanup_resolved(restarted)
@@ -441,7 +445,7 @@ def test_legacy_obligation_clears_only_after_credentials_are_absent(tmp_path):
 
     lifecycle.require_authentication_ready()
 
-    assert not cleanup_path.exists()
+    assert_cleanup_resolved(lifecycle)
     assert state.authenticated and state.refresh_token == "old-refresh"
 
 
