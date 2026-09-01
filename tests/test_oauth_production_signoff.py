@@ -48,20 +48,33 @@ def windows_acl_command(path: Path, command: str) -> str:
     return result.stdout
 
 
+def run_icacls(path: Path, *arguments: str) -> None:
+    try:
+        subprocess.run(
+            ["icacls.exe", str(path), *arguments],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise windows_acl_failure(path, error) from None
+
+
 def restrict_windows_receipt_directory(path: Path) -> None:
     username = os.environ.get("USERNAME")
     if not username:
         raise AssertionError("Windows receipt ACL fixture requires USERNAME")
     domain = os.environ.get("USERDOMAIN")
     operator = f"{domain}\\{username}" if domain else username
-    try:
-        subprocess.run(
-            ["icacls.exe", str(path), "/inheritance:r", "/grant:r",
-             f"{operator}:(OI)(CI)F"],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        raise windows_acl_failure(path, error) from None
+    run_icacls(path, "/inheritance:r", "/grant:r", f"{operator}:(OI)(CI)F")
+    acl = windows_receipt_acl(path)
+    foreign_sids = sorted({
+        rule["sid"] for rule in acl["rules"] if rule["sid"] != acl["operator"]
+    })
+    for sid in foreign_sids:
+        run_icacls(path, "/remove", f"*{sid}")
+    expected = [{"sid": acl["operator"], "inherited": False,
+                 "access": "Allow", "rights": "FullControl"}]
+    if windows_receipt_acl(path)["rules"] != expected:
+        raise AssertionError("Windows receipt ACL fixture did not isolate operator")
 
 
 def windows_receipt_acl(path: Path) -> dict:
@@ -125,22 +138,58 @@ class WindowsReceiptAclFixtureTests(unittest.TestCase):
     def test_fixture_persists_operator_dacl_without_provider_set_acl(self) -> None:
         path = Path("receipt directory's [literal] name")
         environment = {"USERNAME": "private-user", "USERDOMAIN": "private-host"}
+        operator = "operator-sid"
+        with_system = {"operator": operator, "rules": [
+            {"sid": operator, "inherited": False, "access": "Allow",
+             "rights": "FullControl"},
+            {"sid": "S-1-5-18", "inherited": False, "access": "Allow",
+             "rights": "FullControl"},
+        ]}
+        operator_only = {"operator": operator, "rules": with_system["rules"][:1]}
         with (
             patch.dict(os.environ, environment, clear=True),
-            patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="")) as run,
+            patch.object(subprocess, "run", side_effect=[
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout=json.dumps(with_system)),
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout=json.dumps(operator_only)),
+            ]) as run,
         ):
             restrict_windows_receipt_directory(path)
 
-        arguments = run.call_args.args[0]
-        self.assertEqual(arguments, [
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(calls[0], [
             "icacls.exe", str(path), "/inheritance:r", "/grant:r",
             r"private-host\private-user:(OI)(CI)F",
         ])
-        self.assertNotIn("shell", run.call_args.kwargs)
-        self.assertTrue(run.call_args.kwargs["capture_output"])
-        self.assertTrue(run.call_args.kwargs["text"])
-        self.assertTrue(run.call_args.kwargs["check"])
-        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertEqual(calls[2], ["icacls.exe", str(path), "/remove", "*S-1-5-18"])
+        self.assertEqual(len(calls), 4)
+        for call in run.call_args_list:
+            self.assertNotIn("shell", call.kwargs)
+            self.assertTrue(call.kwargs["capture_output"])
+            self.assertTrue(call.kwargs["text"])
+            self.assertTrue(call.kwargs["check"])
+            self.assertEqual(call.kwargs["timeout"], 30)
+
+    def test_fixture_fails_closed_when_foreign_rule_survives_removal(self) -> None:
+        path = Path("receipt directory")
+        acl = {"operator": "operator-sid", "rules": [
+            {"sid": "operator-sid", "inherited": False, "access": "Allow",
+             "rights": "FullControl"},
+            {"sid": "S-1-5-18", "inherited": False, "access": "Allow",
+             "rights": "FullControl"},
+        ]}
+        with (
+            patch.dict(os.environ, {"USERNAME": "operator"}, clear=True),
+            patch.object(subprocess, "run", side_effect=[
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout=json.dumps(acl)),
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout=json.dumps(acl)),
+            ]),
+            self.assertRaisesRegex(AssertionError, "did not isolate operator"),
+        ):
+            restrict_windows_receipt_directory(path)
 
     def test_fixture_fails_closed_without_windows_operator(self) -> None:
         with (
