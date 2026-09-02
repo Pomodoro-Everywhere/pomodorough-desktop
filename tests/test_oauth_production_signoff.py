@@ -14,6 +14,9 @@ from unittest.mock import Mock, patch
 from pomodorough import oauth_production_signoff as signoff
 
 
+_WINDOWS_LOCAL_SYSTEM_SID = "S-1-5-18"
+
+
 def windows_acl_failure(
     path: Path, error: subprocess.CalledProcessError | subprocess.TimeoutExpired,
 ) -> AssertionError:
@@ -65,7 +68,7 @@ def restrict_windows_receipt_directory(path: Path) -> None:
     domain = os.environ.get("USERDOMAIN")
     operator = f"{domain}\\{username}" if domain else username
     run_icacls(path, "/inheritance:r", "/grant:r", f"{operator}:(OI)(CI)F")
-    acl = windows_receipt_acl(path)
+    acl = windows_directory_acl(path)
     foreign_sids = sorted({
         rule["sid"] for rule in acl["rules"] if rule["sid"] != acl["operator"]
     })
@@ -73,21 +76,48 @@ def restrict_windows_receipt_directory(path: Path) -> None:
         run_icacls(path, "/remove", f"*{sid}")
     expected = [{"sid": acl["operator"], "inherited": False,
                  "access": "Allow", "rights": "FullControl"}]
-    if windows_receipt_acl(path)["rules"] != expected:
+    if windows_directory_acl(path)["rules"] != expected:
         raise AssertionError("Windows receipt ACL fixture did not isolate operator")
 
 
-def windows_receipt_acl(path: Path) -> dict:
-    return json.loads(windows_acl_command(path, """
+def windows_path_acl(path: Path, path_type: str) -> dict:
+    command = """
         $operator = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = [System.IO.File]::GetAccessControl($env:POMODOROUGH_TEST_ACL_PATH)
+        $acl = [System.IO.__PATH_TYPE__]::GetAccessControl($env:POMODOROUGH_TEST_ACL_PATH)
         $rules = @($acl.GetAccessRules($true, $true,
             [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
             @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited;
                access = $_.AccessControlType.ToString(); rights = $_.FileSystemRights.ToString() }
         })
         @{ operator = $operator.Value; rules = $rules } | ConvertTo-Json -Depth 4 -Compress
-    """))
+    """
+    return json.loads(windows_acl_command(path, command.replace("__PATH_TYPE__", path_type)))
+
+
+def windows_directory_acl(path: Path) -> dict:
+    return windows_path_acl(path, "Directory")
+
+
+def windows_receipt_acl(path: Path) -> dict:
+    return windows_path_acl(path, "File")
+
+
+def assert_private_windows_receipt_acl(acl: dict) -> None:
+    operator = acl.get("operator")
+    rules = acl.get("rules")
+    if not isinstance(operator, str) or not operator or not isinstance(rules, list):
+        raise AssertionError("Windows receipt ACL is not private")
+    operator_rule = {
+        "sid": operator, "inherited": True,
+        "access": "Allow", "rights": "FullControl",
+    }
+    system_rule = {
+        "sid": _WINDOWS_LOCAL_SYSTEM_SID, "inherited": True,
+        "access": "Allow", "rights": "FullControl",
+    }
+    if operator_rule not in rules or any(rule not in (operator_rule, system_rule)
+                                         for rule in rules):
+        raise AssertionError("Windows receipt ACL is not private")
 
 
 class _SecretStore:
@@ -135,6 +165,32 @@ class _Service:
 
 
 class WindowsReceiptAclFixtureTests(unittest.TestCase):
+    def test_file_acl_accepts_operator_and_local_system_inheritance(self) -> None:
+        operator = "operator-sid"
+        assert_private_windows_receipt_acl({"operator": operator, "rules": [
+            {"sid": operator, "inherited": True, "access": "Allow",
+             "rights": "FullControl"},
+            {"sid": _WINDOWS_LOCAL_SYSTEM_SID, "inherited": True,
+             "access": "Allow", "rights": "FullControl"},
+        ]})
+
+    def test_file_acl_rejects_unrelated_principal_or_rights(self) -> None:
+        operator = "operator-sid"
+        operator_rule = {"sid": operator, "inherited": True, "access": "Allow",
+                         "rights": "FullControl"}
+        invalid_rules = [
+            [operator_rule, {"sid": "S-1-1-0", "inherited": True,
+                             "access": "Allow", "rights": "FullControl"}],
+            [operator_rule, {"sid": _WINDOWS_LOCAL_SYSTEM_SID, "inherited": True,
+                             "access": "Allow", "rights": "ReadAndExecute"}],
+        ]
+        for rules in invalid_rules:
+            with (
+                self.subTest(rules=rules),
+                self.assertRaisesRegex(AssertionError, "ACL is not private"),
+            ):
+                assert_private_windows_receipt_acl({"operator": operator, "rules": rules})
+
     def test_fixture_persists_operator_dacl_without_provider_set_acl(self) -> None:
         path = Path("receipt directory's [literal] name")
         environment = {"USERNAME": "private-user", "USERDOMAIN": "private-host"}
@@ -164,6 +220,9 @@ class WindowsReceiptAclFixtureTests(unittest.TestCase):
         ])
         self.assertEqual(calls[2], ["icacls.exe", str(path), "/remove", "*S-1-5-18"])
         self.assertEqual(len(calls), 4)
+        for index in (1, 3):
+            self.assertIn("[System.IO.Directory]::GetAccessControl", calls[index][4])
+            self.assertNotIn("[System.IO.File]::GetAccessControl", calls[index][4])
         for call in run.call_args_list:
             self.assertNotIn("shell", call.kwargs)
             self.assertTrue(call.kwargs["capture_output"])
@@ -364,11 +423,7 @@ class ProductionOAuthSignoffTests(unittest.TestCase):
 
             self.assertEqual(json.loads(path.read_text()), receipt)
             if os.name == "nt":
-                acl = windows_receipt_acl(path)
-                self.assertTrue(acl["rules"])
-                for rule in acl["rules"]:
-                    self.assertEqual(rule, {"sid": acl["operator"], "inherited": True,
-                                            "access": "Allow", "rights": "FullControl"})
+                assert_private_windows_receipt_acl(windows_receipt_acl(path))
             else:
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             original = path.read_bytes()
