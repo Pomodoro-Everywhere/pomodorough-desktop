@@ -72,7 +72,7 @@ if os.environ.get("POMODOROUGH_SHARED_CORE_SMOKE") == "1":
     if (
         not expected_client_id
         or oauth_config.get("client_id") != expected_client_id
-        or oauth_config.get("client_secret")
+        or not oauth_config.get("client_secret")
     ):
         raise SystemExit("packaged OAuth resource is invalid")
     raise SystemExit(0)

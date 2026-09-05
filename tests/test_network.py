@@ -195,9 +195,9 @@ class OAuthResourceTests(unittest.TestCase):
         config = json.loads(resource.read_text(encoding="utf-8"))["installed"]
         self.assertEqual(
             config["client_id"],
-            "614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com",
+            "614768274539-s6grr0j7iplvvsum3lhkt9icntr5reif.apps.googleusercontent.com",
         )
-        self.assertNotIn("client_secret", config)
+        self.assertTrue(config.get("client_secret"))
 
     def test_credentials_accept_installed_web_and_root_documents(self) -> None:
         variants = (
@@ -245,6 +245,8 @@ class OAuthResourceTests(unittest.TestCase):
         retired_client_id = (
             "614768274539-u8f4a71jko6undhdadku2h7mq200lmt8.apps.googleusercontent.com"
         )
+        resource = files("pomodorough").joinpath("resources/oauth-client.json")
+        bundled = json.loads(resource.read_text(encoding="utf-8"))["installed"]
         variants = (
             {"installed": {"client_id": retired_client_id}},
             {"installed": {"client_id": "custom-client", "client_secret": "secret"}},
@@ -262,9 +264,11 @@ class OAuthResourceTests(unittest.TestCase):
 
                 self.assertEqual(
                     credentials["client_id"],
-                    "614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com",
+                    bundled["client_id"],
                 )
-                self.assertEqual(credentials["client_secret"], "")
+                self.assertEqual(
+                    credentials["client_secret"], bundled.get("client_secret", "")
+                )
 
     def test_invalid_credentials_report_source_path(self) -> None:
         with TemporaryDirectory() as directory:

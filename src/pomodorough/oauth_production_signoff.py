@@ -47,8 +47,8 @@ def _account_fingerprint(user: dict[str, Any]) -> str:
 def _packaged_oauth_credentials() -> dict[str, str]:
     bundled = files("pomodorough").joinpath("resources/oauth-client.json")
     packaged = _parse_oauth_credentials(bundled)
-    if packaged.get("client_secret"):
-        raise ProductionSignoffError("packaged OAuth client contains a secret")
+    if not packaged.get("client_secret"):
+        raise ProductionSignoffError("packaged OAuth client is missing its secret")
     if _read_oauth_credentials() != packaged:
         raise ProductionSignoffError("active OAuth config differs from packaged config")
     return packaged

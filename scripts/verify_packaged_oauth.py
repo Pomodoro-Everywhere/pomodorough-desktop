@@ -57,9 +57,6 @@ def main() -> int:
     if not isinstance(expected_client_id, str) or not expected_client_id:
         print("invalid expected OAuth resource", file=sys.stderr)
         return 2
-    if expected.get("client_secret", ""):
-        print("expected OAuth resource contains a client secret", file=sys.stderr)
-        return 2
 
     verified = 0
     for value in sys.argv[2:]:
@@ -77,7 +74,7 @@ def main() -> int:
             except (OSError, ValueError, json.JSONDecodeError):
                 print("invalid packaged OAuth resource", file=sys.stderr)
                 return 1
-            if packaged != expected or packaged.get("client_secret", ""):
+            if packaged != expected:
                 print("invalid packaged OAuth resource", file=sys.stderr)
                 return 1
             verified += 1

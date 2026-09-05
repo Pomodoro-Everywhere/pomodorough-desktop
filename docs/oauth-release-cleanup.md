@@ -10,7 +10,7 @@ Remaining external work: obtain the three assets from one immutable release revi
 
 ## Rotate or revoke the compromised credential
 
-The final bundled Desktop OAuth client ID is stored in `src/pomodorough/resources/oauth-client.json`. The app uses PKCE and does not need a client secret. Treat these as three distinct credentials throughout cleanup:
+The final bundled Desktop OAuth client ID is stored in `src/pomodorough/resources/oauth-client.json`. Google now issues Desktop clients with a client secret, so the bundled resource carries both the ID and the secret and the app sends both (plus PKCE) at the token endpoint. Treat these as three distinct credentials throughout cleanup:
 
 - **Old production client:** retained temporarily so already-released clients continue to work.
 - **Exposed intermediate client:** any client created or shown during rotation that is not the final bundled client. Delete it immediately after identifying it from the Google audit log; never infer it from the current resource file.
@@ -28,7 +28,7 @@ If Google does not offer an in-place reset, replace the client:
 1. Create an OAuth client of type **Desktop app**.
 2. Add the new client ID to the production server's `GOOGLE_NATIVE_CLIENT_IDS`. Keep the old ID during the transition.
 3. Deploy the server and verify that it accepts an ID token whose audience is the new client ID.
-4. Replace only `client_id` in `src/pomodorough/resources/oauth-client.json`. Do not add `client_secret`.
+4. Replace `client_id` and `client_secret` in `src/pomodorough/resources/oauth-client.json` with the Download JSON values captured at creation; the secret is shown only once.
 5. Build the wheel, source archive, Flatpak bundle, and Windows executable from that commit.
 6. Complete the downloaded wheel, Flatpak, and Windows production sign-offs below and retain their private evidence before ending the transition.
 7. Delete the old production OAuth client in Google Cloud Console. Do not delete the final replacement client.
@@ -45,7 +45,7 @@ After the release exists, set the tag and download the published assets. Run Bas
 export REPOSITORY=Pomodoro-Everywhere/pomodorough-desktop
 export TAG=v0.10.0
 export VERSION="${TAG#v}"
-export EXPECTED_OAUTH_CLIENT_ID='614768274539-a70rconcgcn51ksk37ud352cra2ccb7r.apps.googleusercontent.com'
+export EXPECTED_OAUTH_CLIENT_ID='614768274539-s6grr0j7iplvvsum3lhkt9icntr5reif.apps.googleusercontent.com'
 mkdir -p "scan-$VERSION"
 gh release download "$TAG" --repo "$REPOSITORY" --dir "scan-$VERSION"
 cd "scan-$VERSION"
@@ -104,7 +104,7 @@ Verify every packaged OAuth document and scan every unpacked byte for the compro
 mapfile -t OAUTH_FILES < <(find flatpak-root -name oauth-client.json -type f -print)
 test "${#OAUTH_FILES[@]}" -gt 0
 for file in "${OAUTH_FILES[@]}"; do
-  jq -e --arg expected "$EXPECTED_OAUTH_CLIENT_ID" '(.installed // .web // .) | (.client_id == $expected) and ((.client_secret // "") == "")' "$file" >/dev/null
+  jq -e --arg expected "$EXPECTED_OAUTH_CLIENT_ID" '(.installed // .web // .) | (.client_id == $expected) and ((.client_secret // "") != "")' "$file" >/dev/null
 done
 python3 ../scripts/scan_secret.py flatpak-root
 ```
@@ -123,7 +123,7 @@ cd ..
 mapfile -t OAUTH_FILES < <(find windows-root -name oauth-client.json -type f -print)
 test "${#OAUTH_FILES[@]}" -gt 0
 for file in "${OAUTH_FILES[@]}"; do
-  jq -e --arg expected "$EXPECTED_OAUTH_CLIENT_ID" '(.installed // .web // .) | (.client_id == $expected) and ((.client_secret // "") == "")' "$file" >/dev/null
+  jq -e --arg expected "$EXPECTED_OAUTH_CLIENT_ID" '(.installed // .web // .) | (.client_id == $expected) and ((.client_secret // "") != "")' "$file" >/dev/null
 done
 python3 ../scripts/scan_secret.py windows-root
 ```
@@ -261,12 +261,12 @@ Close the external OAuth release-cleanup item only when all of these facts are r
 
 - Google revoked the compromised secret or deleted its old OAuth client.
 - Production accepts the retained or replacement Desktop client ID.
-- A downloaded wheel, Flatpak, and Windows artifact each complete Google sign-in without a client secret.
+- A downloaded wheel, Flatpak, and Windows artifact each complete Google sign-in with the bundled client ID and secret.
 - Each artifact validates the authenticated account returned by production `/api/v1/me`; the headless sign-off receipt does not certify account rendering in the UI.
 - Each artifact restores the account after the process exits and starts again.
 - Private sign-off receipts and execution records bind those checks to the same release revision, exact assets, required platforms, and account fingerprint.
 - The downloaded wheel, Flatpak, and Windows assets match `SHA256SUMS.txt` and their GitHub attestations.
-- The unpacked Flatpak and PyInstaller payloads contain no non-empty `client_secret` and no byte sequence equal to the compromised secret.
+- The unpacked Flatpak and PyInstaller payloads carry the expected bundled `client_secret` and no byte sequence equal to the compromised secret.
 - Raw assets and all unpacked wheel, source archive, Flatpak, and Windows payloads pass the release scan procedure in `scripts/unpack_release_artifacts.sh` and `scripts/verify_release_artifacts.sh`; retain sanitized results.
 - The private rollout record identifies the chosen cleanup branch and includes operator/time, Google audit-log event IDs, server deployment IDs, and the branch-specific evidence below. Do not retain tokens or credential-bearing responses.
   - **Replacement client:** record deletion of the old OAuth client, removal of its ID from production `GOOGLE_NATIVE_CLIENT_IDS`, and post-deployment verification that the old audience is rejected and the replacement audience is accepted.

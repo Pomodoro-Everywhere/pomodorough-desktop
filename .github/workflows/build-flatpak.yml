@@ -98,7 +98,7 @@ jobs:
             --env=POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID="$expected_client_id" \
             --command=python3 \
             me.egigoka.Pomodorough \
-            -c 'import json, os; from importlib.resources import files; document=json.loads(files("pomodorough").joinpath("resources/oauth-client.json").read_text(encoding="utf-8")); config=document.get("installed") or document; valid=config.get("client_id") == os.environ["POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID"] and not config.get("client_secret"); raise SystemExit(0 if valid else "invalid packaged OAuth resource")'
+            -c 'import json, os; from importlib.resources import files; document=json.loads(files("pomodorough").joinpath("resources/oauth-client.json").read_text(encoding="utf-8")); config=document.get("installed") or document; valid=config.get("client_id") == os.environ["POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID"] and config.get("client_secret"); raise SystemExit(0 if valid else "invalid packaged OAuth resource")'
           flatpak run --user --command=python3 \
             me.egigoka.Pomodorough \
             -m pomodorough.oauth_artifact_verifier --self-test

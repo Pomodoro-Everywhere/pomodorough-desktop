@@ -43,9 +43,18 @@ class PackagedOAuthValidationTests(unittest.TestCase):
                 text=True,
             )
 
-    def test_accepts_final_secret_free_client_in_every_package(self) -> None:
+    def test_accepts_final_client_in_every_package(self) -> None:
         document = {"installed": {"client_id": "final-client"}}
         result = self.run_validator(document, [document, document, document, document])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("packaged OAuth resources verified", result.stdout)
+
+    def test_accepts_matching_client_secret_in_every_package(self) -> None:
+        document = {
+            "installed": {"client_id": "final-client", "client_secret": "shipped"}
+        }
+        result = self.run_validator(document, [document, document])
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("packaged OAuth resources verified", result.stdout)
@@ -57,18 +66,22 @@ class PackagedOAuthValidationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing packaged OAuth resource", result.stderr)
 
-    def test_rejects_wrong_client_or_nonempty_secret(self) -> None:
-        expected = {"installed": {"client_id": "final-client"}}
-        wrong_client = {"installed": {"client_id": "old-client"}}
-        leaked_secret = {
+    def test_rejects_wrong_client_or_mismatched_secret(self) -> None:
+        expected = {
+            "installed": {"client_id": "final-client", "client_secret": "shipped"}
+        }
+        wrong_client = {
+            "installed": {"client_id": "old-client", "client_secret": "shipped"}
+        }
+        mismatched_secret = {
             "installed": {
                 "client_id": "final-client",
-                "client_secret": "must-not-ship",
+                "client_secret": "different",
             }
         }
 
         wrong_result = self.run_validator(expected, [wrong_client])
-        secret_result = self.run_validator(expected, [leaked_secret])
+        secret_result = self.run_validator(expected, [mismatched_secret])
 
         self.assertEqual(wrong_result.returncode, 1)
         self.assertEqual(secret_result.returncode, 1)

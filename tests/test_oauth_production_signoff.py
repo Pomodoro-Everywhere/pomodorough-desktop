@@ -391,8 +391,8 @@ class ProductionOAuthSignoffTests(unittest.TestCase):
         self.assertTrue(service.shutdown_called)
 
     def test_packaged_credentials_reject_active_override(self) -> None:
-        packaged = {"client_id": "packaged", "client_secret": ""}
-        active = {"client_id": "override", "client_secret": ""}
+        packaged = {"client_id": "packaged", "client_secret": "shipped"}
+        active = {"client_id": "override", "client_secret": "shipped"}
         with (
             patch.object(signoff, "_parse_oauth_credentials", return_value=packaged),
             patch.object(signoff, "_read_oauth_credentials", return_value=active),
