@@ -9,17 +9,45 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 
 from . import __version__
 
+MAX_SSE_BUFFER_BYTES = 64 * 1024
+MAX_SSE_LINE_BYTES = 64 * 1024
+MAX_SSE_EVENT_BYTES = 64 * 1024
+
+
+class RevisionEventOverflowError(Exception):
+    """Raised when an SSE stream exceeds its bounded buffer."""
+
 
 class RevisionEventParser:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
+        max_line_bytes: int = MAX_SSE_LINE_BYTES,
+        max_event_bytes: int = MAX_SSE_EVENT_BYTES,
+    ) -> None:
         self.buffer = b""
         self.data_lines: list[bytes] = []
+        self.max_buffer_bytes = max_buffer_bytes
+        self.max_line_bytes = max_line_bytes
+        self.max_event_bytes = max_event_bytes
+        self._event_bytes = 0
+
+    def _discard(self) -> None:
+        self.buffer = b""
+        self.data_lines = []
+        self._event_bytes = 0
 
     def feed(self, chunk: bytes) -> list[int]:
         self.buffer += chunk
+        if len(self.buffer) > self.max_buffer_bytes:
+            self._discard()
+            raise RevisionEventOverflowError("SSE buffer exceeds size limit.")
         revisions: list[int] = []
         while b"\n" in self.buffer:
             line, self.buffer = self.buffer.split(b"\n", 1)
+            if len(line) > self.max_line_bytes:
+                self._discard()
+                raise RevisionEventOverflowError("SSE line exceeds size limit.")
             line = line.rstrip(b"\r")
             if not line:
                 revision = self._dispatch()
@@ -29,6 +57,10 @@ class RevisionEventParser:
                 data = line[5:]
                 if data.startswith(b" "):
                     data = data[1:]
+                self._event_bytes += len(data)
+                if self._event_bytes > self.max_event_bytes:
+                    self._discard()
+                    raise RevisionEventOverflowError("SSE event exceeds size limit.")
                 self.data_lines.append(data)
         return revisions
 
@@ -37,6 +69,7 @@ class RevisionEventParser:
             return None
         raw = b"\n".join(self.data_lines)
         self.data_lines = []
+        self._event_bytes = 0
         try:
             document = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -111,7 +144,11 @@ class RevisionStream:
         if not self.response_is_valid(reply):
             reply.readAll()
             return ()
-        revisions = tuple(self.state.parser.feed(bytes(reply.readAll())))
+        try:
+            revisions = tuple(self.state.parser.feed(bytes(reply.readAll())))
+        except RevisionEventOverflowError:
+            self._drop_overflowed_stream(reply)
+            return ()
         if revisions:
             self.state.reconnect_attempt = 0
         return revisions
@@ -122,6 +159,13 @@ class RevisionStream:
         content_type = bytes(reply.rawHeader("Content-Type"))
         media_type = content_type.split(b";", 1)[0].strip().lower()
         return status == 200 and media_type == b"text/event-stream"
+
+    def _drop_overflowed_stream(self, reply: QNetworkReply) -> None:
+        parser = self.state.parser
+        self.state.parser = RevisionEventParser(
+            parser.max_buffer_bytes, parser.max_line_bytes, parser.max_event_bytes
+        )
+        reply.abort()
 
     def finish(self, reply: QNetworkReply) -> RevisionFinish:
         if reply is not self.state.reply:

@@ -22,6 +22,18 @@ class SecureStoreError(OSError):
     pass
 
 
+_WINDOWS_BLOB_LIMIT = 64 * 1024
+
+
+def _read_capped_bytes(path: Path, limit: int) -> bytes:
+    """Read a local secure blob with an oversize rejection."""
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise SecureStoreError("Secure value exceeds size limit.")
+    return data
+
+
 class TokenCleanupPendingError(SecureStoreError):
     pass
 
@@ -283,9 +295,11 @@ class PlatformSecretStore:
         if os.name == "nt":
             path = self._windows_path(key)
             try:
-                encrypted = path.read_bytes()
+                encrypted = _read_capped_bytes(path, _WINDOWS_BLOB_LIMIT)
             except FileNotFoundError:
                 return None
+            except SecureStoreError:
+                raise
             except OSError as error:
                 raise SecureStoreError(f"Secure value could not be read: {error}") from error
             return self._windows_unprotect(encrypted)

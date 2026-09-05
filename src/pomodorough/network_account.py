@@ -21,6 +21,21 @@ from .storage_revocation import PendingSessionRevocations, credential_api_base
 _CLEARED_DELETION_CLEANUP = {"version": 1, "cleanupState": "cleared"}
 _MOVEFILE_REPLACE_EXISTING = 0x1
 _MOVEFILE_WRITE_THROUGH = 0x8
+_DELETION_CLEANUP_LIMIT = 64 * 1024
+
+
+class _LocalDocumentTooLarge(Exception):
+    pass
+
+
+def _read_capped_text(path: Path, limit: int) -> str:
+    """Read a small local JSON document with an oversize rejection."""
+    if path.stat().st_size > limit:
+        raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+    text = path.read_text(encoding="utf-8")
+    if len(text.encode("utf-8")) > limit:
+        raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+    return text
 
 
 def _platform_name(filesystem: Any = os) -> str:
@@ -95,9 +110,13 @@ def _sync_replaced_file_directory(path: Path, filesystem: Any = os) -> None:
 
 def _account_deletion_cleanup_blocks_authentication(path: Path) -> bool:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(_read_capped_text(path, _DELETION_CLEANUP_LIMIT))
     except FileNotFoundError:
         return False
+    except _LocalDocumentTooLarge:
+        raise SecureStoreError(
+            "Account deletion cleanup obligation is unreadable or malformed."
+        ) from None
     except (OSError, ValueError, UnicodeError):
         raise SecureStoreError(
             "Account deletion cleanup obligation is unreadable or malformed."
@@ -806,9 +825,13 @@ class AccountLifecycle:
         if not self._path_exists(path):
             return None
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
+            document = json.loads(_read_capped_text(path, _DELETION_CLEANUP_LIMIT))
         except FileNotFoundError:
             return None
+        except _LocalDocumentTooLarge:
+            raise SecureStoreError(
+                "Account deletion cleanup obligation is unreadable or malformed."
+            ) from None
         except (OSError, ValueError, UnicodeError):
             raise SecureStoreError(
                 "Account deletion cleanup obligation is unreadable or malformed."

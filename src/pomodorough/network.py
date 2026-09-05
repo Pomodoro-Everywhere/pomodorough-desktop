@@ -73,9 +73,15 @@ RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS = frozenset(
 )
 _DEFAULT_SECRET_STORE = object()
 _HTTP_RESPONSE_BODY_LIMIT = 1024 * 1024
+_OAUTH_CREDENTIALS_LIMIT = 64 * 1024
+_FALLBACK_DOCUMENT_LIMIT = 64 * 1024
 
 
 class _ResponseBodyTooLarge(Exception):
+    pass
+
+
+class _LocalDocumentTooLarge(Exception):
     pass
 
 
@@ -131,6 +137,27 @@ def _read_bounded_response_body(response: _ReadableResponse) -> bytes:
     if len(body) > _HTTP_RESPONSE_BODY_LIMIT:
         raise _ResponseBodyTooLarge
     return bytes(body)
+
+
+def _read_capped_text(source: Any, limit: int) -> str:
+    """Read a small local JSON document with an oversize rejection."""
+    if isinstance(source, Path):
+        if source.stat().st_size > limit:
+            raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+        text = source.read_text(encoding="utf-8")
+        if len(text.encode("utf-8")) > limit:
+            raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+        return text
+    read_bytes = getattr(source, "read_bytes", None)
+    if callable(read_bytes):
+        raw = read_bytes()
+        if len(raw) > limit:
+            raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+        return raw.decode("utf-8")
+    text = source.read_text(encoding="utf-8")
+    if len(text.encode("utf-8")) > limit:
+        raise _LocalDocumentTooLarge(f"Local document exceeds {limit} bytes.")
+    return text
 
 
 def _decode_http_error(body: bytes, status: int) -> ApiError:
@@ -711,9 +738,13 @@ class TokenStore:
 
     def _load_fallback(self) -> dict[str, Any] | None:
         try:
-            document = json.loads(self.fallback_path.read_text())
+            document = json.loads(
+                _read_capped_text(self.fallback_path, _FALLBACK_DOCUMENT_LIMIT)
+            )
         except FileNotFoundError:
             return None
+        except _LocalDocumentTooLarge:
+            raise SecureStoreError("Local sign-out state is malformed.") from None
         except (ValueError, UnicodeError):
             raise SecureStoreError("Local sign-out state is malformed.") from None
         if not isinstance(document, dict):
@@ -780,7 +811,7 @@ class Worker(QRunnable):
 
 def _parse_oauth_credentials(source: Any) -> dict[str, str]:
     try:
-        document = json.loads(source.read_text(encoding="utf-8"))
+        document = json.loads(_read_capped_text(source, _OAUTH_CREDENTIALS_LIMIT))
         config = document.get("installed") or document.get("web") or document
         return {
             "client_id": config["client_id"],
@@ -788,6 +819,8 @@ def _parse_oauth_credentials(source: Any) -> dict[str, str]:
             "auth_uri": config.get("auth_uri", "https://accounts.google.com/o/oauth2/v2/auth"),
             "token_uri": config.get("token_uri", "https://oauth2.googleapis.com/token"),
         }
+    except _LocalDocumentTooLarge as error:
+        raise ApiError(_text("network.error.oauth_config", path=source)) from error
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise ApiError(_text("network.error.oauth_config", path=source)) from error
 
