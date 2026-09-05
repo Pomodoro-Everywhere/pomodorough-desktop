@@ -1,0 +1,5 @@
+secret:
+  ignored_matches:
+  - match: b3a985549e427fcc2d7a531138f121fbafb4f821075ae77c28f59e7d1db8128a
+    name: Bundled Desktop OAuth client secret (intentional, installed-app flow)
+version: 2
