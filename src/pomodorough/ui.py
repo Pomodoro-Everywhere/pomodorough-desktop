@@ -222,6 +222,11 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
     def _show_notice(self, message: str) -> None:
         QMessageBox.warning(self, "Pomodorough", message)
 
+    def _is_window_foreground(self) -> bool:
+        if self.isActiveWindow():
+            return True
+        return QApplication.activeWindow() is self
+
     def _notify(self, title: str, message: str) -> None:
         source_timer = self._current_timer()
         self._alert_timer_identity = (
@@ -234,7 +239,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self.sound_timer.start()
         self.stop_sound_button.setVisible(True)
         self.stop_sound_button.setEnabled(True)
-        if self.tray:
+        if self.tray and not self._is_window_foreground():
             self.tray.showMessage(title, message, self.app_icon, 7000)
 
     def _show_window(self) -> None:
