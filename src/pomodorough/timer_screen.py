@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .core import (
     ACTIVE_STATUSES,
     PHASES,
@@ -148,6 +149,7 @@ class TimerScreen(QWidget):
         self._build_duration_controls(settings)
         self._build_auto_break_controls(settings)
         self._build_alert_notice()
+        self._build_version_label()
         self.right_layout.addStretch()
         self.content_layout.addWidget(self.right_panel, 2)
         self.right_panel.hide()
@@ -224,6 +226,14 @@ class TimerScreen(QWidget):
             self.strings.text("pattern.alert_accessible")
         )
         self.right_layout.addWidget(self.alert_guarantee)
+
+    def _build_version_label(self) -> None:
+        self.version_label = QLabel(
+            self.strings.text("pattern.version", version=__version__)
+        )
+        self.version_label.setObjectName("taskSubtitle")
+        self.version_label.setWordWrap(True)
+        self.right_layout.addWidget(self.version_label)
 
     def set_settings_visible(self, visible: bool) -> None:
         self.right_panel.setVisible(visible)

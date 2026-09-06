@@ -57,6 +57,7 @@
   "pattern.auto_breaks_detail": "Short after focus. Long every fourth completed focus.",
   "pattern.alert_guarantee": "Completion alerts sound while Pomodorough is running (the window may stay in the system tray). If the process is closed, no background alert is guaranteed; overdue timers are restored on next launch.",
   "pattern.alert_accessible": "Completion alert availability",
+  "pattern.version": "Version {version}",
   "task.focus": "Focus task",
   "task.next_focus": "Next focus task",
   "task.active_context": "Active timer task: {task}",
