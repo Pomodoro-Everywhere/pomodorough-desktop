@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,28 @@ class ResolveDsnTests(unittest.TestCase):
                 with patch.object(Path, "read_text", return_value=payload):
                     with patch.object(Path, "stat", return_value=_Stat(10)):
                         self.assertIsNone(resolve_dsn(env={}, config_path=path))
+
+    def test_default_config_path_supplies_dsn(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            Path(dirname, "sentry.json").write_text(
+                json.dumps({"dsn": DSN}), encoding="utf-8"
+            )
+            with (
+                patch.object(
+                    sentry_monitoring, "user_config_path", return_value=Path(dirname)
+                ),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(resolve_dsn(), DSN)
+
+    def test_oversize_config_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            path = Path(dirname, "sentry.json")
+            path.write_text(
+                json.dumps({"dsn": DSN, "padding": "x" * 9000}), encoding="utf-8"
+            )
+            self.assertGreater(path.stat().st_size, 8_192)
+            self.assertIsNone(resolve_dsn(env={}, config_path=path))
 
 
 class InitSentryTests(unittest.TestCase):
