@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from .iroh_network import IrohService
 from .network import CloudService
+from .sentry_monitoring import init_sentry_from_environment
 from .storage import Store
 from .ui import MainWindow, resource_path
 
@@ -26,6 +27,7 @@ def _instance_lock() -> QLockFile:
 
 
 def main() -> int:
+    init_sentry_from_environment()
     app = QApplication(sys.argv)
     app.setApplicationName("Pomodorough")
     app.setApplicationDisplayName("Pomodorough")

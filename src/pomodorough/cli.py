@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 from .localization import Strings
+from .sentry_monitoring import init_sentry_from_environment
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer, normalize_phase
 
@@ -282,6 +283,7 @@ def main(
     locale: str | None = None,
 ) -> int:
     strings = Strings(locale)
+    init_sentry_from_environment()
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
     raw_args = tuple(sys.argv[1:] if argv is None else argv)

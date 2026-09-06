@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .localization import Strings
+from .sentry_monitoring import init_sentry_from_environment
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
@@ -170,6 +171,7 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
 
 
 def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int:
+    init_sentry_from_environment()
     strings = Strings(locale)
     parser = argparse.ArgumentParser(
         prog="pomodorough-tui",
