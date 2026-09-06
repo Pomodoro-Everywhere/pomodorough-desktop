@@ -20,7 +20,7 @@ FLAKE = ROOT / "flake.nix"
 
 CORE_COMMIT = "20f9696b9a7c5dd9f0a253b21a5c9bd225f9e9b2"
 CORE_RELEASE_TAG = "v0.14.0"
-CORE_SHA256 = "7f55b8ea25f88745c029244f8f93dc1301e0f43d61c316e43c0e5a96b8f2ec6b"
+CORE_SHA256 = "e83b0ed6905317368fd13b4aa8891a305df7132e33bbee1baca6f47056fc15f7"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
 UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
 VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
