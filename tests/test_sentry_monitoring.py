@@ -14,6 +14,7 @@ from pomodorough import __version__, sentry_monitoring
 from pomodorough.sentry_monitoring import (
     POMODOROUGH_SENTRY_DISABLE_ENV_VAR,
     POMODOROUGH_SENTRY_DSN_ENV_VAR,
+    POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR,
     SENTRY_DSN_ENV_VAR,
     init_sentry,
     init_sentry_from_environment,
@@ -23,6 +24,23 @@ from pomodorough.sentry_monitoring import (
 )
 
 DSN = "https://public@example.ingest.sentry.io/1"
+
+# Hermetic isolation: point the packaged-default seam at a missing file so
+# a release-baked `sentry_dsn_default` resource cannot leak into
+# no-source→None assertions. Production leaves this env var unset and reads
+# the baked resource.
+_ISOLATED_PACKAGED_DEFAULT_PATH = "/nonexistent-pm-packaged-default-hermetic"
+
+
+class _HermeticPackagedDefaultMixin:
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        patcher = patch.dict(
+            os.environ,
+            {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: _ISOLATED_PACKAGED_DEFAULT_PATH},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class TemporaryJson:
@@ -46,7 +64,7 @@ class _Stat:
         self.st_size = size
 
 
-class ResolveDsnTests(unittest.TestCase):
+class ResolveDsnTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
     def test_no_sources_returns_none(self) -> None:
         self.assertIsNone(resolve_dsn(env={}, config_path=Path("/nonexistent.json")))
 
@@ -78,7 +96,10 @@ class ResolveDsnTests(unittest.TestCase):
                 path = Path(f"/nonexistent-sentry-{index}.json")
                 with patch.object(Path, "read_text", return_value=payload):
                     with patch.object(Path, "stat", return_value=_Stat(10)):
-                        self.assertIsNone(resolve_dsn(env={}, config_path=path))
+                        with patch.object(
+                            sentry_monitoring, "_packaged_default_dsn", return_value=None
+                        ):
+                            self.assertIsNone(resolve_dsn(env={}, config_path=path))
 
     def test_default_config_path_supplies_dsn(self) -> None:
         with tempfile.TemporaryDirectory() as dirname:
@@ -161,7 +182,7 @@ class InitSentryTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), "False")
 
 
-class PackagedDefaultTests(unittest.TestCase):
+class PackagedDefaultTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
     def test_packaged_default_used_when_nothing_else(self) -> None:
         with patch.object(sentry_monitoring, '_packaged_default_dsn', return_value=DSN):
             self.assertEqual(resolve_dsn(env={}, config_path=Path('/nonexistent.json')), DSN)
@@ -184,10 +205,66 @@ class PackagedDefaultTests(unittest.TestCase):
             self.assertIsNone(resolve_dsn(env={}, config_path=Path('/nonexistent.json')))
 
     def test_missing_packaged_file_returns_none(self) -> None:
+        # Isolated override points at a missing file, so this holds even
+        # when the release step baked a real DSN into the resource.
         self.assertIsNone(sentry_monitoring._packaged_default_dsn())
+        self.assertIsNone(sentry_monitoring._packaged_default_dsn(env={}))
+        self.assertIsNone(
+            resolve_dsn(env={}, config_path=Path("/nonexistent.json"))
+        )
+
+    def test_missing_baked_resource_returns_none_without_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with patch(
+                "importlib.resources.files", side_effect=FileNotFoundError("missing")
+            ):
+                self.assertIsNone(sentry_monitoring._packaged_default_dsn())
+                self.assertIsNone(sentry_monitoring._packaged_default_dsn(env={}))
+
+    def test_override_file_supplies_dsn_when_nothing_else(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            override = Path(dirname, "sentry_dsn_default")
+            override.write_text(DSN, encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: str(override)},
+            ):
+                self.assertEqual(sentry_monitoring._packaged_default_dsn(), DSN)
+                self.assertEqual(sentry_monitoring._packaged_default_dsn(env={}), DSN)
+                self.assertEqual(
+                    resolve_dsn(env={}, config_path=Path("/nonexistent.json")), DSN
+                )
+
+    def test_explicit_env_override_beats_process_env(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            override = Path(dirname, "sentry_dsn_default")
+            override.write_text(DSN, encoding="utf-8")
+            env = {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: str(override)}
+            self.assertEqual(sentry_monitoring._packaged_default_dsn(env=env), DSN)
+
+    def test_override_shadows_baked_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            override = Path(dirname, "sentry_dsn_default")
+            override.write_text(DSN, encoding="utf-8")
+
+            class _FakeBaked:
+                def joinpath(self, *parts: str) -> _FakeBaked:
+                    return self
+
+                def open(self, mode: str = "r", encoding: str | None = None) -> io.StringIO:
+                    return io.StringIO("https://baked@example/9")
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: str(override)},
+                ),
+                patch("importlib.resources.files", return_value=_FakeBaked()),
+            ):
+                self.assertEqual(sentry_monitoring._packaged_default_dsn(), DSN)
 
 
-class OptOutTests(unittest.TestCase):
+class OptOutTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
     def test_disable_flag_beats_everything(self) -> None:
         env = {
             POMODOROUGH_SENTRY_DISABLE_ENV_VAR: "1",
@@ -272,7 +349,7 @@ class OptOutTests(unittest.TestCase):
                 self.assertIn(needle, text)
 
 
-class BomToleranceTests(unittest.TestCase):
+class BomToleranceTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
     def test_config_with_bom_parses(self) -> None:
         with tempfile.TemporaryDirectory() as dirname:
             path = Path(dirname, "sentry.json")
@@ -292,9 +369,10 @@ class BomToleranceTests(unittest.TestCase):
         with patch(
             "importlib.resources.files", return_value=_FakeResource()
         ):
-            self.assertEqual(
-                sentry_monitoring._packaged_default_dsn(), DSN
-            )
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    sentry_monitoring._packaged_default_dsn(), DSN
+                )
 
 
 _ADVERSARIAL_EVENT = {

@@ -24,6 +24,9 @@ from . import __version__
 SENTRY_DSN_ENV_VAR = "SENTRY_DSN"
 POMODOROUGH_SENTRY_DSN_ENV_VAR = "POMODOROUGH_SENTRY_DSN"
 POMODOROUGH_SENTRY_DISABLE_ENV_VAR = "POMODOROUGH_SENTRY_DISABLE"
+POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR = (
+    "POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE"
+)
 SENTRY_CONFIG_FILENAME = "sentry.json"
 SENTRY_PACKAGED_DEFAULT_RESOURCE = "sentry_dsn_default"
 SENTRY_ENVIRONMENT = "production"
@@ -130,10 +133,47 @@ def resolve_dsn(
     dsn = _read_config_dsn(path)
     if dsn:
         return dsn
-    return _packaged_default_dsn()
+    return _packaged_default_dsn(env=environment)
 
 
-def _packaged_default_dsn() -> str | None:
+def _packaged_default_override_path(
+    environment: Mapping[str, str] | None,
+) -> Path | None:
+    """Test seam for the baked DSN file location.
+
+    Production reads the packaged ``sentry_dsn_default`` resource when this
+    is unset. Tests point it at an isolated missing file so a release-baked
+    DSN cannot leak into no-source assertions. The explicit ``env`` mapping
+    wins; the process environment is a fallback so ``resolve_dsn(env={})``
+    stays hermetic under a global test isolation.
+    """
+    candidates: list[Mapping[str, str] | None] = [environment, os.environ]
+    for source in candidates:
+        if source is None:
+            continue
+        raw = str(source.get(POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR) or "")
+        if raw.strip():
+            return Path(raw.strip())
+        if source is environment and environment is os.environ:
+            break
+    return None
+
+
+def _read_packaged_override(path: Path) -> str | None:
+    try:
+        if path.stat().st_size > _CONFIG_SIZE_LIMIT:
+            return None
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError, UnicodeError):
+        return None
+    dsn = text.strip()
+    return dsn or None
+
+
+def _packaged_default_dsn(env: Mapping[str, str] | None = None) -> str | None:
+    override = _packaged_default_override_path(env)
+    if override is not None:
+        return _read_packaged_override(override)
     try:
         from importlib import resources
 
