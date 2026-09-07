@@ -19,6 +19,7 @@ from . import __version__
 SENTRY_DSN_ENV_VAR = "SENTRY_DSN"
 POMODOROUGH_SENTRY_DSN_ENV_VAR = "POMODOROUGH_SENTRY_DSN"
 SENTRY_CONFIG_FILENAME = "sentry.json"
+SENTRY_PACKAGED_DEFAULT_RESOURCE = "sentry_dsn_default"
 SENTRY_ENVIRONMENT = "production"
 _CONFIG_SIZE_LIMIT = 8_192
 
@@ -53,7 +54,25 @@ def resolve_dsn(
         if dsn:
             return dsn
     path = config_path or (_config_root() / SENTRY_CONFIG_FILENAME)
-    return _read_config_dsn(path)
+    dsn = _read_config_dsn(path)
+    if dsn:
+        return dsn
+    return _packaged_default_dsn()
+
+
+def _packaged_default_dsn() -> str | None:
+    try:
+        from importlib import resources
+
+        resource = resources.files('pomodorough').joinpath(
+            'resources', SENTRY_PACKAGED_DEFAULT_RESOURCE
+        )
+        with resource.open('r', encoding='utf-8') as stream:
+            text = stream.read()
+    except (OSError, ValueError, TypeError, ImportError):
+        return None
+    dsn = text.strip()
+    return dsn or None
 
 
 def init_sentry(

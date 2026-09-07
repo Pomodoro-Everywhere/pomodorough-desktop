@@ -28,3 +28,4 @@ google-oauth.json
 /coverage.xml
 /htmlcov/
 /.audit/
+src/pomodorough/resources/sentry_dsn_default

@@ -157,5 +157,31 @@ class InitSentryTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), "False")
 
 
+class PackagedDefaultTests(unittest.TestCase):
+    def test_packaged_default_used_when_nothing_else(self) -> None:
+        with patch.object(sentry_monitoring, '_packaged_default_dsn', return_value=DSN):
+            self.assertEqual(resolve_dsn(env={}, config_path=Path('/nonexistent.json')), DSN)
+
+    def test_env_beats_packaged_default(self) -> None:
+        with patch.object(sentry_monitoring, '_packaged_default_dsn', return_value='https://other@example/2'):
+            self.assertEqual(
+                resolve_dsn(env={SENTRY_DSN_ENV_VAR: DSN}, config_path=Path('/nonexistent.json')), DSN
+            )
+
+    def test_config_file_beats_packaged_default(self) -> None:
+        with (
+            TemporaryJson({'dsn': DSN}) as path,
+            patch.object(sentry_monitoring, '_packaged_default_dsn', return_value='https://other@example/2'),
+        ):
+            self.assertEqual(resolve_dsn(env={}, config_path=path), DSN)
+
+    def test_blank_packaged_default_is_ignored(self) -> None:
+        with patch.object(sentry_monitoring, '_packaged_default_dsn', return_value=None):
+            self.assertIsNone(resolve_dsn(env={}, config_path=Path('/nonexistent.json')))
+
+    def test_missing_packaged_file_returns_none(self) -> None:
+        self.assertIsNone(sentry_monitoring._packaged_default_dsn())
+
+
 if __name__ == "__main__":
     unittest.main()

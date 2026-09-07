@@ -48,4 +48,5 @@ pomodorough = [
     "resources/*.wasm",
     "resources/*.wasm.sha256",
     "resources/CORE_COMMIT",
+    "resources/sentry_dsn_default",
 ]

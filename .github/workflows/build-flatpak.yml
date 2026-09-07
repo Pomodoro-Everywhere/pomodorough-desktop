@@ -31,6 +31,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Write Sentry DSN default for release telemetry
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SENTRY_DSN:-}" ]]; then
+            printf '%s' "$SENTRY_DSN" > src/pomodorough/resources/sentry_dsn_default
+          fi
+
       - name: Read release version
         id: release
         shell: bash
