@@ -84,6 +84,8 @@ def valid_room_id(value: Any) -> bool:
     try:
         return len(b64url_decode(value, label="room ID")) == 32
     except IrohProtocolError:
+        # Pure validator over untrusted peer input: False is the contract,
+        # so stay silent.
         return False
 
 

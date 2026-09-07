@@ -10,6 +10,7 @@ reported without configuration. Reporting is strictly opt-out: see the
 
 from __future__ import annotations
 
+import collections.abc
 import json
 import os
 import re
@@ -52,6 +53,10 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "code",
     }
 )
+# `code` matches only as an exact or suffix hit: substring matching
+# over-filters codec operations ("encode", "codec") and hides numeric
+# diagnostics. The allowlist covers diagnostic codes that are safe to keep.
+_CODE_SUFFIX_ALLOWLIST = frozenset({"errorcode", "statuscode", "exitcode"})
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
@@ -192,10 +197,26 @@ def _packaged_default_dsn(env: Mapping[str, str] | None = None) -> str | None:
     return dsn or None
 
 
+def _is_code_key(lowered: str) -> bool:
+    if lowered == "code":
+        return True
+    if not lowered.endswith("code"):
+        return False
+    if lowered in _CODE_SUFFIX_ALLOWLIST:
+        return False
+    # Codec operations share the suffix but carry no secret.
+    if lowered.endswith(("encode", "decode")) or "codec" in lowered:
+        return False
+    return True
+
+
 def _sensitive_key(key: Any) -> bool:
-    return isinstance(key, str) and any(
-        part in key.lower() for part in _SENSITIVE_KEY_PARTS
-    )
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    if _is_code_key(lowered):
+        return True
+    return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
 
 def _scrub_string(text: str) -> str:
@@ -226,6 +247,11 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
             else:
                 cleaned[key] = _scrub_value(item, depth + 1)
         return cleaned
+    if isinstance(value, collections.abc.Mapping):
+        # Non-dict mappings (proxies, immutable views) stay opaque: their
+        # iteration contract is unknown, so recursing could leak sensitive
+        # leaves through a custom items() view.
+        return _FILTERED
     if isinstance(value, list):
         return [_scrub_value(item, depth + 1) for item in value]
     if isinstance(value, tuple):

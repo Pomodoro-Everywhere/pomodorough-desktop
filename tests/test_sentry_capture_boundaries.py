@@ -1,27 +1,38 @@
-"""Regression tests for silent-failure triage (D17).
+"""Regression tests for silent-failure triage (D17, D24).
 
 Maps each silenced boundary to its reporting contract:
 
 - Captured (user-visible failure, report but stay non-fatal):
   iroh_network shutdown, accept-loop shed, accept-incoming refusal,
   network keyring clear.
-- Silent with comment (truly expected races): missing fallback unlink,
-  consumed-tempfile unlink, best-effort parent chmod.
+- Silent with comment (truly expected races or best-effort mirrors):
+  missing fallback unlink, consumed-tempfile unlink, best-effort parent
+  chmod, OAuth signoff child spawn (D24), legacy secret-tool read/mirror
+  (D24), legacy pending-id skip (D24), cursor-visibility probe (D24,
+  see test_tui), foreign task-title shortcut skip (D24), room-ID
+  validator rejections (D24).
 """
 
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+from pomodorough import oauth_production_signoff
+from pomodorough.core import task_from_title
 from pomodorough.iroh_network import EndpointKeyStore, IrohService
+from pomodorough.iroh_protocol import room_id_for_secret, valid_room_id
 from pomodorough.network import TokenStore
+from pomodorough.secure_store import SecureStoreError
 from pomodorough.storage import Store
+from pomodorough.storage_replication_projection import ReplicatedStateProjection
 
 
 class _MemorySecretStore:
@@ -246,6 +257,171 @@ class ExpectedSilenceTests(unittest.TestCase):
                     service._thread = None
 
         asyncio.run(scenario())
+
+
+class OAuthSignoffRestartSilenceTests(unittest.TestCase):
+    def test_spawn_failure_reports_false_without_capture(self) -> None:
+        with patch.object(
+            oauth_production_signoff.subprocess,
+            "run",
+            side_effect=OSError("noexec"),
+        ):
+            self.assertFalse(
+                oauth_production_signoff._restart_in_child(
+                    Path("/tmp/signoff"), "device", "fp"
+                )
+            )
+
+    def test_child_exit_failure_reports_false(self) -> None:
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"
+        )
+        with patch.object(
+            oauth_production_signoff.subprocess, "run", return_value=failed
+        ):
+            self.assertFalse(
+                oauth_production_signoff._restart_in_child(
+                    Path("/tmp/signoff"), "device", "fp"
+                )
+            )
+
+
+class LegacySecretToolSilenceTests(unittest.TestCase):
+    def _store(self, directory: str) -> TokenStore:
+        return TokenStore(
+            "device-1", secret_store=None, fallback_path=Path(directory) / "s.json"
+        )
+
+    def test_lookup_spawn_failure_reads_as_absent(self) -> None:
+        with TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "pomodorough.network.shutil.which",
+                    return_value="/usr/bin/secret-tool",
+                ),
+                patch(
+                    "pomodorough.network.subprocess.run",
+                    side_effect=OSError("no keyring"),
+                ),
+                patch("pomodorough.network.capture_exception") as capture,
+            ):
+                self.assertIsNone(
+                    self._store(directory)._load_legacy_secret_tool()
+                )
+            capture.assert_not_called()
+
+    def test_malformed_legacy_blob_is_absent_unless_strict(self) -> None:
+        malformed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="not-json{{{", stderr=""
+        )
+        with TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "pomodorough.network.shutil.which",
+                    return_value="/usr/bin/secret-tool",
+                ),
+                patch(
+                    "pomodorough.network.subprocess.run", return_value=malformed
+                ),
+                patch("pomodorough.network.capture_exception") as capture,
+            ):
+                store = self._store(directory)
+                self.assertIsNone(store._load_legacy_secret_tool())
+                with self.assertRaisesRegex(SecureStoreError, "malformed"):
+                    store._load_legacy_secret_tool(strict=True)
+            capture.assert_not_called()
+
+    def test_mirror_write_failure_keeps_authoritative_fallback(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self._store(directory)
+            with (
+                patch(
+                    "pomodorough.network.shutil.which",
+                    return_value="/usr/bin/secret-tool",
+                ),
+                patch(
+                    "pomodorough.network.subprocess.run",
+                    side_effect=OSError("no keyring"),
+                ),
+                patch("pomodorough.network.capture_exception") as capture,
+            ):
+                store._save_legacy_token_locked('{"refreshToken":"r"}')
+            capture.assert_not_called()
+            self.assertEqual(
+                store.fallback_path.read_text(encoding="utf-8"),
+                '{"refreshToken":"r"}',
+            )
+
+
+class PendingUuid7SkipTests(unittest.TestCase):
+    def test_legacy_ids_are_skipped_from_reservation(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.sqlite3")
+            try:
+                settings = store.load()["settings"]
+                command = store.queue_command(
+                    "start", None, "focus", settings["durationsMs"], now_ms=1_000
+                )
+                legacy = str(uuid.uuid4())
+                store.connection.execute(
+                    "INSERT INTO pending_task_operations (id, payload)"
+                    " VALUES (?, ?)",
+                    (legacy, "{}"),
+                )
+                store.connection.commit()
+                identifiers = store._pending_uuid7_ids()
+            finally:
+                store.close()
+            self.assertIn(command["id"], identifiers)
+            self.assertNotIn(legacy, identifiers)
+
+
+class ProjectionUnknownTitleSilenceTests(unittest.TestCase):
+    def _inputs(
+        self, title: str, task_id: str
+    ) -> tuple[dict, dict, list, dict]:
+        projection = ReplicatedStateProjection.__new__(ReplicatedStateProjection)
+        genesis: dict = {"tasks": [], "hlcWallMs": 1, "hlcCounter": 0}
+        records = [{
+            "domain": "task",
+            "deviceId": "device-a",
+            "operation": {
+                "id": "op-1",
+                "type": "upsert",
+                "title": title,
+                "taskId": task_id,
+                "hlcWallMs": 2,
+                "hlcCounter": 0,
+            },
+        }]
+        with patch.object(
+            ReplicatedStateProjection,
+            "_validated_room_records",
+            return_value=(records, genesis),
+        ):
+            return projection._projection_inputs("room-1")
+
+    def test_blank_foreign_title_skips_only_the_shortcut(self) -> None:
+        _genesis, pending, _clocks, known_tasks = self._inputs("", "task-1")
+        self.assertEqual(len(pending["taskOperations"]), 1)
+        self.assertEqual(known_tasks, {})
+
+    def test_valid_title_still_populates_known_tasks(self) -> None:
+        task = task_from_title("Hello")
+        _genesis, pending, _clocks, known_tasks = self._inputs(
+            "Hello", task["id"]
+        )
+        self.assertEqual(len(pending["taskOperations"]), 1)
+        self.assertEqual(known_tasks, {task["id"]: task})
+
+
+class RoomIdValidatorSilenceTests(unittest.TestCase):
+    def test_malformed_ids_are_plain_false(self) -> None:
+        valid = room_id_for_secret(bytes(range(32)))
+        self.assertTrue(valid_room_id(valid))
+        for invalid in ("", "not a room id!!", "a", valid + "!", None, 42):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(valid_room_id(invalid))
 
 
 if __name__ == "__main__":

@@ -1217,6 +1217,8 @@ class Store:
             try:
                 uuid7_parts(identifier)
             except ValueError:
+                # Pending tables may hold legacy non-UUIDv7 ids; only UUIDv7
+                # ids take part in monotonic reservation, so skip the rest.
                 continue
             identifiers.append(identifier)
         return identifiers

@@ -155,6 +155,8 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
     try:
         curses.curs_set(0)
     except curses.error:
+        # Cosmetic only: terminals without cursor-visibility control run
+        # fine with a visible cursor, so stay silent.
         pass
     screen.timeout(250)
     message = ""

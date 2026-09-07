@@ -307,6 +307,9 @@ class TokenStore:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
+            # Best-effort read of the legacy mirror: a spawn failure means
+            # "no legacy credentials", and callers fall through to the
+            # fallback file or the platform store, so stay silent.
             return None
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -315,6 +318,8 @@ class TokenStore:
         except json.JSONDecodeError:
             if strict:
                 raise SecureStoreError("Stored OAuth credentials are malformed.") from None
+            # Best-effort migration read: a malformed legacy blob counts as
+            # absent; strict callers (account-deletion identity) raise above.
             return None
         if isinstance(document, dict):
             return document
@@ -427,6 +432,8 @@ class TokenStore:
                 input=encoded, text=True, timeout=15, check=False,
             )
         except (OSError, subprocess.SubprocessError):
+            # Best-effort mirror write: the fallback file is already
+            # persisted above and stays authoritative, so stay silent.
             return
         if result.returncode == 0:
             self.fallback_path.unlink(missing_ok=True)

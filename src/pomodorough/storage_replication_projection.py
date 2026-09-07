@@ -363,6 +363,9 @@ class ReplicatedStateProjection:
                 try:
                     known = task_from_title(operation.get("title", ""))
                 except ValueError:
+                    # Peer-supplied titles may be blank or oversize; the
+                    # upsert is still projected above and only the known-task
+                    # shortcut is skipped, so stay silent.
                     known = None
                 if known is not None and known["id"] == operation.get("taskId"):
                     known_tasks[known["id"]] = known

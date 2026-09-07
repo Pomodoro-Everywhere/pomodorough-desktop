@@ -97,6 +97,10 @@ def _restart_in_child(root: Path, device_id: str, fingerprint: str) -> bool:
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
+        # Spawn failure already surfaces as False, which the caller reports
+        # as "secure restoration failed" to the operator; the non-zero-exit
+        # path below reports the same outcome, so there is nothing else to
+        # capture here.
         return False
     return result.returncode == 0
 

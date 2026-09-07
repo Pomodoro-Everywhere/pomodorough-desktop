@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 build/
 dist/
+# Operator-fetched Windows binaries must never be committed.
+*.exe
 /pytest-results.xml
 /.release-wheel/
 /.release-sdist/

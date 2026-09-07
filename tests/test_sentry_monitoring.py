@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import MagicMock, patch
 
 from pomodorough import __version__, sentry_monitoring
@@ -456,6 +457,59 @@ class ScrubberTests(unittest.TestCase):
         self.assertEqual(scrubbed["extra"]["authCode"], "[Filtered]")
         self.assertEqual(scrubbed["extra"]["roomCode"], "[Filtered]")
         self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_code_suffix_narrowing_keeps_diagnostic_codes(self) -> None:
+        event = {
+            "extra": {
+                "code": "bare-code-secret",
+                "authCode": "auth-code-secret",
+                "inviteCode": "invite-code-secret",
+                "errorCode": "E_CONN",
+                "statusCode": 500,
+                "exitCode": 1,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in ("bare-code-secret", "auth-code-secret", "invite-code-secret"):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["code"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["authCode"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["inviteCode"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["errorCode"], "E_CONN")
+        self.assertEqual(scrubbed["extra"]["statusCode"], 500)
+        self.assertEqual(scrubbed["extra"]["exitCode"], 1)
+
+    def test_codec_operations_and_code_lookalikes_are_kept(self) -> None:
+        event = {
+            "extra": {
+                "encode": "utf-8",
+                "decode": "utf-8",
+                "codec": "h264",
+                "codecs": ["h264"],
+                "codeReview": "approved",
+                "videoEncode": "fast",
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in ("utf-8", "h264", "approved", "fast"):
+            with self.subTest(raw=raw):
+                self.assertIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["encode"], "utf-8")
+        self.assertEqual(scrubbed["extra"]["decode"], "utf-8")
+        self.assertEqual(scrubbed["extra"]["codec"], "h264")
+        self.assertEqual(scrubbed["extra"]["codecs"], ["h264"])
+        self.assertEqual(scrubbed["extra"]["codeReview"], "approved")
+        self.assertEqual(scrubbed["extra"]["videoEncode"], "fast")
+
+    def test_non_dict_mappings_stay_opaque(self) -> None:
+        proxy = MappingProxyType({"token": "proxy-secret", "plain": 1})
+        event = {"extra": {"proxy": proxy, "items": [proxy]}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertEqual(scrubbed["extra"]["proxy"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["items"], ["[Filtered]"])
 
     def test_bytes_and_sets_are_scrubbed_decode_safe(self) -> None:
         event = {
