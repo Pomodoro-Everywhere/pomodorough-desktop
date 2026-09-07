@@ -236,12 +236,10 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         )
         if self._sound_active and self._alert_timer_identity == identity:
             return
-        if self.completion_sound.is_playing:
-            return
         self._alert_timer_identity = identity
         self.completion_sound.play()
         self._sound_active = True
-        self.sound_timer.stop()
+        self.sound_timer.start()
         self.stop_sound_button.setVisible(True)
         self.stop_sound_button.setEnabled(True)
         if self.tray and not self._is_window_foreground():

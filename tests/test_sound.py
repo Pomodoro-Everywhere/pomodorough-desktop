@@ -39,23 +39,37 @@ class CompletionSoundTests(unittest.TestCase):
         first = MagicMock()
         first.waitForStarted.return_value = True
         first.waitForFinished.return_value = True
+        second = MagicMock()
+        second.waitForStarted.return_value = True
+        second.waitForFinished.return_value = True
         player = CompletionSound()
 
         with (
             patch("pomodorough.sound.sys.platform", "darwin"),
             patch("pomodorough.sound.shutil.which", return_value="/usr/bin/afplay"),
-            patch("pomodorough.sound.QProcess", return_value=first) as process_type,
+            patch("pomodorough.sound.QProcess", side_effect=(first, second)) as process_type,
         ):
             self.assertTrue(player.play())
-            self.assertFalse(player.play())
             # Tick during playback must not cut off the 4.5s wav.
             self.assertFalse(player.play())
+            self.assertFalse(player.play())
+            process_type.assert_called_once_with()
+            self.assertTrue(player.is_playing)
+
+            # Playback finished: next timer tick replays from the start.
+            finished = first.finished.connect.call_args.args[0]
+            finished()
+            self.assertFalse(player.is_playing)
+            self.assertTrue(player.play())
+            self.assertTrue(player.is_playing)
             player.stop()
 
-        process_type.assert_called_once_with()
-        first.terminate.assert_called_once_with()
-        first.waitForFinished.assert_called_once_with(250)
+        self.assertEqual(process_type.call_count, 2)
+        first.terminate.assert_not_called()
         first.deleteLater.assert_called_once_with()
+        second.terminate.assert_called_once_with()
+        second.waitForFinished.assert_called_once_with(250)
+        second.deleteLater.assert_called_once_with()
         self.assertFalse(player.is_playing)
 
     def test_stop_kills_process_that_does_not_terminate(self) -> None:
