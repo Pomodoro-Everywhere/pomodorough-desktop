@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,49 @@ UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
 VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
 VALID_WASM = b"\0asm\x01\0\0\0"
 DIFFERENT_VALID_WASM = VALID_WASM + b"\0\x01\0"
+
+STEP_START = re.compile(r"^      - ")
+STEP_ACTION_KEY = re.compile(r"^        (uses|run):")
+STEPS_BLOCK = re.compile(r"^    steps:\s*$")
+
+
+def _release_step_actions(workflow: Path) -> list[tuple[str, list[str]]]:
+    """Collect (first line, top-level uses:/run: keys) for each job step."""
+    found: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    in_steps = False
+    for line in workflow.read_text(encoding="utf-8").splitlines():
+        if STEPS_BLOCK.match(line):
+            in_steps = True
+            continue
+        if not in_steps:
+            continue
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if STEP_START.match(line):
+            if current is not None:
+                found.append(_summarize_step(current))
+            current = [line]
+        elif current is not None and indent >= 8:
+            current.append(line)
+        elif indent <= 4:
+            found.append(_summarize_step(current))
+            current = None
+            in_steps = False
+    if current is not None:
+        found.append(_summarize_step(current))
+    return found
+
+
+def _summarize_step(lines: list[str]) -> tuple[str, list[str]]:
+    keys = [
+        match.group(1)
+        for line in lines
+        if (match := STEP_ACTION_KEY.match(line)) is not None
+    ]
+    return lines[0].strip(), keys
 
 
 class SharedCoreProvenanceTests(unittest.TestCase):
@@ -367,6 +411,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(workflow.count("grep -q 'Traceback (most recent call last)'"), 2)
         self.assertIn("test -s .release-wheel-smoke.png", workflow)
         self.assertIn("test -s .release-sdist-smoke.png", workflow)
+
+    def test_release_steps_declare_exactly_one_action(self) -> None:
+        for first_line, keys in _release_step_actions(RELEASE_WORKFLOW):
+            self.assertIn(
+                keys,
+                (["uses"], ["run"]),
+                f"step {first_line!r} must declare exactly one of uses:/run:",
+            )
 
 
 if __name__ == "__main__":
