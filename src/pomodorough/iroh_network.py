@@ -692,7 +692,11 @@ class IrohService(QObject):
                 self.status_changed.emit("REPAIR REQUIRED")
                 self._emit_details()
                 return False
-            except Exception:
+            except Exception:  # noqa: BLE001 - per-peer transient failure.
+                # Reasoned silence: peers flap offline, time out, or serve
+                # stale tickets; one bad peer must not block the rest or
+                # spam Sentry every sync tick. Aggregate outcome surfaces
+                # via WAITING FOR PEERS / ready status below.
                 continue
         if synchronized:
             self._emit_ready_status()

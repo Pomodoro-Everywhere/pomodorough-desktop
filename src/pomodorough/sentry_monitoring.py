@@ -49,6 +49,7 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "invite",
         "ticket",
         "cookie",
+        "code",
     }
 )
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -204,13 +205,23 @@ def _scrub_string(text: str) -> str:
     return _BEARER_RE.sub(r"\1" + _FILTERED, redacted)
 
 
+def _scrub_bytes(value: bytes | bytearray) -> str:
+    try:
+        text = bytes(value).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - undecodable bytes stay opaque.
+        return _FILTERED
+    return _scrub_string(text)
+
+
 def _scrub_value(value: Any, depth: int = 0) -> Any:
     if depth > _SCRUB_DEPTH_LIMIT:
         return _FILTERED
     if isinstance(value, dict):
         cleaned: dict[Any, Any] = {}
         for key, item in value.items():
-            if _sensitive_key(key) and not isinstance(item, (dict, list, tuple)):
+            # Sensitive parents stay opaque: recurse would leak unknown
+            # leaves (roomId under invite, ticket parts in lists).
+            if _sensitive_key(key):
                 cleaned[key] = _FILTERED
             else:
                 cleaned[key] = _scrub_value(item, depth + 1)
@@ -219,6 +230,10 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
         return [_scrub_value(item, depth + 1) for item in value]
     if isinstance(value, tuple):
         return tuple(_scrub_value(item, depth + 1) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return [_scrub_value(item, depth + 1) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return _scrub_bytes(value)
     if isinstance(value, str):
         return _scrub_string(value)
     return value
@@ -240,7 +255,12 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
 
 
 def capture_exception(error: BaseException | None = None) -> None:
-    """Report to Sentry when initialized; otherwise a silent no-op."""
+    """Report to Sentry when initialized; otherwise a silent no-op.
+
+    Reporting failure stays fully silent (no stderr): this runs on hot
+    background paths where stderr spam would drown real errors, unlike
+    init_sentry which prints once at startup where a developer sees it.
+    """
     try:
         import sentry_sdk
 

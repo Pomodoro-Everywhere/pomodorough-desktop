@@ -413,7 +413,84 @@ class ScrubberTests(unittest.TestCase):
                 self.assertNotIn(raw, rendered)
         self.assertIn("[Filtered]", rendered)
         self.assertEqual(scrubbed["extra"]["retryCount"], 3)
-        self.assertEqual(scrubbed["extra"]["invite"]["roomId"], "room-1")
+        # Sensitive parents stay opaque: invite subtree carries no leaves.
+        self.assertEqual(scrubbed["extra"]["invite"], "[Filtered]")
+
+    def test_sensitive_containers_stay_opaque(self) -> None:
+        event = {
+            "extra": {
+                "invite": {"roomId": "room-1", "code": "invite-secret"},
+                "ticket": ["ticket-part-a", "ticket-part-b"],
+                "api_key": ("key-part-a", "key-part-b"),
+                "secret": {"nested": {"deep": "shh-deep"}},
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "room-1", "invite-secret", "ticket-part-a", "ticket-part-b",
+            "key-part-a", "key-part-b", "shh-deep",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["invite"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["ticket"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["api_key"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["secret"], "[Filtered]")
+
+    def test_bare_code_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "code": "bare-code-secret",
+                "authCode": "auth-code-secret",
+                "roomCode": "room-code-secret",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in ("bare-code-secret", "auth-code-secret", "room-code-secret"):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["code"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["authCode"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["roomCode"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_bytes_and_sets_are_scrubbed_decode_safe(self) -> None:
+        event = {
+            "extra": {
+                "raw": b"contact alice@example.com Bearer abc123",
+                "buf": bytearray(b"secret bob@example.org"),
+                "tags": {"dave@example.com", "plain"},
+                "frozen": frozenset({"carol@example.net"}),
+                "broken": b"\xff\xfe\xfd",
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertIsInstance(scrubbed["extra"]["raw"], str)
+        self.assertIsInstance(scrubbed["extra"]["buf"], str)
+        rendered = json.dumps(scrubbed["extra"])
+        for raw in (
+            "alice@example.com", "bob@example.org", "dave@example.com",
+            "carol@example.net", "abc123",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertIn("plain", rendered)
+        self.assertIsInstance(scrubbed["extra"]["tags"], list)
+        self.assertIsInstance(scrubbed["extra"]["frozen"], list)
+        self.assertIsInstance(scrubbed["extra"]["broken"], str)
+
+    def test_capture_exception_failure_stays_silent(self) -> None:
+        sdk = MagicMock()
+        sdk.capture_exception.side_effect = RuntimeError("sentry down")
+        with (
+            patch.dict(sys.modules, {"sentry_sdk": sdk}),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            sentry_monitoring.capture_exception(RuntimeError("boom"))
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_scrubber_never_raises(self) -> None:
         self.assertEqual(scrub_sentry_event("not-a-dict", None), "not-a-dict")

@@ -12,10 +12,12 @@ Maps each silenced boundary to its reporting contract:
 from __future__ import annotations
 
 import asyncio
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from pomodorough.iroh_network import EndpointKeyStore, IrohService
 from pomodorough.network import TokenStore
@@ -204,6 +206,46 @@ class ExpectedSilenceTests(unittest.TestCase):
             ) as capture:
                 service.shutdown()
             capture.assert_not_called()
+
+    def test_sync_per_peer_failure_stays_silent(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._room_id = "room-identifier"
+                    service._endpoint = SimpleNamespace(connect=AsyncMock())
+                    service._store = SimpleNamespace(
+                        capture_local_iroh_records=Mock(),
+                        iroh_peers=Mock(
+                            return_value=[{
+                                "endpointTicket": "ticket",
+                                "endpointId": "expected",
+                            }]
+                        ),
+                    )
+                    service._emit_details = Mock()
+                    statuses: list[str] = []
+                    service.status_changed.connect(statuses.append)
+                    fake_iroh = SimpleNamespace(
+                        EndpointTicket=SimpleNamespace(
+                            from_string=Mock(side_effect=ValueError("bad")),
+                        )
+                    )
+                    with (
+                        patch.dict(sys.modules, {"iroh": fake_iroh}),
+                        patch(
+                            "pomodorough.iroh_network.capture_exception"
+                        ) as capture,
+                    ):
+                        result = await service._sync_known_peers()
+                    capture.assert_not_called()
+                    self.assertFalse(result)
+                    self.assertIn("WAITING FOR PEERS", statuses)
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
