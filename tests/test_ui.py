@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -1214,7 +1214,7 @@ class MainWindowDurationTests(unittest.TestCase):
             [("Service arrived", "Short break completed.")],
         )
 
-    def test_completion_repeats_sound_until_stop_control_clears_terminal_timer(
+    def test_completion_plays_once_until_stop_control_clears_terminal_timer(
         self,
     ) -> None:
         with (
@@ -1225,9 +1225,23 @@ class MainWindowDurationTests(unittest.TestCase):
             self._queue_completed_timer()
 
             beep.assert_called_once_with()
-            self.assertTrue(self.window.sound_timer.isActive())
+            self.assertFalse(self.window.sound_timer.isActive())
             self.assertFalse(self.window.stop_sound_button.isHidden())
             self.assertEqual(self.window.stop_sound_button.text(), "STOP SOUND")
+
+            # Second completion event for the same timer must not replay.
+            self.window._render()
+            self.window._notify("Service arrived", "Short break completed.")
+            beep.assert_called_once_with()
+            # Tick during playback must not restart the sound.
+            with patch.object(
+                type(self.window.completion_sound),
+                "is_playing",
+                new_callable=PropertyMock,
+                return_value=True,
+            ):
+                self.window._notify("Service arrived", "Short break completed.")
+                beep.assert_called_once_with()
 
             self.window.stop_sound_button.click()
 
@@ -1274,7 +1288,7 @@ class MainWindowDurationTests(unittest.TestCase):
             patch.object(self.window.completion_sound, "stop") as stop,
         ):
             self._queue_completed_timer()
-            self.assertTrue(self.window.sound_timer.isActive())
+            self.assertFalse(self.window.sound_timer.isActive())
             completed_timer_id = self.window.timer["id"]
 
             self.window._primary_action()

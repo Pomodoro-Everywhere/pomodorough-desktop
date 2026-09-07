@@ -22,6 +22,8 @@ class CompletionSound:
         return self._process is not None or self._winsound_active
 
     def play(self) -> bool:
+        if self.is_playing:
+            return False
         self.stop()
         sound_path = _sound_path()
         if sys.platform.startswith("linux"):
