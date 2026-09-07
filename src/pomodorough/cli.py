@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
+from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import init_sentry_from_environment
 from .storage import Store
@@ -87,7 +88,7 @@ def _print_state(state: dict[str, Any], stream: TextIO, strings: Strings) -> Non
         ),
         file=stream,
     )
-    if display["taskTitle"]:
+    if display["taskTitle"] and display.get("phase") not in BREAK_PHASES:
         print(strings.text("terminal.task", task=display["taskTitle"]), file=stream)
     for key, count in (
         ("terminal.pending_commands", state["pendingCommands"]),

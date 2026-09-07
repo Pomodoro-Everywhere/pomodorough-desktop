@@ -347,6 +347,28 @@ class CliTests(unittest.TestCase):
         self.assertIn("1 auto-start preference operation(s) pending sync\n", output)
         self.assertEqual(error, "")
 
+    def test_status_hides_task_during_break(self) -> None:
+        task = task_from_title("Swift")
+        self.store.queue_task_operation("upsert", task, now_ms=1)
+        self.store.set_selected_task_id(task["id"], now_ms=2)
+        result, _output, error = self.invoke("start", "short-break")
+        self.assertEqual((result, error), (0, ""))
+
+        result, output, error = self.invoke("status")
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertNotIn("Task:", output)
+        self.assertNotIn("Swift", output)
+
+        result, output, error = self.invoke("status", "--json")
+        state = json.loads(output)
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(state["phase"], "short_break")
+        self.assertIsNone(state["taskId"])
+        self.assertIsNone(state["taskTitle"])
+        self.assertIsNone(state["display"]["taskTitle"])
+
     def test_invalid_phase_wraps_domain_error_for_argparse(self) -> None:
         with self.assertRaises(argparse.ArgumentTypeError) as raised:
             phase_argument("rest")

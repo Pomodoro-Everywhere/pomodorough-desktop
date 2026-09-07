@@ -7,6 +7,7 @@ from typing import Any
 
 from .core import (
     ACTIVE_STATUSES,
+    BREAK_PHASES,
     PHASES,
     TERMINAL_STATUSES,
     elapsed_ms,
@@ -203,6 +204,8 @@ class LocalTimer:
         remaining = max(0, planned - elapsed)
         task_id = timer.get("taskId")
         task = self.known_tasks.get(task_id) if isinstance(task_id, str) else None
+        if timer.get("phase") in BREAK_PHASES:
+            task_id, task = None, None
         return {
             "phase": timer["phase"],
             "phaseLabel": PHASES[timer["phase"]]["label"],

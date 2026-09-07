@@ -132,6 +132,43 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Cancelled | 2 min *", rendered)
         self.assertIn("Short Break: Unassigned | Superseded | 1 min", rendered)
 
+    def test_build_lines_hides_task_during_breaks(self) -> None:
+        for phase in ("short_break", "long_break"):
+            with self.subTest(phase=phase):
+                lines = tui.build_lines(
+                    timer_state(
+                        phase=phase,
+                        taskTitle="Swift",
+                        display={
+                            "phase": phase,
+                            "taskTitle": "Swift",
+                            "progress": 0.5,
+                            "remaining": "05:00",
+                        },
+                    ),
+                    [],
+                    80,
+                )
+                rendered = "\n".join(lines)
+                self.assertNotIn("TASK:", rendered)
+                self.assertNotIn("Swift", rendered)
+
+        lines = tui.build_lines(
+            timer_state(
+                phase="focus",
+                taskTitle="Swift",
+                display={
+                    "phase": "focus",
+                    "taskTitle": "Swift",
+                    "progress": 0.5,
+                    "remaining": "12:30",
+                },
+            ),
+            [],
+            80,
+        )
+        self.assertIn("TASK: Swift", "\n".join(lines))
+
     def test_build_lines_reports_empty_history(self) -> None:
         rendered = "\n".join(tui.build_lines(timer_state(status="waiting"), [], 80))
 

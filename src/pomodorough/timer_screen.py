@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .core import (
     ACTIVE_STATUSES,
+    BREAK_PHASES,
     PHASES,
     TERMINAL_STATUSES,
     completed_focus_count_for_day,
@@ -410,12 +411,13 @@ class TimerScreen(QWidget):
         active_task_id = timer.get("taskId") if active else None
         active_task = known_tasks.get(active_task_id) if active_task_id else None
         active_task_label = self._active_task_label(active_task, active_task_id)
+        show_active_task = active and timer.get("phase") not in BREAK_PHASES
         self.active_task_context.setText(
             self.strings.text("task.active_context", task=active_task_label)
-            if active
+            if show_active_task
             else ""
         )
-        self.active_task_context.setVisible(active)
+        self.active_task_context.setVisible(show_active_task)
         choices = self._task_choices(tasks, known_tasks, selected_task_id)
         signature = self._selector_state(
             timer,
@@ -430,7 +432,7 @@ class TimerScreen(QWidget):
         self._populate_task_selector(choices, selected_task_id)
         self._configure_task_selector(
             active,
-            active_task_label,
+            active_task_label if show_active_task else "",
             selected_phase,
             mutations_enabled,
         )
@@ -525,7 +527,7 @@ class TimerScreen(QWidget):
         )
         description = (
             self.strings.text("task.next_description", task=active_task_label)
-            if active
+            if active and active_task_label
             else ""
         )
         self.task_combo.setAccessibleDescription(description)

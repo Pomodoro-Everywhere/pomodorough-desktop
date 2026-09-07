@@ -17,6 +17,7 @@ PHASES = {
 }
 ACTIVE_STATUSES = {"running", "paused"}
 TERMINAL_STATUSES = {"completed", "cancelled", "superseded"}
+BREAK_PHASES = frozenset({"short_break", "long_break"})
 TASK_NAMESPACE = b"pomodorough.task.v1\x00"
 _RFC3339_OFFSET = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})"

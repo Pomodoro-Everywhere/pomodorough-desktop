@@ -273,6 +273,21 @@ class LocalTimerTests(unittest.TestCase):
         self.assertEqual(current["taskId"], task["id"])
         self.assertEqual(current["taskTitle"], task["title"])
 
+    def test_break_start_hides_selected_task(self) -> None:
+        task = task_from_title("Swift")
+        self.store.queue_task_operation("upsert", task, now_ms=500)
+        self.store.set_selected_task_id(task["id"], now_ms=501)
+
+        self.timer.issue("start", phase="short-break", now_ms=1_000)
+
+        current = self.timer.state(now_ms=31_000)
+        self.assertEqual(current["phase"], "short_break")
+        self.assertEqual(current["status"], "running")
+        self.assertIsNone(current["taskId"])
+        self.assertIsNone(current["taskTitle"])
+        self.assertIsNone(current["display"]["taskId"])
+        self.assertIsNone(current["display"]["taskTitle"])
+
     def test_invalid_action_does_not_queue_command(self) -> None:
         with self.assertRaises(InvalidAction):
             self.timer.issue("pause")

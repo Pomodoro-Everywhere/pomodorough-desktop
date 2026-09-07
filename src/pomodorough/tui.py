@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import init_sentry_from_environment
 from .storage import Store
@@ -56,7 +57,7 @@ def _timer_lines(
         strings.text("tui.keys_primary"),
         strings.text("tui.keys_secondary"),
     ]
-    if display["taskTitle"]:
+    if display["taskTitle"] and display.get("phase") not in BREAK_PHASES:
         lines.insert(6, strings.text("terminal.task_upper", task=display["taskTitle"]))
     return lines
 

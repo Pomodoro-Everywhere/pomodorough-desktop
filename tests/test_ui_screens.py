@@ -147,6 +147,52 @@ class ScreenSignalTests(unittest.TestCase):
             ],
         )
 
+    def test_active_break_hides_task_label(self) -> None:
+        screen = TimerScreen(
+            self.strings,
+            {
+                "durations": {
+                    "focus": 25,
+                    "short_break": 5,
+                    "long_break": 15,
+                },
+                "autoStartBreaks": False,
+            },
+        )
+        tasks = [{"id": "task-1", "title": "Swift"}]
+        known_tasks = {"task-1": {"id": "task-1", "title": "Swift"}}
+        settings = {"selectedTaskId": "task-1"}
+
+        for phase in ("short_break", "long_break"):
+            with self.subTest(phase=phase):
+                screen.invalidate_task_selector()
+                screen.render_task_selector(
+                    {"taskId": None, "phase": phase, "status": "running"},
+                    True,
+                    selected_phase=phase,
+                    settings=settings,
+                    tasks=tasks,
+                    known_tasks=known_tasks,
+                    mutations_enabled=True,
+                )
+                self.assertEqual(screen.active_task_context.text(), "")
+                self.assertTrue(screen.active_task_context.isHidden())
+                self.assertEqual(screen.task_combo.toolTip(), "")
+                self.assertEqual(screen.task_combo.accessibleDescription(), "")
+
+        screen.invalidate_task_selector()
+        screen.render_task_selector(
+            {"taskId": "task-1", "phase": "focus", "status": "running"},
+            True,
+            selected_phase="focus",
+            settings=settings,
+            tasks=tasks,
+            known_tasks=known_tasks,
+            mutations_enabled=True,
+        )
+        self.assertIn("Swift", screen.active_task_context.text())
+        self.assertFalse(screen.active_task_context.isHidden())
+
     def test_tasks_screen_renders_and_emits_task_payloads(self) -> None:
         screen = TasksScreen(self.strings)
         events: list[tuple[str, str]] = []
