@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -11,11 +12,14 @@ from unittest.mock import MagicMock, patch
 
 from pomodorough import __version__, sentry_monitoring
 from pomodorough.sentry_monitoring import (
+    POMODOROUGH_SENTRY_DISABLE_ENV_VAR,
     POMODOROUGH_SENTRY_DSN_ENV_VAR,
     SENTRY_DSN_ENV_VAR,
     init_sentry,
     init_sentry_from_environment,
     resolve_dsn,
+    scrub_sentry_event,
+    sentry_disabled,
 )
 
 DSN = "https://public@example.ingest.sentry.io/1"
@@ -181,6 +185,174 @@ class PackagedDefaultTests(unittest.TestCase):
 
     def test_missing_packaged_file_returns_none(self) -> None:
         self.assertIsNone(sentry_monitoring._packaged_default_dsn())
+
+
+class OptOutTests(unittest.TestCase):
+    def test_disable_flag_beats_everything(self) -> None:
+        env = {
+            POMODOROUGH_SENTRY_DISABLE_ENV_VAR: "1",
+            SENTRY_DSN_ENV_VAR: DSN,
+        }
+        with TemporaryJson({"dsn": "https://other@example/2"}) as path:
+            with patch.object(
+                sentry_monitoring, "_packaged_default_dsn", return_value=DSN
+            ):
+                self.assertTrue(sentry_disabled(env=env, config_path=path))
+                self.assertIsNone(resolve_dsn(env=env, config_path=path))
+
+    def test_disable_flag_values(self) -> None:
+        for raw, expected in (
+            ("1", True), ("true", True), ("YES", True), (" on ", True),
+            ("0", False), ("false", False), ("", False), ("no", False),
+        ):
+            with self.subTest(raw=raw):
+                env = {POMODOROUGH_SENTRY_DISABLE_ENV_VAR: raw}
+                path = Path("/nonexistent.json")
+                with patch.object(
+                    sentry_monitoring, "_packaged_default_dsn", return_value=None
+                ):
+                    self.assertEqual(sentry_disabled(env=env, config_path=path), expected)
+
+    def test_empty_dsn_env_disables_packaged_default(self) -> None:
+        for raw in ("", "   "):
+            with self.subTest(raw=raw):
+                env = {SENTRY_DSN_ENV_VAR: raw}
+                path = Path("/nonexistent.json")
+                with patch.object(
+                    sentry_monitoring, "_packaged_default_dsn", return_value=DSN
+                ):
+                    self.assertTrue(sentry_disabled(env=env, config_path=path))
+                    self.assertIsNone(resolve_dsn(env=env, config_path=path))
+
+    def test_empty_primary_dsn_shadows_secondary(self) -> None:
+        env = {SENTRY_DSN_ENV_VAR: "", POMODOROUGH_SENTRY_DSN_ENV_VAR: DSN}
+        self.assertIsNone(
+            resolve_dsn(env=env, config_path=Path("/nonexistent.json"))
+        )
+
+    def test_config_disabled_flag_shadows_packaged_default(self) -> None:
+        for payload in ({"disabled": True}, {"disabled": "yes"}, {"disabled": 1}):
+            with self.subTest(payload=payload):
+                with TemporaryJson(payload) as path:
+                    with patch.object(
+                        sentry_monitoring, "_packaged_default_dsn", return_value=DSN
+                    ):
+                        self.assertTrue(sentry_disabled(env={}, config_path=path))
+                        self.assertIsNone(resolve_dsn(env={}, config_path=path))
+
+    def test_config_enabled_flag_keeps_config_dsn(self) -> None:
+        with TemporaryJson({"disabled": False, "dsn": DSN}) as path:
+            with patch.object(
+                sentry_monitoring, "_packaged_default_dsn",
+                return_value="https://other@example/2",
+            ):
+                self.assertFalse(sentry_disabled(env={}, config_path=path))
+                self.assertEqual(resolve_dsn(env={}, config_path=path), DSN)
+
+    def test_from_environment_skips_sdk_when_disabled(self) -> None:
+        sdk = MagicMock()
+        env = {POMODOROUGH_SENTRY_DISABLE_ENV_VAR: "1", SENTRY_DSN_ENV_VAR: DSN}
+        with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            self.assertFalse(init_sentry_from_environment(env=env))
+        sdk.init.assert_not_called()
+
+    def test_readme_discloses_telemetry_and_opt_out(self) -> None:
+        readme = Path(__file__).parents[1] / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        for needle in (
+            "## Error-reporting telemetry",
+            "POMODOROUGH_SENTRY_DISABLE=1",
+            "SENTRY_DSN",
+            "POMODOROUGH_SENTRY_DSN",
+            '"disabled": true',
+            "sentry.json",
+            "Session Replay",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+
+
+class BomToleranceTests(unittest.TestCase):
+    def test_config_with_bom_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            path = Path(dirname, "sentry.json")
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"dsn": DSN}).encode())
+            self.assertEqual(resolve_dsn(env={}, config_path=path), DSN)
+
+    def test_packaged_default_with_bom_resolves_clean(self) -> None:
+        payload = b"\xef\xbb\xbf" + DSN.encode("utf-8")
+
+        class _FakeResource:
+            def joinpath(self, *parts: str) -> _FakeResource:
+                return self
+
+            def open(self, mode: str = "r", encoding: str | None = None) -> io.StringIO:
+                return io.StringIO(payload.decode(encoding or "utf-8"))
+
+        with patch(
+            "importlib.resources.files", return_value=_FakeResource()
+        ):
+            self.assertEqual(
+                sentry_monitoring._packaged_default_dsn(), DSN
+            )
+
+
+_ADVERSARIAL_EVENT = {
+    "message": "sync failed for alice@example.com at /Users/alice/db.sqlite3",
+    "request": {
+        "headers": {
+            "Authorization": "Bearer ya29.secret-token",
+            "Cookie": "session=abc123",
+        }
+    },
+    "extra": {
+        "refreshToken": "refresh-secret",
+        "endpointTicket": "ticket-opaque-value",
+        "invite": {"roomId": "room-1", "endpointTicket": "invite-ticket"},
+        "client_secret": "shh",
+        "retryCount": 3,
+    },
+    "exception": {
+        "values": [
+            {"value": "hello bob@example.org C:\\Users\\Bob\\app.log Bearer abc123"}
+        ]
+    },
+    "breadcrumbs": {"values": [{"message": "GET https://x/ by dave@example.com"}]},
+}
+
+
+class ScrubberTests(unittest.TestCase):
+    def test_adversarial_payloads_are_stripped(self) -> None:
+        scrubbed = scrub_sentry_event(json.loads(json.dumps(_ADVERSARIAL_EVENT)), None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "alice@example.com", "bob@example.org", "dave@example.com",
+            "/Users/alice", "C:\\Users\\Bob", "ya29.secret-token",
+            "refresh-secret", "ticket-opaque-value", "invite-ticket",
+            "shh", "session=abc123",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertIn("[Filtered]", rendered)
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+        self.assertEqual(scrubbed["extra"]["invite"]["roomId"], "room-1")
+
+    def test_scrubber_never_raises(self) -> None:
+        self.assertEqual(scrub_sentry_event("not-a-dict", None), "not-a-dict")
+        self.assertIsNone(scrub_sentry_event(None, None))
+        self.assertEqual(scrub_sentry_event(42, None), 42)
+        circular: dict[str, object] = {}
+        circular["self"] = circular
+        self.assertIsInstance(scrub_sentry_event(circular, None), dict)
+
+    def test_before_send_is_wired_into_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            self.assertTrue(init_sentry(dsn=DSN))
+        _, kwargs = sdk.init.call_args
+        self.assertIs(kwargs["before_send"], scrub_sentry_event)
+        scrubbed = kwargs["before_send"](dict(_ADVERSARIAL_EVENT), {})
+        self.assertNotIn("alice@example.com", json.dumps(scrubbed))
 
 
 if __name__ == "__main__":

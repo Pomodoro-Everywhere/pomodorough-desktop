@@ -22,5 +22,10 @@ python "$script_dir/verify_packaged_oauth.py" \
   "$scan_root/sdist" \
   "$scan_root/flatpak-root" \
   "$scan_root/windows"
+python "$script_dir/verify_packaged_sentry.py" \
+  "$scan_root/wheel" \
+  "$scan_root/sdist" \
+  "$scan_root/flatpak-root" \
+  "$scan_root/windows"
 python "$script_dir/scan_secret.py" "$scan_root"
 python "$script_dir/scan_secret.py" "$artifact_dir"

@@ -60,6 +60,7 @@ from .secure_store import (
     TokenCleanupPendingError,
     token_store_lock,
 )
+from .sentry_monitoring import capture_exception
 from .storage_revocation import PendingSessionRevocations, credential_api_base
 
 _RevisionEventParser = RevisionEventParser
@@ -407,6 +408,7 @@ class TokenStore:
             try:
                 self.fallback_path.unlink()
             except FileNotFoundError:
+                # No stale plaintext fallback exists; nothing to clean.
                 pass
         else:
             self._save_legacy_token_locked(encoded)
@@ -724,8 +726,10 @@ class TokenStore:
                     timeout=10,
                     check=False,
                 )
-            except (OSError, subprocess.SubprocessError):
-                pass
+            except (OSError, subprocess.SubprocessError) as error:
+                # The tombstone keeps sign-out authoritative, but a lingering
+                # keyring credential breaks sign-out trust, so report it.
+                capture_exception(error)
         self._clear_account_deletion_identity_locked()
         # The tombstone remains authoritative until a later successful sign-in.
         # This keeps a stale keyring token from reviving a signed-out session.
@@ -784,6 +788,7 @@ class TokenStore:
             try:
                 temporary_path.unlink()
             except FileNotFoundError:
+                # The tempfile was moved into place; already gone on success.
                 pass
 
 

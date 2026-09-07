@@ -337,6 +337,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for package_root in ("wheel", "sdist", "flatpak-root", "windows"):
             self.assertIn(f'"$scan_root/{package_root}"', verifier)
 
+    def test_release_verifier_checks_packaged_sentry_dsn_format(self) -> None:
+        verifier = VERIFY_RELEASE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("verify_packaged_sentry.py", verifier)
+        for package_root in ("wheel", "sdist", "flatpak-root", "windows"):
+            self.assertIn(f'"$scan_root/{package_root}"', verifier)
+
     def test_release_unpacker_covers_every_compressed_package_format(self) -> None:
         unpacker = UNPACK_RELEASE_SCRIPT.read_text(encoding="utf-8")
 

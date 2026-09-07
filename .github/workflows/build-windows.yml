@@ -35,7 +35,8 @@ jobs:
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          if ($env:SENTRY_DSN) { $env:SENTRY_DSN.Trim() | Out-File -NoNewline -Encoding utf8 src/pomodorough/resources/sentry_dsn_default }
+          # .NET writes UTF-8 without a BOM; Out-File -Encoding utf8 would emit one.
+          if ($env:SENTRY_DSN) { [System.IO.File]::WriteAllText("src/pomodorough/resources/sentry_dsn_default", $env:SENTRY_DSN.Trim()) }
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5

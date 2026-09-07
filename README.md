@@ -230,6 +230,26 @@ Any replacement client ID must be present in the server's
 `GOOGLE_NATIVE_CLIENT_IDS`. Refresh tokens are stored through Secret Service
 when `secret-tool` is available, with a mode-0600 JSON file fallback.
 
+## Error-reporting telemetry
+
+Packaged releases report crashes and sync failures to Sentry through a
+baked-in default DSN, so stability issues surface without configuration.
+Each report carries the release version, the error, and a short breadcrumb
+trail, and nothing else by design: tokens, invites, endpoint tickets,
+emails, and user paths are stripped before upload, and Qt Session Replay
+is not wired at all.
+
+To opt out, use any one of:
+
+- `POMODOROUGH_SENTRY_DISABLE=1`
+- an empty `SENTRY_DSN` or `POMODOROUGH_SENTRY_DSN` (empty disables)
+- `"disabled": true` in `~/.config/pomodorough/sentry.json`
+  (`%APPDATA%\pomodorough\sentry.json` on Windows)
+
+A custom endpoint can be set with `SENTRY_DSN`, `POMODOROUGH_SENTRY_DSN`,
+or the `dsn` key in that same file. There is no in-app toggle; the
+settings panel only covers timer preferences.
+
 ## Local data
 
 | Data | Default location |

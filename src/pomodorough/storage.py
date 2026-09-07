@@ -300,6 +300,7 @@ class Store:
             try:
                 self.path.parent.chmod(0o700)
             except OSError:
+                # Best-effort hardening; some filesystems ignore chmod.
                 pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row

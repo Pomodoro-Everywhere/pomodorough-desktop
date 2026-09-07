@@ -30,6 +30,7 @@ from .iroh_protocol import (
     parse_invite,
     valid_identifier,
 )
+from .sentry_monitoring import capture_exception
 from .storage import Store
 from .secure_store import PlatformSecretStore
 from .uuid7 import reserve_uuid7
@@ -234,8 +235,10 @@ class IrohService(QObject):
         try:
             future = asyncio.run_coroutine_threadsafe(self._shutdown(), loop)
             future.result(timeout=10)
-        except Exception:
-            pass
+        except Exception as error:
+            # Best-effort shutdown: the loop is stopping anyway, but a hung
+            # or failed teardown hides real bugs, so report it.
+            capture_exception(error)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=10)
         self._thread = None
@@ -525,8 +528,10 @@ class IrohService(QObject):
             if len(self._connection_tasks) >= self.MAX_PENDING_HANDSHAKES:
                 try:
                     await incoming.ignore()
-                except Exception:
-                    pass
+                except Exception as error:
+                    # Shed under load is by design, but a failed shed means
+                    # the transport is degrading further; report it.
+                    capture_exception(error)
                 continue
             task = asyncio.create_task(
                 self._accept_incoming(incoming, generation)
@@ -558,8 +563,10 @@ class IrohService(QObject):
             else:
                 try:
                     await incoming.ignore()
-                except Exception:
-                    pass
+                except Exception as error:
+                    # The handshake already failed; a failed refusal cleanup
+                    # hides peer-visible join breakage, so report it.
+                    capture_exception(error)
 
     async def _handle_incoming(self, connection: Any, generation: int) -> None:
         secret = self._required_context()[1]
