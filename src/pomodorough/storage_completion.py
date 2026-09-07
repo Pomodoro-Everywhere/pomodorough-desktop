@@ -75,6 +75,43 @@ class TimerCompletionPolicy:
             "dayEnd": day_end,
         })
 
+    def preview_selected_phase(
+        self,
+        timer: dict[str, Any],
+        history: list[dict[str, Any]],
+        auto_start_breaks: bool,
+        occurred_at: str,
+    ) -> str | None:
+        """Ask Core what phase a finish would advance to, without queuing one."""
+        timer_id = timer.get("id")
+        phase = timer.get("phase")
+        if not isinstance(timer_id, str) or not timer_id:
+            return None
+        if not isinstance(phase, str) or not phase:
+            return None
+        day_start, day_end = self._bounds(occurred_at)
+        try:
+            plan = self._plan({
+                "kind": "finishApplied",
+                # Preview only: Core keys phase/history here, so the timer
+                # identity stands in for the not-yet-queued finish command.
+                "source": {
+                    "commandId": timer_id,
+                    "timerId": timer_id,
+                    "phase": phase,
+                    "occurredAt": occurred_at,
+                },
+                "history": history,
+                "autoStartBreaks": auto_start_breaks,
+                "localDeviceId": self._device_id(),
+                "ownership": self._ownership(timer),
+                "dayStart": day_start,
+                "dayEnd": day_end,
+            })
+        except ValueError:
+            return None
+        return plan.selected_phase
+
     def generated_break(
         self,
         source: dict[str, str],

@@ -227,6 +227,37 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
         self.assertEqual(self.window.clock.time_text, "05:00")
 
+    def test_expired_focus_clock_previews_break_before_finish(self) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        self.window._load_state()
+        self.window._render()
+
+        self.assertEqual(self.window.timer["status"], "completed")
+        self.assertEqual(self.window.clock.phase_text, "SHORT BREAK")
+        self.assertEqual(self.window.clock.time_text, "05:00")
+        self.assertEqual(self.window.settings["selectedPhase"], "focus")
+
+    def test_primary_action_claims_expired_focus_then_starts_break(self) -> None:
+        settings = self.store.load()["settings"]
+        durations_ms = dict(settings["durationsMs"])
+        durations_ms["focus"] = 60_000
+        self.store.queue_command(
+            "start", None, "focus", durations_ms, now_ms=1_000
+        )
+        self.window._load_state()
+
+        self.window._primary_action()
+
+        self.assertEqual(
+            (self.window.timer["phase"], self.window.timer["status"]),
+            ("short_break", "running"),
+        )
+
     def test_timer_and_data_views_expose_accessible_context(self) -> None:
         self.assertEqual(self.window.clock.accessibleName(), "Timer status")
         self.assertIn("Focus", self.window.clock.accessibleDescription())

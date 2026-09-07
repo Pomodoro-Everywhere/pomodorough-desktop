@@ -198,6 +198,7 @@ class TimerInteractionController:
         elif status == "idle":
             self._ports.issue_command("start", None)
         elif status in TERMINAL_STATUSES:
+            context = self._claim_unfinished_completion(context)
             if self._ports.mutation_blocked():
                 return done()
             try:
@@ -211,6 +212,17 @@ class TimerInteractionController:
                 return done(EmitNotice(str(error)))
             return done(LoadState(), Render(), Synchronize())
         return done()
+
+    def _claim_unfinished_completion(
+        self, context: TimerInteractionContext
+    ) -> TimerInteractionContext:
+        timer = self._current_timer_value(context)
+        if timer.get("status") != "completed":
+            return context
+        if (timer.get("lastIntent") or {}).get("type") == "finish":
+            return context
+        self._ports.issue_command("finish", False)
+        return self._context()
 
     def issue(
         self, command_type: str, automatic: bool = False

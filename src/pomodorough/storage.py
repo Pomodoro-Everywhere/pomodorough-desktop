@@ -2412,6 +2412,18 @@ class Store:
         settings["selectedTaskId"] = projection.selected_task_id
         return settings
 
+    def preview_selected_phase(
+        self,
+        timer: dict[str, Any],
+        history: list[dict[str, Any]],
+        auto_start_breaks: bool,
+        now_ms: int,
+    ) -> str | None:
+        """Read-only Core preview of the phase a finish would advance to."""
+        return self._completion_policy.preview_selected_phase(
+            timer, history, auto_start_breaks, utc_timestamp(now_ms)
+        )
+
     @staticmethod
     def projected_history(
         projection: ProjectionApplyV2,

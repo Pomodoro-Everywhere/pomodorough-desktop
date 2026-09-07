@@ -302,11 +302,15 @@ class TimerScreen(QWidget):
         selected_phase: str,
         settings: dict[str, Any],
         now_ms: int,
+        preview_phase: str | None = None,
     ) -> TimerRenderState:
         status = source_timer.get("status", "idle")
+        display_phase = (
+            preview_phase if preview_phase in PHASES else selected_phase
+        )
         timer = timer_for_display(
             source_timer,
-            selected_phase,
+            display_phase,
             settings["durationsMs"],
         )
         elapsed = elapsed_ms(timer, now_ms)

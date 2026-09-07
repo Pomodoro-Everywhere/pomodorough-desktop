@@ -110,7 +110,7 @@ class LocalTimer:
         status = timer.get("status", "idle")
         display_timer = timer_for_display(
             timer,
-            self.selected_phase,
+            self._display_phase(timer, status, projection_now_ms),
             self.settings["durationsMs"],
         )
         canonical_elapsed = elapsed_ms(timer, projection_now_ms)
@@ -159,6 +159,27 @@ class LocalTimer:
                 )
             )
             self.reload(now_ms=projection_now_ms)
+
+    def _display_phase(
+        self,
+        timer: dict[str, Any],
+        status: str,
+        now_ms: int,
+    ) -> str:
+        selected_phase = self.selected_phase
+        if status != "completed" or selected_phase != timer.get("phase"):
+            return selected_phase
+        if (timer.get("lastIntent") or {}).get("type") == "finish":
+            return selected_phase
+        previewed = self.store.preview_selected_phase(
+            timer,
+            self.history,
+            bool(self.settings.get("autoStartBreaks")),
+            now_ms,
+        )
+        if previewed not in PHASES:
+            return selected_phase
+        return previewed
 
     def _finish_completed_timer(
         self,
@@ -373,6 +394,7 @@ class LocalTimer:
         elif status == "idle":
             self.issue("start", now_ms=now_ms)
         elif status in TERMINAL_STATUSES:
+            self._claim_unfinished_completion(now_ms)
             commands = self._store_action(
                 lambda: self.store.queue_restart(
                     self.timer,
@@ -384,6 +406,17 @@ class LocalTimer:
             )
             self.reload()
             return commands[-1]
+
+    def _claim_unfinished_completion(self, now_ms: int | None) -> None:
+        timer = self.current_timer()
+        if timer.get("status") != "completed":
+            return
+        if (timer.get("lastIntent") or {}).get("type") == "finish":
+            return
+        try:
+            self.issue("finish", now_ms=now_ms)
+        except InvalidAction:
+            self.reload(now_ms=now_ms)
 
     def select_phase(self, phase: str) -> None:
         self.reload()

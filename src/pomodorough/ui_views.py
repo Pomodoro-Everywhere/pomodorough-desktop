@@ -329,11 +329,29 @@ class MainWindowViewMixin:
 
     def _render_timer_state(self) -> TimerRenderState:
         source_timer = self._current_timer()
+        now_ms = self.store.effective_timer_now_ms(source_timer)
         return self.timer_screen.presentation(
             source_timer,
             selected_phase=self._selected_phase(),
             settings=self.settings,
-            now_ms=self.store.effective_timer_now_ms(source_timer),
+            now_ms=now_ms,
+            preview_phase=self._preview_completed_phase(source_timer, now_ms),
+        )
+
+    def _preview_completed_phase(
+        self, source_timer: dict[str, Any], now_ms: int
+    ) -> str | None:
+        if source_timer.get("status") != "completed":
+            return None
+        if (source_timer.get("lastIntent") or {}).get("type") == "finish":
+            return None
+        if self._selected_phase() != source_timer.get("phase"):
+            return None
+        return self.store.preview_selected_phase(
+            source_timer,
+            self.history,
+            bool(self.settings.get("autoStartBreaks")),
+            now_ms,
         )
 
     def _render_task_selector(

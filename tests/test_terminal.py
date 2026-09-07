@@ -116,6 +116,36 @@ class LocalTimerTests(unittest.TestCase):
             ("focus", "25:00"),
         )
 
+    def test_expired_focus_displays_break_before_finish(self) -> None:
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+
+        state = self.timer.state(now_ms=61_000)
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual((state["phase"], state["remaining"]), ("focus", "00:00"))
+        self.assertEqual(
+            (state["display"]["phase"], state["display"]["remaining"]),
+            ("short_break", "05:00"),
+        )
+        self.assertEqual(self.timer.selected_phase, "focus")
+        self.assertEqual(
+            self.store.load()["settings"]["selectedPhase"], "focus"
+        )
+
+    def test_primary_claims_expired_focus_then_starts_break(self) -> None:
+        self.timer.issue("start", minutes=1, now_ms=1_000)
+        self.timer.state(now_ms=61_000)
+
+        self.timer.primary(now_ms=61_000)
+
+        state = self.timer.state(now_ms=61_000)
+        self.assertEqual((state["phase"], state["status"]), ("short_break", "running"))
+        self.assertEqual(self.timer.selected_phase, "short_break")
+        self.assertEqual(
+            [command["type"] for command in self.store.load()["pending"]],
+            ["start", "finish", "clear", "start"],
+        )
+
     def test_live_status_deadline_uses_monotonic_time_across_wall_jump(self) -> None:
         physical_ms = 1_800_000_000_000
         with (
