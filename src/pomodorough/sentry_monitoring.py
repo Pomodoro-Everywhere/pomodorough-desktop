@@ -69,13 +69,28 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/=]+")
+_BASIC_AUTH_RE = re.compile(r"(?i)(basic\s+)[A-Za-z0-9\-._~+/=]+")
+_TOKEN_AUTH_RE = re.compile(r"(?i)(token\s+)[A-Za-z0-9\-._~+/=]+")
 # D25: free-text scrubbers beyond key-based filtering, per the privacy
 # notice (direct peers learn IPs; invite codes grant full room access and
 # can embed network addresses). Key filtering alone misses these inside
 # messages, breadcrumbs, and exception values.
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# D27: IPv6 peers are equally identifying; match full and compressed forms
+# (including bracketed and IPv4-mapped) without matching single-colon times.
+_IPV6_RE = re.compile(
+    r"(?i)(?<![0-9a-z:.])(?:[0-9a-f]{0,4}:){2,7}"
+    r"(?:[0-9a-f]{0,4}|(?:\d{1,3}\.){3}\d{1,3})(?![0-9a-z:.])"
+)
 _INVITE_RE = re.compile(r"pomodorough1\.[A-Za-z0-9_-]+")
-_CODE_PARAM_RE = re.compile(r"(?i)([?&]code=)[^&\s\"';]+")
+# D27: also match fragment `#code=` (implicit-flow callbacks put secrets
+# after `#`, never sent to servers but visible in Sentry breadcrumbs).
+_CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
+# D27: OAuth/token query and fragment params carry the same secret as
+# `code=`; scrub them in free text where key filtering cannot see them.
+_TOKEN_PARAM_RE = re.compile(
+    r"(?i)([?&#](?:access_token|id_token|refresh_token|token)=)[^&\s\"';]+"
+)
 
 
 def _config_root() -> Path:
@@ -239,8 +254,14 @@ def _scrub_string(text: str) -> str:
     redacted = _POSIX_HOME_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _WINDOWS_HOME_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _BEARER_RE.sub(r"\1" + _FILTERED, redacted)
+    # D27: Basic and Token schemes authenticate exactly like Bearer.
+    redacted = _BASIC_AUTH_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _TOKEN_AUTH_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _INVITE_RE.sub(_FILTERED, redacted)
     redacted = _CODE_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _TOKEN_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
+    # D27: IPv6 before IPv4 so mapped `::ffff:1.2.3.4` drops as one unit.
+    redacted = _IPV6_RE.sub(_FILTERED, redacted)
     return _IPV4_RE.sub(_FILTERED, redacted)
 
 
@@ -275,6 +296,9 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
     if isinstance(value, tuple):
         return tuple(_scrub_value(item, depth + 1) for item in value)
     if isinstance(value, (set, frozenset)):
+        # D28: sets are unordered and not JSON-serializable, so Sentry
+        # cannot ingest them as-is; emit a scrubbed list. Ordering is
+        # intentionally not preserved.
         return [_scrub_value(item, depth + 1) for item in value]
     if isinstance(value, (bytes, bytearray)):
         return _scrub_bytes(value)
@@ -286,8 +310,9 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
 def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
     """Strip tokens, invites, emails, and user paths from a Sentry event.
 
-    Never raises: a scrubber failure must not drop the original event, so
-    the unwiped event is returned as-is on any internal error.
+    Fail-closed: never raises and never returns a partially scrubbed or
+    original event on internal error. Returning None drops the event in
+    Sentry's before_send contract, which is safer than leaking PII.
     """
     del hint
     try:
@@ -295,15 +320,15 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
             return event
         return _scrub_value(event)
     except Exception:  # noqa: BLE001 - scrubber must stay non-fatal.
-        return event
+        return None
 
 
 def scrub_sentry_breadcrumb(crumb: Any, hint: Any | None = None) -> Any:
     """Scrub a single Sentry breadcrumb with the same policy as events.
 
     Breadcrumbs carry messages, URLs, and data that can embed emails,
-    IPs, invite codes, and OAuth codes. Never raises: on internal error
-    the original crumb is returned so telemetry keeps flowing.
+    IPs, invite codes, and OAuth codes. Fail-closed: on internal error
+    return None so Sentry drops the breadcrumb instead of leaking it.
     """
     del hint
     try:
@@ -311,7 +336,7 @@ def scrub_sentry_breadcrumb(crumb: Any, hint: Any | None = None) -> Any:
             return crumb
         return _scrub_value(crumb)
     except Exception:  # noqa: BLE001 - scrubber must stay non-fatal.
-        return crumb
+        return None
 
 
 def capture_exception(error: BaseException | None = None) -> None:

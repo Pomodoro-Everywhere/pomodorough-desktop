@@ -595,5 +595,69 @@ class LowTriageSilenceTests(unittest.TestCase):
                 store.connection.close()
 
 
+class D28SilenceTests(unittest.TestCase):
+    def test_serve_requests_disconnect_stays_silent_and_closes(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 11
+                    connection = MagicMock()
+                    connection.close_reason.return_value = None
+                    connection.accept_bi = AsyncMock(
+                        side_effect=RuntimeError("peer gone")
+                    )
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        await service._serve_requests(connection, 11)
+                    capture.assert_not_called()
+                    connection.close.assert_called_once_with(0, b"connection ended")
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+    def test_storage_chmod_failure_stays_silent_d28(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = Store.__new__(Store)
+            store.path = Path(directory) / "probe.sqlite3"
+            with (
+                patch(
+                    "pomodorough.sentry_monitoring.capture_exception"
+                ) as capture,
+                patch.object(Path, "chmod", side_effect=OSError("readonly fs")),
+            ):
+                store._open_database(restrict_existing_parent=True)
+            try:
+                capture.assert_not_called()
+                row = store.connection.execute("select 1").fetchone()
+                self.assertEqual(row[0], 1)
+            finally:
+                store.connection.close()
+
+    def test_secure_store_delete_missing_stays_silent_d28(self) -> None:
+        from pomodorough import secure_store as secure_store_module
+        from pomodorough.secure_store import PlatformSecretStore
+
+        with TemporaryDirectory() as directory:
+            store = PlatformSecretStore(Path(directory))
+            missing = MagicMock()
+            missing.unlink.side_effect = FileNotFoundError("gone")
+            with (
+                patch.object(secure_store_module.os, "name", "nt"),
+                patch.object(
+                    PlatformSecretStore, "_windows_path", return_value=missing,
+                ),
+                patch(
+                    "pomodorough.sentry_monitoring.capture_exception"
+                ) as capture,
+            ):
+                store.delete("endpoint-key")
+            capture.assert_not_called()
+            missing.unlink.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

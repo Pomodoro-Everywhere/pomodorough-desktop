@@ -684,5 +684,108 @@ class BreadcrumbHookTests(unittest.TestCase):
         self.assertNotIn("10.1.2.3", rendered)
 
 
+class D27FailClosedTests(unittest.TestCase):
+    def test_event_scrub_failure_drops_instead_of_leaking(self) -> None:
+        with patch.object(
+            sentry_monitoring, "_scrub_value", side_effect=RuntimeError("boom")
+        ):
+            self.assertIsNone(scrub_sentry_event({"secret": "x"}, None))
+
+    def test_breadcrumb_scrub_failure_drops_instead_of_leaking(self) -> None:
+        with patch.object(
+            sentry_monitoring, "_scrub_value", side_effect=RuntimeError("boom")
+        ):
+            self.assertIsNone(scrub_sentry_breadcrumb({"secret": "x"}, None))
+
+    def test_fail_closed_never_raises_or_returns_original(self) -> None:
+        original = {"token": "leak-me"}
+        with patch.object(
+            sentry_monitoring, "_scrub_value", side_effect=ValueError("bad")
+        ):
+            self.assertIsNone(scrub_sentry_event(original, None))
+            self.assertIsNone(scrub_sentry_breadcrumb(original, None))
+        self.assertEqual(original, {"token": "leak-me"})
+
+
+class D27Ipv6ScrubTests(unittest.TestCase):
+    def test_full_and_compressed_ipv6_are_stripped(self) -> None:
+        cases = (
+            "peer at 2001:0db8:85a3:0000:0000:8a2e:0370:7334 done",
+            "peer at 2001:db8::1 done",
+            "peer at fe80::1 done",
+            "peer at ::1 done",
+            "peer at FE80::AABB:CCDD done",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                scrubbed = scrub_sentry_event({"message": text}, None)
+                self.assertNotIn(text.split("peer at ")[1].split(" ")[0], json.dumps(scrubbed))
+                self.assertIn("[Filtered]", json.dumps(scrubbed))
+
+    def test_bracketed_and_mapped_ipv6_are_stripped(self) -> None:
+        for raw in ("[2001:db8::1]", "::ffff:192.0.2.1"):
+            with self.subTest(raw=raw):
+                scrubbed = scrub_sentry_event({"message": f"peer {raw} x"}, None)
+                self.assertNotIn(raw, json.dumps(scrubbed))
+                self.assertNotIn("192.0.2.1", json.dumps(scrubbed))
+
+    def test_single_colon_times_and_versions_are_kept(self) -> None:
+        event = {"extra": {"note": "at 12:34 retry 2 of 5", "release": "0.17.0"}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertIn("12:34", json.dumps(scrubbed))
+        self.assertIn("0.17.0", json.dumps(scrubbed))
+
+
+class D27FragmentAndAuthScrubTests(unittest.TestCase):
+    def test_fragment_code_param_is_stripped(self) -> None:
+        for url in (
+            "https://x/cb#code=secret123",
+            "https://x/cb#code=secret123&state=s",
+            "https://x/cb?code=secret123#frag",
+        ):
+            with self.subTest(url=url):
+                scrubbed = scrub_sentry_event({"message": url}, None)
+                self.assertNotIn("secret123", json.dumps(scrubbed))
+                self.assertIn("[Filtered]", json.dumps(scrubbed))
+
+    def test_token_params_in_query_and_fragment_are_stripped(self) -> None:
+        urls = (
+            "https://x/cb?access_token=tok123&s=1",
+            "https://x/cb#access_token=tok123",
+            "https://x/cb?id_token=id123",
+            "https://x/cb#refresh_token=ref123",
+            "https://x/cb?token=tok123",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                rendered = json.dumps(scrub_sentry_event({"message": url}, None))
+                self.assertNotIn(url.split("=")[1].split("&")[0], rendered)
+
+    def test_basic_and_token_schemes_are_stripped(self) -> None:
+        import base64 as _b64
+
+        cred = _b64.b64encode(b"user:pass-word").decode("ascii")
+        text = f"auth Basic {cred} and Token abc123def"
+        rendered = json.dumps(scrub_sentry_event({"message": text}, None))
+        self.assertNotIn(cred, rendered)
+        self.assertNotIn("abc123def", rendered)
+
+    def test_mixed_adversarial_d27_payload_is_fully_stripped(self) -> None:
+        invite = "pomodorough1.dGVzdGludml0ZXBheWxvYWQ"
+        text = (
+            "user bob@example.org from 2001:db8::5 shared "
+            f"{invite} via https://app/cb#code=frag-secret "
+            "with Basic YWJjMTIz and Token tok-secret "
+            "and https://x/cb#access_token=frag-tok"
+        )
+        rendered = json.dumps(scrub_sentry_event({"message": text}, None))
+        for raw in (
+            "bob@example.org", "2001:db8::5", invite, "frag-secret",
+            "YWJjMTIz", "tok-secret", "frag-tok",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

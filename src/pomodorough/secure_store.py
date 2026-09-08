@@ -349,6 +349,8 @@ class PlatformSecretStore:
             try:
                 self._windows_path(key).unlink()
             except FileNotFoundError:
+                # D28: delete is idempotent; missing means already gone,
+                # so success (not an error) and no Sentry signal.
                 pass
             except OSError as error:
                 raise SecureStoreError(f"Secure value could not be deleted: {error}") from error

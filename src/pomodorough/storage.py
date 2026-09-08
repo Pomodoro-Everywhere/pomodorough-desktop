@@ -303,6 +303,8 @@ class Store:
                 # D26 LOW triage: best-effort hardening; some filesystems
                 # ignore chmod and the database still opens below, so a
                 # chmod failure is not actionable; stay silent.
+                # D28 re-triage: still silent (no Sentry signal; open
+                # succeeds and permissions are defense-in-depth only).
                 pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row

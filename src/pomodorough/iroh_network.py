@@ -612,6 +612,9 @@ class IrohService(QObject):
                 # store/encode races. Capturing every disconnect would spam
                 # Sentry; aggregate health surfaces via WAITING FOR PEERS /
                 # ready status, so close and stay silent.
+                # D28 re-triage: still silent by intent (peer-driven close
+                # is the common case, not an app bug); no sampled capture
+                # because even 1% would be peer-PII noise without signal.
                 connection.close(0, b"connection ended")
                 return
 

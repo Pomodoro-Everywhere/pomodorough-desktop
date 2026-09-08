@@ -29,6 +29,10 @@ google-oauth.json
 *.log
 .idea/
 .vscode/
+# D28: never commit type-check, tox, or property-test caches.
+.mypy_cache/
+.tox/
+.hypothesis/
 /.coverage
 /.coverage.*
 /coverage.json
