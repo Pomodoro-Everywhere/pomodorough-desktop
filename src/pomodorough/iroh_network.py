@@ -526,6 +526,10 @@ class IrohService(QObject):
                 # 0.1s backoff; capturing every tick would spam Sentry.
                 # Health surfaces via status/details plus the captured
                 # shed/ignore failures below, so stay silent here.
+                # D30 sampled-capture decision: still silent, no sampled
+                # capture. Volume is per-tick hot-loop noise with no
+                # per-event signal; degrading transport already reports via
+                # the shed/ignore captures below.
                 await asyncio.sleep(0.1)
                 continue
             if incoming is None:
@@ -570,6 +574,9 @@ class IrohService(QObject):
             # cleanup below stays captured (degrading transport) and join
             # outcome surfaces via failure/status signals, so only
             # close/refuse here and stay silent.
+            # D30 sampled-capture decision: still silent, no sampled
+            # capture. Even 1% would be untrusted-peer PII noise without
+            # app-bug signal; refusal-cleanup failures stay captured.
             if connection is not None:
                 connection.close(1, b"handshake failed")
             else:
@@ -615,6 +622,8 @@ class IrohService(QObject):
                 # D28 re-triage: still silent by intent (peer-driven close
                 # is the common case, not an app bug); no sampled capture
                 # because even 1% would be peer-PII noise without signal.
+                # D30 sampled-capture decision: re-affirmed silent, no
+                # sampled capture.
                 connection.close(0, b"connection ended")
                 return
 
@@ -714,7 +723,8 @@ class IrohService(QObject):
                 self._emit_details()
                 return False
             except Exception:  # noqa: BLE001 - per-peer transient failure.
-                # Reasoned silence: peers flap offline, time out, or serve
+                # Reasoned silence (D30 sampled-capture decision: silent, no
+                # sampled capture): peers flap offline, time out, or serve
                 # stale tickets; one bad peer must not block the rest or
                 # spam Sentry every sync tick. Aggregate outcome surfaces
                 # via WAITING FOR PEERS / ready status below.

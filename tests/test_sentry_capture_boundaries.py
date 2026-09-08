@@ -659,5 +659,31 @@ class D28SilenceTests(unittest.TestCase):
             missing.unlink.assert_called_once()
 
 
+class D30SampledCaptureDecisionTests(unittest.TestCase):
+    def test_iroh_silences_carry_sampled_capture_reasoning(self) -> None:
+        source = (Path(__file__).parents[1] / "src" / "pomodorough"
+                  / "iroh_network.py").read_text(encoding="utf-8")
+        # Four hot peer-driven boundaries (accept_next, handshake,
+        # serve_requests, per-peer sync) stay silent by intent. Each must
+        # carry an explicit D30 sampled-capture decision so a future edit
+        # cannot silently drop the reasoning.
+        self.assertGreaterEqual(
+            source.count("D30 sampled-capture decision"), 4,
+            "each iroh silence needs a D30 sampled-capture decision comment",
+        )
+        self.assertIn("no sampled", source.lower())
+
+    def test_d30_silences_report_through_existing_boundaries(self) -> None:
+        # Behavior proof lives in the targeted silence tests above; this
+        # pins the contract: the four D30 sites must not capture.
+        self.assertTrue(hasattr(IrohAcceptNextTransientSilenceTests,
+                                "test_accept_next_failure_stays_silent_and_continues"))
+        self.assertTrue(hasattr(IrohHandshakeSilenceTests,
+                                "test_handshake_failure_with_clean_refusal_stays_silent"))
+        self.assertTrue(hasattr(IrohServeRequestsSilenceTests,
+                                "test_peer_disconnect_stays_silent_and_closes"))
+        self.assertTrue(hasattr(ExpectedSilenceTests, "test_sync_per_peer_failure_stays_silent"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import MappingProxyType
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from pomodorough import __version__, sentry_monitoring
 from pomodorough.sentry_monitoring import (
@@ -785,6 +785,274 @@ class D27FragmentAndAuthScrubTests(unittest.TestCase):
         ):
             with self.subTest(raw=raw):
                 self.assertNotIn(raw, rendered)
+
+
+class D29DsnFormatTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
+    def test_env_malformed_dsn_returns_none(self) -> None:
+        invalid = (
+            "not-a-dsn", "http://public@example/1", "https://public@example/abc",
+            "https://public@example/", "https://@example/1", "https://public@/1",
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                env = {SENTRY_DSN_ENV_VAR: raw}
+                self.assertIsNone(
+                    resolve_dsn(env=env, config_path=Path("/nonexistent.json"))
+                )
+
+    def test_env_valid_shapes_still_resolve(self) -> None:
+        for raw in (DSN, DSN + "/", f"  {DSN}  "):
+            with self.subTest(raw=raw):
+                env = {SENTRY_DSN_ENV_VAR: raw}
+                self.assertEqual(
+                    resolve_dsn(env=env, config_path=Path("/nonexistent.json")),
+                    DSN if raw.strip() == DSN else raw.strip(),
+                )
+
+    def test_config_malformed_dsn_shadows_packaged(self) -> None:
+        with TemporaryJson({"dsn": "not-a-dsn"}) as path:
+            with patch.object(
+                sentry_monitoring, "_packaged_default_dsn", return_value=DSN
+            ):
+                self.assertIsNone(resolve_dsn(env={}, config_path=path))
+
+    def test_packaged_malformed_dsn_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            override = Path(dirname, "sentry_dsn_default")
+            override.write_text("not-a-dsn", encoding="utf-8")
+            env = {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: str(override)}
+            self.assertIsNone(sentry_monitoring._packaged_default_dsn(env=env))
+
+    def test_packaged_override_malformed_resolves_none(self) -> None:
+        with tempfile.TemporaryDirectory() as dirname:
+            override = Path(dirname, "sentry_dsn_default")
+            override.write_text("https://public@example/abc", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch.dict(
+                    os.environ,
+                    {POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR: str(override)},
+                ):
+                    self.assertIsNone(sentry_monitoring._packaged_default_dsn())
+                    self.assertIsNone(
+                        resolve_dsn(env={}, config_path=Path("/nonexistent.json"))
+                    )
+
+    def test_init_rejects_malformed_dsn(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            self.assertFalse(init_sentry(dsn="not-a-dsn"))
+            self.assertFalse(init_sentry(dsn="https://public@example/abc"))
+        sdk.init.assert_not_called()
+
+
+class D29CaptureFallbackTests(unittest.TestCase):
+    def test_failure_increments_counter_and_stays_silent(self) -> None:
+        sentry_monitoring.reset_capture_fallback_count()
+        try:
+            sdk = MagicMock()
+            sdk.capture_exception.side_effect = RuntimeError("sentry down")
+            with (
+                patch.dict(sys.modules, {"sentry_sdk": sdk}),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                sentry_monitoring.capture_exception(RuntimeError("boom"))
+                self.assertEqual(sentry_monitoring.capture_fallback_count(), 1)
+                sentry_monitoring.capture_exception(RuntimeError("again"))
+                self.assertEqual(sentry_monitoring.capture_fallback_count(), 2)
+            self.assertEqual(stderr.getvalue(), "")
+        finally:
+            sentry_monitoring.reset_capture_fallback_count()
+
+    def test_success_does_not_increment(self) -> None:
+        sentry_monitoring.reset_capture_fallback_count()
+        try:
+            sdk = MagicMock()
+            with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+                sentry_monitoring.capture_exception(RuntimeError("boom"))
+            self.assertEqual(sentry_monitoring.capture_fallback_count(), 0)
+        finally:
+            sentry_monitoring.reset_capture_fallback_count()
+
+
+class D29ExceptionHandlersTests(unittest.TestCase):
+    def _save_state(self) -> dict:
+        return {
+            "hook": sys.excepthook,
+            "orig": sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK,
+            "installed": sentry_monitoring._EXCEPTION_HANDLERS_INSTALLED,
+            "qt_installed": sentry_monitoring._QT_MESSAGE_HANDLER_INSTALLED,
+            "qt_orig": sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER,
+        }
+
+    def _restore_state(self, saved: dict) -> None:
+        sys.excepthook = saved["hook"]
+        sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = saved["orig"]
+        sentry_monitoring._EXCEPTION_HANDLERS_INSTALLED = saved["installed"]
+        sentry_monitoring._QT_MESSAGE_HANDLER_INSTALLED = saved["qt_installed"]
+        sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = saved["qt_orig"]
+
+    def test_sys_excepthook_reports_once_and_is_idempotent(self) -> None:
+        saved = self._save_state()
+        try:
+            sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = None
+            sentry_monitoring._EXCEPTION_HANDLERS_INSTALLED = False
+            previous = Mock()
+            sys.excepthook = previous
+            with patch.object(
+                sentry_monitoring, "install_qt_message_handler", return_value=False
+            ):
+                self.assertTrue(sentry_monitoring.install_exception_handlers())
+                first_hook = sys.excepthook
+                self.assertTrue(sentry_monitoring.install_exception_handlers())
+                self.assertIs(sys.excepthook, first_hook)
+            error = RuntimeError("uncaught")
+            with patch.object(sentry_monitoring, "capture_exception") as capture:
+                sys.excepthook(RuntimeError, error, None)
+                capture.assert_called_once_with(error)
+            previous.assert_called_once()
+        finally:
+            self._restore_state(saved)
+
+    def test_init_installs_handlers_without_duplicates(self) -> None:
+        saved = self._save_state()
+        try:
+            sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = None
+            sentry_monitoring._EXCEPTION_HANDLERS_INSTALLED = False
+            previous = Mock()
+            sys.excepthook = previous
+            sdk = MagicMock()
+            with (
+                patch.dict(sys.modules, {"sentry_sdk": sdk}),
+                patch.object(
+                    sentry_monitoring, "install_qt_message_handler",
+                    return_value=True,
+                ) as qt_install,
+            ):
+                self.assertTrue(init_sentry(dsn=DSN))
+                first_hook = sys.excepthook
+                self.assertTrue(init_sentry(dsn=DSN))
+                self.assertIs(sys.excepthook, first_hook)
+                self.assertEqual(qt_install.call_count, 2)
+            error = RuntimeError("uncaught-after-init")
+            with patch.object(sentry_monitoring, "capture_exception") as capture:
+                sys.excepthook(RuntimeError, error, None)
+                capture.assert_called_once_with(error)
+        finally:
+            self._restore_state(saved)
+
+    def test_qt_handler_reports_fatal_and_chains(self) -> None:
+        saved = self._save_state()
+        try:
+            from PySide6.QtCore import QtMsgType
+
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = Mock()
+            sentry_monitoring._QT_MESSAGE_HANDLER_INSTALLED = False
+            sdk = MagicMock()
+            with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+                sentry_monitoring._sentry_qt_message_handler(
+                    QtMsgType.QtFatalMsg, None,
+                    "crash alice@example.com 10.0.0.5",
+                )
+            _, args, _ = sdk.capture_message.mock_calls[0]
+            self.assertNotIn("alice@example.com", args[0])
+            self.assertNotIn("10.0.0.5", args[0])
+            self.assertIn("[Filtered]", args[0])
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER.assert_called_once()
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER.reset_mock()
+            sdk.capture_message.reset_mock()
+            with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+                sentry_monitoring._sentry_qt_message_handler(
+                    QtMsgType.QtDebugMsg, None, "debug noise",
+                )
+            sdk.capture_message.assert_not_called()
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER.assert_called_once()
+        finally:
+            self._restore_state(saved)
+
+    def test_qt_install_is_idempotent(self) -> None:
+        saved = self._save_state()
+        try:
+            sentry_monitoring._QT_MESSAGE_HANDLER_INSTALLED = False
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = None
+            with patch(
+                "PySide6.QtCore.qInstallMessageHandler", return_value=None
+            ) as installer:
+                self.assertTrue(sentry_monitoring.install_qt_message_handler())
+                self.assertTrue(sentry_monitoring.install_qt_message_handler())
+                installer.assert_called_once()
+        finally:
+            self._restore_state(saved)
+
+
+class D30SensitiveExtensionTests(unittest.TestCase):
+    def test_device_peer_endpoint_room_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "deviceId": "device-secret-1",
+                "deviceName": "my-device",
+                "peerId": "peer-secret-1",
+                "peers": ["peer-secret-2"],
+                "endpointTicket": "endpoint-secret-1",
+                "endpointId": "endpoint-secret-2",
+                "roomId": "room-secret-1",
+                "roomName": "secret-room",
+                "roomSecret": "room-secret-2",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "device-secret-1", "my-device", "peer-secret-1", "peer-secret-2",
+            "endpoint-secret-1", "endpoint-secret-2", "room-secret-1",
+            "secret-room", "room-secret-2",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_new_parts_stay_case_insensitive(self) -> None:
+        event = {"extra": {"DeviceID": "a", "PEER": "b", "Endpoint": "c", "ROOM": "d"}}
+        scrubbed = scrub_sentry_event(event, None)
+        for key in ("DeviceID", "PEER", "Endpoint", "ROOM"):
+            with self.subTest(key=key):
+                self.assertEqual(scrubbed["extra"][key], "[Filtered]")
+
+
+class D30UnknownObjectTests(unittest.TestCase):
+    def test_unknown_objects_are_repr_scrubbed(self) -> None:
+        class _Peer:
+            def __repr__(self) -> str:
+                return "Peer alice@example.com at 10.0.0.5"
+
+        event = {"extra": {"peer": _Peer(), "count": 2}}
+        scrubbed = scrub_sentry_event(event, None)
+        # `peer` key is sensitive so the parent stays opaque by design.
+        self.assertEqual(scrubbed["extra"]["peer"], "[Filtered]")
+        holder = {"extra": {"detail": _Peer(), "count": 2}}
+        # `detail` is not sensitive: unknown object must arrive as a
+        # scrubbed string, never the original object.
+        cleaned = scrub_sentry_event(holder, None)["extra"]["detail"]
+        self.assertIsInstance(cleaned, str)
+        self.assertNotIn("alice@example.com", cleaned)
+        self.assertNotIn("10.0.0.5", cleaned)
+        self.assertIn("[Filtered]", cleaned)
+
+    def test_primitives_passthrough_but_objects_do_not(self) -> None:
+        event = {"extra": {"nothing": None, "flag": True, "n": 42, "f": 3.5}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertIsNone(scrubbed["extra"]["nothing"])
+        self.assertTrue(scrubbed["extra"]["flag"])
+        self.assertEqual(scrubbed["extra"]["n"], 42)
+        self.assertEqual(scrubbed["extra"]["f"], 3.5)
+
+    def test_broken_repr_stays_opaque(self) -> None:
+        class _Broken:
+            def __repr__(self) -> str:
+                raise RuntimeError("no repr")
+
+        scrubbed = scrub_sentry_event({"extra": {"detail": _Broken()}}, None)
+        self.assertEqual(scrubbed["extra"]["detail"], "[Filtered]")
 
 
 if __name__ == "__main__":

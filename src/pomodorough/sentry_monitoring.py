@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import collections.abc
 import json
+import logging
 import os
 import re
+import sys
 import traceback
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,6 +23,8 @@ from typing import Any, Mapping
 from platformdirs import user_config_path
 
 from . import __version__
+
+_LOGGER = logging.getLogger(__name__)
 
 SENTRY_DSN_ENV_VAR = "SENTRY_DSN"
 POMODOROUGH_SENTRY_DSN_ENV_VAR = "POMODOROUGH_SENTRY_DSN"
@@ -54,6 +58,10 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "dsn",
         "credential",
         "code",
+        "device",
+        "peer",
+        "endpoint",
+        "room",
     }
 )
 # `code` matches only as an exact or suffix hit: substring matching
@@ -64,6 +72,15 @@ _SENSITIVE_KEY_PARTS = frozenset(
 # contexts can carry PII or credential-adjacent values, and hiding a
 # display name is safer than leaking a token. `credential` covers both
 # `credential` and `credentials`.
+# D30: `device`/`peer`/`endpoint`/`room` are substring hits on purpose.
+# Device IDs, peer IDs, endpoint tickets, and room IDs are identifying or
+# grant room access; over-filtering a display string is safer than leaking
+# a route. `room` also covers `roomId`/`roomName`/`roomSecret`.
+_CAPTURE_FALLBACK_COUNT = 0
+_ORIGINAL_SYS_EXCEPTHOOK: Any = None
+_EXCEPTION_HANDLERS_INSTALLED = False
+_QT_MESSAGE_HANDLER_INSTALLED = False
+_ORIGINAL_QT_MESSAGE_HANDLER: Any = None
 _CODE_SUFFIX_ALLOWLIST = frozenset({"errorcode", "statuscode", "exitcode"})
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
@@ -148,6 +165,23 @@ def sentry_disabled(
     return _read_config_disabled(config_path or (_config_root() / SENTRY_CONFIG_FILENAME))
 
 
+def _valid_dsn_or_none(candidate: str | None) -> str | None:
+    """Fail-closed DSN shape check shared by all DSN sources.
+
+    D29: ``SENTRY_DSN_FORMAT`` is enforced inside ``resolve_dsn`` (and the
+    packaged default) so a typoed DSN never reaches ``sentry_sdk.init``.
+    Invalid is None, never a passthrough string.
+    """
+    if not candidate:
+        return None
+    text = candidate.strip()
+    if not text:
+        return None
+    if SENTRY_DSN_FORMAT.match(text) is None:
+        return None
+    return text
+
+
 def resolve_dsn(
     *,
     env: Mapping[str, str] | None = None,
@@ -158,18 +192,21 @@ def resolve_dsn(
         return None
     for key in (SENTRY_DSN_ENV_VAR, POMODOROUGH_SENTRY_DSN_ENV_VAR):
         if key in environment:
-            dsn = str(environment.get(key) or "").strip()
             # A present-but-empty DSN is an explicit opt-out: it shadows
             # the config file and the packaged default instead of falling
-            # through to them.
-            return dsn or None
+            # through to them. D29: present-but-malformed shadows too;
+            # failing closed beats reporting to an unintended project.
+            return _valid_dsn_or_none(str(environment.get(key) or ""))
     path = config_path or (_config_root() / SENTRY_CONFIG_FILENAME)
     if _read_config_disabled(path):
         return None
     dsn = _read_config_dsn(path)
-    if dsn:
-        return dsn
-    return _packaged_default_dsn(env=environment)
+    if dsn is not None:
+        # Explicit config DSN shadows the packaged default even when
+        # malformed (None): a typo must disable, not fall through to a
+        # different project the operator did not choose here.
+        return _valid_dsn_or_none(dsn)
+    return _valid_dsn_or_none(_packaged_default_dsn(env=environment))
 
 
 def _packaged_default_override_path(
@@ -209,7 +246,8 @@ def _read_packaged_override(path: Path) -> str | None:
 def _packaged_default_dsn(env: Mapping[str, str] | None = None) -> str | None:
     override = _packaged_default_override_path(env)
     if override is not None:
-        return _read_packaged_override(override)
+        # D29: override files fail closed on malformed DSNs too.
+        return _valid_dsn_or_none(_read_packaged_override(override))
     try:
         from importlib import resources
 
@@ -223,8 +261,8 @@ def _packaged_default_dsn(env: Mapping[str, str] | None = None) -> str | None:
             text = stream.read()
     except (OSError, ValueError, TypeError, ImportError, UnicodeError):
         return None
-    dsn = text.strip()
-    return dsn or None
+    # D29: baked resource must match SENTRY_DSN_FORMAT; malformed → None.
+    return _valid_dsn_or_none(text.strip() or None)
 
 
 def _is_code_key(lowered: str) -> bool:
@@ -273,6 +311,22 @@ def _scrub_bytes(value: bytes | bytearray) -> str:
     return _scrub_string(text)
 
 
+def _scrub_unknown(value: Any) -> Any:
+    """D30: unknown leaves never passthrough.
+
+    JSON primitives (None/bool/int/float) cannot carry PII and stay as-is
+    so numeric diagnostics survive. Every other unknown object is
+    repr-scrubbed: ``repr`` may embed emails, IPs, or tickets, so it goes
+    through the free-text scrubbers instead of leaking raw.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        return _scrub_string(repr(value))
+    except Exception:  # noqa: BLE001 - repr must stay non-fatal.
+        return _FILTERED
+
+
 def _scrub_value(value: Any, depth: int = 0) -> Any:
     if depth > _SCRUB_DEPTH_LIMIT:
         return _FILTERED
@@ -304,7 +358,7 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
         return _scrub_bytes(value)
     if isinstance(value, str):
         return _scrub_string(value)
-    return value
+    return _scrub_unknown(value)
 
 
 def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
@@ -339,19 +393,117 @@ def scrub_sentry_breadcrumb(crumb: Any, hint: Any | None = None) -> Any:
         return None
 
 
+def capture_fallback_count() -> int:
+    """D29: how many ``capture_exception`` reports failed non-fatally."""
+    return _CAPTURE_FALLBACK_COUNT
+
+
+def reset_capture_fallback_count() -> None:
+    """Test seam: reset the D29 capture-failure counter."""
+    global _CAPTURE_FALLBACK_COUNT
+    _CAPTURE_FALLBACK_COUNT = 0
+
+
+def _note_capture_fallback() -> None:
+    global _CAPTURE_FALLBACK_COUNT
+    _CAPTURE_FALLBACK_COUNT += 1
+    # Debug, not stderr: capture runs on hot background paths where stderr
+    # spam would drown real errors. Default logging stays silent (DEBUG
+    # below the lastResort WARNING threshold); operators opting into DEBUG
+    # get the traceback.
+    _LOGGER.debug("Sentry capture failed", exc_info=True)
+
+
 def capture_exception(error: BaseException | None = None) -> None:
     """Report to Sentry when initialized; otherwise a silent no-op.
 
-    Reporting failure stays fully silent (no stderr): this runs on hot
-    background paths where stderr spam would drown real errors, unlike
-    init_sentry which prints once at startup where a developer sees it.
+    Reporting failure stays off stderr but is counted (D29): see
+    ``capture_fallback_count``. This runs on hot background paths where
+    stderr spam would drown real errors, unlike init_sentry which prints
+    once at startup where a developer sees it.
     """
     try:
         import sentry_sdk
 
         sentry_sdk.capture_exception(error)
     except Exception:  # noqa: BLE001 - reporting must stay non-fatal.
+        _note_capture_fallback()
+
+
+def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
+    """D29: report uncaught exceptions, then chain to the prior hook."""
+    if exc_value is not None:
+        try:
+            capture_exception(exc_value)
+        except Exception:  # noqa: BLE001 - hook must stay non-fatal.
+            pass
+    try:
+        previous = _ORIGINAL_SYS_EXCEPTHOOK
+        if previous is not None:
+            previous(exc_type, exc_value, exc_tb)
+    except Exception:  # noqa: BLE001 - chaining must stay non-fatal.
         pass
+
+
+def _sentry_qt_message_handler(mode: Any, context: Any, message: Any) -> None:
+    """D29: report fatal/critical Qt messages, then chain to prior handler."""
+    try:
+        from PySide6.QtCore import QtMsgType
+
+        fatal = (QtMsgType.QtFatalMsg, QtMsgType.QtCriticalMsg)
+        if mode in fatal:
+            try:
+                import sentry_sdk
+
+                sentry_sdk.capture_message(_scrub_string(str(message)))
+            except Exception:  # noqa: BLE001 - reporting stays non-fatal.
+                _note_capture_fallback()
+    finally:
+        try:
+            previous = _ORIGINAL_QT_MESSAGE_HANDLER
+            if previous is not None:
+                previous(mode, context, message)
+        except Exception:  # noqa: BLE001 - chaining stays non-fatal.
+            pass
+
+
+def install_qt_message_handler() -> bool:
+    """D29: install the Qt message handler once; False when unavailable."""
+    global _QT_MESSAGE_HANDLER_INSTALLED, _ORIGINAL_QT_MESSAGE_HANDLER
+    if _QT_MESSAGE_HANDLER_INSTALLED:
+        return True
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+    except ImportError:
+        return False
+    try:
+        _ORIGINAL_QT_MESSAGE_HANDLER = qInstallMessageHandler(
+            _sentry_qt_message_handler
+        )
+    except Exception:  # noqa: BLE001 - install stays non-fatal.
+        return False
+    _QT_MESSAGE_HANDLER_INSTALLED = True
+    return True
+
+
+def install_exception_handlers() -> bool:
+    """D29: install sys.excepthook + Qt handler once (idempotent).
+
+    Safe to call repeatedly and safe to call after ``init_sentry``: the
+    second call is a no-op so uncaught exceptions report exactly once.
+    """
+    global _EXCEPTION_HANDLERS_INSTALLED, _ORIGINAL_SYS_EXCEPTHOOK
+    if _EXCEPTION_HANDLERS_INSTALLED:
+        return True
+    if _ORIGINAL_SYS_EXCEPTHOOK is None:
+        _ORIGINAL_SYS_EXCEPTHOOK = sys.excepthook
+    sys.excepthook = _sentry_sys_excepthook
+    _EXCEPTION_HANDLERS_INSTALLED = True
+    try:
+        install_qt_message_handler()
+    except Exception:  # noqa: BLE001 - Qt install stays best-effort.
+        pass
+    return True
 
 
 def init_sentry(
@@ -360,15 +512,19 @@ def init_sentry(
     release: str | None = None,
     environment: str = SENTRY_ENVIRONMENT,
 ) -> bool:
-    if not dsn or not dsn.strip():
+    if _valid_dsn_or_none(dsn) is None:
         return False
+    # D29: save the pre-SDK hook so our post-init hook replaces (not wraps)
+    # sentry_sdk's own ExcepthookIntegration hook. Chaining to the pre-SDK
+    # hook keeps exactly one Sentry report per uncaught exception.
+    pre_init_hook = sys.excepthook
     try:
         import sentry_sdk
     except ImportError:
         return False
     try:
         sentry_sdk.init(
-            dsn=dsn.strip(),
+            dsn=dsn.strip() if isinstance(dsn, str) else dsn,
             release=release or __version__,
             environment=environment,
             send_default_pii=False,
@@ -378,6 +534,16 @@ def init_sentry(
     except Exception:  # noqa: BLE001 - init failure must stay non-fatal.
         traceback.print_exc()
         return False
+    global _ORIGINAL_SYS_EXCEPTHOOK, _EXCEPTION_HANDLERS_INSTALLED
+    if not _EXCEPTION_HANDLERS_INSTALLED:
+        if _ORIGINAL_SYS_EXCEPTHOOK is None:
+            _ORIGINAL_SYS_EXCEPTHOOK = pre_init_hook
+        sys.excepthook = _sentry_sys_excepthook
+        _EXCEPTION_HANDLERS_INSTALLED = True
+    try:
+        install_qt_message_handler()
+    except Exception:  # noqa: BLE001 - Qt install stays best-effort.
+        pass
     return True
 
 
