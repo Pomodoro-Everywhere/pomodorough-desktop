@@ -1055,5 +1055,116 @@ class D30UnknownObjectTests(unittest.TestCase):
         self.assertEqual(scrubbed["extra"]["detail"], "[Filtered]")
 
 
+class D31OAuthScrubTests(unittest.TestCase):
+    def test_oauth_state_nonce_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "state": "state-secret-abc123",
+                "nonce": "nonce-secret-def456",
+                "oauthState": "oauth-state-secret",
+                "idTokenNonce": "id-nonce-secret",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "state-secret-abc123", "nonce-secret-def456",
+            "oauth-state-secret", "id-nonce-secret",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["state"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["nonce"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_verifier_challenge_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "code_verifier": "verifier-secret-xyz789",
+                "code_challenge": "challenge-secret-uvw012",
+                "verifier": "bare-verifier-secret",
+                "challenge": "bare-challenge-secret",
+                "retryCount": 1,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "verifier-secret-xyz789", "challenge-secret-uvw012",
+            "bare-verifier-secret", "bare-challenge-secret",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["retryCount"], 1)
+
+    def test_authorization_url_params_are_stripped(self) -> None:
+        state = "state-secret-CfDJ8AbC123xyz"
+        nonce = "nonce-secret-n-0S6-WzA2Mj"
+        challenge = "challenge-secret-E9MelhoaNE23"
+        url = (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            "?client_id=524gj.apps.googleusercontent.com"
+            "&redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcallback"
+            "&response_type=code&scope=openid+email+profile"
+            f"&nonce={nonce}&state={state}"
+            f"&code_challenge={challenge}&code_challenge_method=S256"
+            "&prompt=select_account"
+        )
+        rendered = json.dumps(scrub_sentry_event({"message": url}, None))
+        for raw in (state, nonce, challenge):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertIn("[Filtered]", rendered)
+
+    def test_oauth_callback_urls_are_stripped(self) -> None:
+        code = "auth-code-4-0AY0e-gx-secret"
+        state = "callback-state-secret-789"
+        urls = (
+            f"http://127.0.0.1:43123/callback?code={code}&state={state}",
+            f"http://127.0.0.1:43123/callback?state={state}&code={code}",
+            f"https://x/cb#code={code}&state={state}",
+            "https://x/cb?code_verifier=verifier-secret-1&x=1",
+            "https://x/cb#code_challenge=challenge-secret-2",
+            "https://x/cb?nonce=nonce-secret-3&s=1",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                rendered = json.dumps(scrub_sentry_event({"message": url}, None))
+                secret = url.split("=", 1)[1].split("&")[0]
+                self.assertNotIn(secret, rendered)
+                self.assertIn("[Filtered]", rendered)
+
+    def test_contract_authorization_url_never_leaks(self) -> None:
+        from pomodorough.network import DesktopOAuthContract
+
+        state = "contract-state-secret-aaa111"
+        nonce = "contract-nonce-secret-bbb222"
+        verifier = "contract-verifier-secret-ccc333-dBjftJeZ"
+        url = DesktopOAuthContract.authorization_url(
+            {"client_id": "cid", "auth_uri": "https://accounts.google.com/x"},
+            "http://127.0.0.1:43123/callback",
+            nonce, state, verifier,
+        )
+        self.assertIn(state, url)
+        self.assertIn(nonce, url)
+        for crumb in (
+            scrub_sentry_event({"message": url}, None),
+            scrub_sentry_breadcrumb({"message": url}, None),
+        ):
+            rendered = json.dumps(crumb)
+            for raw in (state, nonce):
+                with self.subTest(raw=raw):
+                    self.assertNotIn(raw, rendered)
+        self.assertIn("[Filtered]", json.dumps(scrub_sentry_event({"message": url}, None)))
+
+    def test_oauth_keys_stay_case_insensitive(self) -> None:
+        event = {"extra": {"State": "a", "NONCE": "b", "Code_Verifier": "c"}}
+        scrubbed = scrub_sentry_event(event, None)
+        for key in ("State", "NONCE", "Code_Verifier"):
+            with self.subTest(key=key):
+                self.assertEqual(scrubbed["extra"][key], "[Filtered]")
+
+
 if __name__ == "__main__":
     unittest.main()

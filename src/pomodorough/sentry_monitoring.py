@@ -62,6 +62,10 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "peer",
         "endpoint",
         "room",
+        "state",
+        "nonce",
+        "verifier",
+        "challenge",
     }
 )
 # `code` matches only as an exact or suffix hit: substring matching
@@ -76,6 +80,10 @@ _SENSITIVE_KEY_PARTS = frozenset(
 # Device IDs, peer IDs, endpoint tickets, and room IDs are identifying or
 # grant room access; over-filtering a display string is safer than leaking
 # a route. `room` also covers `roomId`/`roomName`/`roomSecret`.
+# D31: `state`/`nonce`/`verifier`/`challenge` are substring hits on purpose.
+# OAuth state, nonce, PKCE verifier, and challenge grant account access;
+# over-filtering (`statement`, `announce`) is safer than leaking a secret.
+# `verifier` covers `code_verifier`; `challenge` covers `code_challenge`.
 _CAPTURE_FALLBACK_COUNT = 0
 _ORIGINAL_SYS_EXCEPTHOOK: Any = None
 _EXCEPTION_HANDLERS_INSTALLED = False
@@ -105,8 +113,12 @@ _INVITE_RE = re.compile(r"pomodorough1\.[A-Za-z0-9_-]+")
 _CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
 # D27: OAuth/token query and fragment params carry the same secret as
 # `code=`; scrub them in free text where key filtering cannot see them.
+# D31: `state`/`nonce`/`code_verifier`/`code_challenge` are OAuth secrets
+# too (CSRF binding, replay binding, PKCE). Authorization URLs and
+# redirect callbacks embed them as `?state=`/`&nonce=`/`#state=`; scrub
+# them in free text the same way as tokens.
 _TOKEN_PARAM_RE = re.compile(
-    r"(?i)([?&#](?:access_token|id_token|refresh_token|token)=)[^&\s\"';]+"
+    r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|code_verifier|code_challenge)=)[^&\s\"';]+"
 )
 
 
@@ -297,6 +309,10 @@ def _scrub_string(text: str) -> str:
     redacted = _TOKEN_AUTH_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _INVITE_RE.sub(_FILTERED, redacted)
     redacted = _CODE_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
+    # D31: authorization URLs embed OAuth secrets as query params
+    # (`?state=`/`&nonce=`/`&code_challenge=`); callbacks repeat them as
+    # `?code=`/`?state=` or `#...`. _TOKEN_PARAM_RE covers all of these in
+    # free text where key filtering cannot see them.
     redacted = _TOKEN_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
     # D27: IPv6 before IPv4 so mapped `::ffff:1.2.3.4` drops as one unit.
     redacted = _IPV6_RE.sub(_FILTERED, redacted)

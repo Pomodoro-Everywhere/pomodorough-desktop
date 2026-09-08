@@ -21,6 +21,7 @@ from .controller_outcomes import (
     returning,
 )
 from .iroh_protocol import IrohProtocolError, parse_invite, room_id_for_secret
+from .sentry_monitoring import capture_exception
 
 
 def _workspace_transition(action: Callable[..., Any]) -> Callable[..., Any]:
@@ -324,6 +325,10 @@ class ReplicationController:
             self._ports.apply_outcome(done(RenderNetwork()))
             context.iroh.join_room(invite)
         except Exception as error:
+            # D32: join infrastructure failure is unexpected after invite
+            # validation, so report it staying non-fatal. User-visible
+            # outcome still surfaces via iroh_failure below.
+            capture_exception(error)
             self._cancel_iroh_join()
             if self.mode == "centralized":
                 context.cloud.restore()

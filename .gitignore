@@ -41,3 +41,9 @@ google-oauth.json
 /htmlcov/
 /.audit/
 src/pomodorough/resources/sentry_dsn_default
+# D33: ignore generated screenshots but keep the reference, plus editor backups.
+screenshots/*.png
+!screenshots/screenshot.png
+*~
+*.swp
+*.orig

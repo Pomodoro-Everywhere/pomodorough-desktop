@@ -776,8 +776,10 @@ class IrohServiceFinalBranchTests(unittest.TestCase):
             returned = self.service._submit(coroutine, tracked=False)
         self.assertIs(returned, future)
         self.assertNotIn(future, self.service._operations)
-        future.set_exception(RuntimeError("worker failed"))
-        coroutine.close()
+        with patch("pomodorough.iroh_network.capture_exception") as capture:
+            future.set_exception(RuntimeError("worker failed"))
+            coroutine.close()
+        capture.assert_called_once()
         self.assertEqual((statuses, failures), (["UNAVAILABLE"], ["worker failed"]))
 
     def test_details_include_peers_and_ready_status_distinguishes_routes(self) -> None:

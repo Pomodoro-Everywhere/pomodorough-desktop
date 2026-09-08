@@ -818,6 +818,10 @@ class Worker(QRunnable):
         try:
             self.signals.result.emit(self.function())
         except Exception as error:  # noqa: BLE001 - Reports boundary failures to UI.
+            # D32 reasoned silence: ApiError/user cancellations (offline,
+            # auth, timeout) are expected and surface via the error signal
+            # to per-operation on_error UI paths. Capturing all of them
+            # would spam Sentry with user/network noise.
             self.signals.error.emit(error)
         finally:
             self.signals.finished.emit()
@@ -1000,6 +1004,11 @@ class DesktopOAuthContract:
         state: str,
         verifier: str,
     ) -> str:
+        # D31: the returned URL embeds OAuth secrets (state, nonce,
+        # code_challenge). Never breadcrumb, log, or capture it: callers
+        # must not pass it to capture_exception/failure signals, and the
+        # Sentry scrubber stays fail-closed via _TOKEN_PARAM_RE if it ever
+        # reaches free text.
         challenge = base64.urlsafe_b64encode(
             hashlib.sha256(verifier.encode()).digest()
         ).decode().rstrip("=")

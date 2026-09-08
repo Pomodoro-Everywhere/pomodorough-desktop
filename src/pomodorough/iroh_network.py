@@ -309,6 +309,10 @@ class IrohService(QObject):
             except (asyncio.CancelledError, CancelledError):
                 return
             except Exception as error:
+                # D32: background worker failure hides app bugs behind a
+                # generic UNAVAILABLE status, so report it staying non-fatal.
+                # Cancellation above stays silent (expected shutdown race).
+                capture_exception(error)
                 self.status_changed.emit("UNAVAILABLE")
                 self.failure.emit(str(error))
 

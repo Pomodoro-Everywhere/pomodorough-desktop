@@ -1012,6 +1012,11 @@ class AccountLifecycle:
         try:
             self.token_store.clear()
         except (OSError, subprocess.SubprocessError):
+            # D32 reasoned silence: expire runs on the 401 path where the
+            # server already rejected the session. In-memory state is still
+            # cleared below, and explicit sign-out (`_clear_sign_out_store`)
+            # raises instead of swallowing. Capturing every keyring flap
+            # here would spam Sentry with local keyring noise.
             pass
 
     def _clear_session(self) -> None:

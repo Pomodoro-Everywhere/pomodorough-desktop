@@ -659,7 +659,7 @@ class D28SilenceTests(unittest.TestCase):
             missing.unlink.assert_called_once()
 
 
-class D30SampledCaptureDecisionTests(unittest.TestCase):
+class D32SampledCaptureDecisionTests(unittest.TestCase):
     def test_iroh_silences_carry_sampled_capture_reasoning(self) -> None:
         source = (Path(__file__).parents[1] / "src" / "pomodorough"
                   / "iroh_network.py").read_text(encoding="utf-8")
@@ -683,6 +683,133 @@ class D30SampledCaptureDecisionTests(unittest.TestCase):
         self.assertTrue(hasattr(IrohServeRequestsSilenceTests,
                                 "test_peer_disconnect_stays_silent_and_closes"))
         self.assertTrue(hasattr(ExpectedSilenceTests, "test_sync_per_peer_failure_stays_silent"))
+
+
+class D32CaptureOrSilenceTests(unittest.TestCase):
+    def test_expire_clear_failure_stays_silent_and_clears_session(self) -> None:
+        from pomodorough.network_account import AccountLifecycle
+        from pomodorough.network_session import SessionState
+
+        lifecycle = AccountLifecycle.__new__(AccountLifecycle)
+        lifecycle.token_store = Mock(side_effect=OSError("no keyring"))
+        lifecycle.token_store.clear = Mock(side_effect=OSError("no keyring"))
+        lifecycle.state = SessionState()
+        lifecycle.state.access_token = "tok"
+        lifecycle.state.refresh_token = "ref"
+        lifecycle.state.authenticated = True
+        with patch(
+            "pomodorough.sentry_monitoring.capture_exception"
+        ) as capture:
+            lifecycle.expire_session()
+        capture.assert_not_called()
+        self.assertIsNone(lifecycle.state.access_token)
+        self.assertIsNone(lifecycle.state.refresh_token)
+        self.assertFalse(lifecycle.state.authenticated)
+
+    def test_worker_run_stays_silent_and_reports_via_signal(self) -> None:
+        from pomodorough.network import Worker
+
+        worker = Worker(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        errors: list[Exception] = []
+        worker.signals.error.connect(errors.append)
+        with patch("pomodorough.network.capture_exception") as capture:
+            worker.run()
+        capture.assert_not_called()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+
+    def test_submit_worker_failure_is_captured(self) -> None:
+        from concurrent.futures import Future
+
+        with TemporaryDirectory() as directory:
+            service = _iroh_service(directory)
+            service._ensure_loop = Mock(return_value=Mock())  # type: ignore[method-assign]
+            future: Future[object] = Future()
+            statuses: list[str] = []
+            failures: list[str] = []
+            service.status_changed.connect(statuses.append)
+            service.failure.connect(failures.append)
+            with patch(
+                "pomodorough.iroh_network.asyncio.run_coroutine_threadsafe",
+                return_value=future,
+            ):
+                async def _op() -> None:
+                    return None
+
+                coroutine = _op()
+                returned = service._submit(coroutine, tracked=False)
+            self.assertIs(returned, future)
+            with patch(
+                "pomodorough.iroh_network.capture_exception"
+            ) as capture:
+                future.set_exception(RuntimeError("worker failed"))
+                coroutine.close()
+            capture.assert_called_once()
+            self.assertEqual(statuses, ["UNAVAILABLE"])
+            self.assertEqual(failures, ["worker failed"])
+
+    def test_submit_cancellation_stays_silent(self) -> None:
+        from concurrent.futures import Future
+
+        with TemporaryDirectory() as directory:
+            service = _iroh_service(directory)
+            service._ensure_loop = Mock(return_value=Mock())  # type: ignore[method-assign]
+            future: Future[object] = Future()
+            with patch(
+                "pomodorough.iroh_network.asyncio.run_coroutine_threadsafe",
+                return_value=future,
+            ):
+                async def _op() -> None:
+                    return None
+
+                coroutine = _op()
+                service._submit(coroutine, tracked=False)
+            with patch(
+                "pomodorough.iroh_network.capture_exception"
+            ) as capture:
+                future.cancel()
+                coroutine.close()
+            capture.assert_not_called()
+
+    def test_iroh_join_failure_is_captured_and_surfaces(self) -> None:
+        from types import SimpleNamespace
+
+        from pomodorough.replication_controller import ReplicationController
+
+        controller = ReplicationController.__new__(ReplicationController)
+        controller.iroh_status = ""
+        controller.iroh_join_pending = False
+        controller._join_generation = 3
+        controller._joining_room_id = None
+        controller._workspace_lock = __import__("threading").RLock()
+        controller._transition_busy = False
+        controller.mode = "centralized"
+        fake_iroh = Mock()
+        fake_iroh.join_room.side_effect = RuntimeError("join hung")
+        fake_iroh.stop = Mock()
+        fake_store = Mock()
+        fake_store.replication_mode = "centralized"
+        fake_cloud = Mock()
+        context = SimpleNamespace(
+            store=fake_store, cloud=fake_cloud, iroh=fake_iroh,
+            strings=SimpleNamespace(text=lambda key: key), closed=False,
+        )
+        applied: list[object] = []
+        controller._ports = SimpleNamespace(
+            context=lambda: context,
+            apply_outcome=applied.append,
+            iroh_failure=Mock(),
+        )
+        controller._context = lambda: context  # type: ignore[method-assign]
+        with patch(
+            "pomodorough.replication_controller.capture_exception"
+        ) as capture:
+            outcome = controller._start_iroh_join(SimpleNamespace(room_id="room-1"))
+        capture.assert_called_once()
+        self.assertFalse(controller.iroh_join_pending)
+        fake_cloud.restore.assert_called_once()
+        self.assertTrue(outcome is not None)
+        self.assertTrue(any("join hung" in str(item) for item in applied))
 
 
 if __name__ == "__main__":
