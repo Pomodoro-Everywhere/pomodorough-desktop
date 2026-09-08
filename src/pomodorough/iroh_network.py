@@ -521,6 +521,11 @@ class IrohService(QObject):
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # D25 triage: accept_next failures are transient transport
+                # noise (endpoint churn, runtime hiccups) on a hot loop with
+                # 0.1s backoff; capturing every tick would spam Sentry.
+                # Health surfaces via status/details plus the captured
+                # shed/ignore failures below, so stay silent here.
                 await asyncio.sleep(0.1)
                 continue
             if incoming is None:
@@ -558,6 +563,13 @@ class IrohService(QObject):
         except asyncio.CancelledError:
             raise
         except Exception:
+            # D25 triage: handshake failures are peer-caused and frequent
+            # (bad hello, timeout, protocol mismatch, superseded
+            # generation) from untrusted remote input; capturing every bad
+            # peer would spam Sentry and risk peer PII. The failed refusal
+            # cleanup below stays captured (degrading transport) and join
+            # outcome surfaces via failure/status signals, so only
+            # close/refuse here and stay silent.
             if connection is not None:
                 connection.close(1, b"handshake failed")
             else:
@@ -594,6 +606,12 @@ class IrohService(QObject):
             except TimeoutError:
                 return
             except Exception:
+                # D25 triage: serving untrusted peer requests; expected
+                # protocol errors already become error responses inside
+                # _handle_request, so survivors are peer disconnects and
+                # store/encode races. Capturing every disconnect would spam
+                # Sentry; aggregate health surfaces via WAITING FOR PEERS /
+                # ready status, so close and stay silent.
                 connection.close(0, b"connection ended")
                 return
 

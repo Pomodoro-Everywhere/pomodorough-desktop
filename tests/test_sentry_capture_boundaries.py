@@ -1,4 +1,4 @@
-"""Regression tests for silent-failure triage (D17, D24).
+"""Regression tests for silent-failure triage (D17, D24, D25, D26).
 
 Maps each silenced boundary to its reporting contract:
 
@@ -10,7 +10,9 @@ Maps each silenced boundary to its reporting contract:
   chmod, OAuth signoff child spawn (D24), legacy secret-tool read/mirror
   (D24), legacy pending-id skip (D24), cursor-visibility probe (D24,
   see test_tui), foreign task-title shortcut skip (D24), room-ID
-  validator rejections (D24).
+  validator rejections (D24), iroh accept-next transient (D25),
+  iroh handshake peer-caused (D25), iroh serve-requests disconnect (D25),
+  legacy mirror write LOW (D26), parent chmod LOW (D26).
 """
 
 from __future__ import annotations
@@ -422,6 +424,175 @@ class RoomIdValidatorSilenceTests(unittest.TestCase):
         for invalid in ("", "not a room id!!", "a", valid + "!", None, 42):
             with self.subTest(invalid=invalid):
                 self.assertFalse(valid_room_id(invalid))
+
+
+class IrohAcceptNextTransientSilenceTests(unittest.TestCase):
+    def test_accept_next_failure_stays_silent_and_continues(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 3
+                    endpoint = MagicMock()
+                    endpoint.is_closed.return_value = False
+                    endpoint.accept_next = AsyncMock(
+                        side_effect=[RuntimeError("transient"), None]
+                    )
+                    service._endpoint = endpoint
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        with patch(
+                            "pomodorough.iroh_network.asyncio.sleep",
+                            new=AsyncMock(),
+                        ):
+                            await service._accept_loop(3)
+                    capture.assert_not_called()
+                    self.assertEqual(endpoint.accept_next.await_count, 2)
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+
+class IrohHandshakeSilenceTests(unittest.TestCase):
+    def test_handshake_failure_with_clean_refusal_stays_silent(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 5
+                    incoming = MagicMock()
+                    incoming.accept = AsyncMock(
+                        side_effect=RuntimeError("bad hello")
+                    )
+                    incoming.ignore = AsyncMock()
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        await service._accept_incoming(incoming, 5)
+                    capture.assert_not_called()
+                    incoming.ignore.assert_awaited_once()
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+    def test_handshake_failure_with_connection_closes_silently(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 5
+                    incoming = MagicMock()
+                    connection = MagicMock()
+                    connection.alpn.return_value = b"wrong"
+                    accepted = MagicMock()
+                    accepted.connect = AsyncMock(return_value=connection)
+                    incoming.accept = AsyncMock(return_value=accepted)
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        await service._accept_incoming(incoming, 5)
+                    capture.assert_not_called()
+                    connection.close.assert_called_once()
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+
+class IrohServeRequestsSilenceTests(unittest.TestCase):
+    def test_peer_disconnect_stays_silent_and_closes(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 9
+                    connection = MagicMock()
+                    connection.close_reason.return_value = None
+                    connection.accept_bi = AsyncMock(
+                        side_effect=RuntimeError("peer gone")
+                    )
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        await service._serve_requests(connection, 9)
+                    capture.assert_not_called()
+                    connection.close.assert_called_once_with(0, b"connection ended")
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+    def test_idle_timeout_returns_without_capture_or_close(self) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                service = _iroh_service(directory)
+                try:
+                    service._generation = 9
+                    connection = MagicMock()
+                    connection.close_reason.return_value = None
+                    connection.accept_bi = AsyncMock(side_effect=TimeoutError())
+                    with patch(
+                        "pomodorough.iroh_network.capture_exception"
+                    ) as capture:
+                        await service._serve_requests(connection, 9)
+                    capture.assert_not_called()
+                    connection.close.assert_not_called()
+                finally:
+                    service._loop = None
+                    service._thread = None
+
+        asyncio.run(scenario())
+
+
+class LowTriageSilenceTests(unittest.TestCase):
+    def test_d26_mirror_write_failure_stays_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TokenStore(
+                "device-1", secret_store=None,
+                fallback_path=Path(directory) / "s.json",
+            )
+            with (
+                patch(
+                    "pomodorough.network.shutil.which",
+                    return_value="/usr/bin/secret-tool",
+                ),
+                patch(
+                    "pomodorough.network.subprocess.run",
+                    side_effect=OSError("no keyring"),
+                ),
+                patch("pomodorough.network.capture_exception") as capture,
+            ):
+                store._save_legacy_token_locked('{"refreshToken":"r"}')
+            capture.assert_not_called()
+            self.assertEqual(
+                store.fallback_path.read_text(encoding="utf-8"),
+                '{"refreshToken":"r"}',
+            )
+
+    def test_d26_parent_chmod_failure_stays_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = Store.__new__(Store)
+            store.path = Path(directory) / "probe.sqlite3"
+            with (
+                patch(
+                    "pomodorough.sentry_monitoring.capture_exception"
+                ) as capture,
+                patch.object(Path, "chmod", side_effect=OSError("readonly fs")),
+            ):
+                store._open_database(restrict_existing_parent=True)
+            try:
+                capture.assert_not_called()
+                row = store.connection.execute("select 1").fetchone()
+                self.assertEqual(row[0], 1)
+            finally:
+                store.connection.close()
 
 
 if __name__ == "__main__":

@@ -432,8 +432,10 @@ class TokenStore:
                 input=encoded, text=True, timeout=15, check=False,
             )
         except (OSError, subprocess.SubprocessError):
-            # Best-effort mirror write: the fallback file is already
-            # persisted above and stays authoritative, so stay silent.
+            # D26 LOW triage: best-effort mirror write. The fallback file
+            # is already persisted above and stays authoritative, so a
+            # missing keyring binary or spawn failure is not actionable;
+            # stay silent.
             return
         if result.returncode == 0:
             self.fallback_path.unlink(missing_ok=True)

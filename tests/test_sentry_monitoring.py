@@ -20,6 +20,7 @@ from pomodorough.sentry_monitoring import (
     init_sentry,
     init_sentry_from_environment,
     resolve_dsn,
+    scrub_sentry_breadcrumb,
     scrub_sentry_event,
     sentry_disabled,
 )
@@ -562,6 +563,125 @@ class ScrubberTests(unittest.TestCase):
         self.assertIs(kwargs["before_send"], scrub_sentry_event)
         scrubbed = kwargs["before_send"](dict(_ADVERSARIAL_EVENT), {})
         self.assertNotIn("alice@example.com", json.dumps(scrubbed))
+
+
+class SensitiveKeyExtensionTests(unittest.TestCase):
+    def test_auth_dsn_credential_parts_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "authToken": "auth-secret",
+                "oauthState": "oauth-secret",
+                "clientAuth": "client-auth-secret",
+                "sentryDsn": "https://public@example/1",
+                "credential": "cred-secret",
+                "credentials": {"user": "u", "pass": "p"},
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "auth-secret", "oauth-secret", "client-auth-secret",
+            "https://public@example/1", "cred-secret",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["authToken"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["sentryDsn"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["credential"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["credentials"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_sensitive_match_stays_case_insensitive(self) -> None:
+        event = {"extra": {"AuthToken": "a", "DSN": "b", "CREDENTIALS": "c"}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertEqual(scrubbed["extra"]["AuthToken"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["DSN"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["CREDENTIALS"], "[Filtered]")
+
+
+class ScrubStringCodesIpsTests(unittest.TestCase):
+    def test_ipv4_invite_and_code_param_are_stripped(self) -> None:
+        invite = "pomodorough1.eyJ2IjoxLCJyb29tSWQiOiJhYmMifQ"
+        event = {
+            "message": f"peer at 192.168.1.10 sent {invite}",
+            "extra": {
+                "detail": "callback https://x/cb?code=secret123&state=s",
+                "plain": "ok",
+            },
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in ("192.168.1.10", invite, "secret123"):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertIn("[Filtered]", rendered)
+        self.assertEqual(scrubbed["extra"]["plain"], "ok")
+
+    def test_benign_versions_and_diagnostic_codes_are_kept(self) -> None:
+        event = {
+            "extra": {
+                "release": "0.17.0",
+                "errorCode": "E_CONN",
+                "statusCode": 500,
+                "message": "retry 2 of 5",
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertEqual(scrubbed["extra"]["release"], "0.17.0")
+        self.assertEqual(scrubbed["extra"]["errorCode"], "E_CONN")
+        self.assertEqual(scrubbed["extra"]["statusCode"], 500)
+        self.assertIn("retry 2 of 5", json.dumps(scrubbed))
+
+    def test_mixed_adversarial_free_text_is_fully_stripped(self) -> None:
+        invite = "pomodorough1.dGVzdGludml0ZXBheWxvYWQ"
+        text = (
+            f"user bob@example.org from 10.0.0.5 shared {invite} "
+            "via https://app/cb?code=oauth-secret Bearer abc123"
+        )
+        scrubbed = scrub_sentry_event({"message": text}, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "bob@example.org", "10.0.0.5", invite, "oauth-secret", "abc123",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+
+
+class BreadcrumbHookTests(unittest.TestCase):
+    def test_breadcrumb_scrubs_message_and_data(self) -> None:
+        invite = "pomodorough1.eyJ2IjoxLCJyb29tSWQiOiJ4eXoifQ"
+        crumb = {
+            "message": "GET https://x/ by dave@example.com from 192.168.0.2",
+            "data": {"invite": invite, "retryCount": 2},
+        }
+        scrubbed = scrub_sentry_breadcrumb(dict(crumb), {})
+        rendered = json.dumps(scrubbed)
+        for raw in ("dave@example.com", "192.168.0.2", invite):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["data"]["invite"], "[Filtered]")
+        self.assertEqual(scrubbed["data"]["retryCount"], 2)
+
+    def test_breadcrumb_passthrough_and_never_raises(self) -> None:
+        self.assertEqual(scrub_sentry_breadcrumb("not-a-dict", None), "not-a-dict")
+        self.assertIsNone(scrub_sentry_breadcrumb(None, None))
+        circular: dict[str, object] = {}
+        circular["self"] = circular
+        self.assertIsInstance(scrub_sentry_breadcrumb(circular, None), dict)
+
+    def test_before_breadcrumb_is_wired_into_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            self.assertTrue(init_sentry(dsn=DSN))
+        _, kwargs = sdk.init.call_args
+        self.assertIs(kwargs["before_breadcrumb"], scrub_sentry_breadcrumb)
+        scrubbed = kwargs["before_breadcrumb"](
+            {"message": "hi alice@example.com 10.1.2.3"}, {}
+        )
+        rendered = json.dumps(scrubbed)
+        self.assertNotIn("alice@example.com", rendered)
+        self.assertNotIn("10.1.2.3", rendered)
 
 
 if __name__ == "__main__":

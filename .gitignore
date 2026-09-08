@@ -23,6 +23,12 @@ google-oauth.json
 .DS_Store
 .cache_ggshield
 .ruff_cache/
+# D26: never commit local secrets, logs, or editor state.
+.env
+.env.*
+*.log
+.idea/
+.vscode/
 /.coverage
 /.coverage.*
 /coverage.json

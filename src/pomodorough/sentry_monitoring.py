@@ -43,6 +43,7 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "passwd",
         "password",
         "authorization",
+        "auth",
         "bearer",
         "api_key",
         "apikey",
@@ -50,17 +51,31 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "invite",
         "ticket",
         "cookie",
+        "dsn",
+        "credential",
         "code",
     }
 )
 # `code` matches only as an exact or suffix hit: substring matching
 # over-filters codec operations ("encode", "codec") and hides numeric
 # diagnostics. The allowlist covers diagnostic codes that are safe to keep.
+# D26: `auth`/`dsn`/`credential` are substring hits on purpose. `auth`
+# also matches `author`/`oauth` and stays filtered fail-closed: those
+# contexts can carry PII or credential-adjacent values, and hiding a
+# display name is safer than leaking a token. `credential` covers both
+# `credential` and `credentials`.
 _CODE_SUFFIX_ALLOWLIST = frozenset({"errorcode", "statuscode", "exitcode"})
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/=]+")
+# D25: free-text scrubbers beyond key-based filtering, per the privacy
+# notice (direct peers learn IPs; invite codes grant full room access and
+# can embed network addresses). Key filtering alone misses these inside
+# messages, breadcrumbs, and exception values.
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_INVITE_RE = re.compile(r"pomodorough1\.[A-Za-z0-9_-]+")
+_CODE_PARAM_RE = re.compile(r"(?i)([?&]code=)[^&\s\"';]+")
 
 
 def _config_root() -> Path:
@@ -223,7 +238,10 @@ def _scrub_string(text: str) -> str:
     redacted = _EMAIL_RE.sub(_FILTERED, text)
     redacted = _POSIX_HOME_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _WINDOWS_HOME_RE.sub(r"\1" + _FILTERED, redacted)
-    return _BEARER_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _BEARER_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _INVITE_RE.sub(_FILTERED, redacted)
+    redacted = _CODE_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
+    return _IPV4_RE.sub(_FILTERED, redacted)
 
 
 def _scrub_bytes(value: bytes | bytearray) -> str:
@@ -280,6 +298,22 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
         return event
 
 
+def scrub_sentry_breadcrumb(crumb: Any, hint: Any | None = None) -> Any:
+    """Scrub a single Sentry breadcrumb with the same policy as events.
+
+    Breadcrumbs carry messages, URLs, and data that can embed emails,
+    IPs, invite codes, and OAuth codes. Never raises: on internal error
+    the original crumb is returned so telemetry keeps flowing.
+    """
+    del hint
+    try:
+        if not isinstance(crumb, dict):
+            return crumb
+        return _scrub_value(crumb)
+    except Exception:  # noqa: BLE001 - scrubber must stay non-fatal.
+        return crumb
+
+
 def capture_exception(error: BaseException | None = None) -> None:
     """Report to Sentry when initialized; otherwise a silent no-op.
 
@@ -314,6 +348,7 @@ def init_sentry(
             environment=environment,
             send_default_pii=False,
             before_send=scrub_sentry_event,
+            before_breadcrumb=scrub_sentry_breadcrumb,
         )
     except Exception:  # noqa: BLE001 - init failure must stay non-fatal.
         traceback.print_exc()

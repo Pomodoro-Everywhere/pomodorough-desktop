@@ -300,7 +300,9 @@ class Store:
             try:
                 self.path.parent.chmod(0o700)
             except OSError:
-                # Best-effort hardening; some filesystems ignore chmod.
+                # D26 LOW triage: best-effort hardening; some filesystems
+                # ignore chmod and the database still opens below, so a
+                # chmod failure is not actionable; stay silent.
                 pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
