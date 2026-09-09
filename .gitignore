@@ -47,3 +47,5 @@ screenshots/*.png
 *~
 *.swp
 *.orig
+# D34: operator download-staging dirs (e.g. desk021dl/) are fetch residue, never source.
+desk*dl/
