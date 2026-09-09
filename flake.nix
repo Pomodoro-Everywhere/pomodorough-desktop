@@ -35,7 +35,7 @@
         {
           default = pkgs.python3.pkgs.buildPythonApplication {
             pname = "pomodorough-linux";
-            version = "0.22.0";
+            version = "0.22.1";
             pyproject = true;
             src = pkgs.lib.fileset.toSource {
               root = ./.;
