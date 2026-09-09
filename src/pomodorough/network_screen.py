@@ -349,5 +349,5 @@ class NetworkScreen(QFrame):
     def stylesheet() -> str:
         return """
         QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
-        QLabel#privacyNotice { color: palette(mid); background: palette(alternate-base); border-left: 4px solid palette(highlight); padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
+        QLabel#privacyNotice { color: palette(text); background: palette(alternate-base); border-left: 4px solid palette(highlight); padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
         """

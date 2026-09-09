@@ -214,7 +214,7 @@ class TasksScreen(QFrame):
     def stylesheet() -> str:
         return """
         QLabel#countBadge { background: palette(highlight); color: palette(highlighted-text); border: 2px solid palette(mid); padding: 2px 8px; font-weight: bold; }
-        QLabel#emptyState { color: palette(mid); padding: 24px; }
+        QLabel#emptyState { color: palette(text); padding: 24px; }
         QTableWidget { background: palette(base); color: palette(text); border: 2px solid palette(mid); gridline-color: palette(alternate-base); outline: none; }
         QHeaderView::section { background: palette(button); color: palette(button-text); border: 1px solid palette(mid); padding: 6px; font-weight: 800; }
         """
