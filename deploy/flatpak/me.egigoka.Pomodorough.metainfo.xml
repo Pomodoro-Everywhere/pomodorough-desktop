@@ -24,6 +24,7 @@
   <url type="homepage">https://github.com/Pomodoro-Everywhere/pomodorough-desktop</url>
   <url type="bugtracker">https://github.com/Pomodoro-Everywhere/pomodorough-desktop/issues</url>
   <releases>
+    <release version="0.22.0" date="2026-09-09"/>
     <release version="0.21.0" date="2026-09-08"/>
     <release version="0.20.0" date="2026-09-08"/>
     <release version="0.19.0" date="2026-09-08"/>
