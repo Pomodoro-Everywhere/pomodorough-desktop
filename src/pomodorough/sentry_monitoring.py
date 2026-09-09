@@ -66,6 +66,9 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "nonce",
         "verifier",
         "challenge",
+        "session",
+        "ssid",
+        "sid",
     }
 )
 # `code` matches only as an exact or suffix hit: substring matching
@@ -84,6 +87,10 @@ _SENSITIVE_KEY_PARTS = frozenset(
 # OAuth state, nonce, PKCE verifier, and challenge grant account access;
 # over-filtering (`statement`, `announce`) is safer than leaking a secret.
 # `verifier` covers `code_verifier`; `challenge` covers `code_challenge`.
+# D35: `session`/`ssid`/`sid` are substring hits on purpose. Session IDs
+# grant account access; over-filtering (`obsession`, `consider`, `reside`)
+# is safer than leaking a session. `session` covers `session_id` and
+# `sessionId`; `sid` covers `sid` and `ssid` (`ssid` listed explicitly).
 _CAPTURE_FALLBACK_COUNT = 0
 _ORIGINAL_SYS_EXCEPTHOOK: Any = None
 _EXCEPTION_HANDLERS_INSTALLED = False

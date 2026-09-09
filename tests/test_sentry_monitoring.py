@@ -1166,5 +1166,59 @@ class D31OAuthScrubTests(unittest.TestCase):
                 self.assertEqual(scrubbed["extra"][key], "[Filtered]")
 
 
+class D35SessionScrubTests(unittest.TestCase):
+    def test_session_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "session": "session-secret-1",
+                "session_id": "session-id-secret-2",
+                "sessionId": "session-id-secret-3",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "session-secret-1",
+            "session-id-secret-2",
+            "session-id-secret-3",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["session"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["session_id"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["sessionId"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_sid_ssid_keys_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "sid": "sid-secret-1",
+                "ssid": "ssid-secret-2",
+                "clientSid": "client-sid-secret-3",
+                "retryCount": 1,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "sid-secret-1",
+            "ssid-secret-2",
+            "client-sid-secret-3",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["sid"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["ssid"], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 1)
+
+    def test_session_keys_stay_case_insensitive(self) -> None:
+        event = {"extra": {"Session": "a", "SESSION_ID": "b", "SID": "c", "SSID": "d"}}
+        scrubbed = scrub_sentry_event(event, None)
+        for key in ("Session", "SESSION_ID", "SID", "SSID"):
+            with self.subTest(key=key):
+                self.assertEqual(scrubbed["extra"][key], "[Filtered]")
+
+
 if __name__ == "__main__":
     unittest.main()
