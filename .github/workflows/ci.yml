@@ -177,6 +177,17 @@ jobs:
           path: pomodorough-core-source
           persist-credentials: false
 
+      - name: Cache Cargo downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pomodorough-core-source/target
+          key: cargo-${{ runner.os }}-1.97.1-${{ env.CORE_COMMIT }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.97.1-
+
       - name: Verify pinned source and released shared core
         shell: bash
         run: |
@@ -212,6 +223,14 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
+
+      - name: Cache npm downloads for Pyright
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.npm
+          key: npm-pyright-1.1.413-${{ runner.os }}
+          restore-keys: |
+            npm-pyright-
 
       - name: Install Ruff
         run: python -m pip install ruff==0.15.22

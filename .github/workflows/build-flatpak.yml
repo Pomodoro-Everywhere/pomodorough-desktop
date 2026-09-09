@@ -93,7 +93,7 @@ jobs:
           bundle: Pomodorough-${{ steps.release.outputs.version }}-x86_64.flatpak
           manifest-path: deploy/flatpak/me.egigoka.Pomodorough.yml
           arch: x86_64
-          cache-key: flatpak-builder-${{ github.sha }}
+          cache-key: flatpak-builder-kde-6.10-${{ hashFiles('deploy/flatpak/me.egigoka.Pomodorough.yml') }}
 
       - name: Verify shared core in Flatpak bundle
         shell: bash

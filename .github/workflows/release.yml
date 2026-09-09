@@ -257,7 +257,7 @@ jobs:
 
   flatpak:
     name: Build Flatpak
-    needs: package
+    needs: ci
     permissions:
       contents: read
     uses: ./.github/workflows/build-flatpak.yml
@@ -266,7 +266,7 @@ jobs:
 
   windows:
     name: Build Windows executable
-    needs: package
+    needs: ci
     permissions:
       contents: read
     uses: ./.github/workflows/build-windows.yml
