@@ -377,6 +377,20 @@ jobs:
           )
           expected_release_assets=("${expected_assets[@]}" "SHA256SUMS.txt")
 
+          verify_attestations() {
+            local asset pid failed=0
+            local -a pids=()
+            # Fixed six-asset inventory bounds concurrency; collect every result.
+            for asset in "${expected_release_assets[@]}"; do
+              gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" &
+              pids+=("$!")
+            done
+            for pid in "${pids[@]}"; do
+              wait "$pid" || failed=1
+            done
+            return "$failed"
+          }
+
           verify_release_assets() {
             published_dir="$(mktemp -d "$RUNNER_TEMP/published-release.XXXXXX")"
             gh release download "$RELEASE_TAG" \
@@ -391,10 +405,7 @@ jobs:
               printf '%s\n' "${expected_assets[@]}" | sort > expected-manifest-assets.txt
               awk '{print $2}' SHA256SUMS.txt | sed 's|^\*||' | sort > actual-manifest-assets.txt
               cmp expected-manifest-assets.txt actual-manifest-assets.txt
-              for asset in "${expected_assets[@]}"; do
-                gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
-              done
-              gh attestation verify SHA256SUMS.txt --repo "$GITHUB_REPOSITORY"
+              verify_attestations
             )
             test -n "$COMPROMISED_GOOGLE_CLIENT_SECRET"
             published_scan="$(mktemp -d "$RUNNER_TEMP/published-secret-scan.XXXXXX")"
