@@ -19,9 +19,9 @@ WINDOWS_LAUNCHER = ROOT / "deploy" / "windows" / "launcher.py"
 HOMEBREW_FORMULA = ROOT / "deploy" / "homebrew" / "pomodorough.rb.in"
 FLAKE = ROOT / "flake.nix"
 
-CORE_COMMIT = "238ef9fb9bff60d541da00b9b58b72b0d68d1f4d"
-CORE_RELEASE_TAG = "v0.23.0"
-CORE_SHA256 = "659a492ee2543e8166526b8bb7a7b4b51aef43447aba4c97b5baa841f924cbfa"
+CORE_COMMIT = "cf818b8636a71a2b1470df12b844e48481f051e8"
+CORE_RELEASE_TAG = "v0.24.0"
+CORE_SHA256 = "0878d0e7297971dbe5a84208c3b9c7817f3648207b6ac78f0962c011ef34eec6"
 PROVENANCE_SCRIPT = ROOT / "scripts" / "verify_shared_core_provenance.py"
 UNPACK_RELEASE_SCRIPT = ROOT / "scripts" / "unpack_release_artifacts.sh"
 VERIFY_RELEASE_SCRIPT = ROOT / "scripts" / "verify_release_artifacts.sh"
@@ -401,14 +401,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(
             "cmp expected-manifest-assets.txt actual-manifest-assets.txt", verification
         )
-        self.assertIn('for asset in "${expected_assets[@]}"; do', verification)
+        attestations = workflow.split("          verify_attestations() {", 1)[1].split(
+            "          }", 1
+        )[0]
+        self.assertIn("              verify_attestations\n", verification)
+        self.assertIn('for asset in "${expected_release_assets[@]}"; do', attestations)
         self.assertIn(
-            'gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"',
-            verification,
+            'gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" &',
+            attestations,
         )
         self.assertIn(
-            "gh attestation verify SHA256SUMS.txt --repo \"$GITHUB_REPOSITORY\"",
-            verification,
+            'expected_release_assets=("${expected_assets[@]}" "SHA256SUMS.txt")',
+            workflow,
         )
 
     def test_installed_python_artifacts_run_gui_smoke_without_tracebacks(self) -> None:
