@@ -46,10 +46,10 @@ class _MemorySecretStore:
     def load(self, key: str) -> bytes | None:
         return self.values.get(key)
 
-    def save(self, key: str, value: bytes) -> None:
+    def save(self, key: str, secret: bytes) -> None:
         if self.fail_save:
             raise SecureStoreError("controlled secure-store failure")
-        self.values[key] = value
+        self.values[key] = secret
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
@@ -72,12 +72,12 @@ class _PrivateFileSecretStore:
         except FileNotFoundError:
             return None
 
-    def save(self, key: str, value: bytes) -> None:
+    def save(self, key: str, secret: bytes) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._path(key)
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "wb") as output:
-            output.write(value)
+            output.write(secret)
         path.chmod(0o600)
 
     def delete(self, key: str) -> None:
@@ -414,10 +414,10 @@ def _platform_store_roundtrip(store: Any) -> bool:
     if not available:
         return False
     key = f"oauth-artifact:{secrets.token_hex(16)}"
-    value = secrets.token_bytes(32)
+    secret = secrets.token_bytes(32)
     try:
-        store.save(key, value)
-        if store.load(key) != value:
+        store.save(key, secret)
+        if store.load(key) != secret:
             return False
         store.delete(key)
         return store.load(key) is None
@@ -442,9 +442,9 @@ def _new_platform_store(root: Path) -> PlatformSecretStore:
 def _verify_platform_store_child(root: Path, key: str, digest: str) -> bool:
     store = _new_platform_store(root)
     try:
-        value = store.load(key)
-        if value is None or not secrets.compare_digest(
-            hashlib.sha256(value).hexdigest(), digest
+        secret = store.load(key)
+        if secret is None or not secrets.compare_digest(
+            hashlib.sha256(secret).hexdigest(), digest
         ):
             return False
         store.delete(key)
@@ -479,10 +479,10 @@ def _platform_store_process_roundtrip(root: Path) -> bool:
     if not available:
         return False
     key = f"oauth-artifact:{secrets.token_hex(16)}"
-    value = secrets.token_bytes(32)
-    digest = hashlib.sha256(value).hexdigest()
+    secret = secrets.token_bytes(32)
+    digest = hashlib.sha256(secret).hexdigest()
     try:
-        store.save(key, value)
+        store.save(key, secret)
         result = subprocess.run(
             _platform_store_child_command(root, key, digest),
             capture_output=True,

@@ -353,11 +353,11 @@ class IrohService(QObject):
         self, iroh: Any, owner: int
     ) -> tuple[Any, bool] | None:
         self.status_changed.emit("OPENING ROUTE")
-        key = self.key_store.load_or_create()
+        endpoint_secret = self.key_store.load_or_create()
         endpoint = await iroh.Endpoint.bind(
             iroh.EndpointOptions(
                 preset=iroh.preset_n0(),
-                secret_key=key,
+                secret_key=endpoint_secret,
                 alpns=[ALPN],
             )
         )

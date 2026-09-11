@@ -97,6 +97,7 @@ _EXCEPTION_HANDLERS_INSTALLED = False
 _QT_MESSAGE_HANDLER_INSTALLED = False
 _ORIGINAL_QT_MESSAGE_HANDLER: Any = None
 _CODE_SUFFIX_ALLOWLIST = frozenset({"errorcode", "statuscode", "exitcode"})
+_BARE_SECRET_KEYS = frozenset({"key", "value"})
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
@@ -297,11 +298,20 @@ def _is_code_key(lowered: str) -> bool:
     return True
 
 
+def _is_bare_secret_key(lowered: str) -> bool:
+    # D38: exact `key`/`value` frame vars hold 32B endpoint secrets
+    # (Endpoint.bind, SecretStore.save). Substring `key` over-filters
+    # `keyboard`/`monkey`, so match exact only, like `_is_code_key`.
+    return lowered in _BARE_SECRET_KEYS
+
+
 def _sensitive_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
     lowered = key.lower()
     if _is_code_key(lowered):
+        return True
+    if _is_bare_secret_key(lowered):
         return True
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
@@ -551,6 +561,9 @@ def init_sentry(
             release=release or __version__,
             environment=environment,
             send_default_pii=False,
+            # D38: frame locals carry 32B endpoint secrets (`key`/`value`
+            # frame vars through Endpoint.bind); never capture them.
+            include_local_variables=False,
             before_send=scrub_sentry_event,
             before_breadcrumb=scrub_sentry_breadcrumb,
         )

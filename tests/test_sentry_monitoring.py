@@ -1220,5 +1220,55 @@ class D35SessionScrubTests(unittest.TestCase):
                 self.assertEqual(scrubbed["extra"][key], "[Filtered]")
 
 
+class D38FrameVarsScrubTests(unittest.TestCase):
+    def test_bare_key_value_frame_vars_are_filtered(self) -> None:
+        key_secret = b"K" * 32
+        value_secret = b"V" * 32
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "function": "_open_room_endpoint",
+                                    "vars": {
+                                        "key": key_secret,
+                                        "value": value_secret,
+                                        "secret": "control-secret-xyz",
+                                        "retryCount": 3,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed, default=str)
+        self.assertNotIn("K" * 32, rendered)
+        self.assertNotIn("V" * 32, rendered)
+        self.assertNotIn("control-secret-xyz", rendered)
+        frame_vars = scrubbed["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"]
+        self.assertEqual(frame_vars["key"], "[Filtered]")
+        self.assertEqual(frame_vars["value"], "[Filtered]")
+        self.assertEqual(frame_vars["secret"], "[Filtered]")
+        self.assertEqual(frame_vars["retryCount"], 3)
+
+    def test_key_substring_lookalike_is_preserved(self) -> None:
+        event = {"extra": {"keyboard": "us-layout", "retryCount": 3}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertEqual(scrubbed["extra"]["keyboard"], "us-layout")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_init_disables_local_variables(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            self.assertTrue(init_sentry(dsn=DSN))
+        _, kwargs = sdk.init.call_args
+        self.assertFalse(kwargs["include_local_variables"])
+
+
 if __name__ == "__main__":
     unittest.main()

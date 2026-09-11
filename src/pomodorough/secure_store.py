@@ -41,7 +41,7 @@ class TokenCleanupPendingError(SecureStoreError):
 class SecretStore(Protocol):
     def load(self, key: str) -> bytes | None: ...
 
-    def save(self, key: str, value: bytes) -> None: ...
+    def save(self, key: str, secret: bytes) -> None: ...
 
     def delete(self, key: str) -> None: ...
 
@@ -110,12 +110,12 @@ class SecretMutationJournal:
             return False
         failures: list[BaseException] = []
         for key in reversed(self._order):
-            previous = self._snapshots[key]
+            previous_secret = self._snapshots[key]
             try:
-                if previous is None:
+                if previous_secret is None:
                     self._store.delete(key)
                 else:
-                    self._store.save(key, previous)
+                    self._store.save(key, previous_secret)
             except BaseException as error:
                 failures.append(error)
         if failures:
@@ -124,9 +124,9 @@ class SecretMutationJournal:
             ) from failures[0]
         return False
 
-    def save(self, key: str, value: bytes) -> None:
+    def save(self, key: str, secret: bytes) -> None:
         self._watch(key)
-        self._store.save(key, value)
+        self._store.save(key, secret)
 
     def delete(self, key: str) -> None:
         self._watch(key)
@@ -176,10 +176,10 @@ def _macos_find(service: str, key: str) -> tuple[int, bytes | None, ctypes.c_voi
         ctypes.byref(data),
         ctypes.byref(item),
     )
-    value = ctypes.string_at(data, length.value) if status == 0 else None
+    secret = ctypes.string_at(data, length.value) if status == 0 else None
     if data.value:
         security.SecKeychainItemFreeContent(None, data)
-    return status, value, item
+    return status, secret, item
 
 
 def _macos_release(item: ctypes.c_void_p) -> None:
@@ -194,24 +194,24 @@ def _macos_require(operation: str, status: int) -> None:
 
 
 def _macos_load(service: str, key: str) -> bytes | None:
-    status, value, item = _macos_find(service, key)
+    status, secret, item = _macos_find(service, key)
     try:
         if status == _MACOS_ITEM_NOT_FOUND:
             return None
         _macos_require("lookup", status)
-        return value
+        return secret
     finally:
         _macos_release(item)
 
 
-def _macos_save(service: str, key: str, value: bytes) -> None:
+def _macos_save(service: str, key: str, secret: bytes) -> None:
     status, _existing, item = _macos_find(service, key)
     security, _core = _macos_frameworks()
-    buffer = ctypes.create_string_buffer(value)
+    buffer = ctypes.create_string_buffer(secret)
     try:
         if status == 0:
             result = security.SecKeychainItemModifyAttributesAndData(
-                item, None, len(value), ctypes.cast(buffer, ctypes.c_void_p)
+                item, None, len(secret), ctypes.cast(buffer, ctypes.c_void_p)
             )
         elif status == _MACOS_ITEM_NOT_FOUND:
             service_bytes = service.encode("utf-8")
@@ -223,7 +223,7 @@ def _macos_save(service: str, key: str, value: bytes) -> None:
                 service_bytes,
                 len(key_bytes),
                 key_bytes,
-                len(value),
+                len(secret),
                 ctypes.cast(buffer, ctypes.c_void_p),
                 ctypes.byref(created),
             )
@@ -237,7 +237,7 @@ def _macos_save(service: str, key: str, value: bytes) -> None:
 
 
 def _macos_delete(service: str, key: str) -> None:
-    status, _value, item = _macos_find(service, key)
+    status, _secret, item = _macos_find(service, key)
     try:
         if status == _MACOS_ITEM_NOT_FOUND:
             return
@@ -322,20 +322,20 @@ class PlatformSecretStore:
         except ValueError as error:
             raise SecureStoreError("Secure storage returned malformed data.") from error
 
-    def save(self, key: str, value: bytes) -> None:
+    def save(self, key: str, secret: bytes) -> None:
         self._validate_key(key)
-        if not isinstance(value, bytes) or not value:
+        if not isinstance(secret, bytes) or not secret:
             raise SecureStoreError("Secure value must contain bytes.")
         available, reason = self.availability()
         if not available:
             raise SecureStoreError(reason)
         if os.name == "nt":
-            self._write_private(self._windows_path(key), self._windows_protect(value))
+            self._write_private(self._windows_path(key), self._windows_protect(secret))
             return
         if sys_platform() == "darwin":
-            _macos_save(self.service, key, value)
+            _macos_save(self.service, key, secret)
             return
-        encoded = base64.b64encode(value).decode("ascii")
+        encoded = base64.b64encode(secret).decode("ascii")
         result = self._run(self._command("save", key), input_text=encoded)
         if result.returncode != 0:
             raise SecureStoreError(
@@ -421,15 +421,15 @@ class PlatformSecretStore:
         return self.root / name
 
     @staticmethod
-    def _windows_protect(value: bytes) -> bytes:
-        return _windows_crypt(value, protect=True)
+    def _windows_protect(secret: bytes) -> bytes:
+        return _windows_crypt(secret, protect=True)
 
     @staticmethod
-    def _windows_unprotect(value: bytes) -> bytes:
-        return _windows_crypt(value, protect=False)
+    def _windows_unprotect(secret: bytes) -> bytes:
+        return _windows_crypt(secret, protect=False)
 
     @staticmethod
-    def _write_private(path: Path, value: bytes) -> None:
+    def _write_private(path: Path, secret: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
@@ -438,7 +438,7 @@ class PlatformSecretStore:
                 os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as output:
                 descriptor = -1
-                output.write(value)
+                output.write(secret)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, path)
@@ -455,12 +455,12 @@ class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
 
-def _windows_crypt(value: bytes, *, protect: bool) -> bytes:
+def _windows_crypt(secret: bytes, *, protect: bool) -> bytes:
     if os.name != "nt":
         raise SecureStoreError("Windows Data Protection API is unavailable.")
-    source_buffer = ctypes.create_string_buffer(value)
+    source_buffer = ctypes.create_string_buffer(secret)
     source = _DataBlob(
-        len(value), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_ubyte))
+        len(secret), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_ubyte))
     )
     target = _DataBlob()
     crypt32 = ctypes.windll.crypt32
