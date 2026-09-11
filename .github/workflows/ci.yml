@@ -31,9 +31,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CORE_COMMIT: "e4fed82d6902f226fa1063bc3489f5e44828abfb"
-  CORE_RELEASE_TAG: "v0.27.0"
-  CORE_SHA256: "3c2bcb5a35caacf22dcf13291f139f05e2c530d2c0823e7a1bd7b095a58e5bd5"
+  CORE_COMMIT: "c7a5b0ea110ae75df1f4629881220b850d5f7ea2"
+  CORE_RELEASE_TAG: "v0.28.0"
+  CORE_SHA256: "723a3e642aaf29f0f68bcc38ecf2ec0e97ad05912787785dc459d7425c6f545f"
 
 jobs:
   candidate-source:
