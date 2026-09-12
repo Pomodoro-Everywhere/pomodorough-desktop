@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -26,6 +27,7 @@ from .core import (
     empty_timer,
     task_from_title,
 )
+from .sentry_monitoring import capture_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +183,15 @@ class TimerInteractionController:
         if context.replication_mode == "iroh":
             try:
                 context.store.project_iroh_expiry(context.projection_now_ms)
-            except (OSError, ValueError) as error:
-                self._ports.notice(str(error))
+            except (OSError, sqlite3.Error) as error:
+                # D41: infra failure reports to Sentry; failure omits
+                # Synchronize so it is not masked as success.
+                capture_exception(error)
+                self.auto_finish_in_progress = False
+                return done(LoadState(), Render(), EmitNotice(str(error)))
+            except ValueError as error:
+                self.auto_finish_in_progress = False
+                return done(LoadState(), Render(), EmitNotice(str(error)))
             self.auto_finish_in_progress = False
             return done(LoadState(), Render(), Synchronize())
         self._ports.issue_command("finish", True)
@@ -208,7 +217,11 @@ class TimerInteractionController:
                     context.settings["durationsMs"],
                     context.settings.get("selectedTaskId"),
                 )
-            except (OSError, ValueError) as error:
+            except (OSError, sqlite3.Error) as error:
+                # D41: infra failure reports to Sentry, still notice-only.
+                capture_exception(error)
+                return done(EmitNotice(str(error)))
+            except ValueError as error:
                 return done(EmitNotice(str(error)))
             return done(LoadState(), Render(), Synchronize())
         return done()
@@ -237,7 +250,12 @@ class TimerInteractionController:
             return done()
         try:
             queued = self._queue_timer_command_value(context, command_type, automatic)
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            self.auto_finish_in_progress = False
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             self.auto_finish_in_progress = False
             return done(EmitNotice(str(error)))
         if not queued:
@@ -328,7 +346,11 @@ class TimerInteractionController:
                     else require_canonical
                 )
             )
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return returning(False, EmitNotice(str(error)))
+        except ValueError as error:
             return returning(False, EmitNotice(str(error)))
         if not commands:
             return returning(False)
@@ -359,7 +381,13 @@ class TimerInteractionController:
             task_id = None
         try:
             context.store.set_selected_task_id(task_id)
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            self._ports.apply_outcome(done(LoadState()))
+            self._ports.invalidate_task_selector()
+            return done(Render(), EmitNotice(str(error)))
+        except ValueError as error:
             self._ports.apply_outcome(done(LoadState()))
             self._ports.invalidate_task_selector()
             return done(Render(), EmitNotice(str(error)))
@@ -380,7 +408,11 @@ class TimerInteractionController:
                 context.store.queue_task_operation("upsert", task)
             context.settings["selectedTaskId"] = task["id"]
             context.store.set_selected_task_id(task["id"])
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             return done(EmitNotice(str(error)))
         self._ports.clear_task_input()
         return done(LoadState(), Render(), Synchronize())
@@ -397,7 +429,11 @@ class TimerInteractionController:
             if context.settings.get("selectedTaskId") == task_id:
                 context.settings["selectedTaskId"] = None
                 context.store.set_selected_task_id(None)
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             return done(EmitNotice(str(error)))
         return done(LoadState(), Render(), Synchronize())
 
@@ -408,7 +444,11 @@ class TimerInteractionController:
         context = self._context()
         try:
             context.store.queue_duration_operation(phase, value * 60_000)
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return done(LoadState(), EmitNotice(str(error)))
+        except ValueError as error:
             return done(LoadState(), EmitNotice(str(error)))
         self._ports.apply_outcome(done(LoadState()))
         context = self._context()
@@ -425,7 +465,13 @@ class TimerInteractionController:
         context = self._context()
         try:
             context.store.set_auto_start_breaks(enabled)
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            self._ports.apply_outcome(done(LoadState()))
+            self._ports.refresh_auto_breaks(self._context().settings)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             self._ports.apply_outcome(done(LoadState()))
             self._ports.refresh_auto_breaks(self._context().settings)
             return done(EmitNotice(str(error)))

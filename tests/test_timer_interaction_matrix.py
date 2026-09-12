@@ -105,8 +105,11 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         )
         harness.store.project_iroh_expiry.assert_called_once_with(123_000)
         harness.store.project_iroh_expiry.side_effect = ValueError("projection failed")
-        harness.controller.tick()
-        harness.ports.notice.assert_called_with("projection failed")
+        failed = harness.controller.tick()
+        # D41: failure surfaces via EmitNotice and omits Synchronize.
+        self.assertIsInstance(failed.effects[-1], EmitNotice)
+        self.assertEqual(failed.effects[-1].message, "projection failed")
+        self.assertNotIn(Synchronize, tuple(map(type, failed.effects)))
         self.assertFalse(harness.controller.auto_finish_in_progress)
 
     def test_expired_centralized_timer_delegates_eligibility_to_store(self) -> None:

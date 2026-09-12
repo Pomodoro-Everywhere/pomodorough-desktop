@@ -139,7 +139,13 @@ class ReplicationController:
         context = self._context()
         try:
             context.store.set_replication_mode(mode)
-        except (OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            self._ports.set_replication_mode(self.mode)
+            effects = (LoadState(), Render()) if cancelled_join else ()
+            return done(EmitNotice(str(error)), *effects)
+        except ValueError as error:
             self._ports.set_replication_mode(self.mode)
             effects = (LoadState(), Render()) if cancelled_join else ()
             return done(EmitNotice(str(error)), *effects)
@@ -192,7 +198,13 @@ class ReplicationController:
         try:
             if self._saved_iroh_room_ready_value():
                 return True
-        except (OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            self._ports.set_replication_mode(self.mode)
+            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            return False
+        except ValueError as error:
             self._ports.set_replication_mode(self.mode)
             self._ports.apply_outcome(done(EmitNotice(str(error))))
             return False
@@ -268,7 +280,11 @@ class ReplicationController:
         )
         try:
             room_id = context.store.create_iroh_room(secrets.token_bytes(32), name)
-        except (OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             return done(EmitNotice(str(error)))
         self.mode = "iroh"
         context.cloud.stop_revision_stream()
@@ -305,7 +321,12 @@ class ReplicationController:
                 invite.endpoint_id,
                 invite.endpoint_ticket,
             )
-        except (IrohProtocolError, OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            # IrohProtocolError subclasses ValueError and stays validation-only.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except (IrohProtocolError, ValueError) as error:
             return done(EmitNotice(str(error)))
         return self._start_iroh_join(invite)
 
@@ -354,7 +375,12 @@ class ReplicationController:
             self._cancel_iroh_join()
             try:
                 context.store.set_replication_mode("offline")
-            except (OSError, ValueError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error) as error:
+                # D41: infra failure reports to Sentry, still notice-only.
+                capture_exception(error)
+                self._ports.set_replication_mode(self.mode)
+                return done(EmitNotice(str(error)), LoadState(), Render())
+            except ValueError as error:
                 self._ports.set_replication_mode(self.mode)
                 return done(EmitNotice(str(error)), LoadState(), Render())
             self.mode = "offline"
@@ -371,7 +397,11 @@ class ReplicationController:
             return done()
         try:
             context.store.leave_iroh_room()
-        except (OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D41: infra failure reports to Sentry, still notice-only for user.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
             return done(EmitNotice(str(error)))
         if context.iroh is not None:
             context.iroh.stop()
@@ -391,7 +421,11 @@ class ReplicationController:
         if context.iroh is not None:
             try:
                 context.store.capture_local_iroh_records()
-            except (OSError, ValueError) as error:
+            except (OSError, sqlite3.Error) as error:
+                # D41: infra failure reports to Sentry, still notice-only.
+                capture_exception(error)
+                return done(EmitNotice(str(error)))
+            except ValueError as error:
                 return done(EmitNotice(str(error)))
             context.iroh.sync_now()
         return done()
