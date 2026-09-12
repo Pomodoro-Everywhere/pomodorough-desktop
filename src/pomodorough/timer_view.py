@@ -42,9 +42,13 @@ class _ClockGeometry:
         )
 
 
-def ceiling_minutes(planned_ms: int) -> int:
+def ceiling_minutes(planned_ms: int | None) -> int:
     """One tick per ceiling minute of the displayed timer, like Apple Dial."""
-    return max(1, (max(1, int(planned_ms)) + 59_999) // 60_000)
+    try:
+        value = int(planned_ms)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 25
+    return max(1, (max(1, value) + 59_999) // 60_000)
 
 
 class _ClockRenderer:

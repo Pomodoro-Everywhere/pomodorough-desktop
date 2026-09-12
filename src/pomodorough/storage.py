@@ -56,6 +56,7 @@ from .storage_model import (
 from .storage_replication import ReplicationStorage, _iroh_conflict_time_ms
 from .storage_sync import SyncStorage, SyncStorageDependencies
 from .storage_workspace import WorkspacePersistence
+from .sentry_monitoring import capture_exception
 from .uuid7 import reserve_uuid7, uuid7_parts
 
 _LOCAL_SCHEMA_SQL = """
@@ -1747,7 +1748,15 @@ class Store:
                 now_ms,
                 use_server_clock=use_server_clock,
             )
-            self._retarget_active_focus_task_locked(task_id, now_ms)
+            try:
+                self._retarget_active_focus_task_locked(task_id, now_ms)
+            except (OSError, sqlite3.Error) as error:
+                # D46: retarget marker is local-only best-effort; a read
+                # failure must not roll back the primary selected-task write.
+                # Infra still reports to Sentry; validation stays silent.
+                capture_exception(error)
+            except (ValueError, KeyError):
+                pass
             self._capture_iroh_after_mutation_locked()
         return operation
 
@@ -1782,7 +1791,15 @@ class Store:
             state = self.load(projection=True)
             timer = self.projected_state(now_ms=now_ms, state=state).canonical_timer
         except ValueError:
-            snapshot = self.get_meta("snapshot", {})
+            try:
+                snapshot = self.get_meta("snapshot", {})
+            except (OSError, sqlite3.Error) as error:
+                # D46: fallback read must not mask the original failure.
+                # Infra still reports to Sentry; validation stays silent.
+                capture_exception(error)
+                return None
+            except (ValueError, KeyError):
+                return None
             timer = snapshot.get("canonicalTimer") if isinstance(snapshot, dict) else None
         if not isinstance(timer, dict):
             return None
@@ -2508,7 +2525,11 @@ class Store:
         }
         try:
             retargets = self.task_retargets()
-        except (OSError, ValueError, KeyError):
+        except (OSError, sqlite3.Error) as error:
+            # Infra failure reports to Sentry; history falls back unretargeted.
+            capture_exception(error)
+            retargets = {}
+        except (ValueError, KeyError):
             retargets = {}
         history: list[dict[str, Any]] = []
         for item in projection.history:

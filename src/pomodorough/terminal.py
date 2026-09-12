@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from collections.abc import Callable
 from copy import deepcopy
@@ -16,6 +17,7 @@ from .core import (
     timer_for_display,
 )
 from .localization import Strings
+from .sentry_monitoring import capture_exception
 from .storage import Store
 
 PHASE_ALIASES = {
@@ -56,6 +58,7 @@ class LocalTimer:
         self.pending_durations: list[dict[str, Any]] = []
         self.pending_auto_starts: list[dict[str, Any]] = []
         self.resolution_pending = False
+        self._cached_retargets: dict[str, Any] = {}
         self.reload()
 
     def reload(self, *, now_ms: int | None = None) -> None:
@@ -83,6 +86,18 @@ class LocalTimer:
             self.known_tasks[task["id"]] = task
         self.timer = projection.canonical_timer
         self.history = self.store.projected_history(projection, state)
+        self._cached_retargets = self._load_retargets()
+
+    def _load_retargets(self) -> dict[str, Any]:
+        """D45: cache retarget markers per reload to avoid per-frame reads."""
+        try:
+            return self.store.task_retargets()
+        except (OSError, sqlite3.Error) as error:
+            # Infra failure reports to Sentry; fallback stays empty.
+            capture_exception(error)
+            return {}
+        except (ValueError, KeyError):
+            return {}
 
     @property
     def selected_phase(self) -> str:
@@ -215,6 +230,7 @@ class LocalTimer:
         *,
         elapsed: int | None = None,
         planned: int | None = None,
+        retargets: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         elapsed = elapsed_ms(timer, now_ms) if elapsed is None else elapsed
         planned = (
@@ -223,7 +239,8 @@ class LocalTimer:
             else planned
         )
         remaining = max(0, planned - elapsed)
-        task_id = self._resolved_timer_task_id(timer)
+        cached = retargets if retargets is not None else self._cached_retargets
+        task_id = self._resolved_timer_task_id(timer, cached)
         task = self.known_tasks.get(task_id) if isinstance(task_id, str) else None
         if timer.get("phase") in BREAK_PHASES:
             task_id, task = None, None
@@ -239,7 +256,11 @@ class LocalTimer:
             "progress": min(1.0, elapsed / planned),
         }
 
-    def _resolved_timer_task_id(self, timer: dict[str, Any]) -> str | None:
+    def _resolved_timer_task_id(
+        self,
+        timer: dict[str, Any],
+        retargets: dict[str, Any] | None = None,
+    ) -> str | None:
         """Prefer local retarget marker while a focus timer runs, like Apple."""
         task_id = timer.get("taskId")
         if timer.get("phase") in BREAK_PHASES:
@@ -249,11 +270,33 @@ class LocalTimer:
         timer_id = timer.get("id")
         if not isinstance(timer_id, str) or not timer_id:
             return task_id if isinstance(task_id, str) else None
+        if retargets is None:
+            retargets = getattr(self, "_cached_retargets", None)
+        if isinstance(retargets, dict):
+            return self._retarget_from_map(timer_id, task_id, retargets)
         try:
             found, retargeted = self.store.retargeted_task_id(timer_id)
-        except (OSError, ValueError, KeyError):
+        except (OSError, sqlite3.Error) as error:
+            # Infra failure reports to Sentry; fallback keeps timer task.
+            capture_exception(error)
+            return task_id if isinstance(task_id, str) else None
+        except (ValueError, KeyError):
             return task_id if isinstance(task_id, str) else None
         return retargeted if found else (task_id if isinstance(task_id, str) else None)
+
+    @staticmethod
+    def _retarget_from_map(
+        timer_id: str,
+        task_id: Any,
+        retargets: dict[str, Any],
+    ) -> str | None:
+        """D45: resolve from cached markers without a per-frame DB read."""
+        if timer_id not in retargets:
+            return task_id if isinstance(task_id, str) else None
+        retargeted = retargets[timer_id]
+        if isinstance(retargeted, str) and retargeted:
+            return retargeted
+        return None
 
     def _state_document(
         self,
@@ -263,11 +306,13 @@ class LocalTimer:
         canonical_elapsed: int,
         canonical_planned: int,
     ) -> dict[str, Any]:
+        cached = getattr(self, "_cached_retargets", None)
         metrics = self._timer_metrics(
             timer,
             projection_now_ms,
             elapsed=canonical_elapsed,
             planned=canonical_planned,
+            retargets=cached,
         )
         return {
             "timerId": timer.get("id") or None,
@@ -281,7 +326,9 @@ class LocalTimer:
             "remainingMs": metrics["remainingMs"],
             "remaining": metrics["remaining"],
             "progress": metrics["progress"],
-            "display": self._timer_metrics(display_timer, projection_now_ms),
+            "display": self._timer_metrics(
+                display_timer, projection_now_ms, retargets=cached
+            ),
             "pendingCommands": len(self.pending),
             "pendingDurationOperations": len(self.pending_durations),
             "pendingAutoStartOperations": len(self.pending_auto_starts),

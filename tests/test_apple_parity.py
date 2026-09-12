@@ -93,6 +93,11 @@ class CeilingMinuteTests(unittest.TestCase):
             with self.subTest(planned=planned):
                 self.assertEqual(ceiling_minutes(planned), expected)
 
+    def test_ceiling_none_and_invalid_fallback(self) -> None:
+        for planned in (None, "bad", "", object()):
+            with self.subTest(planned=planned):
+                self.assertEqual(ceiling_minutes(planned), 25)
+
     def test_long_tick_every_fifth(self) -> None:
         for total in (1, 5, 25):
             with self.subTest(total=total):
@@ -207,6 +212,8 @@ class TaskRetargetTests(unittest.TestCase):
         self.store.queue_task_operation("upsert", other, now_ms=2)
         self.store.set_selected_task_id(task["id"], now_ms=3)
         start = self._start_focus(task["id"], now_ms=4)
+        # D48: retarget while running so the marker exists before finish.
+        self.store.set_selected_task_id(other["id"], now_ms=5)
         timer = {
             "id": start["timerId"],
             "phase": "focus",
@@ -217,13 +224,54 @@ class TaskRetargetTests(unittest.TestCase):
             "taskId": task["id"],
         }
         settings = self.store.load()["settings"]
-        self.store.queue_command("finish", timer, "focus", settings["durationsMs"], now_ms=5)
-        self.store.set_selected_task_id(other["id"], now_ms=6)
+        self.store.queue_command("finish", timer, "focus", settings["durationsMs"], now_ms=6)
         state = self.store.load(projection=True)
         projection = self.store.projected_state(now_ms=6, state=state)
         history = self.store.projected_history(projection, state)
         matches = [h for h in history if h.get("timerId") == start["timerId"]]
         self.assertTrue(matches)
+        self.assertEqual(matches[0].get("taskId"), other["id"])
+        self._assert_unassign_clears_history(start, other["id"])
+
+    def _assert_unassign_clears_history(
+        self, finished: dict[str, object], other_id: str
+    ) -> None:
+        """D48: unassign while running clears the history taskId."""
+        completed = {
+            "id": finished["timerId"],
+            "phase": "focus",
+            "status": "completed",
+            "plannedDurationMs": finished["plannedDurationMs"],
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": finished["occurredAt"],
+            "taskId": other_id,
+        }
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "clear", completed, "focus", settings["durationsMs"], now_ms=7
+        )
+        self.store.set_selected_task_id(other_id, now_ms=8)
+        start = self._start_focus(other_id, now_ms=9)
+        self.store.set_selected_task_id(None, now_ms=10)
+        timer = {
+            "id": start["timerId"],
+            "phase": "focus",
+            "status": "running",
+            "plannedDurationMs": start["plannedDurationMs"],
+            "elapsedAtAnchorMs": 0,
+            "anchorAt": start["occurredAt"],
+            "taskId": other_id,
+        }
+        settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "finish", timer, "focus", settings["durationsMs"], now_ms=11
+        )
+        state = self.store.load(projection=True)
+        projection = self.store.projected_state(now_ms=11, state=state)
+        history = self.store.projected_history(projection, state)
+        matches = [h for h in history if h.get("timerId") == start["timerId"]]
+        self.assertTrue(matches)
+        self.assertNotIn("taskId", matches[0])
 
     def test_terminal_metrics_prefers_retarget(self) -> None:
         first = task_from_title("Active first")

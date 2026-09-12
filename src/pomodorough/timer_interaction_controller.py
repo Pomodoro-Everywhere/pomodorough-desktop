@@ -307,9 +307,17 @@ class TimerInteractionController:
         self, command_type: str, automatic: bool
     ) -> ControllerOutcome[bool]:
         context = self._context()
-        return returning(
-            self._queue_timer_command_value(context, command_type, automatic)
-        )
+        try:
+            queued = self._queue_timer_command_value(
+                context, command_type, automatic
+            )
+        except (OSError, sqlite3.Error) as error:
+            # D43: direct dispatch bypasses issue() guard; same split as D41.
+            capture_exception(error)
+            return returning(False, EmitNotice(str(error)))
+        except ValueError as error:
+            return returning(False, EmitNotice(str(error)))
+        return returning(queued)
 
     def after_timer_command(
         self, command_type: str, automatic: bool
@@ -364,7 +372,14 @@ class TimerInteractionController:
             return done(Render())
         context = self._context()
         context.settings["selectedPhase"] = phase
-        context.store.set_selected_phase(phase)
+        try:
+            context.store.set_selected_phase(phase)
+        except (OSError, sqlite3.Error) as error:
+            # D42: same OSError/sqlite3 vs ValueError split as D41.
+            capture_exception(error)
+            return done(Render(), EmitNotice(str(error)))
+        except ValueError as error:
+            return done(Render(), EmitNotice(str(error)))
         return done(Render())
 
     def task_selection_changed(self, index: int) -> ControllerOutcome[None]:
