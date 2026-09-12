@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .core import (
     ACTIVE_STATUSES,
-    BREAK_PHASES,
     PHASES,
     TERMINAL_STATUSES,
     completed_focus_count_for_day,
@@ -32,7 +31,7 @@ from .core import (
     timer_for_display,
 )
 from .localization import Strings
-from .timer_view import ClockWidget
+from .timer_view import ClockWidget, ceiling_minutes
 
 
 @dataclass(frozen=True)
@@ -338,6 +337,7 @@ class TimerScreen(QWidget):
             phase_label,
             labels.get(state.status, state.status),
             state.elapsed / state.planned,
+            ceiling_minutes(state.display_timer.get("plannedDurationMs", state.planned)),
         )
         progress = long_break_progress(completed_focus_count_for_day(history))
         self.long_break_progress.setText("●" * progress + "○" * (4 - progress))
@@ -409,23 +409,12 @@ class TimerScreen(QWidget):
         known_tasks: dict[str, dict[str, Any]],
         mutations_enabled: bool,
     ) -> None:
-        selected_task_id = (
-            settings.get("selectedTaskId") if selected_phase == "focus" else None
-        )
-        active_task_id = timer.get("taskId") if active else None
-        active_task = known_tasks.get(active_task_id) if active_task_id else None
-        active_task_label = self._active_task_label(active_task, active_task_id)
-        show_active_task = active and timer.get("phase") not in BREAK_PHASES
-        self.active_task_context.setText(
-            self.strings.text("task.active_context", task=active_task_label)
-            if show_active_task
-            else ""
-        )
-        self.active_task_context.setVisible(show_active_task)
+        del timer, active, selected_phase
+        selected_task_id = settings.get("selectedTaskId")
+        self.active_task_context.setText("")
+        self.active_task_context.setVisible(False)
         choices = self._task_choices(tasks, known_tasks, selected_task_id)
         signature = self._selector_state(
-            timer,
-            selected_phase,
             selected_task_id,
             choices,
             mutations_enabled,
@@ -434,26 +423,10 @@ class TimerScreen(QWidget):
             return
         self._task_selector_signature = signature
         self._populate_task_selector(choices, selected_task_id)
-        self._configure_task_selector(
-            active,
-            active_task_label if show_active_task else "",
-            selected_phase,
-            mutations_enabled,
-        )
+        self._configure_task_selector(mutations_enabled)
 
     def invalidate_task_selector(self) -> None:
         self._task_selector_signature = None
-
-    def _active_task_label(
-        self,
-        task: dict[str, Any] | None,
-        task_id: str | None,
-    ) -> str:
-        if task:
-            return task["title"]
-        if task_id:
-            return self.strings.text("task.deleted")
-        return self.strings.text("task.unassigned")
 
     def _task_choices(
         self,
@@ -476,15 +449,11 @@ class TimerScreen(QWidget):
 
     @staticmethod
     def _selector_state(
-        timer: dict[str, Any],
-        selected_phase: str,
         selected_task_id: str | None,
         choices: list[dict[str, Any]],
         mutations_enabled: bool,
     ) -> tuple[Any, ...]:
         return (
-            timer.get("status"),
-            selected_phase,
             selected_task_id,
             mutations_enabled,
             tuple((task["id"], task["title"]) for task in choices),
@@ -518,22 +487,11 @@ class TimerScreen(QWidget):
 
     def _configure_task_selector(
         self,
-        active: bool,
-        active_task_label: str,
-        selected_phase: str,
         mutations_enabled: bool,
     ) -> None:
-        self.task_combo.setEnabled(mutations_enabled and selected_phase == "focus")
-        self.task_combo.setAccessibleName(
-            self.strings.text("task.next_focus")
-            if active
-            else self.strings.text("task.focus")
-        )
-        description = (
-            self.strings.text("task.next_description", task=active_task_label)
-            if active and active_task_label
-            else ""
-        )
+        self.task_combo.setEnabled(mutations_enabled)
+        self.task_combo.setAccessibleName(self.strings.text("task.focus"))
+        description = self.strings.text("task.retarget_hint")
         self.task_combo.setAccessibleDescription(description)
         self.task_combo.setToolTip(description)
 

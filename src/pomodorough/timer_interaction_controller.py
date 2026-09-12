@@ -502,8 +502,8 @@ class TimerInteractionController:
         return done()
 
     def stop_sound_and_clear(self) -> ControllerOutcome[None]:
-        status = self._current_timer_value().get("status")
+        # Apple parity: finished timers show Start, no Dismiss. The GUI
+        # stop-sound control only silences the completion alert; the next
+        # Start replaces the finished timer via queue_restart.
         self._ports.apply_outcome(self.stop_sound())
-        if status in TERMINAL_STATUSES:
-            self._ports.issue_command("clear", None)
         return done()

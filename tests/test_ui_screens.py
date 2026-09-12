@@ -162,6 +162,7 @@ class ScreenSignalTests(unittest.TestCase):
         tasks = [{"id": "task-1", "title": "Swift"}]
         known_tasks = {"task-1": {"id": "task-1", "title": "Swift"}}
         settings = {"selectedTaskId": "task-1"}
+        expected_hint = "Applies to the current running focus timer and the next timer."
 
         for phase in ("short_break", "long_break"):
             with self.subTest(phase=phase):
@@ -177,8 +178,10 @@ class ScreenSignalTests(unittest.TestCase):
                 )
                 self.assertEqual(screen.active_task_context.text(), "")
                 self.assertTrue(screen.active_task_context.isHidden())
-                self.assertEqual(screen.task_combo.toolTip(), "")
-                self.assertEqual(screen.task_combo.accessibleDescription(), "")
+                self.assertTrue(screen.task_combo.isEnabled())
+                self.assertEqual(screen.task_combo.accessibleName(), "Focus task")
+                self.assertEqual(screen.task_combo.toolTip(), expected_hint)
+                self.assertEqual(screen.task_combo.accessibleDescription(), expected_hint)
 
         screen.invalidate_task_selector()
         screen.render_task_selector(
@@ -190,8 +193,39 @@ class ScreenSignalTests(unittest.TestCase):
             known_tasks=known_tasks,
             mutations_enabled=True,
         )
-        self.assertIn("Swift", screen.active_task_context.text())
-        self.assertFalse(screen.active_task_context.isHidden())
+        self.assertEqual(screen.active_task_context.text(), "")
+        self.assertTrue(screen.active_task_context.isHidden())
+        self.assertTrue(screen.task_combo.isEnabled())
+        self.assertEqual(screen.task_combo.accessibleName(), "Focus task")
+        self.assertEqual(screen.task_combo.toolTip(), expected_hint)
+
+    def test_single_task_selector_stays_enabled_while_running(self) -> None:
+        screen = TimerScreen(
+            self.strings,
+            {
+                "durations": {
+                    "focus": 25,
+                    "short_break": 5,
+                    "long_break": 15,
+                },
+                "autoStartBreaks": False,
+            },
+        )
+        tasks = [{"id": "task-1", "title": "Swift"}]
+        known_tasks = {"task-1": {"id": "task-1", "title": "Swift"}}
+        screen.invalidate_task_selector()
+        screen.render_task_selector(
+            {"taskId": "task-1", "phase": "focus", "status": "running"},
+            True,
+            selected_phase="focus",
+            settings={"selectedTaskId": "task-1"},
+            tasks=tasks,
+            known_tasks=known_tasks,
+            mutations_enabled=True,
+        )
+        self.assertTrue(screen.task_combo.isEnabled())
+        self.assertEqual(screen.task_combo.currentData(), "task-1")
+        self.assertEqual(screen.active_task_context.text(), "")
 
     def test_tasks_screen_renders_and_emits_task_payloads(self) -> None:
         screen = TasksScreen(self.strings)

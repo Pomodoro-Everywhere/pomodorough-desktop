@@ -1747,8 +1747,73 @@ class Store:
                 now_ms,
                 use_server_clock=use_server_clock,
             )
+            self._retarget_active_focus_task_locked(task_id, now_ms)
             self._capture_iroh_after_mutation_locked()
         return operation
+
+    def task_retargets(self) -> dict[str, Any]:
+        """Local-only active-timer retarget markers, like Apple legacy map."""
+        value = self.get_meta("taskRetargets", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    def retargeted_task_id(self, timer_id: str) -> tuple[bool, str | None]:
+        retargets = self.task_retargets()
+        if not isinstance(timer_id, str) or timer_id not in retargets:
+            return False, None
+        task_id = retargets[timer_id]
+        return True, task_id if isinstance(task_id, str) and task_id else None
+
+    def _retarget_active_focus_task_locked(
+        self, task_id: str | None, now_ms: int
+    ) -> None:
+        timer = self._active_focus_timer_locked(now_ms)
+        if timer is None:
+            return
+        timer_id = str(timer.get("id"))
+        retargets = self.get_meta("taskRetargets", {})
+        if not isinstance(retargets, dict):
+            retargets = {}
+        retargets[timer_id] = task_id
+        self._set_meta("taskRetargets", retargets)
+        self._rewrite_pending_start_task_locked(timer_id, task_id)
+
+    def _active_focus_timer_locked(self, now_ms: int) -> dict[str, Any] | None:
+        try:
+            state = self.load(projection=True)
+            timer = self.projected_state(now_ms=now_ms, state=state).canonical_timer
+        except ValueError:
+            snapshot = self.get_meta("snapshot", {})
+            timer = snapshot.get("canonicalTimer") if isinstance(snapshot, dict) else None
+        if not isinstance(timer, dict):
+            return None
+        if timer.get("status") not in ACTIVE_STATUSES:
+            return None
+        if timer.get("phase") != "focus":
+            return None
+        if not isinstance(timer.get("id"), str) or not timer.get("id"):
+            return None
+        return timer
+
+    def _rewrite_pending_start_task_locked(
+        self, timer_id: str, task_id: str | None
+    ) -> None:
+        for row in self.connection.execute(
+            "SELECT id, payload FROM pending_commands"
+        ):
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("timerId") != timer_id or payload.get("type") != "start":
+                continue
+            if task_id is None:
+                payload.pop("taskId", None)
+            else:
+                payload["taskId"] = task_id
+            self.connection.execute(
+                "UPDATE pending_commands SET payload = ? WHERE id = ?",
+                (json.dumps(payload, separators=(",", ":")), row["id"]),
+            )
 
     def queue_command(
         self, command_type: str, timer: dict[str, Any] | None, selected_phase: str,
@@ -2430,23 +2495,40 @@ class Store:
             timer, history, auto_start_breaks, utc_timestamp(now_ms)
         )
 
-    @staticmethod
     def projected_history(
+        self,
         projection: ProjectionApplyV2,
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Annotate core history with local-only pending-sync presentation state."""
+        """Annotate core history with pending flag and local retarget markers."""
         pending_timer_ids = {
             command.get("timerId")
             for command in state["pending"]
             if isinstance(command.get("timerId"), str)
         }
-        return [
-            {**item, "pending": True}
-            if item.get("timerId") in pending_timer_ids
-            else item
-            for item in projection.history
-        ]
+        try:
+            retargets = self.task_retargets()
+        except (OSError, ValueError, KeyError):
+            retargets = {}
+        history: list[dict[str, Any]] = []
+        for item in projection.history:
+            timer_id = item.get("timerId")
+            needs_retarget = isinstance(timer_id, str) and timer_id in retargets
+            needs_pending = timer_id in pending_timer_ids
+            if not needs_retarget and not needs_pending:
+                history.append(item)
+                continue
+            resolved = dict(item)
+            if needs_retarget:
+                retargeted = retargets[timer_id]
+                if isinstance(retargeted, str) and retargeted:
+                    resolved["taskId"] = retargeted
+                else:
+                    resolved.pop("taskId", None)
+            if needs_pending:
+                resolved["pending"] = True
+            history.append(resolved)
+        return history
 
     def _validated_projection_state(
         self,

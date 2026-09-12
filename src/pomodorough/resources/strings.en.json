@@ -63,6 +63,7 @@
   "task.active_context": "Active timer task: {task}",
   "task.active_accessible": "Active timer task",
   "task.next_description": "Changes the next focus timer only. The active timer remains assigned to {task}.",
+  "task.retarget_hint": "Applies to the current running focus timer and the next timer.",
   "task.unassigned": "Unassigned",
   "task.deleted": "Deleted task",
   "task.board": "TASK BOARD",

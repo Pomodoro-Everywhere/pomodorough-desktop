@@ -295,8 +295,13 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertTrue(self.window.auto_breaks.isEnabled())
         self.assertEqual(self.window.pattern_scope.text(), "Applies to next timer")
         self.assertTrue(self.window.task_combo.isEnabled())
-        self.assertEqual(self.window.task_combo.accessibleName(), "Next focus task")
-        self.assertIn("Unassigned", self.window.active_task_context.text())
+        self.assertEqual(self.window.task_combo.accessibleName(), "Focus task")
+        self.assertEqual(
+            self.window.task_combo.accessibleDescription(),
+            "Applies to the current running focus timer and the next timer.",
+        )
+        self.assertEqual(self.window.active_task_context.text(), "")
+        self.assertTrue(self.window.active_task_context.isHidden())
 
         self.window.phase_buttons["long_break"].click()
         self.assertEqual(self.window.timer["id"], start["timerId"])
@@ -1277,12 +1282,24 @@ class MainWindowDurationTests(unittest.TestCase):
                 beep.assert_called_once_with()
                 self.assertTrue(self.window.sound_timer.isActive())
 
+            completed_id = self.window.timer["id"]
             self.window.stop_sound_button.click()
 
         self.assertFalse(self.window.sound_timer.isActive())
         self.assertTrue(self.window.stop_sound_button.isHidden())
         stop_sound.assert_called_once_with()
-        issue.assert_called_once_with("clear")
+        issue.assert_not_called()
+        self.assertEqual(self.window.timer["id"], completed_id)
+        self.assertEqual(self.window.timer["status"], "completed")
+
+    def test_finished_timer_start_replaces_without_dismiss(self) -> None:
+        self._queue_completed_timer()
+        completed_id = self.window.timer["id"]
+
+        self.window._primary_action()
+
+        self.assertEqual(self.window.timer["status"], "running")
+        self.assertNotEqual(self.window.timer["id"], completed_id)
 
     def test_pending_clear_hides_synced_terminal_timer(self) -> None:
         self._queue_completed_timer()
@@ -1856,11 +1873,13 @@ class MainWindowDurationTests(unittest.TestCase):
             True,
         )
         self.assertTrue(self.window.task_combo.isEnabled())
-        self.assertEqual(self.window.task_combo.accessibleName(), "Next focus task")
-        self.assertIn(
-            "remains assigned to Remote task",
+        self.assertEqual(self.window.task_combo.accessibleName(), "Focus task")
+        self.assertEqual(
             self.window.task_combo.accessibleDescription(),
+            "Applies to the current running focus timer and the next timer.",
         )
+        self.assertEqual(self.window.active_task_context.text(), "")
+        self.assertTrue(self.window.active_task_context.isHidden())
 
     def test_remote_task_deletion_does_not_queue_clear_and_keeps_history_title(
         self,

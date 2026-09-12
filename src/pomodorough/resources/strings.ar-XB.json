@@ -240,6 +240,7 @@
   "task.name_accessible": "⟦‼ Tåsk nåmë ‼⟧",
   "task.next_description": "⟦‼ Chångës thë nëxt føcüs tïmër ønly. Thë åctïvë tïmër rëmåïns åssïgnëd tø {task}. ‼⟧",
   "task.next_focus": "⟦‼ Nëxt føcüs tåsk ‼⟧",
+  "task.retarget_hint": "⟦‼ Åpplïës tø thë cürrënt rünnïng føcüs tïmër ånd thë nëxt tïmër. ‼⟧",
   "task.placeholder": "⟦‼ Wrïtë rëlëåsë nøtës ‼⟧",
   "task.pomodoro.one": "⟦‼ PØMØDØRØ ‼⟧",
   "task.pomodoro.other": "⟦‼ PØMØDØRØS ‼⟧",

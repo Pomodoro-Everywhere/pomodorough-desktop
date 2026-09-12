@@ -230,7 +230,7 @@ class MainWindowViewMixin:
         timer = self.timer_screen
         timer.primary_action_requested.connect(self._primary_action)
         timer.command_requested.connect(self._issue)
-        timer.stop_sound_requested.connect(self._stop_sound_and_clear)
+        timer.stop_sound_requested.connect(self._stop_sound)
         timer.phase_selected.connect(self._select_phase)
         timer.duration_changed.connect(self._duration_changed)
         timer.task_selection_changed.connect(self._task_selection_changed)

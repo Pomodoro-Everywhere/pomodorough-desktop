@@ -223,7 +223,7 @@ class LocalTimer:
             else planned
         )
         remaining = max(0, planned - elapsed)
-        task_id = timer.get("taskId")
+        task_id = self._resolved_timer_task_id(timer)
         task = self.known_tasks.get(task_id) if isinstance(task_id, str) else None
         if timer.get("phase") in BREAK_PHASES:
             task_id, task = None, None
@@ -238,6 +238,22 @@ class LocalTimer:
             "remaining": format_remaining(remaining),
             "progress": min(1.0, elapsed / planned),
         }
+
+    def _resolved_timer_task_id(self, timer: dict[str, Any]) -> str | None:
+        """Prefer local retarget marker while a focus timer runs, like Apple."""
+        task_id = timer.get("taskId")
+        if timer.get("phase") in BREAK_PHASES:
+            return None
+        if timer.get("status") not in ACTIVE_STATUSES:
+            return task_id if isinstance(task_id, str) else None
+        timer_id = timer.get("id")
+        if not isinstance(timer_id, str) or not timer_id:
+            return task_id if isinstance(task_id, str) else None
+        try:
+            found, retargeted = self.store.retargeted_task_id(timer_id)
+        except (OSError, ValueError, KeyError):
+            return task_id if isinstance(task_id, str) else None
+        return retargeted if found else (task_id if isinstance(task_id, str) else None)
 
     def _state_document(
         self,

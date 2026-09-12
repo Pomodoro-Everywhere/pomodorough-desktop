@@ -42,6 +42,11 @@ class _ClockGeometry:
         )
 
 
+def ceiling_minutes(planned_ms: int) -> int:
+    """One tick per ceiling minute of the displayed timer, like Apple Dial."""
+    return max(1, (max(1, int(planned_ms)) + 59_999) // 60_000)
+
+
 class _ClockRenderer:
     def __init__(
         self,
@@ -53,6 +58,7 @@ class _ClockRenderer:
         phase_text: str,
         status_text: str,
         progress: float,
+        tick_count: int = 25,
     ) -> None:
         self.painter = painter
         self.geometry = geometry
@@ -61,6 +67,7 @@ class _ClockRenderer:
         self.phase_text = phase_text
         self.status_text = status_text
         self.progress = progress
+        self.tick_count = max(1, int(tick_count))
 
     def paint(self) -> None:
         self._paint_face()
@@ -93,14 +100,15 @@ class _ClockRenderer:
     def _paint_ticks(self) -> None:
         radius = self.geometry.radius
         text = self.palette.color(QPalette.ColorRole.Text)
+        total = max(1, self.tick_count)
         self.painter.save()
         self.painter.translate(self.geometry.center)
         self.painter.setPen(QPen(text, max(3, self.geometry.side * 0.009)))
-        for tick in range(60):
+        for tick in range(total):
             length = radius * (0.11 if tick % 5 == 0 else 0.055)
             outer = radius * 0.81
             self.painter.drawLine(QPointF(0, -outer), QPointF(0, -outer + length))
-            self.painter.rotate(6)
+            self.painter.rotate(360.0 / total)
         self.painter.restore()
 
     def _paint_progress(self) -> None:
@@ -211,6 +219,7 @@ class ClockWidget(QWidget):
         self.phase_text = self.strings.text("phase.focus").upper()
         self.status_text = self.strings.text("status.rail.idle")
         self.progress = 0.0
+        self.tick_count = 25
         self.setAccessibleName(self.strings.text("status.timer_accessible"))
         self.setMinimumSize(170, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -219,12 +228,18 @@ class ClockWidget(QWidget):
         return QSize(360, 360)
 
     def set_state(
-        self, time_text: str, phase: str, status: str, progress: float
+        self,
+        time_text: str,
+        phase: str,
+        status: str,
+        progress: float,
+        tick_count: int = 25,
     ) -> None:
         self.time_text = time_text
         self.phase_text = phase.upper()
         self.status_text = status.upper()
         self.progress = max(0.0, min(1.0, progress))
+        self.tick_count = max(1, int(tick_count))
         self.setAccessibleDescription(
             self.strings.text(
                 "status.timer_description",
@@ -246,4 +261,5 @@ class ClockWidget(QWidget):
             phase_text=self.phase_text,
             status_text=self.status_text,
             progress=self.progress,
+            tick_count=self.tick_count,
         ).paint()

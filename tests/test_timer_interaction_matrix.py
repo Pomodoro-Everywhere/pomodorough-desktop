@@ -207,11 +207,17 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         self.assertNotIn(Synchronize, tuple(map(type, harness.controller.maybe_auto_start_break(sync=False).effects)))
         harness.current_timer = timer("completed")
         harness.controller.stop_sound_and_clear()
-        self.assertEqual(harness.issued[-1], ("clear", None))
+        self.assertEqual(harness.issued, [])
+        harness.ports.set_stop_sound_control.assert_called_with(False)
         harness.current_timer = timer("running")
         before = len(harness.issued)
         harness.controller.stop_sound_and_clear()
         self.assertEqual(len(harness.issued), before)
+
+    def test_primary_action_from_completed_restarts_without_dismiss(self) -> None:
+        harness = TimerHarness("completed")
+        harness.controller.primary_action()
+        harness.store.queue_restart.assert_called_once()
 
 
 if __name__ == "__main__":
