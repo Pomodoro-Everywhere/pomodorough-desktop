@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import curses
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 from .core import BREAK_PHASES
 from .localization import Strings
-from .sentry_monitoring import init_sentry_from_environment
+from .sentry_monitoring import capture_exception, init_sentry_from_environment
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
@@ -169,7 +170,11 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
             message = ""
             if not handle_key(timer, key):
                 return
-        except (InvalidAction, OSError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D49: infra failure reports to Sentry, still notice-only.
+            capture_exception(error)
+            message = str(error)
+        except InvalidAction as error:
             message = str(error)
 
 

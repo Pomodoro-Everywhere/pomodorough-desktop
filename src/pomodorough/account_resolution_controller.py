@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -21,6 +22,7 @@ from .controller_outcomes import (
     done,
     returning,
 )
+from .sentry_monitoring import capture_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,14 +81,13 @@ class AccountResolutionController:
         context = self._context()
         try:
             pending = context.store.pending_resolution()
+        except (OSError, sqlite3.Error) as error:
+            capture_exception(error)
+            self._enter_corrupted_resolution_value(context.user, str(error))
+            return returning(True, EmitNotice(str(error)))
         except ValueError as error:
-            self.resolution_corruption = str(error)
-            self.history_resolution_active = True
-            self.resolution_user = context.user
-            self.resolution_phase = None
-            self.resolution_preview = None
-            self.resolution_request_id = None
-            self.resolution_retry_paused = True
+            # validation stays silent
+            self._enter_corrupted_resolution_value(context.user, str(error))
             return returning(True)
         if pending is None:
             return returning(False)
@@ -136,9 +137,18 @@ class AccountResolutionController:
         if context.cloud.busy:
             return self.schedule_resolution_retry()
         if self.resolution_phase == "resolve":
-            pending = context.store.pending_resolution(
-                str(self.resolution_user.get("id", ""))
-            )
+            try:
+                pending = context.store.pending_resolution(
+                    str(self.resolution_user.get("id", ""))
+                )
+            except (OSError, sqlite3.Error) as error:
+                capture_exception(error)
+                self.resolution_retry_paused = True
+                return done(EmitNotice(str(error)))
+            except ValueError as error:
+                # validation stays silent
+                self.resolution_retry_paused = True
+                return done(EmitNotice(str(error)))
             if pending is None:
                 self.resolution_phase = "preview"
             else:
@@ -264,18 +274,36 @@ class AccountResolutionController:
             )
         )
         context = self._context()
-        has_pending = context.store.has_sendable_sync_operations()
+        try:
+            has_pending = context.store.has_sendable_sync_operations()
+        except (OSError, sqlite3.Error) as error:
+            capture_exception(error)
+            return self._sendable_fallback_value(context, notices, str(error))
+        except ValueError as error:
+            # validation stays silent
+            return self._sendable_fallback_value(context, notices, str(error))
         effects: list[Any] = [SetAccountState(not has_pending)]
         if has_pending:
             effects.append(Synchronize())
         if notices:
-            effects.append(
-                EmitNotice(
-                    context.strings.text(
-                        "resolution.history_conflict", detail="; ".join(notices)
-                    )
-                )
+            effects.append(self._history_conflict_notice_value(context, notices))
+        return done(*effects)
+
+    def _history_conflict_notice_value(
+        self, context: AccountResolutionContext, notices: list[str]
+    ) -> EmitNotice:
+        return EmitNotice(
+            context.strings.text(
+                "resolution.history_conflict", detail="; ".join(notices)
             )
+        )
+
+    def _sendable_fallback_value(
+        self, context: AccountResolutionContext, notices: list[str], message: str
+    ) -> ControllerOutcome[None]:
+        effects: list[Any] = [SetAccountState(False), EmitNotice(message)]
+        if notices:
+            effects.append(self._history_conflict_notice_value(context, notices))
         return done(*effects)
 
     def bootstrap_conflict(self, details: dict[str, Any]) -> ControllerOutcome[None]:
@@ -312,7 +340,11 @@ class AccountResolutionController:
         context = self._context()
         try:
             pending = context.store.pending_resolution()
+        except (OSError, sqlite3.Error) as error:
+            capture_exception(error)
+            return self.handle_resolution_corruption(user, error)
         except ValueError as error:
+            # validation stays silent
             return self.handle_resolution_corruption(user, error)
         owner = pending["owner"] if pending is not None else context.user
         owner_id = owner.get("id") if isinstance(owner, dict) else None
@@ -354,8 +386,19 @@ class AccountResolutionController:
         self.resolution_request_id = None
         self.resolution_retry_paused = False
 
+    def _enter_corrupted_resolution_value(
+        self, user: dict[str, Any] | None, message: str
+    ) -> None:
+        self.resolution_corruption = message
+        self.history_resolution_active = True
+        self.resolution_user = user
+        self.resolution_phase = None
+        self.resolution_preview = None
+        self.resolution_request_id = None
+        self.resolution_retry_paused = True
+
     def handle_resolution_corruption(
-        self, user: dict[str, Any], error: ValueError
+        self, user: dict[str, Any], error: Exception
     ) -> ControllerOutcome[None]:
         context = self._context()
         self.resolution_corruption = str(error)

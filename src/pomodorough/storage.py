@@ -1756,6 +1756,7 @@ class Store:
                 # Infra still reports to Sentry; validation stays silent.
                 capture_exception(error)
             except (ValueError, KeyError):
+                # validation stays silent
                 pass
             self._capture_iroh_after_mutation_locked()
         return operation
@@ -1799,6 +1800,7 @@ class Store:
                 capture_exception(error)
                 return None
             except (ValueError, KeyError):
+                # validation stays silent
                 return None
             timer = snapshot.get("canonicalTimer") if isinstance(snapshot, dict) else None
         if not isinstance(timer, dict):
@@ -2530,6 +2532,7 @@ class Store:
             capture_exception(error)
             retargets = {}
         except (ValueError, KeyError):
+            # validation stays silent
             retargets = {}
         history: list[dict[str, Any]] = []
         for item in projection.history:

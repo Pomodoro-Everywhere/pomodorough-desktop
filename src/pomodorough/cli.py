@@ -11,7 +11,7 @@ from typing import Any, Sequence, TextIO
 
 from .core import BREAK_PHASES
 from .localization import Strings
-from .sentry_monitoring import init_sentry_from_environment
+from .sentry_monitoring import capture_exception, init_sentry_from_environment
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer, normalize_phase
 
@@ -243,13 +243,19 @@ def _run_with_store(
     try:
         store = store or Store(args.data.expanduser() if args.data else None)
         run(args, LocalTimer(store, strings=strings), output, strings)
-    except (InvalidAction, *STORAGE_ERRORS, json.JSONDecodeError) as error:
+    except STORAGE_ERRORS as error:
+        # Sweep: infra failure reports to Sentry; CLI still prints + exits 2.
+        capture_exception(error)
+        runtime_error = error
+    except (InvalidAction, json.JSONDecodeError) as error:
         runtime_error = error
     finally:
         if owns_store and store is not None:
             try:
                 store.close()
             except STORAGE_ERRORS as error:
+                # Sweep: close-path infra reports too; first error still wins.
+                capture_exception(error)
                 runtime_error = runtime_error or error
     return runtime_error
 

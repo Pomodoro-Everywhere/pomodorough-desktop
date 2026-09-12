@@ -97,6 +97,7 @@ class LocalTimer:
             capture_exception(error)
             return {}
         except (ValueError, KeyError):
+            # validation stays silent
             return {}
 
     @property
@@ -281,6 +282,7 @@ class LocalTimer:
             capture_exception(error)
             return task_id if isinstance(task_id, str) else None
         except (ValueError, KeyError):
+            # validation stays silent
             return task_id if isinstance(task_id, str) else None
         return retargeted if found else (task_id if isinstance(task_id, str) else None)
 

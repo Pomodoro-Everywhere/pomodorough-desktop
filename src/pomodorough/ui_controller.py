@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time  # public test seam: patches shared time module
 from functools import wraps
 from typing import Any
@@ -34,6 +35,7 @@ from .replication_controller import (
     ReplicationPorts,
 )
 from .shared_core import ProjectionApplyV2
+from .sentry_monitoring import capture_exception
 from .synchronization_controller import (
     SynchronizationContext,
     SynchronizationController,
@@ -414,12 +416,30 @@ class ApplicationController:
 
     def _load_state(self) -> None:
         previous_timer = getattr(self, "timer", None)
-        state, provisional_timer_ids, projection = self._project_current_state(
-            previous_timer
-        )
+        try:
+            state, provisional_ids, projection = self._project_current_state(
+                previous_timer
+            )
+        except (OSError, sqlite3.Error) as error:
+            # D50: projection chain guarded; infra reports, keep old state.
+            capture_exception(error)
+            self.notice.emit(str(error))
+            return
+        except (ValueError, KeyError, TypeError) as error:
+            self.notice.emit(str(error))
+            return
         self._read_resolution_corruption()
-        self._install_projected_state(state, projection)
-        self._reconcile_loaded_timer(previous_timer, provisional_timer_ids)
+        try:
+            self._install_projected_state(state, projection)
+        except (OSError, sqlite3.Error) as error:
+            # D50: projection install guarded; infra reports, keep old state.
+            capture_exception(error)
+            self.notice.emit(str(error))
+            return
+        except (ValueError, KeyError, TypeError) as error:
+            self.notice.emit(str(error))
+            return
+        self._reconcile_loaded_timer(previous_timer, provisional_ids)
         self._install_projected_tasks(projection)
         self._refresh_loaded_controls()
 
@@ -443,6 +463,10 @@ class ApplicationController:
         try:
             self.store.pending_resolution()
             self.account_resolution.resolution_corruption = None
+        except (OSError, sqlite3.Error) as error:
+            # D50: bare read guarded; infra reports, still surfaces.
+            capture_exception(error)
+            self.account_resolution.resolution_corruption = str(error)
         except ValueError as error:
             self.account_resolution.resolution_corruption = str(error)
 
@@ -527,13 +551,21 @@ class ApplicationController:
         if self.replication.iroh_join_pending:
             self.notice.emit(self.strings.text("network.wait_join"))
             return True
-        if (
-            not self.account_resolution.history_resolution_active
-            and self.store.pending_resolution() is not None
-        ):
-            self._activate_persisted_resolution()
-            self._render()
-            self._set_account_state(False)
+        if not self.account_resolution.history_resolution_active:
+            try:
+                pending = self.store.pending_resolution()
+            except (OSError, sqlite3.Error) as error:
+                # D50: bare read guarded; infra reports, fail-closed blocked.
+                capture_exception(error)
+                self.notice.emit(str(error))
+                return True
+            except ValueError as error:
+                self.notice.emit(str(error))
+                return True
+            if pending is not None:
+                self._activate_persisted_resolution()
+                self._render()
+                self._set_account_state(False)
         if not self.account_resolution.history_resolution_active:
             return False
         self.notice.emit(self.strings.text("resolution.blocked"))

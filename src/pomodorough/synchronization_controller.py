@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -17,6 +18,7 @@ from .controller_outcomes import (
     Synchronize,
     done,
 )
+from .sentry_monitoring import capture_exception
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +73,12 @@ class SynchronizationController:
     def _sync_iroh(self, context: SynchronizationContext) -> ControllerOutcome[None]:
         try:
             changed = context.store.capture_local_iroh_records()
-        except (OSError, ValueError) as error:
+        except (OSError, sqlite3.Error) as error:
+            # D49: infra failure reports to Sentry, still notice-only.
+            capture_exception(error)
+            self._ports.iroh_failure(str(error))
+            return done()
+        except ValueError as error:
             self._ports.iroh_failure(str(error))
             return done()
         if changed:
@@ -83,19 +90,34 @@ class SynchronizationController:
     def _sync_centralized(
         self, context: SynchronizationContext
     ) -> ControllerOutcome[None]:
-        if (
-            not context.history_resolution_active
-            and context.store.pending_resolution() is not None
-        ):
-            self._ports.activate_persisted_resolution()
-            self._ports.apply_outcome(done(Render(), SetAccountState(False)))
-            context = self._context()
+        if not context.history_resolution_active:
+            try:
+                pending = context.store.pending_resolution()
+            except (OSError, sqlite3.Error) as error:
+                # D50: bare read guarded; infra reports, notice-only.
+                capture_exception(error)
+                self._ports.apply_outcome(done(EmitNotice(str(error))))
+                return done()
+            except ValueError as error:
+                self._ports.apply_outcome(done(EmitNotice(str(error))))
+                return done()
+            if pending is not None:
+                self._ports.activate_persisted_resolution()
+                self._ports.apply_outcome(done(Render(), SetAccountState(False)))
+                context = self._context()
         if not context.cloud.authenticated:
             return done()
         if context.history_resolution_active:
             self._ports.continue_history_resolution()
             return done()
-        payload = context.store.sync_payload()
+        try:
+            payload = context.store.sync_payload()
+        except (OSError, sqlite3.Error) as error:
+            # D50: bare read guarded; infra reports, notice-only.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except (KeyError, TypeError, ValueError) as error:
+            return done(EmitNotice(str(error)))
         has_pending = bool(
             payload["commands"]
             or payload["taskOperations"]
@@ -146,6 +168,11 @@ class SynchronizationController:
                 request,
                 **self._ports.response_timing(response),
             )
+        except (OSError, sqlite3.Error) as error:
+            # D49: infra failure reports to Sentry, still failure+notice.
+            capture_exception(error)
+            self._ports.apply_outcome(self.cloud_failure(str(error)))
+            return done(EmitNotice(str(error)))
         except (KeyError, TypeError, ValueError) as error:
             self._ports.apply_outcome(self.cloud_failure(str(error)))
             return done(EmitNotice(str(error)))
@@ -157,19 +184,42 @@ class SynchronizationController:
             )
         )
         context = self._context()
-        has_pending = context.store.has_sendable_sync_operations()
+        return self._final_sync_effects(context, notices)
+
+    def _final_sync_effects(
+        self, context: SynchronizationContext, notices: list[str]
+    ) -> ControllerOutcome[None]:
+        try:
+            has_pending = context.store.has_sendable_sync_operations()
+        except (OSError, sqlite3.Error) as error:
+            # D50: bare read guarded; infra reports, fail-closed unsynced.
+            capture_exception(error)
+            return self._sendable_fallback(context, notices, str(error))
+        except (ValueError, KeyError) as error:
+            return self._sendable_fallback(context, notices, str(error))
         effects: list[Any] = [SetAccountState(not has_pending)]
         if has_pending:
             effects.append(Synchronize())
         if notices:
-            effects.append(
-                EmitNotice(
-                    context.strings.text(
-                        "resolution.sync_conflict", detail="; ".join(notices)
-                    )
-                )
-            )
+            effects.append(self._conflict_notice(context, notices))
         return done(*effects)
+
+    def _sendable_fallback(
+        self, context: SynchronizationContext, notices: list[str], message: str
+    ) -> ControllerOutcome[None]:
+        effects: list[Any] = [SetAccountState(False), EmitNotice(message)]
+        if notices:
+            effects.append(self._conflict_notice(context, notices))
+        return done(*effects)
+
+    def _conflict_notice(
+        self, context: SynchronizationContext, notices: list[str]
+    ) -> EmitNotice:
+        return EmitNotice(
+            context.strings.text(
+                "resolution.sync_conflict", detail="; ".join(notices)
+            )
+        )
 
     def cloud_failure(self, message: str) -> ControllerOutcome[None]:
         self.sync_request = None

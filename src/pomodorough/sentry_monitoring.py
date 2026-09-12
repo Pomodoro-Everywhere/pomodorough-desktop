@@ -152,23 +152,33 @@ _CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
 # /`private_key` and D39 `*key` compounds) arrive the same way in token
 # URLs, OAuth bodies logged as text, and stringified JSON payloads. Same
 # `[?&#]` prefix + terminators as the OAuth set so fragments match too.
+# D51: `session`/`session_id`/`sid`/`ssid`/`room`/`endpoint`/`device`/
+# `peer`/`ticket`/`invite` grant account or room access the same way and
+# arrive as free-text `?session=`/`?sid=`/`#room=` params; scrub them here
+# where key filtering cannot see them.
 _TOKEN_PARAM_RE = re.compile(
     r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
     r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
     r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
-    r"signing_key|signingkey|public_key|publickey)=)[^&\s\"';]+"
+    r"signing_key|signingkey|public_key|publickey|session|session_id|"
+    r"sessionid|sid|ssid|room|endpoint|device|peer|ticket|invite)=)"
+    r"[^&\s\"';]+"
 )
 # D40: stringified payloads (`{"client_secret":"…"}`) survive as plain
 # strings where dict-key filtering cannot see them. Match the same secret
 # names in `"name":"value"` / `'name':'value'` JSON-string form; the
 # closing quote stays outside the match so it survives the substitution.
+# D51: same `session`/`sid`/`room`/`endpoint`/`device`/`peer`/`ticket`/
+# `invite`/`ssid` family in JSON-string form (`{"session":"…"}`).
 _JSON_SECRET_RE = re.compile(
     r"(?i)([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
     r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
     r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
-    r"signing_key|signingkey|public_key|publickey)[\"']\s*:\s*[\"'])"
+    r"signing_key|signingkey|public_key|publickey|session|session_id|"
+    r"sessionid|sid|ssid|room|endpoint|device|peer|ticket|invite)[\"']"
+    r"\s*:\s*[\"'])"
     r"[^\"']+"
 )
 

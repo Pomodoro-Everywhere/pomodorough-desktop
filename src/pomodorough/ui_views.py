@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 from .arrivals_screen import ArrivalsScreen
 from .core import format_remaining
 from .network_screen import PRIVACY_POLICY_URL as PRIVACY_POLICY_URL, NetworkScreen
+from .sentry_monitoring import capture_exception
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
 
@@ -375,7 +377,7 @@ class MainWindowViewMixin:
     def _render_network(self) -> None:
         if not hasattr(self, "network_screen"):
             return
-        room = self.store.iroh_room()
+        room = self._cached_iroh_room_value()
         available = self.iroh is not None and self.iroh.availability()[0]
         reason = self._iroh_unavailable_reason(available)
         self.network_screen.render(
@@ -397,6 +399,19 @@ class MainWindowViewMixin:
             self.account_button.setAccessibleName(
                 self.strings.text("network.account_inactive_accessible")
             )
+
+    def _cached_iroh_room_value(self) -> Any:
+        try:
+            room = self.store.iroh_room()
+        except (OSError, sqlite3.Error) as error:
+            # D50: per-250ms read guarded; reuse cached room on infra failure.
+            capture_exception(error)
+            return getattr(self, "_cached_iroh_room", None)
+        except (ValueError, KeyError):
+            # validation stays silent; reuse cached room.
+            return getattr(self, "_cached_iroh_room", None)
+        self._cached_iroh_room = room
+        return room
 
     def _iroh_unavailable_reason(self, available: bool) -> str:
         if self.iroh is not None and not available:

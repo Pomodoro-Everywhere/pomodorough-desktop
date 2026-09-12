@@ -137,13 +137,18 @@ class TimerInteractionController:
         context = self._context()
         if context.closed:
             return done()
-        if (
-            (context.user is None or not context.cloud.authenticated)
-            and not context.cloud.busy
-            and context.store.has_pending_auto_break()
-        ):
-            self._ports.maybe_auto_start_break(require_canonical=False)
-            context = self._context()
+        if (context.user is None or not context.cloud.authenticated) and not context.cloud.busy:
+            try:
+                pending_break = context.store.has_pending_auto_break()
+            except (OSError, sqlite3.Error) as error:
+                # D50: per-250ms read guarded; infra reports, notice-only.
+                capture_exception(error)
+                return done(EmitNotice(str(error)))
+            except ValueError as error:
+                return done(EmitNotice(str(error)))
+            if pending_break:
+                self._ports.maybe_auto_start_break(require_canonical=False)
+                context = self._context()
         timer = self._current_timer_value(context)
         context, timer = self._refresh_expired_timer(context, timer)
         if timer.get("status") not in {"running", "completed"}:
@@ -495,7 +500,16 @@ class TimerInteractionController:
     def schedule_pending_auto_break(
         self, *, require_canonical: bool | None = None
     ) -> ControllerOutcome[None]:
-        if self._context().store.has_pending_auto_break():
+        try:
+            has_pending = self._context().store.has_pending_auto_break()
+        except (OSError, sqlite3.Error) as error:
+            # Sweep: scheduling read guarded like tick(); infra reports,
+            # notice-only so a broken DB cannot kill the outcome chain.
+            capture_exception(error)
+            return done(EmitNotice(str(error)))
+        except ValueError as error:
+            return done(EmitNotice(str(error)))
+        if has_pending:
             delay_ms = max(
                 0,
                 math.ceil((self.auto_break_not_before - time.monotonic()) * 1000),
