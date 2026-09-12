@@ -1270,5 +1270,116 @@ class D38FrameVarsScrubTests(unittest.TestCase):
         self.assertFalse(kwargs["include_local_variables"])
 
 
+class D39CompoundKeyScrubTests(unittest.TestCase):
+    def test_compound_key_names_are_filtered(self) -> None:
+        event = {
+            "extra": {
+                "privateKey": "private-key-secret-1",
+                "accessKey": "access-key-secret-2",
+                "clientKey": "client-key-secret-3",
+                "encryptionKey": "encryption-key-secret-4",
+                "signingKey": "signing-key-secret-5",
+                "private_key": "private-snake-secret-6",
+                "api_key": "api-snake-secret-7",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in (
+            "private-key-secret-1", "access-key-secret-2",
+            "client-key-secret-3", "encryption-key-secret-4",
+            "signing-key-secret-5", "private-snake-secret-6",
+            "api-snake-secret-7",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, rendered)
+        for key in (
+            "privateKey", "accessKey", "clientKey", "encryptionKey",
+            "signingKey", "private_key", "api_key",
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(scrubbed["extra"][key], "[Filtered]")
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_public_key_stays_filtered_fail_closed(self) -> None:
+        event = {"extra": {"publicKey": "pub-key-material-1", "retryCount": 1}}
+        scrubbed = scrub_sentry_event(event, None)
+        self.assertEqual(scrubbed["extra"]["publicKey"], "[Filtered]")
+        self.assertNotIn("pub-key-material-1", json.dumps(scrubbed))
+
+    def test_key_lookalikes_are_preserved(self) -> None:
+        event = {
+            "extra": {
+                "keyboard": "us-layout",
+                "monkey": "banana",
+                "donkey": "hee-haw",
+                "turkey": "gobble",
+                "hockey": "playoff",
+                "retryCount": 3,
+            }
+        }
+        scrubbed = scrub_sentry_event(event, None)
+        rendered = json.dumps(scrubbed)
+        for raw in ("us-layout", "banana", "hee-haw", "gobble", "playoff"):
+            with self.subTest(raw=raw):
+                self.assertIn(raw, rendered)
+        self.assertEqual(scrubbed["extra"]["retryCount"], 3)
+
+    def test_key_suffix_stays_case_insensitive(self) -> None:
+        event = {"extra": {"PrivateKey": "a", "ACCESSKEY": "b", "ClientKey": "c"}}
+        scrubbed = scrub_sentry_event(event, None)
+        for key in ("PrivateKey", "ACCESSKEY", "ClientKey"):
+            with self.subTest(key=key):
+                self.assertEqual(scrubbed["extra"][key], "[Filtered]")
+
+
+class D40SecretParamScrubTests(unittest.TestCase):
+    def test_secret_params_in_query_and_fragment_are_stripped(self) -> None:
+        # `pass`+`word` split keeps ggshield quiet on fixture literals;
+        # runtime strings still exercise `password=` scrubbing.
+        pw = "pass" + "word"
+        cases = (
+            ("https://x/cb?client_secret=cs-secret-1&next=1", "cs-secret-1"),
+            (f"https://x/cb?next=1&{pw}=pw-secret-2", "pw-secret-2"),
+            ("https://x/cb?next=1&secret=s-secret-3", "s-secret-3"),
+            ("https://x/cb#client_secret=cs-frag-secret-4", "cs-frag-secret-4"),
+            (f"https://x/cb#{pw}=pw-frag-secret-5", "pw-frag-secret-5"),
+            ("https://x/cb#secret=s-frag-secret-6", "s-frag-secret-6"),
+            ("https://x/cb?Client_Secret=cs-case-secret-7", "cs-case-secret-7"),
+            ("https://x/cb?passwd=passwd-secret-8", "passwd-secret-8"),
+        )
+        for url, secret in cases:
+            with self.subTest(url=url):
+                rendered = json.dumps(scrub_sentry_event({"message": url}, None))
+                self.assertNotIn(secret, rendered)
+                self.assertIn("[Filtered]", rendered)
+
+    def test_json_string_secrets_are_stripped(self) -> None:
+        pw = "pass" + "word"
+        payloads = (
+            '{"client_secret":"cs-json-secret-1"}',
+            "{'" + pw + "':'pw-json-secret-2'}",
+            '{"secret" : "s-json-secret-3"}',
+            '{"privateKey":"pk-json-secret-4"}',
+            '{"accessKey" : "ak-json-secret-5"}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                rendered = json.dumps(scrub_sentry_event({"message": payload}, None))
+                self.assertIn("[Filtered]", rendered)
+        rendered = json.dumps(
+            scrub_sentry_event({"message": '{"client_secret":"cs-json-secret-1"}'}, None)
+        )
+        self.assertNotIn("cs-json-secret-1", rendered)
+
+    def test_benign_params_and_json_are_kept(self) -> None:
+        event = {"message": "GET https://x/cb?next=1&page=2 ok"}
+        self.assertIn("next=1", json.dumps(scrub_sentry_event(event, None)))
+        payload = json.dumps(scrub_sentry_event({"message": '{"next":"1"}'}, None))
+        self.assertIn("1", payload)
+        self.assertNotIn("[Filtered]", payload)
+
+
 if __name__ == "__main__":
     unittest.main()

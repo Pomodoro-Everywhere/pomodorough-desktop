@@ -97,6 +97,29 @@ _EXCEPTION_HANDLERS_INSTALLED = False
 _QT_MESSAGE_HANDLER_INSTALLED = False
 _ORIGINAL_QT_MESSAGE_HANDLER: Any = None
 _CODE_SUFFIX_ALLOWLIST = frozenset({"errorcode", "statuscode", "exitcode"})
+# D39: `monkey`-class words share the `key` suffix but carry no secret
+# (`monkey`/`donkey`/`turkey`/`jockey`/`whiskey`/`hockey` + plurals).
+# `keyboard` never matches exact-or-suffix `key` (ends with `board`) but
+# stays pinned as a pass case. `publicKey` stays filtered fail-closed:
+# public material is still identifying and a misnamed private value must
+# not slip through.
+_KEY_SUFFIX_ALLOWLIST = frozenset(
+    {
+        "monkey",
+        "monkeys",
+        "donkey",
+        "donkeys",
+        "turkey",
+        "turkeys",
+        "jockey",
+        "jockeys",
+        "whiskey",
+        "whiskeys",
+        "hockey",
+        "hockeys",
+        "keyboard",
+    }
+)
 _BARE_SECRET_KEYS = frozenset({"key", "value"})
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
@@ -125,8 +148,28 @@ _CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
 # too (CSRF binding, replay binding, PKCE). Authorization URLs and
 # redirect callbacks embed them as `?state=`/`&nonce=`/`#state=`; scrub
 # them in free text the same way as tokens.
+# D40: `client_secret`/`password`/`secret` (+ `passwd`/`api_key`/`apikey`
+# /`private_key` and D39 `*key` compounds) arrive the same way in token
+# URLs, OAuth bodies logged as text, and stringified JSON payloads. Same
+# `[?&#]` prefix + terminators as the OAuth set so fragments match too.
 _TOKEN_PARAM_RE = re.compile(
-    r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|code_verifier|code_challenge)=)[^&\s\"';]+"
+    r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|"
+    r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
+    r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
+    r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
+    r"signing_key|signingkey|public_key|publickey)=)[^&\s\"';]+"
+)
+# D40: stringified payloads (`{"client_secret":"…"}`) survive as plain
+# strings where dict-key filtering cannot see them. Match the same secret
+# names in `"name":"value"` / `'name':'value'` JSON-string form; the
+# closing quote stays outside the match so it survives the substitution.
+_JSON_SECRET_RE = re.compile(
+    r"(?i)([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
+    r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
+    r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
+    r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
+    r"signing_key|signingkey|public_key|publickey)[\"']\s*:\s*[\"'])"
+    r"[^\"']+"
 )
 
 
@@ -305,6 +348,25 @@ def _is_bare_secret_key(lowered: str) -> bool:
     return lowered in _BARE_SECRET_KEYS
 
 
+def _is_key_suffix(lowered: str) -> bool:
+    # D39: compound `*Key` names (`privateKey`, `accessKey`, `clientKey`,
+    # `encryptionKey`, `signingKey`) leak through substring parts (only
+    # underscore `private_key`/`api_key` hit). Match exact-or-suffix `key`
+    # like `_is_code_key`, covering snake+camel in one rule (`private_key`
+    # and `privateKey` both lowercase to `*key`). `publicKey` stays True
+    # here (fail-closed, see _KEY_SUFFIX_ALLOWLIST comment).
+    if lowered in ("key", "keys"):
+        return True
+    if not (lowered.endswith("key") or lowered.endswith("keys")):
+        return False
+    if lowered in _KEY_SUFFIX_ALLOWLIST:
+        return False
+    for denied in _KEY_SUFFIX_ALLOWLIST:
+        if denied != "keyboard" and lowered.endswith(denied):
+            return False
+    return True
+
+
 def _sensitive_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
@@ -312,6 +374,8 @@ def _sensitive_key(key: Any) -> bool:
     if _is_code_key(lowered):
         return True
     if _is_bare_secret_key(lowered):
+        return True
+    if _is_key_suffix(lowered):
         return True
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
@@ -330,7 +394,10 @@ def _scrub_string(text: str) -> str:
     # (`?state=`/`&nonce=`/`&code_challenge=`); callbacks repeat them as
     # `?code=`/`?state=` or `#...`. _TOKEN_PARAM_RE covers all of these in
     # free text where key filtering cannot see them.
+    # D40: same for `?client_secret=`/`?password=`/`?secret=` (+ passwd,
+    # api_key, D39 compounds) and `"client_secret":"…"` JSON strings.
     redacted = _TOKEN_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _JSON_SECRET_RE.sub(r"\1" + _FILTERED, redacted)
     # D27: IPv6 before IPv4 so mapped `::ffff:1.2.3.4` drops as one unit.
     redacted = _IPV6_RE.sub(_FILTERED, redacted)
     return _IPV4_RE.sub(_FILTERED, redacted)
