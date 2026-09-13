@@ -63,6 +63,7 @@ class _ClockRenderer:
         status_text: str,
         progress: float,
         tick_count: int = 25,
+        dots: int = 0,
     ) -> None:
         self.painter = painter
         self.geometry = geometry
@@ -72,6 +73,7 @@ class _ClockRenderer:
         self.status_text = status_text
         self.progress = progress
         self.tick_count = max(1, int(tick_count))
+        self.dots = max(0, min(4, int(dots)))
 
     def paint(self) -> None:
         self._paint_face()
@@ -80,6 +82,24 @@ class _ClockRenderer:
         self._paint_pointer()
         self._paint_display()
         self._paint_labels()
+        self._paint_dots()
+
+    def _paint_dots(self) -> None:
+        radius = self.geometry.radius
+        center = self.geometry.center
+        window_text = self.palette.color(QPalette.ColorRole.WindowText)
+        text = self.palette.color(QPalette.ColorRole.Text)
+        dot_radius = max(3.0, self.geometry.side * 0.009)
+        spacing = radius * 0.11
+        y = center.y() + radius * 0.60
+        self.painter.setPen(QPen(window_text, 2))
+        for index in range(4):
+            x = center.x() + (index - 1.5) * spacing
+            if index < self.dots:
+                self.painter.setBrush(text)
+            else:
+                self.painter.setBrush(Qt.BrushStyle.NoBrush)
+            self.painter.drawEllipse(QPointF(x, y), dot_radius, dot_radius)
 
     def _paint_face(self) -> None:
         side = self.geometry.side
@@ -149,16 +169,10 @@ class _ClockRenderer:
 
     def _paint_display(self) -> None:
         side = self.geometry.side
+        radius = self.geometry.radius
         center = self.geometry.center
-        board = self.geometry.display_board()
         base = self.palette.color(QPalette.ColorRole.Base)
         text = self.palette.color(QPalette.ColorRole.Text)
-        window = self.palette.color(QPalette.ColorRole.Window)
-        self.painter.setPen(QPen(base, max(4, side * 0.013)))
-        self.painter.setBrush(text)
-        self.painter.drawRect(board)
-        self.painter.setPen(QPen(window, 3))
-        self.painter.drawLine(center.x(), board.top() + 5, center.x(), board.bottom() - 5)
         display_font = QFont(
             "DejaVu Sans Mono",
             max(20, round(side * 0.105)),
@@ -166,6 +180,19 @@ class _ClockRenderer:
         )
         display_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 91)
         self.painter.setFont(display_font)
+        board_width = (
+            self.painter.fontMetrics().horizontalAdvance(self.time_text)
+            + radius * 0.24
+        )
+        board = QRectF(
+            center.x() - board_width / 2,
+            center.y() - radius * 0.27,
+            board_width,
+            radius * 0.54,
+        )
+        self.painter.setPen(QPen(base, max(4, side * 0.013)))
+        self.painter.setBrush(text)
+        self.painter.drawRect(board)
         self.painter.setPen(base)
         self.painter.drawText(board, Qt.AlignmentFlag.AlignCenter, self.time_text)
 
@@ -184,12 +211,19 @@ class _ClockRenderer:
         label_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
         self.painter.setFont(label_font)
         self.painter.setPen(window_text)
+        phase_width = min(
+            radius * 1.6,
+            self.painter.fontMetrics().horizontalAdvance(self.phase_text)
+            + radius * 0.18,
+        )
         phase_rect = QRectF(
-            self.geometry.dial.left(),
+            center.x() - phase_width / 2,
             board.top() - radius * 0.24,
-            side,
+            phase_width,
             radius * 0.18,
         )
+        self.painter.fillRect(phase_rect, alternate)
+        self.painter.setPen(window_text)
         self.painter.drawText(
             phase_rect,
             Qt.AlignmentFlag.AlignCenter,
@@ -224,6 +258,7 @@ class ClockWidget(QWidget):
         self.status_text = self.strings.text("status.rail.idle")
         self.progress = 0.0
         self.tick_count = 25
+        self.dots = 0
         self.setAccessibleName(self.strings.text("status.timer_accessible"))
         self.setMinimumSize(170, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -238,12 +273,14 @@ class ClockWidget(QWidget):
         status: str,
         progress: float,
         tick_count: int = 25,
+        dots: int = 0,
     ) -> None:
         self.time_text = time_text
         self.phase_text = phase.upper()
         self.status_text = status.upper()
         self.progress = max(0.0, min(1.0, progress))
         self.tick_count = max(1, int(tick_count))
+        self.dots = max(0, min(4, int(dots)))
         self.setAccessibleDescription(
             self.strings.text(
                 "status.timer_description",
@@ -251,6 +288,8 @@ class ClockWidget(QWidget):
                 time=time_text,
                 status=status.lower(),
             )
+            + " "
+            + self.strings.text("status.pomodoro_progress_value", count=self.dots)
         )
         self.update()
 
@@ -266,4 +305,5 @@ class ClockWidget(QWidget):
             status_text=self.status_text,
             progress=self.progress,
             tick_count=self.tick_count,
+            dots=self.dots,
         ).paint()

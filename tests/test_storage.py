@@ -3207,6 +3207,51 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(self.store.load(), before)
 
+    def test_queue_restart_accepts_synced_completed_retained_timer(self) -> None:
+        settings = self.store.load()["settings"]
+        start = self.store.queue_command(
+            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+        )
+        running, _history = rebuild_optimistic(None, [], [start])
+        self.store.queue_command(
+            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+        )
+        completed, _history = rebuild_optimistic(
+            None, [], self.store.load()["pending"]
+        )
+        # Simulate synced application: the snapshot retains the completed
+        # canonical timer recorded in history while no command is pending.
+        snapshot = self.store.get_meta("snapshot")
+        snapshot["canonicalTimer"] = completed
+        snapshot["history"] = [
+            {
+                "id": completed["id"],
+                "timerId": completed["id"],
+                "taskId": completed.get("taskId"),
+                "commandId": completed["lastIntent"]["commandId"],
+                "phase": completed["phase"],
+                "status": "completed",
+                "plannedDurationMs": completed["plannedDurationMs"],
+                "completedAt": completed["lastIntent"]["occurredAt"],
+                "endedAt": completed["lastIntent"]["occurredAt"],
+            }
+        ]
+        self.store.set_meta("snapshot", snapshot)
+        with self.store.connection:
+            self.store.connection.execute("DELETE FROM pending_commands")
+        self.assertEqual(self.store.load()["pending"], [])
+        self.assertIsNone(
+            self.store.projected_state(now_ms=3_000).canonical_timer
+        )
+
+        commands = self.store.queue_restart(
+            completed, "focus", settings["durationsMs"], now_ms=3_000
+        )
+
+        self.assertEqual(
+            [command["type"] for command in commands], ["clear", "start"]
+        )
+
     def test_cancel_and_clear_is_atomic_ordered_and_restart_safe(self) -> None:
         settings = self.store.load()["settings"]
         start = self.store.queue_command(

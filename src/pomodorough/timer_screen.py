@@ -70,26 +70,27 @@ class TimerScreen(QWidget):
         self.left_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom)
         self.clock = ClockWidget(self.strings)
         self.left_layout.addWidget(self.clock, 1)
-        self.long_break_progress = QLabel("○○○○")
-        self.long_break_progress.setObjectName("microLabel")
-        self.long_break_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.long_break_progress.setAccessibleName(
-            self.strings.text("status.pomodoro_progress")
+        self.controls_panel = QWidget()
+        self.controls_layout = QBoxLayout(
+            QBoxLayout.Direction.TopToBottom, self.controls_panel
         )
-        self.left_layout.addWidget(self.long_break_progress)
+        self.controls_layout.setContentsMargins(0, 0, 0, 0)
+        self._controls_centered = False
         self.active_task_context = QLabel("")
         self.active_task_context.setObjectName("taskSubtitle")
         self.active_task_context.setAccessibleName(
             self.strings.text("task.active_accessible")
         )
         self.active_task_context.setWordWrap(True)
-        self.left_layout.addWidget(self.active_task_context)
+        self.controls_layout.addWidget(self.active_task_context)
         self._build_actions()
+        self.left_layout.addWidget(self.controls_panel, 0)
         self.content_layout.addLayout(self.left_layout, 3)
 
     def _build_actions(self) -> None:
         self.actions_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self.actions_layout.setSpacing(8)
+        self.actions_layout.setContentsMargins(0, 0, 0, 0)
         self._build_task_selector()
         self.primary_button = QPushButton(
             self.strings.text(
@@ -111,9 +112,27 @@ class TimerScreen(QWidget):
         self.stop_sound_button = QPushButton(self.strings.text("status.stop_sound"))
         self.stop_sound_button.clicked.connect(self.stop_sound_requested)
         self.stop_sound_button.setVisible(False)
-        for widget in self._action_widgets():
-            self.actions_layout.addWidget(widget, 1)
-        self.left_layout.addLayout(self.actions_layout)
+        # iPad rule: portrait stacking in every orientation. Task picker
+        # on top, primary full width, secondaries share one row below.
+        # The column is width-capped and centered so wide windows keep
+        # phone-like proportions instead of stretching one long strip.
+        column = QWidget()
+        column.setMaximumWidth(480)
+        column_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom, column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(8)
+        column_layout.addWidget(self.task_selector_panel)
+        column_layout.addWidget(self.primary_button)
+        secondary_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        secondary_layout.setSpacing(8)
+        secondary_layout.addWidget(self.finish_button, 1)
+        secondary_layout.addWidget(self.cancel_button, 1)
+        secondary_layout.addWidget(self.stop_sound_button, 1)
+        column_layout.addLayout(secondary_layout)
+        self.actions_layout.addStretch(1)
+        self.actions_layout.addWidget(column)
+        self.actions_layout.addStretch(1)
+        self.controls_layout.addLayout(self.actions_layout)
 
     def _build_task_selector(self) -> None:
         self.task_selector_panel = QFrame()
@@ -130,15 +149,6 @@ class TimerScreen(QWidget):
         self.task_combo.currentIndexChanged.connect(self.task_selection_changed)
         layout.addWidget(label)
         layout.addWidget(self.task_combo, 1)
-
-    def _action_widgets(self) -> tuple[QWidget, ...]:
-        return (
-            self.task_selector_panel,
-            self.primary_button,
-            self.finish_button,
-            self.cancel_button,
-            self.stop_sound_button,
-        )
 
     def _build_settings_panel(self, settings: dict[str, Any]) -> None:
         self.right_panel = QFrame()
@@ -239,16 +249,26 @@ class TimerScreen(QWidget):
         self.right_panel.setVisible(visible)
 
     def apply_responsive_layout(self, *, landscape: bool, compact: bool) -> None:
-        self.left_layout.setDirection(
-            QBoxLayout.Direction.LeftToRight
-            if landscape
-            else QBoxLayout.Direction.TopToBottom
-        )
-        self.actions_layout.setDirection(
-            QBoxLayout.Direction.TopToBottom
-            if landscape
-            else QBoxLayout.Direction.LeftToRight
-        )
+        # Landscape: dial left, controls right (vertically centered).
+        # Portrait: stacked column, controls pinned under the dial.
+        if landscape:
+            self.left_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+            self.left_layout.setStretch(0, 3)
+            self.left_layout.setStretch(1, 2)
+            self.controls_panel.setMaximumWidth(460)
+            if not self._controls_centered:
+                self.controls_layout.insertStretch(0, 1)
+                self.controls_layout.addStretch(1)
+                self._controls_centered = True
+        else:
+            self.left_layout.setDirection(QBoxLayout.Direction.TopToBottom)
+            self.left_layout.setStretch(0, 1)
+            self.left_layout.setStretch(1, 0)
+            self.controls_panel.setMaximumWidth(16777215)
+            if self._controls_centered:
+                self.controls_layout.takeAt(0)
+                self.controls_layout.takeAt(self.controls_layout.count() - 1)
+                self._controls_centered = False
         self.content_layout.setSpacing(12 if compact else 22)
         self.left_layout.setSpacing(6 if compact else 10)
         margin = 12 if compact else 18
@@ -332,17 +352,14 @@ class TimerScreen(QWidget):
     ) -> None:
         labels = self.status_labels()
         phase_label = self.strings.text(f"phase.{state.display_timer['phase']}")
+        progress = long_break_progress(completed_focus_count_for_day(history))
         self.clock.set_state(
             format_remaining(state.remaining),
             phase_label,
             labels.get(state.status, state.status),
             state.elapsed / state.planned,
             ceiling_minutes(state.display_timer.get("plannedDurationMs", state.planned)),
-        )
-        progress = long_break_progress(completed_focus_count_for_day(history))
-        self.long_break_progress.setText("●" * progress + "○" * (4 - progress))
-        self.long_break_progress.setAccessibleDescription(
-            self.strings.text("status.pomodoro_progress_value", count=progress)
+            dots=progress,
         )
 
     def render_controls(
@@ -383,17 +400,19 @@ class TimerScreen(QWidget):
 
     @staticmethod
     def status_labels_for(strings: Strings) -> dict[str, str]:
-        return {
+        labels = {
             value: strings.text(f"status.rail.{value}")
             for value in (
                 "idle",
                 "running",
                 "paused",
-                "completed",
                 "cancelled",
                 "superseded",
             )
         }
+        # Finished timers read back as idle on the rail board.
+        labels["completed"] = strings.text("status.rail.idle")
+        return labels
 
     def status_labels(self) -> dict[str, str]:
         return self.status_labels_for(self.strings)

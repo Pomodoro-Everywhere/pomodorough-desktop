@@ -161,7 +161,6 @@ class MainWindowViewMixin:
             "content_layout",
             "left_layout",
             "clock",
-            "long_break_progress",
             "active_task_context",
             "actions_layout",
             "task_selector_panel",

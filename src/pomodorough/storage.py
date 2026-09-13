@@ -2044,12 +2044,42 @@ class Store:
         current = projection.canonical_timer
         if (not isinstance(current, dict) or current.get("status") not in statuses
                 or self._timer_fingerprint(current) != self._timer_fingerprint(timer)):
-            raise ValueError(error)
+            current = self._retained_terminal_context(state, timer, statuses)
+            if current is None:
+                raise ValueError(error)
         settings = self.projected_settings(state, projection)
         task_id = settings.get("selectedTaskId")
         if validate_task and not any(task.get("id") == task_id for task in projection.tasks):
             task_id = None
         return current, settings["selectedPhase"], settings["durationsMs"], task_id
+
+    @staticmethod
+    def _retained_terminal_context(
+        state: dict[str, Any], timer: dict[str, Any], statuses: set[str]
+    ) -> dict[str, Any] | None:
+        """Accept a retained terminal timer the projection evicted.
+
+        Projection input drops a retained canonical timer once its id is
+        recorded in history, so a synced completion leaves projected
+        canonical empty while the UI still presents the retained timer.
+        Nothing changed underneath in that state: accept the retained timer
+        when it is terminal, recorded in history, and no command is pending.
+        """
+        if (
+            not isinstance(timer, dict)
+            or timer.get("status") not in statuses
+            or timer.get("status") in ACTIVE_STATUSES
+        ):
+            return None
+        if state.get("pending"):
+            return None
+        snapshot = state.get("snapshot")
+        history = snapshot.get("history", []) if isinstance(snapshot, dict) else []
+        recorded = any(
+            isinstance(item, dict) and item.get("timerId") == timer.get("id")
+            for item in history
+        )
+        return dict(timer) if recorded else None
 
     def _queue_reserved_pair(self, first: tuple[str, dict[str, Any] | None],
                              second: tuple[str, dict[str, Any] | None], phase: str,
