@@ -38,14 +38,14 @@ class D63StorageErrorsContractTests(unittest.TestCase):
         from pomodorough import cli as cli_module
 
         error = SharedCoreError("wasm load failed")
-        with patch.object(cli_module, "LocalTimer"):
-            with patch.object(cli_module, "run", side_effect=error):
-                with patch(
-                    "pomodorough.cli.capture_exception",
-                ) as capture:
-                    result = cli_module._run_with_store(
-                        Mock(), Mock(), Mock(), Strings(),
-                    )
+        with (
+            patch.object(cli_module, "LocalTimer"),
+            patch.object(cli_module, "run", side_effect=error),
+            patch("pomodorough.cli.capture_exception") as capture,
+        ):
+            result = cli_module._run_with_store(
+                Mock(), Mock(), Mock(), Strings(),
+            )
         self.assertIs(result, error)
         capture.assert_called_once_with(error)
 
@@ -55,16 +55,16 @@ class D63StorageErrorsContractTests(unittest.TestCase):
         error = SharedCoreError("wasm load failed")
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.object(cli_module, "Store", side_effect=error):
-            with patch(
-                "pomodorough.cli.capture_exception",
-            ) as capture:
-                try:
-                    result = cli_module.main(
-                        ("start", "--json"), stdout=stdout, stderr=stderr,
-                    )
-                except SharedCoreError:
-                    self.fail("SharedCoreError escaped cli.main")
+        with (
+            patch.object(cli_module, "Store", side_effect=error),
+            patch("pomodorough.cli.capture_exception") as capture,
+        ):
+            try:
+                result = cli_module.main(
+                    ("start", "--json"), stdout=stdout, stderr=stderr,
+                )
+            except SharedCoreError:
+                self.fail("SharedCoreError escaped cli.main")
         self.assertEqual(result, 2)
         capture.assert_called_once_with(error)
         payload = json.loads(stderr.getvalue())
@@ -90,7 +90,6 @@ class D63StorageErrorsContractTests(unittest.TestCase):
 
     def test_tui_loop_captures_shared_core_error_and_survives(self) -> None:
         from pomodorough import tui as tui_module
-
         from tests.test_tui import FakeScreen
 
         error = SharedCoreError("wasm load failed")
@@ -185,6 +184,8 @@ class D64TuiCloseGuardTests(unittest.TestCase):
         self.assertIn("disk gone", stderr)
         self.assertNotIn("close failed", stderr)
         self.assertEqual(capture.call_count, 2)
+        self.assertIs(capture.call_args_list[0][0][0], body)
+        self.assertIs(capture.call_args_list[1][0][0], close)
 
     def test_close_infra_on_success_becomes_2_with_capture(self) -> None:
         close = sqlite3.OperationalError("close failed")
