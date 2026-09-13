@@ -50,8 +50,11 @@ def main() -> int:
     except (OSError, sqlite3.Error) as error:
         # D57: startup owns the single report (Store.device_id never
         # captures); fail closed instead of running without identity.
+        # D60: capture then return without re-raising: the global
+        # excepthook installed by init_sentry_from_environment would
+        # capture the same failure a second time (2 events per startup).
         capture_exception(error)
-        raise
+        return 1
     app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(cloud.shutdown)
     app.aboutToQuit.connect(iroh.shutdown)

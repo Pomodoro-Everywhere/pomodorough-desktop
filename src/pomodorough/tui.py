@@ -13,6 +13,8 @@ from .sentry_monitoring import capture_exception, init_sentry_from_environment
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
+STORAGE_ERRORS = (OSError, sqlite3.Error)
+
 
 def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings:
     candidate = strings or getattr(timer, "strings", None)
@@ -191,19 +193,27 @@ def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int
     )
     parser.add_argument("--data", type=Path, help=strings.text("terminal.data_help"))
     args = parser.parse_args(argv)
-    store = Store(args.data.expanduser() if args.data else None)
+    store = None
     try:
+        # D62: Store() lives inside the boundary so OSError/sqlite3
+        # reports to Sentry and exits 2 like the CLI, never via traceback.
+        store = Store(args.data.expanduser() if args.data else None)
         timer = LocalTimer(store)
         timer.strings = strings
         curses.wrapper(_run, timer)
         return 0
     except KeyboardInterrupt:
         return 130
+    except STORAGE_ERRORS as error:
+        capture_exception(error)
+        print(strings.text("tui.error", error=error), file=sys.stderr)
+        return 2
     except curses.error as error:
         print(strings.text("tui.error", error=error), file=sys.stderr)
         return 2
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

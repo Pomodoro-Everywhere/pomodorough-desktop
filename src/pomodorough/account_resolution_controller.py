@@ -332,11 +332,22 @@ class AccountResolutionController:
         context = self._context()
         user_id = self.resolution_user.get("id")
         request_id = self.resolution_request_id
-        if (
-            not isinstance(user_id, str)
-            or not isinstance(request_id, str)
-            or not context.store.discard_pending_resolution(user_id, request_id)
-        ):
+        if not isinstance(user_id, str) or not isinstance(request_id, str):
+            self.resolution_retry_paused = True
+            return done(EmitNotice(context.strings.text("resolution.discard_failed")))
+        try:
+            discarded = context.store.discard_pending_resolution(user_id, request_id)
+        except (OSError, sqlite3.Error) as error:
+            # D61: infra failure reports to Sentry (D53 split), still
+            # pause+notice so the Qt slot never raises and retry stays held.
+            capture_exception(error)
+            self.resolution_retry_paused = True
+            return done(EmitNotice(str(error)))
+        except (KeyError, TypeError, ValueError) as error:
+            # validation stays silent
+            self.resolution_retry_paused = True
+            return done(EmitNotice(str(error)))
+        if not discarded:
             self.resolution_retry_paused = True
             return done(EmitNotice(context.strings.text("resolution.discard_failed")))
         self.resolution_phase = "preview"

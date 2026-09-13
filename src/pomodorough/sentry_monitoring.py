@@ -161,14 +161,20 @@ _CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
 # `?invite_code=` + camelCase `roomId`/`deviceId`/`peerId`/
 # `endpointUrl`/`ticketCode`/`inviteCode`); match snake + flat (which
 # covers camelCase case-insensitively) alongside the bare names.
+# D58: invite fields `roomSecret`/`roomName`/`endpointTicket`/
+# `endpointId` (+ snake `room_secret`/`room_name`/`endpoint_ticket`/
+# `endpoint_id` + flat) leak the same way in free-text URLs and
+# JSON strings; match them here where key filtering cannot see them.
 _TOKEN_PARAM_RE = re.compile(
     r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
     r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
     r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
     r"signing_key|signingkey|public_key|publickey|session|session_id|"
-    r"sessionid|sid|ssid|room|room_id|roomid|endpoint|endpoint_url|"
-    r"endpointurl|device|device_id|deviceid|peer|peer_id|peerid|"
+    r"sessionid|sid|ssid|room|room_id|roomid|room_secret|roomsecret|"
+    r"room_name|roomname|endpoint|endpoint_url|endpointurl|"
+    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|"
+    r"device_id|deviceid|peer|peer_id|peerid|"
     r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)=)"
     r"[^&\s\"';]+"
 )
@@ -182,14 +188,18 @@ _TOKEN_PARAM_RE = re.compile(
 # `{"device_id":"…"}`, `{"peer_id":"…"}`, `{"endpoint_url":"…"}`,
 # `{"ticket_code":"…"}`, `{"invite_code":"…"}` + camelCase); match
 # snake + flat alongside the bare names.
+# D58: same invite-field gap (`{"roomSecret":"…"}`, `{"roomName":"…"}`,
+# `{"endpointTicket":"…"}`, `{"endpointId":"…"}` + snake/flat).
 _JSON_SECRET_RE = re.compile(
     r"(?i)([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
     r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
     r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
     r"signing_key|signingkey|public_key|publickey|session|session_id|"
-    r"sessionid|sid|ssid|room|room_id|roomid|endpoint|endpoint_url|"
-    r"endpointurl|device|device_id|deviceid|peer|peer_id|peerid|"
+    r"sessionid|sid|ssid|room|room_id|roomid|room_secret|roomsecret|"
+    r"room_name|roomname|endpoint|endpoint_url|endpointurl|"
+    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|"
+    r"device_id|deviceid|peer|peer_id|peerid|"
     r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)[\"']"
     r"\s*:\s*[\"'])"
     r"[^\"']+"

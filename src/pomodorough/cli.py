@@ -237,7 +237,16 @@ def _run_with_store(
     store: Store | None,
     output: TextIO,
     strings: Strings,
-) -> InvalidAction | OSError | sqlite3.Error | json.JSONDecodeError | None:
+) -> (
+    InvalidAction
+    | OSError
+    | sqlite3.Error
+    | json.JSONDecodeError
+    | KeyError
+    | TypeError
+    | ValueError
+    | None
+):
     owns_store = store is None
     runtime_error = None
     try:
@@ -247,7 +256,9 @@ def _run_with_store(
         # Sweep: infra failure reports to Sentry; CLI still prints + exits 2.
         capture_exception(error)
         runtime_error = error
-    except (InvalidAction, json.JSONDecodeError) as error:
+    except (InvalidAction, KeyError, TypeError, ValueError) as error:
+        # D59: validation stays silent (no Sentry capture), like the TUI
+        # loop; json.JSONDecodeError is a ValueError subclass, covered here.
         runtime_error = error
     finally:
         if owns_store and store is not None:
@@ -261,7 +272,15 @@ def _run_with_store(
 
 
 def _print_runtime_error(
-    error: InvalidAction | OSError | sqlite3.Error | json.JSONDecodeError,
+    error: (
+        InvalidAction
+        | OSError
+        | sqlite3.Error
+        | json.JSONDecodeError
+        | KeyError
+        | TypeError
+        | ValueError
+    ),
     as_json: bool,
     stderr: TextIO,
     strings: Strings,
