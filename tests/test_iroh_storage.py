@@ -317,7 +317,7 @@ class IrohStorageTests(unittest.TestCase):
             "operation-rejected", None, 1_786_000_000_000
         )
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.insert_remote_iroh_records(room_id, [record])
 
         self.assertEqual(self.store.load(), before)

@@ -26,7 +26,7 @@ from .shared_core import (
     ProjectionApplyV2,
     SharedCore as SharedCore,
     SharedCoreDispatcher,
-    SharedCoreError,
+    SharedCoreOperationError,
     apply_projection_v2,
 )
 from .storage_canonical import (
@@ -2347,7 +2347,8 @@ class Store:
             normalized_value = core.dispatch(
                 "task.identity.v1", {"title": task.get("title", "")}
             )
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
         if not isinstance(normalized_value, dict):
             raise ValueError("Shared core returned an invalid task identity.")
@@ -2458,7 +2459,8 @@ class Store:
         )
         try:
             return apply_projection_v2(core, projection_input)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
 
     def _with_device_id(self, item: dict[str, Any]) -> dict[str, Any]:

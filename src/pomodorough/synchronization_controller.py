@@ -19,6 +19,7 @@ from .controller_outcomes import (
     done,
 )
 from .sentry_monitoring import capture_exception
+from .shared_core import SharedCoreError
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +74,7 @@ class SynchronizationController:
     def _sync_iroh(self, context: SynchronizationContext) -> ControllerOutcome[None]:
         try:
             changed = context.store.capture_local_iroh_records()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D49: infra failure reports to Sentry, still notice-only.
             capture_exception(error)
             self._ports.iroh_failure(str(error))
@@ -93,7 +94,7 @@ class SynchronizationController:
         if not context.history_resolution_active:
             try:
                 pending = context.store.pending_resolution()
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D50: bare read guarded; infra reports, notice-only.
                 capture_exception(error)
                 self._ports.apply_outcome(done(EmitNotice(str(error))))
@@ -112,7 +113,7 @@ class SynchronizationController:
             return done()
         try:
             payload = context.store.sync_payload()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: bare read guarded; infra reports, notice-only.
             capture_exception(error)
             return done(EmitNotice(str(error)))
@@ -168,7 +169,7 @@ class SynchronizationController:
                 request,
                 **self._ports.response_timing(response),
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D49: infra failure reports to Sentry, still failure+notice.
             capture_exception(error)
             self._ports.apply_outcome(self.cloud_failure(str(error)))
@@ -191,7 +192,7 @@ class SynchronizationController:
     ) -> ControllerOutcome[None]:
         try:
             has_pending = context.store.has_sendable_sync_operations()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: bare read guarded; infra reports, fail-closed unsynced.
             capture_exception(error)
             return self._sendable_fallback(context, notices, str(error))

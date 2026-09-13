@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .shared_core import SharedCoreDispatcher, SharedCoreError
+from .shared_core import SharedCoreDispatcher, SharedCoreOperationError
 from .storage_model import MAX_CLOCK_SKEW_MS, MAX_SAFE_INTEGER, _default_shared_core
 
 
@@ -58,7 +58,8 @@ class GenerationReservation:
                     "local": {"wallMs": local[0], "counter": local[1]},
                     "physicalNowMs": now_ms,
                 })
-            except SharedCoreError as error:
+            except SharedCoreOperationError as error:
+                # D68: only operation rejection is validation; load/ABI stay infra.
                 if local[0] == now_ms and local[1] == MAX_SAFE_INTEGER:
                     raise ValueError(
                         "Logical clock counter has no safe integer headroom."

@@ -10,7 +10,7 @@ from typing import Any
 
 from .core import parse_timestamp_ms, task_from_title
 from .shared_core import (
-    SharedCoreError,
+    SharedCoreOperationError,
     TimerCompletionPlanV1,
     apply_projection_v2,
     plan_timer_completion_v1,
@@ -63,7 +63,8 @@ class GeneratedBreakPlanner:
         core = self._shared_core() or _default_shared_core()
         try:
             return plan_timer_completion_v1(core, input_value)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
 
     @staticmethod
@@ -401,7 +402,8 @@ class ReplicatedStateProjection:
             core = _default_shared_core()
         try:
             return apply_projection_v2(core, projection_input)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
 
     def _validated_projection(

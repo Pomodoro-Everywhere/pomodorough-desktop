@@ -196,6 +196,10 @@ _TOKEN_PARAM_RE = re.compile(
 # snake + flat alongside the bare names.
 # D58: same invite-field gap (`{"roomSecret":"…"}`, `{"roomName":"…"}`,
 # `{"endpointTicket":"…"}`, `{"endpointId":"…"}` + snake/flat).
+# D67: stringified JSON also carries unquoted scalars (`{"token":12345}`,
+# `{"session":null}`, `{"room_id": 987}`); the quoted branch above requires
+# an opening quote, so add an unquoted-scalar alternation (`[^,\s\}]+`)
+# with a `(?![\"'])` guard so quoted values stay on the first branch.
 _JSON_SECRET_RE = re.compile(
     r"(?i)([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
@@ -209,6 +213,18 @@ _JSON_SECRET_RE = re.compile(
     r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)[\"']"
     r"\s*:\s*[\"'])"
     r"[^\"']+"
+    r"|([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
+    r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
+    r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
+    r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
+    r"signing_key|signingkey|public_key|publickey|session|session_id|"
+    r"sessionid|sid|ssid|room|room_id|roomid|room_secret|roomsecret|"
+    r"room_name|roomname|endpoint|endpoint_url|endpointurl|"
+    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|"
+    r"device_id|deviceid|peer|peer_id|peerid|"
+    r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)[\"']"
+    r"\s*:\s*(?![\"']))"
+    r"[^,\s\}]+"
 )
 
 
@@ -419,6 +435,12 @@ def _sensitive_key(key: Any) -> bool:
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
 
+def _json_secret_replacement(match: re.Match[str]) -> str:
+    # D67: first branch keeps the opening value quote in group 1 (closing
+    # quote stays outside the match); the unquoted branch lands in group 2.
+    return (match.group(1) or match.group(2)) + _FILTERED
+
+
 def _scrub_string(text: str) -> str:
     redacted = _EMAIL_RE.sub(_FILTERED, text)
     redacted = _POSIX_HOME_RE.sub(r"\1" + _FILTERED, redacted)
@@ -436,7 +458,7 @@ def _scrub_string(text: str) -> str:
     # D40: same for `?client_secret=`/`?password=`/`?secret=` (+ passwd,
     # api_key, D39 compounds) and `"client_secret":"…"` JSON strings.
     redacted = _TOKEN_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
-    redacted = _JSON_SECRET_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _JSON_SECRET_RE.sub(_json_secret_replacement, redacted)
     # D27: IPv6 before IPv4 so mapped `::ffff:1.2.3.4` drops as one unit.
     redacted = _IPV6_RE.sub(_FILTERED, redacted)
     return _IPV4_RE.sub(_FILTERED, redacted)

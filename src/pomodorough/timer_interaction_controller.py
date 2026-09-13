@@ -28,6 +28,7 @@ from .core import (
     task_from_title,
 )
 from .sentry_monitoring import capture_exception
+from .shared_core import SharedCoreError
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +141,7 @@ class TimerInteractionController:
         if (context.user is None or not context.cloud.authenticated) and not context.cloud.busy:
             try:
                 pending_break = context.store.has_pending_auto_break()
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D50: per-250ms read guarded; infra reports, notice-only.
                 capture_exception(error)
                 return done(EmitNotice(str(error)))
@@ -188,7 +189,7 @@ class TimerInteractionController:
         if context.replication_mode == "iroh":
             try:
                 context.store.project_iroh_expiry(context.projection_now_ms)
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry; failure omits
                 # Synchronize so it is not masked as success.
                 capture_exception(error)
@@ -222,7 +223,7 @@ class TimerInteractionController:
                     context.settings["durationsMs"],
                     context.settings.get("selectedTaskId"),
                 )
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry, still notice-only.
                 capture_exception(error)
                 return done(EmitNotice(str(error)))
@@ -255,7 +256,7 @@ class TimerInteractionController:
             return done()
         try:
             queued = self._queue_timer_command_value(context, command_type, automatic)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self.auto_finish_in_progress = False
@@ -316,7 +317,7 @@ class TimerInteractionController:
             queued = self._queue_timer_command_value(
                 context, command_type, automatic
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D43: direct dispatch bypasses issue() guard; same split as D41.
             capture_exception(error)
             return returning(False, EmitNotice(str(error)))
@@ -359,7 +360,7 @@ class TimerInteractionController:
                     else require_canonical
                 )
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return returning(False, EmitNotice(str(error)))
@@ -379,7 +380,7 @@ class TimerInteractionController:
         context.settings["selectedPhase"] = phase
         try:
             context.store.set_selected_phase(phase)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D42: same OSError/sqlite3 vs ValueError split as D41.
             capture_exception(error)
             return done(Render(), EmitNotice(str(error)))
@@ -401,7 +402,7 @@ class TimerInteractionController:
             task_id = None
         try:
             context.store.set_selected_task_id(task_id)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self._ports.apply_outcome(done(LoadState()))
@@ -428,7 +429,7 @@ class TimerInteractionController:
                 context.store.queue_task_operation("upsert", task)
             context.settings["selectedTaskId"] = task["id"]
             context.store.set_selected_task_id(task["id"])
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return done(EmitNotice(str(error)))
@@ -449,7 +450,7 @@ class TimerInteractionController:
             if context.settings.get("selectedTaskId") == task_id:
                 context.settings["selectedTaskId"] = None
                 context.store.set_selected_task_id(None)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return done(EmitNotice(str(error)))
@@ -464,7 +465,7 @@ class TimerInteractionController:
         context = self._context()
         try:
             context.store.queue_duration_operation(phase, value * 60_000)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return done(LoadState(), EmitNotice(str(error)))
@@ -485,7 +486,7 @@ class TimerInteractionController:
         context = self._context()
         try:
             context.store.set_auto_start_breaks(enabled)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self._ports.apply_outcome(done(LoadState()))
@@ -502,7 +503,7 @@ class TimerInteractionController:
     ) -> ControllerOutcome[None]:
         try:
             has_pending = self._context().store.has_pending_auto_break()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # Sweep: scheduling read guarded like tick(); infra reports,
             # notice-only so a broken DB cannot kill the outcome chain.
             capture_exception(error)

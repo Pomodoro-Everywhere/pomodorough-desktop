@@ -83,8 +83,14 @@ class AppLifecycleTests(unittest.TestCase):
         iroh_factory.assert_called_once_with(store)
         window_type.assert_called_once_with(store, cloud, icon, iroh)
         application.aboutToQuit.connect.assert_has_calls(
-            [call(cloud.shutdown), call(iroh.shutdown), call(store.close)]
+            [call(cloud.shutdown), call(iroh.shutdown)]
         )
+        guarded_close = application.aboutToQuit.connect.call_args_list[-1].args[0]
+        # D69: store.close rides a guarded slot now, never raw: aboutToQuit
+        # slots must not raise on WAL-checkpoint I/O failure.
+        self.assertIsNot(guarded_close, store.close)
+        guarded_close()
+        store.close.assert_called_once_with()
         window.show.assert_called_once_with()
 
         install_signal.assert_called_once()

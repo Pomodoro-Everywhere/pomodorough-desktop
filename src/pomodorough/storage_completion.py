@@ -7,7 +7,7 @@ from .core import parse_timestamp_ms
 from .shared_core import (
     ProjectionApplyV2,
     SharedCoreDispatcher,
-    SharedCoreError,
+    SharedCoreOperationError,
     TimerCompletionPlanV1,
     plan_timer_completion_v1,
 )
@@ -141,7 +141,8 @@ class TimerCompletionPolicy:
         core = self._shared_core() or _default_shared_core()
         try:
             return plan_timer_completion_v1(core, input_value)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
 
     def _ownership(self, timer: Any) -> dict[str, str] | None:

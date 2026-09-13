@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from .core import parse_timestamp_ms
-from .shared_core import SharedCoreError
+from .shared_core import SharedCoreOperationError
 from .storage_model import _default_shared_core
 
 _CORE_QUEUE_OPERATION_FIELDS = {
@@ -724,7 +724,8 @@ class SharedCoreReconciliationAdapter:
         core = self._dependencies.shared_core() or _default_shared_core()
         try:
             value = core.dispatch("reconcile.rebase.v1", input_value)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
         result = self._hooks._validated_reconciliation_output(
             value, canonical, request, pending

@@ -34,7 +34,7 @@ from .replication_controller import (
     ReplicationController,
     ReplicationPorts,
 )
-from .shared_core import ProjectionApplyV2
+from .shared_core import ProjectionApplyV2, SharedCoreError
 from .sentry_monitoring import capture_exception
 from .synchronization_controller import (
     SynchronizationContext,
@@ -420,7 +420,7 @@ class ApplicationController:
             state, provisional_ids, projection = self._project_current_state(
                 previous_timer
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: projection chain guarded; infra reports, keep old state.
             capture_exception(error)
             self.notice.emit(str(error))
@@ -431,7 +431,7 @@ class ApplicationController:
         self._read_resolution_corruption()
         try:
             self._install_projected_state(state, projection)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: projection install guarded; infra reports, keep old state.
             capture_exception(error)
             self.notice.emit(str(error))
@@ -463,7 +463,7 @@ class ApplicationController:
         try:
             self.store.pending_resolution()
             self.account_resolution.resolution_corruption = None
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: bare read guarded; infra reports, still surfaces.
             capture_exception(error)
             self.account_resolution.resolution_corruption = str(error)
@@ -554,7 +554,7 @@ class ApplicationController:
         if not self.account_resolution.history_resolution_active:
             try:
                 pending = self.store.pending_resolution()
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D50: bare read guarded; infra reports, fail-closed blocked.
                 capture_exception(error)
                 self.notice.emit(str(error))

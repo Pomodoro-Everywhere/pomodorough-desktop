@@ -22,6 +22,15 @@ def _iroh_service(store: Store) -> IrohService:
     return IrohService(store.path, store.device_id)
 
 
+def _close_store(store: Store) -> None:
+    try:
+        store.close()
+    except (OSError, sqlite3.Error, SharedCoreError) as error:
+        # D69: mirror D64 close guard — aboutToQuit slots must not raise;
+        # WAL-checkpoint I/O can fail here, so capture instead of traceback.
+        capture_exception(error)
+
+
 def _instance_lock() -> QLockFile:
     data_home = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
     data_home.mkdir(parents=True, exist_ok=True)
@@ -61,7 +70,7 @@ def main() -> int:
     app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(cloud.shutdown)
     app.aboutToQuit.connect(iroh.shutdown)
-    app.aboutToQuit.connect(store.close)
+    app.aboutToQuit.connect(lambda: _close_store(store))
     window.show()
 
     screenshot_path = os.environ.get("POMODOROUGH_SCREENSHOT")

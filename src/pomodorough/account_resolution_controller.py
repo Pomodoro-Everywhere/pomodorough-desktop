@@ -23,6 +23,7 @@ from .controller_outcomes import (
     returning,
 )
 from .sentry_monitoring import capture_exception
+from .shared_core import SharedCoreError
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +82,7 @@ class AccountResolutionController:
         context = self._context()
         try:
             pending = context.store.pending_resolution()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
             self._enter_corrupted_resolution_value(context.user, str(error))
             return returning(True, EmitNotice(str(error)))
@@ -141,7 +142,7 @@ class AccountResolutionController:
                 pending = context.store.pending_resolution(
                     str(self.resolution_user.get("id", ""))
                 )
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 capture_exception(error)
                 self.resolution_retry_paused = True
                 return done(EmitNotice(str(error)))
@@ -170,7 +171,7 @@ class AccountResolutionController:
                 response,
                 **self._ports.response_timing(response),
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D53: infra failure reports to Sentry, still pause+notice.
             capture_exception(error)
             self.resolution_phase = "preview"
@@ -196,7 +197,7 @@ class AccountResolutionController:
                 int(plan["expectedRevision"]),
                 strategy,
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D53: infra failure reports to Sentry, still pause+notice.
             capture_exception(error)
             self.resolution_retry_paused = True
@@ -276,7 +277,7 @@ class AccountResolutionController:
                 self.resolution_request_id,
                 **self._ports.response_timing(response),
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D53: infra failure reports to Sentry, still pause+notice.
             capture_exception(error)
             self.resolution_retry_paused = True
@@ -296,7 +297,7 @@ class AccountResolutionController:
         context = self._context()
         try:
             has_pending = context.store.has_sendable_sync_operations()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
             return self._sendable_fallback_value(context, notices, str(error))
         except ValueError as error:
@@ -337,7 +338,7 @@ class AccountResolutionController:
             return done(EmitNotice(context.strings.text("resolution.discard_failed")))
         try:
             discarded = context.store.discard_pending_resolution(user_id, request_id)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D61: infra failure reports to Sentry (D53 split), still
             # pause+notice so the Qt slot never raises and retry stays held.
             capture_exception(error)
@@ -371,7 +372,7 @@ class AccountResolutionController:
         context = self._context()
         try:
             pending = context.store.pending_resolution()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
             return self.handle_resolution_corruption(user, error)
         except ValueError as error:

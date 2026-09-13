@@ -22,6 +22,7 @@ from .controller_outcomes import (
 )
 from .iroh_protocol import IrohProtocolError, parse_invite, room_id_for_secret
 from .sentry_monitoring import capture_exception
+from .shared_core import SharedCoreError
 
 
 def _workspace_transition(action: Callable[..., Any]) -> Callable[..., Any]:
@@ -139,7 +140,7 @@ class ReplicationController:
         context = self._context()
         try:
             context.store.set_replication_mode(mode)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self._ports.set_replication_mode(self.mode)
@@ -198,7 +199,7 @@ class ReplicationController:
         try:
             if self._saved_iroh_room_ready_value():
                 return True
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self._ports.set_replication_mode(self.mode)
@@ -280,7 +281,7 @@ class ReplicationController:
         )
         try:
             room_id = context.store.create_iroh_room(secrets.token_bytes(32), name)
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return done(EmitNotice(str(error)))
@@ -321,7 +322,7 @@ class ReplicationController:
                 invite.endpoint_id,
                 invite.endpoint_ticket,
             )
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             # IrohProtocolError subclasses ValueError and stays validation-only.
             capture_exception(error)
@@ -375,7 +376,7 @@ class ReplicationController:
             self._cancel_iroh_join()
             try:
                 context.store.set_replication_mode("offline")
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry, still notice-only.
                 capture_exception(error)
                 self._ports.set_replication_mode(self.mode)
@@ -397,7 +398,7 @@ class ReplicationController:
             return done()
         try:
             context.store.leave_iroh_room()
-        except (OSError, sqlite3.Error) as error:
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             return done(EmitNotice(str(error)))
@@ -421,7 +422,7 @@ class ReplicationController:
         if context.iroh is not None:
             try:
                 context.store.capture_local_iroh_records()
-            except (OSError, sqlite3.Error) as error:
+            except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry, still notice-only.
                 capture_exception(error)
                 return done(EmitNotice(str(error)))

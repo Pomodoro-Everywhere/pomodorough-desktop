@@ -21,7 +21,11 @@ from pomodorough.core import (
     rebuild_tasks,
     task_from_title,
 )
-from pomodorough.shared_core import SharedCore, SharedCoreLoadError
+from pomodorough.shared_core import (
+    SharedCore,
+    SharedCoreABIError,
+    SharedCoreLoadError,
+)
 from pomodorough.storage import (
     MAX_CLOCK_SKEW_MS,
     MAX_SAFE_INTEGER,
@@ -416,7 +420,7 @@ class StorageTests(unittest.TestCase):
         self.store = Store(self.path, shared_core=core)
 
         with self.assertRaisesRegex(
-            ValueError, "malformed projection.apply.v2 output"
+            SharedCoreABIError, "malformed projection.apply.v2 output"
         ):
             self.store.projected_state(now_ms=1_000)
 
@@ -480,7 +484,7 @@ class StorageTests(unittest.TestCase):
         ).fetchone()[0]
         before_hlc = self.store.get_meta("hlc")
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.queue_task_operation(
                 "upsert", {"id": "native-task-id", "title": "Task"}, now_ms=1
             )
@@ -534,7 +538,7 @@ class StorageTests(unittest.TestCase):
         before_hlc = self.store.get_meta("hlc")
         before_uuid = self.store.get_meta("lastUuidV7")
 
-        with self.assertRaisesRegex(ValueError, "projection unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "projection unavailable"):
             self.store.queue_task_operation("upsert", task, now_ms=1_000)
 
         self.assertEqual(
@@ -559,7 +563,7 @@ class StorageTests(unittest.TestCase):
         before_hlc = self.store.get_meta("hlc")
         before_uuid = self.store.get_meta("lastUuidV7")
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.queue_duration_operation("focus", 30 * 60_000, now_ms=1_000)
 
         self.assertEqual(core.calls[0][0], "hlc.tick.v1")
@@ -582,7 +586,7 @@ class StorageTests(unittest.TestCase):
         before_uuid = self.store.get_meta("lastUuidV7")
         before_legacy = self.store.get_meta("autoStartLegacyDefaultUnknown")
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.set_auto_start_breaks(True, now_ms=1_000)
 
         self.assertEqual(core.calls[0][0], "hlc.tick.v1")
@@ -607,7 +611,7 @@ class StorageTests(unittest.TestCase):
         before_hlc = self.store.get_meta("hlc")
         before_uuid = self.store.get_meta("lastUuidV7")
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.set_selected_task_id("task-id", now_ms=1_000)
 
         self.assertEqual(core.calls[0][0], "hlc.tick.v1")
@@ -638,7 +642,7 @@ class StorageTests(unittest.TestCase):
             )
         }
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.queue_command(
                 "start", None, "focus", settings["durationsMs"], now_ms=1_000
             )
@@ -659,7 +663,7 @@ class StorageTests(unittest.TestCase):
         self.store = Store(self.path, shared_core=core)
         before = self.store.load()
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store._projected_local_genesis()
 
         self.assertEqual(core.calls[0][0], "projection.apply.v2")
@@ -2507,7 +2511,7 @@ class StorageTests(unittest.TestCase):
             error=SharedCoreLoadError("core unavailable")
         )
 
-        with self.assertRaisesRegex(ValueError, "core unavailable"):
+        with self.assertRaisesRegex(SharedCoreLoadError, "core unavailable"):
             self.store.apply_sync(response, request)
 
         self.assertEqual(self.store.load(), before)
@@ -3672,7 +3676,7 @@ class StorageTests(unittest.TestCase):
         )
         before_database = _serialize_logical_database(self.store.connection)
 
-        with self.assertRaisesRegex(ValueError, "internally inconsistent"):
+        with self.assertRaisesRegex(SharedCoreABIError, "internally inconsistent"):
             self.store.process_auto_break(require_canonical=False, now_ms=3_000)
 
         self.assertEqual(_serialize_logical_database(self.store.connection), before_database)

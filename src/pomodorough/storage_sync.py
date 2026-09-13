@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .core import PHASES
-from .shared_core import SharedCoreError
+from .shared_core import SharedCoreOperationError
 from .storage_model import (
     MAX_SAFE_INTEGER,
     RESOLUTION_OPERATION_MAX,
@@ -331,7 +331,8 @@ class SyncStorage:
         core = self._dependencies.shared_core() or _default_shared_core()
         try:
             value = core.dispatch("bootstrap.plan.v1", plan_input)
-        except SharedCoreError as error:
+        except SharedCoreOperationError as error:
+            # D68: only operation rejection is validation; load/ABI stay infra.
             raise ValueError(str(error)) from error
         return self._validated_bootstrap_plan(
             value, local_history, canonical["history"]
