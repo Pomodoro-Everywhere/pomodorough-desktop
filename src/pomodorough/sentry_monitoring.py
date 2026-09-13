@@ -141,7 +141,11 @@ _IPV6_RE = re.compile(
 _INVITE_RE = re.compile(r"pomodorough1\.[A-Za-z0-9_-]+")
 # D27: also match fragment `#code=` (implicit-flow callbacks put secrets
 # after `#`, never sent to servers but visible in Sentry breadcrumbs).
-_CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
+# D65: `;` joins params like `&` in legacy URLs/matrix params
+# (`?a=1;roomSecret=x`), so it joins the prefix class everywhere `[?&#]`
+# appears. Bare `k=v` prose without any prefix stays a known limitation:
+# matching it would over-filter benign prose (`room=5`, `state=ok`).
+_CODE_PARAM_RE = re.compile(r"(?i)([?&#;]code=)[^&\s\"';]+")
 # D27: OAuth/token query and fragment params carry the same secret as
 # `code=`; scrub them in free text where key filtering cannot see them.
 # D31: `state`/`nonce`/`code_verifier`/`code_challenge` are OAuth secrets
@@ -165,8 +169,10 @@ _CODE_PARAM_RE = re.compile(r"(?i)([?&#]code=)[^&\s\"';]+")
 # `endpointId` (+ snake `room_secret`/`room_name`/`endpoint_ticket`/
 # `endpoint_id` + flat) leak the same way in free-text URLs and
 # JSON strings; match them here where key filtering cannot see them.
+# D65: prefix class gains `;` (`?a=1;roomSecret=x`); bare `k=v` prose
+# without a prefix character stays a documented limitation (see above).
 _TOKEN_PARAM_RE = re.compile(
-    r"(?i)([?&#](?:access_token|id_token|refresh_token|token|state|nonce|"
+    r"(?i)([?&#;](?:access_token|id_token|refresh_token|token|state|nonce|"
     r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
     r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
     r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"

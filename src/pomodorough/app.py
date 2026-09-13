@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 from .iroh_network import IrohService
 from .network import CloudService
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
+from .shared_core import SharedCoreError
 from .storage import Store
 from .ui import MainWindow, resource_path
 
@@ -47,12 +48,14 @@ def main() -> int:
         cloud = CloudService(store.device_id)
         iroh = _iroh_service(store)
         window = MainWindow(store, cloud, icon, iroh)
-    except (OSError, sqlite3.Error) as error:
+    except (OSError, sqlite3.Error, SharedCoreError) as error:
         # D57: startup owns the single report (Store.device_id never
         # captures); fail closed instead of running without identity.
         # D60: capture then return without re-raising: the global
         # excepthook installed by init_sentry_from_environment would
         # capture the same failure a second time (2 events per startup).
+        # D63: SharedCoreError (wasm load via _default_shared_core) is
+        # infra here too: capture + exit 1, never via traceback.
         capture_exception(error)
         return 1
     app.aboutToQuit.connect(window.shutdown)

@@ -12,11 +12,12 @@ from typing import Any, Sequence, TextIO
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
+from .shared_core import SharedCoreError
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer, normalize_phase
 
 JSON_ERROR_VERSION = 1
-STORAGE_ERRORS = (OSError, sqlite3.Error)
+STORAGE_ERRORS = (OSError, sqlite3.Error, SharedCoreError)
 
 
 class CLIArgumentError(Exception):
@@ -241,6 +242,7 @@ def _run_with_store(
     InvalidAction
     | OSError
     | sqlite3.Error
+    | SharedCoreError
     | json.JSONDecodeError
     | KeyError
     | TypeError
@@ -254,6 +256,9 @@ def _run_with_store(
         run(args, LocalTimer(store, strings=strings), output, strings)
     except STORAGE_ERRORS as error:
         # Sweep: infra failure reports to Sentry; CLI still prints + exits 2.
+        # D63: SharedCoreError (wasm load) is infra, not validation:
+        # _default_shared_core() constructs outside the storage try, so it
+        # escapes as SharedCoreError and must capture here, never traceback.
         capture_exception(error)
         runtime_error = error
     except (InvalidAction, KeyError, TypeError, ValueError) as error:
@@ -276,6 +281,7 @@ def _print_runtime_error(
         InvalidAction
         | OSError
         | sqlite3.Error
+        | SharedCoreError
         | json.JSONDecodeError
         | KeyError
         | TypeError

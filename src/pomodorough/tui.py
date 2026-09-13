@@ -10,10 +10,11 @@ from typing import Any, Sequence
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
+from .shared_core import SharedCoreError
 from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
-STORAGE_ERRORS = (OSError, sqlite3.Error)
+STORAGE_ERRORS = (OSError, sqlite3.Error, SharedCoreError)
 
 
 def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings:
@@ -172,8 +173,10 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
             message = ""
             if not handle_key(timer, key):
                 return
-        except (OSError, sqlite3.Error) as error:
+        except STORAGE_ERRORS as error:
             # D49: infra failure reports to Sentry, still notice-only.
+            # D63: SharedCoreError (wasm load via _default_shared_core)
+            # is infra here too: capture + notice, loop survives.
             capture_exception(error)
             message = str(error)
         except InvalidAction as error:
@@ -194,32 +197,43 @@ def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int
     parser.add_argument("--data", type=Path, help=strings.text("terminal.data_help"))
     args = parser.parse_args(argv)
     store = None
+    result = 0
     try:
         # D62: Store() lives inside the boundary so OSError/sqlite3
         # reports to Sentry and exits 2 like the CLI, never via traceback.
+        # D63: SharedCoreError rides STORAGE_ERRORS (wasm load is infra).
         store = Store(args.data.expanduser() if args.data else None)
         timer = LocalTimer(store)
         timer.strings = strings
         curses.wrapper(_run, timer)
-        return 0
     except KeyboardInterrupt:
-        return 130
+        result = 130
     except STORAGE_ERRORS as error:
         capture_exception(error)
         print(strings.text("tui.error", error=error), file=sys.stderr)
-        return 2
+        result = 2
     except (InvalidAction, KeyError, TypeError, ValueError) as error:
         # CLI parity: corrupt settings/snapshot stays silent (no Sentry
         # capture), exits 2 like cli._run_with_store validation, never
         # via traceback or the excepthook (which would over-capture).
         print(strings.text("tui.error", error=error), file=sys.stderr)
-        return 2
+        result = 2
     except curses.error as error:
         print(strings.text("tui.error", error=error), file=sys.stderr)
-        return 2
+        result = 2
     finally:
         if store is not None:
-            store.close()
+            try:
+                store.close()
+            except STORAGE_ERRORS as error:
+                # D64: mirror cli._run_with_store close guard: capture
+                # close-path infra, first error wins (success becomes 2,
+                # failure keeps its code so close never masks it).
+                capture_exception(error)
+                if result == 0:
+                    print(strings.text("tui.error", error=error), file=sys.stderr)
+                    result = 2
+    return result
 
 
 if __name__ == "__main__":
