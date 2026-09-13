@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from pomodorough.shared_core import (  # noqa: E402
+from pomodorough.shared_core import (
     SharedCoreABIError,
     SharedCoreError,
     SharedCoreLoadError,
@@ -135,6 +135,38 @@ class D66ControllerBoundaryTests(unittest.TestCase):
                 self.fail("SharedCoreError escaped timer controller")
         capture.assert_called_once_with(error)
         self.assertIn("wasm load failed", str(outcome.effects))
+
+    def test_read_resolution_corruption_captures_shared_core_error(self) -> None:
+        from types import SimpleNamespace
+
+        from pomodorough.ui_controller import ApplicationController
+
+        error = SharedCoreError("wasm load failed")
+        store = Mock()
+        store.pending_resolution.side_effect = error
+        account = SimpleNamespace(resolution_corruption=None)
+        controller = SimpleNamespace(store=store, account_resolution=account)
+        with patch("pomodorough.ui_controller.capture_exception") as capture:
+            try:
+                ApplicationController._read_resolution_corruption(controller)
+            except SharedCoreError:
+                self.fail("SharedCoreError escaped _read_resolution_corruption")
+        capture.assert_called_once_with(error)
+        self.assertEqual(account.resolution_corruption, str(error))
+
+    def test_read_resolution_corruption_validation_stays_silent(self) -> None:
+        from types import SimpleNamespace
+
+        from pomodorough.ui_controller import ApplicationController
+
+        store = Mock()
+        store.pending_resolution.side_effect = ValueError("corrupted")
+        account = SimpleNamespace(resolution_corruption=None)
+        controller = SimpleNamespace(store=store, account_resolution=account)
+        with patch("pomodorough.ui_controller.capture_exception") as capture:
+            ApplicationController._read_resolution_corruption(controller)
+        capture.assert_not_called()
+        self.assertEqual(account.resolution_corruption, "corrupted")
 
 
 class D67UnquotedJsonScrubTests(unittest.TestCase):
