@@ -89,16 +89,21 @@ class _ClockRenderer:
         center = self.geometry.center
         window_text = self.palette.color(QPalette.ColorRole.WindowText)
         text = self.palette.color(QPalette.ColorRole.Text)
+        base = self.palette.color(QPalette.ColorRole.Base)
         dot_radius = max(3.0, self.geometry.side * 0.009)
+        background_radius = dot_radius + max(2.0, self.geometry.side * 0.006)
         spacing = radius * 0.11
         y = center.y() + radius * 0.60
-        self.painter.setPen(QPen(window_text, 2))
         for index in range(4):
             x = center.x() + (index - 1.5) * spacing
+            self.painter.setPen(Qt.PenStyle.NoPen)
+            self.painter.setBrush(base)
+            self.painter.drawEllipse(QPointF(x, y), background_radius, background_radius)
+            self.painter.setPen(QPen(window_text, 2))
             if index < self.dots:
                 self.painter.setBrush(text)
             else:
-                self.painter.setBrush(Qt.BrushStyle.NoBrush)
+                self.painter.setBrush(base)
             self.painter.drawEllipse(QPointF(x, y), dot_radius, dot_radius)
 
     def _paint_face(self) -> None:
