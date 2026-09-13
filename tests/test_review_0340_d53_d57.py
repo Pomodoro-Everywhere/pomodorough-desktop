@@ -324,14 +324,14 @@ class D57DeviceIdGuardTests(unittest.TestCase):
             pass
         self.temporary.cleanup()
 
-    def test_infra_captures_and_raises(self) -> None:
+    def test_infra_bubbles_without_internal_capture(self) -> None:
         self.store.close()
         with patch(
             "pomodorough.storage.capture_exception",
         ) as capture:
             with self.assertRaises(sqlite3.Error):
                 _ = self.store.device_id
-        capture.assert_called_once()
+        capture.assert_not_called()
 
     def test_validation_stays_silent_but_raises(self) -> None:
         with patch.object(
@@ -344,14 +344,36 @@ class D57DeviceIdGuardTests(unittest.TestCase):
                     _ = self.store.device_id
         capture.assert_not_called()
 
-    def test_hot_caller_inherits_single_capture(self) -> None:
-        self.store.close()
-        with patch(
-            "pomodorough.storage.capture_exception",
-        ) as capture:
-            with self.assertRaises(sqlite3.Error):
-                self.store._with_device_id({"id": "op-1"})
-        capture.assert_called_once()
+    def test_pending_start_reports_exactly_once_across_namespaces(self) -> None:
+        from types import SimpleNamespace
+
+        from pomodorough import cli as cli_module
+
+        real_get_meta = self.store.get_meta
+
+        def get_meta(key, default=None):
+            if key == "deviceId":
+                raise sqlite3.Error("device identity unreadable")
+            return real_get_meta(key, default)
+
+        args = SimpleNamespace(
+            command="start", phase=None, minutes=None, as_json=True,
+        )
+        with patch.object(self.store, "get_meta", side_effect=get_meta):
+            with patch(
+                "pomodorough.storage.capture_exception",
+            ) as storage_capture:
+                with patch(
+                    "pomodorough.cli.capture_exception",
+                ) as boundary_capture:
+                    error = cli_module._run_with_store(
+                        args, self.store, Mock(), Strings(),
+                    )
+        self.assertIsInstance(error, sqlite3.Error)
+        storage_capture.assert_not_called()
+        boundary_capture.assert_called_once()
+        total = storage_capture.call_count + boundary_capture.call_count
+        self.assertEqual(total, 1)
 
 
 if __name__ == "__main__":

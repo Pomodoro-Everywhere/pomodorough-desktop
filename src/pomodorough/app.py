@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from .iroh_network import IrohService
 from .network import CloudService
-from .sentry_monitoring import init_sentry_from_environment
+from .sentry_monitoring import capture_exception, init_sentry_from_environment
 from .storage import Store
 from .ui import MainWindow, resource_path
 
@@ -41,10 +42,16 @@ def main() -> int:
     if not instance_lock.tryLock(0):
         return 0
 
-    store = Store()
-    cloud = CloudService(store.device_id)
-    iroh = _iroh_service(store)
-    window = MainWindow(store, cloud, icon, iroh)
+    try:
+        store = Store()
+        cloud = CloudService(store.device_id)
+        iroh = _iroh_service(store)
+        window = MainWindow(store, cloud, icon, iroh)
+    except (OSError, sqlite3.Error) as error:
+        # D57: startup owns the single report (Store.device_id never
+        # captures); fail closed instead of running without identity.
+        capture_exception(error)
+        raise
     app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(cloud.shutdown)
     app.aboutToQuit.connect(iroh.shutdown)
