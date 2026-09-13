@@ -295,6 +295,38 @@ class D62TuiStartupBoundaryTests(unittest.TestCase):
         timer_type.assert_not_called()
         wrapper.assert_not_called()
 
+    def test_validation_stays_silent_returns_2(self) -> None:
+        from pomodorough import tui as tui_module
+        from pomodorough.terminal import InvalidAction
+
+        errors = (
+            InvalidAction("bad action"),
+            KeyError("bad key"),
+            TypeError("bad type"),
+            ValueError("corrupt settings"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(
+                        tui_module, "Store", side_effect=error
+                    ) as store_type,
+                    patch.object(tui_module, "LocalTimer") as timer_type,
+                    patch.object(tui_module.curses, "wrapper") as wrapper,
+                    patch(
+                        "pomodorough.tui.capture_exception",
+                    ) as capture,
+                ):
+                    try:
+                        result = tui_module.main([])
+                    except Exception as exc:  # noqa: BLE001
+                        self.fail(f"validation escaped: {exc!r}")
+                self.assertEqual(result, 2)
+                capture.assert_not_called()
+                store_type.assert_called_once()
+                timer_type.assert_not_called()
+                wrapper.assert_not_called()
+
     def test_success_path_still_closes_store(self) -> None:
         from pomodorough import tui as tui_module
 

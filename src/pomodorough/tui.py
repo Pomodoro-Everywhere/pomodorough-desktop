@@ -208,6 +208,12 @@ def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int
         capture_exception(error)
         print(strings.text("tui.error", error=error), file=sys.stderr)
         return 2
+    except (InvalidAction, KeyError, TypeError, ValueError) as error:
+        # CLI parity: corrupt settings/snapshot stays silent (no Sentry
+        # capture), exits 2 like cli._run_with_store validation, never
+        # via traceback or the excepthook (which would over-capture).
+        print(strings.text("tui.error", error=error), file=sys.stderr)
+        return 2
     except curses.error as error:
         print(strings.text("tui.error", error=error), file=sys.stderr)
         return 2
