@@ -1293,7 +1293,16 @@ class Store:
 
     @property
     def device_id(self) -> str:
-        return str(self.get_meta("deviceId"))
+        # D57: bare meta read guarded; infra reports then fail-closed
+        # raise so hot callers inherit the D50 split from one place.
+        try:
+            return str(self.get_meta("deviceId"))
+        except (OSError, sqlite3.Error) as error:
+            capture_exception(error)
+            raise
+        except (ValueError, TypeError, KeyError):
+            # validation stays silent
+            raise
 
 
     def load(self, *, projection: bool = False) -> dict[str, Any]:

@@ -176,6 +176,10 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
             message = str(error)
         except InvalidAction as error:
             message = str(error)
+        except (KeyError, TypeError, ValueError) as error:
+            # D54: validation stays silent (no Sentry capture);
+            # corrupt settings/snapshot shows as notice, loop survives.
+            message = str(error)
 
 
 def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int:

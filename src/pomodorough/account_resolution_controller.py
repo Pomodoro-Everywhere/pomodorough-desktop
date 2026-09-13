@@ -170,7 +170,15 @@ class AccountResolutionController:
                 response,
                 **self._ports.response_timing(response),
             )
+        except (OSError, sqlite3.Error) as error:
+            # D53: infra failure reports to Sentry, still pause+notice.
+            capture_exception(error)
+            self.resolution_phase = "preview"
+            self.resolution_preview = None
+            self.resolution_retry_paused = True
+            return done(EmitNotice(str(error)))
         except (KeyError, TypeError, ValueError) as error:
+            # validation stays silent
             self.resolution_phase = "preview"
             self.resolution_preview = None
             self.resolution_retry_paused = True
@@ -188,7 +196,13 @@ class AccountResolutionController:
                 int(plan["expectedRevision"]),
                 strategy,
             )
+        except (OSError, sqlite3.Error) as error:
+            # D53: infra failure reports to Sentry, still pause+notice.
+            capture_exception(error)
+            self.resolution_retry_paused = True
+            return done(EmitNotice(str(error)))
         except (KeyError, TypeError, ValueError) as error:
+            # validation stays silent
             self.resolution_retry_paused = True
             return done(EmitNotice(str(error)))
         self.resolution_phase = "resolve"
@@ -262,7 +276,13 @@ class AccountResolutionController:
                 self.resolution_request_id,
                 **self._ports.response_timing(response),
             )
+        except (OSError, sqlite3.Error) as error:
+            # D53: infra failure reports to Sentry, still pause+notice.
+            capture_exception(error)
+            self.resolution_retry_paused = True
+            return done(EmitNotice(str(error)))
         except (KeyError, TypeError, ValueError) as error:
+            # validation stays silent
             self.resolution_retry_paused = True
             return done(EmitNotice(str(error)))
         self._clear_history_resolution_value()

@@ -167,6 +167,10 @@ class LocalTimer:
         physical_now_ms: int,
         projection_now_ms: int,
     ) -> None:
+        # D55: infra bubbles to the CLI/TUI capture boundary
+        # (cli._run_with_store, tui._run); this helper never captures,
+        # so one failure reports exactly once. Validation surfaces as
+        # InvalidAction via _store_action.
         if not self.resolution_pending and self.store.has_pending_auto_break():
             self._store_action(
                 lambda: self.store.process_auto_break(
@@ -338,6 +342,10 @@ class LocalTimer:
         }
 
     def _store_action(self, action: Callable[[], Any]) -> Any:
+        # D55: boundary-capture contract — infra (OSError/sqlite3.Error)
+        # bubbles raw to the CLI/TUI capture boundary; only validation
+        # maps to InvalidAction here. Capturing here would double-report
+        # with tui._run / cli._run_with_store.
         try:
             return action()
         except ValueError as error:
