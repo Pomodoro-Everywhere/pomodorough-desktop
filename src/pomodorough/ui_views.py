@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
-    QLabel,
     QPushButton,
     QStackedWidget,
     QToolButton,
@@ -83,15 +82,6 @@ class MainWindowViewMixin:
 
     def _build_header(self) -> None:
         header = QHBoxLayout()
-        brand = QVBoxLayout()
-        brand.setSpacing(0)
-        title = QLabel(self.strings.text("brand.name"))
-        title.setObjectName("brand")
-        tagline = QLabel(self.strings.text("brand.tagline"))
-        tagline.setObjectName("tagline")
-        brand.addWidget(title)
-        brand.addWidget(tagline)
-        header.addLayout(brand)
         self.navigation = ScreenNavigation(self.strings, self)
         self.screen_group = self.navigation.group
         self.screen_buttons = self.navigation.buttons
