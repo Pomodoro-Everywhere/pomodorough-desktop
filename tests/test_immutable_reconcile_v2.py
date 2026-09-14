@@ -493,6 +493,57 @@ class ProductionBundleV2Tests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_sync_install_tolerates_completion_between_render_and_receipt(
+        self,
+    ) -> None:
+        # The server renders canonical before a timer completes; receipt
+        # lands after it. Replay must use the server render time reconcile
+        # used, or the legitimate skew raises a false mismatch.
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            store = Store(Path(temporary.name) / "state.sqlite3")
+            try:
+                durations = {
+                    "focus": 60_000,
+                    "short_break": 60_000,
+                    "long_break": 60_000,
+                }
+                started_at = 1_700_000_000_000
+                completion_at = started_at + 60_000
+                server_ms = completion_at - 2_000
+                round_trip_ms = 8_000
+                store.queue_command(
+                    "start", None, "focus", durations, None,
+                    now_ms=started_at,
+                )
+                running = store.projected_state(
+                    now_ms=started_at + 1_000
+                ).canonical_timer
+                assert running is not None
+                request = store.sync_payload()
+                request_phys = server_ms - round_trip_ms
+                store.apply_sync(
+                    _canonical_response(
+                        store,
+                        request,
+                        canonicalTimer=dict(running),
+                        durationsMs=dict(durations),
+                        serverTime=utc_timestamp(server_ms),
+                        serverHlcWallMs=server_ms,
+                        serverHlcCounter=0,
+                    ),
+                    request,
+                    request_physical_ms=request_phys,
+                    received_physical_ms=request_phys + round_trip_ms,
+                    request_monotonic_ms=1_000,
+                    received_monotonic_ms=1_000 + round_trip_ms,
+                )
+                self.assertEqual(store.pending_sync(), None)
+            finally:
+                store.close()
+        finally:
+            temporary.cleanup()
+
     def test_unsupported_v2_bundle_still_fails_closed(self) -> None:
         from pomodorough.shared_core import SharedCoreOperationError
 

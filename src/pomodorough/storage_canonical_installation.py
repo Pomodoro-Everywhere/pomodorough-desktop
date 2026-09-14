@@ -4,7 +4,14 @@ import sqlite3
 from copy import deepcopy
 from typing import Any, Protocol
 
-from .storage_model import MAX_CLOCK_SKEW_MS, utc_timestamp
+from .core import ACTIVE_STATUSES, PHASES, parse_timestamp_ms
+from .shared_core import SharedCoreOperationError, plan_timer_completion_v1
+from .storage_canonical_reconciliation import generated_break_day_bounds
+from .storage_model import (
+    MAX_CLOCK_SKEW_MS,
+    _default_shared_core,
+    utc_timestamp,
+)
 
 _RESOLUTION_QUEUE_DELETIONS = (
     ("commands", "DELETE FROM pending_commands WHERE id = ?"),
@@ -97,6 +104,11 @@ class CanonicalInstallationDependencies(Protocol):
     ) -> dict[str, Any] | None: ...
 
     def pending_sync(self) -> dict[str, Any] | None: ...
+
+    @property
+    def device_id(self) -> str: ...
+
+    def shared_core(self) -> Any: ...
 
 
 class CanonicalInstallationHooks(Protocol):
@@ -342,9 +354,15 @@ class AtomicCanonicalInstaller:
         expected: dict[str, Any] | None,
         safe_pending: dict[str, list[dict[str, Any]]] | None = None,
     ) -> Any:
+        # Replay at the server render time reconcile used. Receipt time
+        # (trusted_response_ms) can fall past a timer completion that the
+        # server had not yet observed; replaying there is legitimate skew,
+        # not divergence.
+        # trusted_response_ms is kept for the hooks signature.
+        del trusted_response_ms
         if safe_pending is not None:
             projection = self._dependencies._project_canonical_with_pending(
-                canonical, safe_pending, trusted_response_ms
+                canonical, safe_pending, canonical["serverTimeMs"]
             )
         else:
             settings = self._dependencies._normalize_settings(
@@ -353,7 +371,7 @@ class AtomicCanonicalInstaller:
             projection_settings["durationsMs"] = canonical["durationsMs"]
             projection = self._dependencies._project_operation(
                 projection_settings,
-                now=utc_timestamp(trusted_response_ms),
+                now=utc_timestamp(canonical["serverTimeMs"]),
                 base=canonical,
             )
         actual = {
@@ -478,8 +496,163 @@ class AtomicCanonicalInstaller:
             expected_projection=reconciliation["projection"],
             safe_pending=reconciliation["projectionPending"],
         )
+        self._advance_selected_phase_for_remote_finish(canonical)
         self._dependencies._prune_command_physical_times()
         return notices
+
+    def _has_active_canonical_timer(self, canonical: dict[str, Any]) -> bool:
+        timer = canonical.get("canonicalTimer")
+        return (
+            isinstance(timer, dict) and timer.get("status") in ACTIVE_STATUSES
+        )
+
+    def _has_local_phase_advance(self) -> bool:
+        return (
+            self._dependencies.connection.execute(
+                "SELECT 1 FROM pending_phase_advances LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
+    def _has_sendable_pending(self) -> bool:
+        pending = self._dependencies._preflight_pending_queues(
+            require_clock_coverage=False
+        )
+        return any(
+            pending.get(key)
+            for key in (
+                "sendableCommands",
+                "taskOperations",
+                "durationOperations",
+                "autoStartOperations",
+                "selectedTaskOperations",
+            )
+        )
+
+    @staticmethod
+    def _completed_stamp(item: Any) -> tuple[int, str] | None:
+        if not isinstance(item, dict):
+            return None
+        if item.get("status") != "completed":
+            return None
+        stamp = item.get("completedAt") or item.get("endedAt")
+        if not isinstance(stamp, str):
+            return None
+        stamp_ms = parse_timestamp_ms(stamp)
+        if stamp_ms is None:
+            return None
+        return stamp_ms, stamp
+
+    @staticmethod
+    def _source_from_item(item: dict[str, Any], stamp: str) -> dict[str, Any] | None:
+        timer_id = item.get("timerId")
+        phase = item.get("phase")
+        if not isinstance(timer_id, str) or not timer_id:
+            return None
+        if not isinstance(phase, str) or phase not in PHASES:
+            return None
+        command_id = item.get("commandId")
+        if not isinstance(command_id, str) or not command_id:
+            command_id = timer_id
+        return {
+            "commandId": command_id,
+            "timerId": timer_id,
+            "phase": phase,
+            "occurredAt": stamp,
+        }
+
+    def _latest_completed_source(
+        self, history: Any
+    ) -> tuple[dict[str, Any], str, str] | None:
+        if not isinstance(history, list) or not history:
+            return None
+        best: dict[str, Any] | None = None
+        best_ms: int | None = None
+        best_stamp: str | None = None
+        for item in history:
+            located = self._completed_stamp(item)
+            if located is None:
+                continue
+            stamp_ms, stamp = located
+            if best_ms is None or stamp_ms > best_ms:
+                best, best_ms, best_stamp = item, stamp_ms, stamp
+        if best is None or best_stamp is None or best_ms is None:
+            return None
+        source = self._source_from_item(best, best_stamp)
+        if source is None:
+            return None
+        day_start, day_end = generated_break_day_bounds(best_ms)
+        return source, day_start, day_end
+
+    def _remote_finish_selected_phase(
+        self,
+        canonical: dict[str, Any],
+        source: dict[str, Any],
+        day_start: str,
+        day_end: str,
+    ) -> str | None:
+        history = canonical.get("history", [])
+        if not isinstance(history, list):
+            return None
+        auto_start = bool(canonical.get("autoStartBreaks", False))
+        try:
+            device_id = self._dependencies.device_id
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not isinstance(device_id, str) or not device_id:
+            return None
+        try:
+            core = self._dependencies.shared_core()
+        except (AttributeError, TypeError, ValueError):
+            core = None
+        if core is None:
+            core = _default_shared_core()
+        try:
+            plan = plan_timer_completion_v1(
+                core,
+                {
+                    "kind": "finishApplied",
+                    "source": source,
+                    "history": history,
+                    "autoStartBreaks": auto_start,
+                    "localDeviceId": device_id,
+                    "ownership": None,
+                    "dayStart": day_start,
+                    "dayEnd": day_end,
+                },
+            )
+        except (ValueError, SharedCoreOperationError):
+            return None
+        return plan.selected_phase
+
+    def _advance_selected_phase_for_remote_finish(
+        self, canonical: dict[str, Any]
+    ) -> None:
+        if self._has_active_canonical_timer(canonical):
+            return
+        if self._has_local_phase_advance():
+            return
+        if self._has_sendable_pending():
+            return
+        located = self._latest_completed_source(canonical.get("history"))
+        if located is None:
+            return
+        source, day_start, day_end = located
+        settings = self._dependencies._normalize_settings(
+            self._dependencies.get_meta("settings", {})
+        )
+        current = settings.get("selectedPhase")
+        if current != source["phase"]:
+            return
+        derived = self._remote_finish_selected_phase(
+            canonical, source, day_start, day_end
+        )
+        if derived is None or derived == current:
+            return
+        if derived not in PHASES:
+            return
+        settings["selectedPhase"] = derived
+        self._dependencies._set_meta("settings", settings)
 
     def apply_resolution(
         self,

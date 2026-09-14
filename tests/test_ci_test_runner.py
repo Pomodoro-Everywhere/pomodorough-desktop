@@ -82,7 +82,8 @@ def full_test_command(step: str) -> list[str]:
     commands = [line.strip().removeprefix("run: ") for line in step.splitlines()
                 if " -m pytest " in line]
     assert len(commands) == 1, "Each full-suite step must invoke pytest once"
-    return shlex.split(commands[0].removeprefix("QT_QPA_PLATFORM=offscreen "))
+    return shlex.split(commands[0].removeprefix("POMODOROUGH_SENTRY_DISABLE=1 ")
+                                 .removeprefix("QT_QPA_PLATFORM=offscreen "))
 
 
 def fixture_test_command(command: list[str]) -> list[str]:
@@ -102,6 +103,7 @@ def run_tests(command: list[str], directory: Path, home: Path, *arguments: str):
     environment = dict(os.environ, HOME=str(home), USERPROFILE=str(home),
                        XDG_CONFIG_HOME=str(home / "config"),
                        XDG_DATA_HOME=str(home / "data"),
+                       POMODOROUGH_SENTRY_DISABLE="1",
                        QT_QPA_PLATFORM="offscreen", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     environment.pop("PYTEST_ADDOPTS", None)
     return subprocess.run(
@@ -125,6 +127,11 @@ def assert_full_suite_contract(
         assert f"python -m pip install --disable-pip-version-check --no-deps {UV_PIN}" in install_commands
     else:
         assert f"QT_QPA_PLATFORM=offscreen {shlex.join(expected)}" in suite
+        pytest_lines = [line.strip().removeprefix("run: ")
+                        for line in suite.splitlines() if " -m pytest " in line]
+        assert pytest_lines == [
+            f"POMODOROUGH_SENTRY_DISABLE=1 QT_QPA_PLATFORM=offscreen {shlex.join(expected)}"
+        ], "Release package tests must disable Sentry"
     assert full_test_command(suite) == expected
     if install_step == test_step:
         assert suite.index(" -m pip install ") < suite.index(" -m pytest ")
