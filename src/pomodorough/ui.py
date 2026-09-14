@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QCursor,
     QDesktopServices,
     QIcon,
     QPainter,
@@ -172,12 +173,16 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(
             lambda reason: (
-                self._show_window()
+                self._show_tray_menu()
                 if reason == QSystemTrayIcon.ActivationReason.Trigger
                 else None
             )
         )
         self.tray.show()
+
+    def _show_tray_menu(self) -> None:
+        if self.tray_menu:
+            self.tray_menu.popup(QCursor.pos())
 
     def _update_tray_progress(self, progress: float, active: bool) -> None:
         if not self.tray:
