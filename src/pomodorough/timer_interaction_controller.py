@@ -77,6 +77,10 @@ class TimerInteractionController:
         self.auto_finish_in_progress = False
         self.auto_break_not_before = 0.0
         self.provisional_auto_break_timer_ids: set[str] = set()
+        # One-shot: the first reconcile after construction is the cold-start
+        # load. Later reconciles are in-session refreshes and must never
+        # pre-mark anything notified.
+        self._startup_reconcile_pending = True
 
     def _context(self) -> TimerInteractionContext:
         return self._ports.context()
@@ -132,6 +136,23 @@ class TimerInteractionController:
             )
         ):
             self.notified_timer_id = None
+        startup_reconcile, self._startup_reconcile_pending = (
+            self._startup_reconcile_pending,
+            False,
+        )
+        if (
+            startup_reconcile
+            and previous_timer is None
+            and context.timer is not None
+            and context.timer.get("status") == "completed"
+            and (context.timer.get("lastIntent") or {}).get("type") == "finish"
+        ):
+            # Cold-start load only (first reconcile): a timer finished by an
+            # explicit finish intent was already processed (and alerted) in a
+            # past session, so mark it notified instead of replaying its
+            # completion alert/sound. Completions by expiry still alert, and
+            # in-session reloads must still alert for fresh completions.
+            self.notified_timer_id = context.timer.get("id")
         return done()
 
     def tick(self) -> ControllerOutcome[None]:

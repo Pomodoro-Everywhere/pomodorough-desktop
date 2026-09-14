@@ -261,6 +261,36 @@ class ApplicationControllerLifecycleTests(unittest.TestCase):
         self.assertEqual(events, ["stop_sound"])
         self.assertEqual(controller.provisional_auto_break_timer_ids, set())
 
+    def test_startup_completed_timer_marks_notified_without_alert(self) -> None:
+        class Controller(WindowApplicationController):
+            store = None
+            cloud = None
+            timer: ClassVar[dict[str, object]] = {
+                "id": "done",
+                "phase": "focus",
+                "status": "completed",
+                "lastIntent": {"type": "finish"},
+            }
+            settings: ClassVar[dict[str, object]] = {
+                "selectedPhase": "focus",
+                "durationsMs": {"focus": 1},
+            }
+            user = None
+            tasks: ClassVar[list[dict[str, object]]] = []
+            known_tasks: ClassVar[dict[str, dict[str, object]]] = {}
+            _closed = False
+            _projection_now_ms = 0
+
+        controller = Controller()
+        self.assertIsNone(controller.timer_interactions.notified_timer_id)
+        controller._reconcile_loaded_timer(None, set())
+        self.assertEqual(controller.timer_interactions.notified_timer_id, "done")
+        # One-shot: a later reload must not pre-mark a different timer.
+        other = Controller()
+        other.timer_interactions._startup_reconcile_pending = False
+        other._reconcile_loaded_timer(None, set())
+        self.assertIsNone(other.timer_interactions.notified_timer_id)
+
 
 if __name__ == "__main__":
     unittest.main()
