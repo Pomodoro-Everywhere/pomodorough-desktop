@@ -1,6 +1,6 @@
 """v2-capable SharedCore double for desktop contract tests.
 
-The pinned production bundle (Core 0.39.0) serves ``reconcile.rebase.v2``
+The pinned production bundle (Core 0.40.0) serves ``reconcile.rebase.v2``
 directly; production code calls v2 unconditionally with no v1 fallback.
 
 Tests must still verify the client glue (durable never-sent proof, exact
