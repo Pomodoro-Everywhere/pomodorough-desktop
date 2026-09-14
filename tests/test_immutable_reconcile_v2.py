@@ -2,9 +2,11 @@
 
 Covers in-flight acknowledgement, lost-response retry, restart recovery,
 already-synced Start convergence, peer/Iroh capture, and history
-convergence. The pinned production bundle predates v2, so these tests run
-against the spec-derived double (tests/v2_core_double.py); one adaptive
-test pins the fail-closed production behavior while the bundle lacks v2.
+convergence. The pinned production bundle (Core 0.38.0) serves v2, so the
+production-bundle tests run against the real SharedCore; the client-glue
+tests keep the spec-derived double (tests/v2_core_double.py) for delivery
+mechanics, and one stub test pins fail-closed behavior for stale bundles
+with no v1 fallback.
 """
 
 from __future__ import annotations
@@ -467,25 +469,58 @@ class ImmutableReconcileV2Tests(unittest.TestCase):
         self.assertIn(first, room_view["knownTasks"] + room_view["tasks"])
 
 
-class ProductionBundleWithoutV2Tests(unittest.TestCase):
-    def test_apply_sync_fails_closed_without_v1_fallback(self) -> None:
+class ProductionBundleV2Tests(unittest.TestCase):
+    def test_apply_sync_uses_real_v2_for_task_upsert(self) -> None:
         from pomodorough.shared_core import SharedCore
 
-        try:
-            SharedCore().dispatch("reconcile.rebase.v2", {})
-            self.skipTest("bundled Core already serves v2")
-        except Exception as error:
-            self.assertIn("unsupported shared-core operation", str(error))
+        version = SharedCore().dispatch("core.version", {})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.38.0"})
         temporary = tempfile.TemporaryDirectory()
         try:
             store = Store(Path(temporary.name) / "state.sqlite3")
             try:
                 store.queue_task_operation(
-                    "upsert", task_from_title("Bundle probe"), now_ms=1
+                    "upsert", task_from_title("Real v2 probe"), now_ms=1
+                )
+                request = store.sync_payload()
+                store.apply_sync(
+                    _canonical_response(store, request), request
+                )
+                self.assertEqual(store.load()["pending"], [])
+                self.assertIsNone(store.pending_sync())
+            finally:
+                store.close()
+        finally:
+            temporary.cleanup()
+
+    def test_unsupported_v2_bundle_still_fails_closed(self) -> None:
+        from pomodorough.shared_core import SharedCoreOperationError
+
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            store = Store(Path(temporary.name) / "state.sqlite3")
+            try:
+                class UnsupportedCore:
+                    @staticmethod
+                    def dispatch(operation: str, value: object) -> object:
+                        del value
+                        raise SharedCoreOperationError(
+                            operation,
+                            "unsupported shared-core operation: "
+                            "reconcile.rebase.v2",
+                        )
+
+                store.queue_task_operation(
+                    "upsert", task_from_title("Stale bundle probe"), now_ms=1
                 )
                 request = store.sync_payload()
                 before = store.load()
-                with self.assertRaisesRegex(ValueError, "reconcile.rebase.v2"):
+                # Install the stale bundle only around apply_sync: queueing
+                # itself needs a working Core.
+                store._shared_core = UnsupportedCore()  # type: ignore[assignment]
+                with self.assertRaisesRegex(
+                    ValueError, "upgrade pinned Core.*no v1 fallback"
+                ):
                     store.apply_sync(
                         _canonical_response(store, request), request
                     )
@@ -498,56 +533,19 @@ class ProductionBundleWithoutV2Tests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_missing_v2_error_is_explicit_and_names_no_fallback(self) -> None:
+    def test_production_dispatches_v2_and_never_v1(self) -> None:
         from pomodorough.shared_core import SharedCore
 
-        try:
-            SharedCore().dispatch("reconcile.rebase.v2", {})
-            self.skipTest("bundled Core already serves v2")
-        except Exception:
-            pass
         temporary = tempfile.TemporaryDirectory()
         try:
             store = Store(Path(temporary.name) / "state.sqlite3")
             try:
-                store.queue_task_operation(
-                    "upsert", task_from_title("Explicit probe"), now_ms=1
-                )
-                request = store.sync_payload()
-                with self.assertRaisesRegex(
-                    ValueError, "upgrade pinned Core.*no v1 fallback"
-                ):
-                    store.apply_sync(
-                        _canonical_response(store, request), request
-                    )
-            finally:
-                store.close()
-        finally:
-            temporary.cleanup()
-
-    def test_production_never_dispatches_v1_for_reconciliation(self) -> None:
-        from pomodorough.shared_core import SharedCore
-
-        try:
-            SharedCore().dispatch("reconcile.rebase.v2", {})
-            self.skipTest("bundled Core already serves v2")
-        except Exception:
-            pass
-        temporary = tempfile.TemporaryDirectory()
-        try:
-            store = Store(Path(temporary.name) / "state.sqlite3")
-            try:
+                real = SharedCore()
                 seen: list[str] = []
-                real = store._shared_core
-                if real is None:
-                    from pomodorough.storage_model import _default_shared_core
-
-                    real = _default_shared_core()
 
                 class RecordingCore:
                     def dispatch(self, operation: str, value: object) -> object:
                         seen.append(operation)
-                        assert real is not None
                         return real.dispatch(operation, value)
 
                 store._shared_core = RecordingCore()  # type: ignore[assignment]
@@ -556,10 +554,9 @@ class ProductionBundleWithoutV2Tests(unittest.TestCase):
                 )
                 request = store.sync_payload()
                 seen.clear()
-                with self.assertRaises(ValueError):
-                    store.apply_sync(
-                        _canonical_response(store, request), request
-                    )
+                store.apply_sync(
+                    _canonical_response(store, request), request
+                )
                 self.assertIn("reconcile.rebase.v2", seen)
                 self.assertNotIn("reconcile.rebase.v1", seen)
             finally:
@@ -587,14 +584,11 @@ class DoubleVsAuthoritativeTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_double_succeeds_where_bundle_v2_is_unsupported(self) -> None:
+    def test_double_serves_v2_alongside_real_core(self) -> None:
         from pomodorough.shared_core import SharedCore
 
-        try:
-            SharedCore().dispatch("reconcile.rebase.v2", {})
-            self.skipTest("bundled Core already serves v2")
-        except Exception:
-            pass
+        version = SharedCore().dispatch("core.version", {})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.38.0"})
         core = V2EmulatingSharedCore()
         local = {
             "commands": [],

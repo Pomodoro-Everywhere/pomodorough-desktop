@@ -1,10 +1,7 @@
 """v2-capable SharedCore double for desktop contract tests.
 
-The pinned production bundle predates ``reconcile.rebase.v2`` (Core 0.37.0
-answers it with "unsupported shared-core operation"), while the accepted
-immutable contract requires clients to call v2 and never fall back to v1.
-Production code therefore calls v2 unconditionally and surfaces recovery
-when the Core cannot serve it.
+The pinned production bundle (Core 0.38.0) serves ``reconcile.rebase.v2``
+directly; production code calls v2 unconditionally with no v1 fallback.
 
 Tests must still verify the client glue (durable never-sent proof, exact
 payload persistence, atomic snapshot/head install, safe optimistic
