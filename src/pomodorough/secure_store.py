@@ -22,6 +22,48 @@ class SecureStoreError(OSError):
     pass
 
 
+def is_infra_secure_store_error(error: BaseException) -> bool:
+    """D73: infra-backed SecureStoreError carries an OSError/subprocess cause.
+
+    Platform spawn/read/delete failures wrap OSError or
+    subprocess.SubprocessError as __cause__/__context__. Malformed-data
+    errors either chain ValueError (base64/JSON decode) or carry no cause
+    with a malformed message. Only infra-backed errors report to Sentry.
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = []
+    cause = getattr(error, "__cause__", None)
+    context = getattr(error, "__context__", None)
+    if isinstance(cause, BaseException):
+        stack.append(cause)
+    if isinstance(context, BaseException):
+        stack.append(context)
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (OSError, subprocess.SubprocessError)):
+            # SecureStoreError itself is OSError; the cause chain holding
+            # a distinct OSError/subprocess error proves infra failure.
+            if current is not error:
+                return True
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        if isinstance(context, BaseException):
+            stack.append(context)
+    return False
+
+
+def should_capture_secure_store_error(error: BaseException) -> bool:
+    """D73: capture infra-backed errors, stay silent for malformed data."""
+    if is_infra_secure_store_error(error):
+        return True
+    return "malformed" not in str(error).lower()
+
+
 _WINDOWS_BLOB_LIMIT = 64 * 1024
 
 
@@ -488,4 +530,10 @@ def sys_platform() -> str:
     return sys.platform
 
 
-__all__ = ["PlatformSecretStore", "SecretMutationJournal", "SecureStoreError"]
+__all__ = [
+    "PlatformSecretStore",
+    "SecretMutationJournal",
+    "SecureStoreError",
+    "is_infra_secure_store_error",
+    "should_capture_secure_store_error",
+]

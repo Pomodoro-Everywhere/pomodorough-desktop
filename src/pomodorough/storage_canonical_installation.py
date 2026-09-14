@@ -720,6 +720,7 @@ class AtomicCanonicalInstaller:
             expected_projection=reconciliation["projection"],
             safe_pending=reconciliation["projectionPending"],
         )
+        self._advance_selected_phase_for_remote_finish(canonical)
         self._dependencies._prune_command_physical_times()
         return notices
 

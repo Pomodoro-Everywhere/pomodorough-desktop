@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +14,21 @@ from .shared_core import (
 )
 from .storage_canonical_reconciliation import generated_break_day_bounds
 from .storage_model import _default_shared_core
+
+_LOGGER = logging.getLogger(__name__)
+
+_preview_plan_failures = 0
+
+
+def preview_plan_failure_count() -> int:
+    """D74: how many preview plan failures were absorbed as None."""
+    return _preview_plan_failures
+
+
+def reset_preview_plan_failure_count() -> None:
+    """D74 test seam: reset the preview plan-failure counter."""
+    global _preview_plan_failures
+    _preview_plan_failures = 0
 
 
 class TimerCompletionPolicy:
@@ -108,7 +124,12 @@ class TimerCompletionPolicy:
                 "dayStart": day_start,
                 "dayEnd": day_end,
             })
-        except ValueError:
+        except ValueError as error:
+            # D74: preview is best-effort on hot render paths; count and
+            # debug-log plan rejection instead of failing silently.
+            global _preview_plan_failures
+            _preview_plan_failures += 1
+            _LOGGER.debug("preview selected-phase plan rejected: %s", error)
             return None
         return plan.selected_phase
 

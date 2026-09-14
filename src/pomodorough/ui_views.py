@@ -7,10 +7,15 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractButton,
     QButtonGroup,
+    QComboBox,
     QFrame,
     QHBoxLayout,
+    QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -20,6 +25,7 @@ from PySide6.QtWidgets import (
 from .arrivals_screen import ArrivalsScreen
 from .core import format_remaining
 from .network_screen import PRIVACY_POLICY_URL as PRIVACY_POLICY_URL, NetworkScreen
+from .secure_store import SecureStoreError, should_capture_secure_store_error
 from .sentry_monitoring import capture_exception
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
@@ -160,6 +166,7 @@ class MainWindowViewMixin:
             "cancel_button",
             "stop_sound_button",
             "right_panel",
+            "settings_scroll",
             "right_layout",
             "pattern_scope",
             "phase_group",
@@ -249,15 +256,64 @@ class MainWindowViewMixin:
             QShortcut(QKeySequence("Ctrl+Shift+F"), self),
             *(QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self) for index in range(4)),
         ]
-        self.shortcuts[0].activated.connect(self._primary_action)
+        self.shortcuts[0].activated.connect(self._shortcut_primary_action)
         self.shortcuts[1].activated.connect(lambda: self._issue("finish"))
         for index, shortcut in enumerate(self.shortcuts[2:]):
             shortcut.activated.connect(
-                lambda page=index: self.navigation.screen_requested.emit(page)
+                lambda page=index: self._shortcut_show_screen(page)
             )
+
+    @staticmethod
+    def _focused_widget_consumes_space() -> bool:
+        # D71: the global Space shortcut must not steal Space from the
+        # focused control. Buttons/checkboxes click with Space, text inputs
+        # type it, combos/spins consume it for popup/editing.
+        widget = QApplication.focusWidget()
+        if widget is None:
+            return False
+        return isinstance(
+            widget,
+            (
+                QAbstractButton,
+                QLineEdit,
+                QPlainTextEdit,
+                QComboBox,
+                QSpinBox,
+            ),
+        )
+
+    @staticmethod
+    def _focused_widget_is_text_input() -> bool:
+        # D75: Ctrl+digit navigation must not fire while the user edits
+        # text. QSpinBox/QComboBox own an embedded QLineEdit; when either
+        # has focus the user is editing, so skip navigation.
+        widget = QApplication.focusWidget()
+        if widget is None:
+            return False
+        return isinstance(
+            widget, (QLineEdit, QPlainTextEdit, QSpinBox, QComboBox)
+        )
+
+    def _shortcut_primary_action(self) -> None:
+        if self._focused_widget_consumes_space():
+            return
+        self._primary_action()
+
+    def _shortcut_show_screen(self, index: int) -> None:
+        if self._focused_widget_is_text_input():
+            return
+        self.navigation.screen_requested.emit(index)
 
     def _settings_toggled(self, visible: bool) -> None:
         self.timer_screen.set_settings_visible(visible)
+        # D76: settings panel needs ~310px beside the timer column; raise
+        # the window minimum while visible so controls do not clip.
+        # Scroll (settings_scroll) covers short heights.
+        if hasattr(self, "setMinimumWidth"):
+            try:
+                self.setMinimumWidth(880 if visible else 600)
+            except RuntimeError:
+                pass
         label = self.strings.text(
             "status.settings_hide" if visible else "status.settings_show"
         )
@@ -273,6 +329,9 @@ class MainWindowViewMixin:
             self.primary_button,
             self.task_input,
             self.history_list,
+            # D72: network screen needs a keyboard target like the other
+            # three pages; the replication-mode combo is always focusable.
+            self.replication_mode_combo,
         )
         if index < len(focus_targets):
             focus_targets[index].setFocus(Qt.FocusReason.ShortcutFocusReason)
@@ -392,6 +451,12 @@ class MainWindowViewMixin:
     def _cached_iroh_room_value(self) -> Any:
         try:
             room = self.store.iroh_room()
+        except SecureStoreError as error:
+            # D73: infra-backed secure-store failures (OSError/subprocess
+            # cause) report; malformed-data stays silent like validation.
+            if should_capture_secure_store_error(error):
+                capture_exception(error)
+            return getattr(self, "_cached_iroh_room", None)
         except (OSError, sqlite3.Error) as error:
             # D50: per-250ms read guarded; reuse cached room on infra failure.
             capture_exception(error)

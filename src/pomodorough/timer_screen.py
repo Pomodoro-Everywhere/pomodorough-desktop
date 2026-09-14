@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -161,7 +162,15 @@ class TimerScreen(QWidget):
         self._build_alert_notice()
         self._build_version_label()
         self.right_layout.addStretch()
-        self.content_layout.addWidget(self.right_panel, 2)
+        # D76: settings content scrolls instead of clipping on short
+        # windows; the scroll wrapper carries the layout stretch.
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setWidget(self.right_panel)
+        self.settings_scroll.setMinimumWidth(225)
+        self.settings_scroll.setMaximumWidth(370)
+        self.content_layout.addWidget(self.settings_scroll, 2)
+        self.settings_scroll.hide()
         self.right_panel.hide()
 
     def _build_pattern_heading(self) -> None:
@@ -247,6 +256,8 @@ class TimerScreen(QWidget):
 
     def set_settings_visible(self, visible: bool) -> None:
         self.right_panel.setVisible(visible)
+        if hasattr(self, "settings_scroll"):
+            self.settings_scroll.setVisible(visible)
 
     def apply_responsive_layout(self, *, landscape: bool, compact: bool) -> None:
         # Landscape: dial left, controls right (vertically centered).
@@ -276,6 +287,9 @@ class TimerScreen(QWidget):
         self.right_layout.setSpacing(7 if compact else 12)
         self.right_panel.setMinimumWidth(225 if compact else 310)
         self.right_panel.setMaximumWidth(300 if compact else 370)
+        if hasattr(self, "settings_scroll"):
+            self.settings_scroll.setMinimumWidth(225 if compact else 310)
+            self.settings_scroll.setMaximumWidth(300 if compact else 370)
 
     def render(
         self,
