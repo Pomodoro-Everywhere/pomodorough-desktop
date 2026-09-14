@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
+from pomodorough.core import task_from_title
 from pomodorough.storage import Store, utc_timestamp
 from pomodorough.storage_replication import ReplicationStorage
 from pomodorough.storage_replication_coordination import (
@@ -125,6 +126,126 @@ class ReplicationStorageModuleTests(unittest.TestCase):
         self.assertEqual(serialize(capture()), local_bytes)
         self.store.set_replication_mode("iroh")
         self.assertEqual(serialize(capture()), room_bytes)
+
+    def test_delivery_proof_follows_workspace_across_switch_and_reopen(
+        self,
+    ) -> None:
+        self.store.queue_task_operation(
+            "upsert", task_from_title("Central proof task"), now_ms=1_000
+        )
+        central = self.store.delivery_proof()
+        self.assertTrue(central["taskOperations"])
+        self.store.set_meta("canonicalHead", {"wallMs": 7, "counter": 1})
+        self.store.create_iroh_room(bytes(range(32)))
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {domain: [] for domain in central},
+        )
+        self.assertIsNone(self.store.canonical_head())
+        self.store.queue_task_operation(
+            "upsert", task_from_title("Room proof task"), now_ms=2_000
+        )
+        room = self.store.delivery_proof()
+        # Iroh mode publishes mutations to room records immediately, so
+        # the durable proof is empty while the record holds the payload.
+        self.assertEqual(room, {domain: [] for domain in central})
+        self.assertNotEqual(room, central)
+        self.store.set_meta("canonicalHead", {"wallMs": 9, "counter": 0})
+        self.store.leave_iroh_room()
+        self.assertEqual(self.store.delivery_proof(), central)
+        self.assertEqual(self.store.canonical_head(), (7, 1))
+        self.store.close()
+        self.store = Store(
+            Path(self.temporary.name) / "state.sqlite3", iroh_secret_store=self.secrets
+        )
+        self.store.set_replication_mode("iroh")
+        self.assertEqual(self.store.delivery_proof(), room)
+        self.assertEqual(self.store.canonical_head(), (9, 0))
+        self.store.leave_iroh_room()
+        self.assertEqual(self.store.delivery_proof(), central)
+
+    def test_legacy_workspace_without_proof_does_not_inherit_current_claim(
+        self,
+    ) -> None:
+        workspace = self.store._capture_workspace()
+        workspace["metadata"].pop("deliveryProof", None)
+        workspace["metadata"].pop("canonicalHead", None)
+        self.store.set_meta(
+            "deliveryProof",
+            {"commands": ["stale"], "taskOperations": [],
+             "durationOperations": [], "autoStartOperations": [],
+             "selectedTaskOperations": []},
+        )
+        self.store.set_meta("canonicalHead", {"wallMs": 3, "counter": 0})
+        with self.store._immediate_transaction():
+            self.store._restore_workspace(workspace)
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {"commands": [], "taskOperations": [],
+             "durationOperations": [], "autoStartOperations": [],
+             "selectedTaskOperations": []},
+        )
+        self.assertIsNone(self.store.canonical_head())
+
+    def test_reset_deletes_account_proof_without_resurrecting_on_room_return(
+        self,
+    ) -> None:
+        self.store.set_meta(
+            "deliveryProof",
+            {"commands": ["account-command"], "taskOperations": [],
+             "durationOperations": [], "autoStartOperations": [],
+             "selectedTaskOperations": []},
+        )
+        self.store.set_meta("canonicalHead", {"wallMs": 5, "counter": 0})
+        self.store.reset_account_data()
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {"commands": [], "taskOperations": [],
+             "durationOperations": [], "autoStartOperations": [],
+             "selectedTaskOperations": []},
+        )
+        self.assertIsNone(self.store.canonical_head())
+        self.store.create_iroh_room(bytes(range(32)))
+        self.store.leave_iroh_room()
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {"commands": [], "taskOperations": [],
+             "durationOperations": [], "autoStartOperations": [],
+             "selectedTaskOperations": []},
+        )
+
+    def test_room_reset_clears_only_account_owned_return_proof(self) -> None:
+        for account_owned in (False, True):
+            with self.subTest(account_owned=account_owned):
+                central = {
+                    "commands": ["central-command"], "taskOperations": [],
+                    "durationOperations": [], "autoStartOperations": [],
+                    "selectedTaskOperations": [],
+                }
+                room = {
+                    "commands": [], "taskOperations": [],
+                    "durationOperations": [], "autoStartOperations": [],
+                    "selectedTaskOperations": [],
+                }
+                snapshot = self.store.get_meta("snapshot")
+                snapshot["user"] = {"id": "account"} if account_owned else None
+                self.store.set_meta("snapshot", snapshot)
+                self.store.set_meta("deliveryProof", central)
+                self.store.create_iroh_room(bytes([int(account_owned)]) * 32)
+                self.store.set_meta("deliveryProof", room)
+                self.store.reset_account_data()
+                self.assertEqual(self.store.delivery_proof(), room)
+                self.store.leave_iroh_room()
+                if account_owned:
+                    self.assertEqual(
+                        self.store.delivery_proof(),
+                        {domain: [] for domain in central},
+                    )
+                else:
+                    self.assertEqual(self.store.delivery_proof(), central)
+                self.store.set_replication_mode("iroh")
+                self.assertEqual(self.store.delivery_proof(), room)
+                self.store.leave_iroh_room()
 
     def test_room_creation_rolls_back_workspace_when_secret_save_fails(self) -> None:
         serialize = self.store._workspace_storage.serialize

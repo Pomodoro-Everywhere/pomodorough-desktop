@@ -289,40 +289,37 @@ class D51SessionScrubTests(unittest.TestCase):
 class D52SilenceCommentTests(unittest.TestCase):
     def test_validation_comments_present(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src" / "pomodorough"
-        terminal = (root / "terminal.py").read_text(encoding="utf-8")
         storage = (root / "storage.py").read_text(encoding="utf-8")
+        # Immutable retarget removed the terminal overlay fallbacks; the
+        # active-focus snapshot fallback keeps the silent-validation rule.
         self.assertGreaterEqual(
-            terminal.count("# validation stays silent"), 2,
-        )
-        self.assertGreaterEqual(
-            storage.count("# validation stays silent"), 3,
+            storage.count("# validation stays silent"), 1,
         )
 
-    def test_terminal_validation_returns_silently(self) -> None:
+    def test_terminal_resolution_is_pure_projection(self) -> None:
         from pomodorough.terminal import LocalTimer
 
-        timer = LocalTimer.__new__(LocalTimer)
-        timer.store = Mock()
-        timer.store.task_retargets.side_effect = ValueError("corrupt")
-        with patch(
-            "pomodorough.terminal.capture_exception",
-        ) as capture:
-            self.assertEqual(timer._load_retargets(), {})
-        capture.assert_not_called()
+        self.assertEqual(
+            LocalTimer._resolved_timer_task_id({"phase": "focus", "taskId": "t-1"}),
+            "t-1",
+        )
+        self.assertIsNone(
+            LocalTimer._resolved_timer_task_id(
+                {"phase": "short_break", "taskId": "t-1"}
+            )
+        )
 
-    def test_storage_history_validation_falls_back(self) -> None:
+    def test_storage_history_marks_pending_without_overlay(self) -> None:
         from pomodorough.storage import Store
 
         store = Store.__new__(Store)
-        store.task_retargets = Mock(side_effect=ValueError("corrupt"))
         projection = SimpleNamespace(history=[{"timerId": "t-1"}])
         state = {"pending": []}
-        with patch(
-            "pomodorough.storage.capture_exception",
-        ) as capture:
-            history = store.projected_history(projection, state)
-        capture.assert_not_called()
+        history = Store.projected_history(store, projection, state)
         self.assertEqual(history, [{"timerId": "t-1"}])
+        state = {"pending": [{"timerId": "t-1"}]}
+        history = Store.projected_history(store, projection, state)
+        self.assertEqual(history, [{"timerId": "t-1", "pending": True}])
 
 
 if __name__ == "__main__":

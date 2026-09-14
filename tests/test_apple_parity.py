@@ -172,7 +172,7 @@ class TaskRetargetTests(unittest.TestCase):
             "start", None, "focus", settings["durationsMs"], task_id, now_ms=now_ms
         )
 
-    def test_live_retarget_rewrites_pending_start_and_marker(self) -> None:
+    def test_live_retarget_queues_immutable_operation(self) -> None:
         first = task_from_title("First task")
         second = task_from_title("Second task")
         self.store.queue_task_operation("upsert", first, now_ms=1)
@@ -186,12 +186,16 @@ class TaskRetargetTests(unittest.TestCase):
         pending = [c for c in loaded["pending"] if c.get("timerId") == timer_id]
         starts = [c for c in pending if c.get("type") == "start"]
         self.assertTrue(starts)
-        self.assertEqual(starts[0].get("taskId"), second["id"])
-        found, retargeted = self.store.retargeted_task_id(timer_id)
-        self.assertTrue(found)
-        self.assertEqual(retargeted, second["id"])
+        # Immutable contract: the queued Start keeps its original payload.
+        self.assertEqual(starts[0].get("taskId"), first["id"])
+        retargets = [c for c in pending if c.get("type") == "retarget"]
+        self.assertEqual(len(retargets), 1)
+        self.assertEqual(retargets[0].get("taskId"), second["id"])
+        self.assertIn(
+            retargets[0]["id"], self.store.delivery_proof()["commands"]
+        )
 
-    def test_unassign_retarget_clears_pending_task(self) -> None:
+    def test_unassign_retarget_queues_explicit_null(self) -> None:
         task = task_from_title("Solo task")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"], now_ms=2)
@@ -200,19 +204,20 @@ class TaskRetargetTests(unittest.TestCase):
         pending = [c for c in self.store.load()["pending"] if c.get("timerId") == start["timerId"]]
         starts = [c for c in pending if c.get("type") == "start"]
         self.assertTrue(starts)
-        self.assertNotIn("taskId", starts[0])
-        found, retargeted = self.store.retargeted_task_id(start["timerId"])
-        self.assertTrue(found)
-        self.assertIsNone(retargeted)
+        self.assertEqual(starts[0].get("taskId"), task["id"])
+        retargets = [c for c in pending if c.get("type") == "retarget"]
+        self.assertEqual(len(retargets), 1)
+        self.assertIn("taskId", retargets[0])
+        self.assertIsNone(retargets[0].get("taskId"))
 
-    def test_history_applies_retarget_marker(self) -> None:
+    def test_history_reflects_immutable_retarget(self) -> None:
         task = task_from_title("History task")
         other = task_from_title("Other task")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.queue_task_operation("upsert", other, now_ms=2)
         self.store.set_selected_task_id(task["id"], now_ms=3)
         start = self._start_focus(task["id"], now_ms=4)
-        # D48: retarget while running so the marker exists before finish.
+        # D48: retarget while running so the operation exists before finish.
         self.store.set_selected_task_id(other["id"], now_ms=5)
         timer = {
             "id": start["timerId"],
@@ -273,7 +278,7 @@ class TaskRetargetTests(unittest.TestCase):
         self.assertTrue(matches)
         self.assertNotIn("taskId", matches[0])
 
-    def test_terminal_metrics_prefers_retarget(self) -> None:
+    def test_terminal_metrics_follow_retarget_operation(self) -> None:
         first = task_from_title("Active first")
         second = task_from_title("Active second")
         self.store.queue_task_operation("upsert", first, now_ms=1)
@@ -290,11 +295,14 @@ class TaskRetargetTests(unittest.TestCase):
         self.assertEqual(after["taskId"], second["id"])
         self.assertEqual(after["taskTitle"], second["title"])
 
-    def test_idle_retarget_leaves_no_marker(self) -> None:
+    def test_idle_selection_queues_no_retarget(self) -> None:
         task = task_from_title("Idle task")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"], now_ms=2)
-        self.assertEqual(self.store.task_retargets(), {})
+        pending = self.store.load()["pending"]
+        self.assertEqual(
+            [c for c in pending if c.get("type") == "retarget"], []
+        )
 
 
 class SingleSelectorTests(unittest.TestCase):

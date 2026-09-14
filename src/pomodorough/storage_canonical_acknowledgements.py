@@ -98,14 +98,23 @@ def validate_reconciliation_queues(
     dropped: set[str],
     invalid: ValueError,
 ) -> None:
+    """Require immutable identities, clocks, and occurrences.
+
+    V2 never rebases retained clocks or occurrences. Core's accepted
+    generated-break normalization may still adjust a retained break
+    batch's phase, planned duration, and observed elapsed time; every
+    other field must round-trip exactly.
+    """
     for domain, operations in normalized.items():
         ids = [str(item.get("id", "")) for item in operations]
         expected = retained_queue_ids(domain, local, canonical, dropped)
         if len(ids) != len(set(ids)) or set(ids) != expected:
             raise invalid
-        allowed = {"occurredAt", "hlcWallMs", "hlcCounter"}
-        if domain == "commands":
-            allowed |= {"phase", "plannedDurationMs", "observedElapsedMs"}
+        allowed = (
+            {"phase", "plannedDurationMs", "observedElapsedMs"}
+            if domain == "commands"
+            else set()
+        )
         for operation in operations:
             original = local[domain][str(operation["id"])]
             if any(

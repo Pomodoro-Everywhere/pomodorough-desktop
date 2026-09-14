@@ -87,12 +87,18 @@ class CanonicalStorageDependencies:
     _immediate_transaction: Callable[[], Any]
     _preflight_pending_queues: Callable[..., dict[str, Any]]
     _project_operation: Callable[..., Any]
+    _project_canonical_with_pending: Callable[..., Any]
+    _set_canonical_head: Callable[[int, int], None]
+    _retire_delivery_proof: Callable[[dict[str, list[str]]], None]
     _prune_command_physical_times: Callable[[], None]
     _set_trusted_time_anchor: _SetTrustedTimeAnchorCallback
     pending_resolution: Callable[..., dict[str, Any] | None]
     pending_sync: Callable[[], dict[str, Any] | None]
     _command_physical_times: Callable[[], dict[str, int]]
     _validated_projection_state: _ValidatedProjectionStateCallback
+    delivery_proof: Callable[[], dict[str, list[str]]]
+    never_sent_claim: Callable[[dict[str, list[str]]], dict[str, list[str]]]
+    drop_delivery_proof: Callable[[str, str], None]
 
 
 _COMPONENT_TYPES = {

@@ -873,6 +873,7 @@ class IrohService(QObject):
             deviceId=self.device_id,
             endpointTicket=self._current_endpoint_ticket(),
             platform=self._platform_name(),
+            capabilities=["retarget-v1"],
         )
 
     def _validate_hello(self, hello: dict[str, Any], remote_id: str) -> None:
@@ -890,6 +891,7 @@ class IrohService(QObject):
             raise IrohProtocolError("Peer hello ticket does not match Iroh identity.")
 
     def _save_peer(self, hello: dict[str, Any], remote_id: str) -> None:
+        capabilities = hello.get("capabilities")
         self._required_store().upsert_iroh_peer(
             self._required_context()[0],
             remote_id,
@@ -897,6 +899,7 @@ class IrohService(QObject):
             hello["deviceId"],
             hello.get("displayName"),
             int(time.time() * 1000),
+            capabilities if isinstance(capabilities, list) else None,
         )
         self._emit_details()
 

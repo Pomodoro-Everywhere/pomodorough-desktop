@@ -20,7 +20,14 @@ MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_CLOCK_SKEW_MS = 300_000
 MAX_SERVER_TIME_UNCERTAINTY_MS = 30_000
 MAX_CLOCK_CONTINUITY_DRIFT_MS = 1_000
-COMMAND_TYPES = {"start", "pause", "resume", "finish", "cancel", "clear"}
+COMMAND_TYPES = {"start", "pause", "resume", "finish", "cancel", "clear", "retarget"}
+DELIVERY_QUEUE_DOMAINS = (
+    "commands",
+    "taskOperations",
+    "durationOperations",
+    "autoStartOperations",
+    "selectedTaskOperations",
+)
 
 
 _DEFAULT_SHARED_CORE: SharedCore | None = None

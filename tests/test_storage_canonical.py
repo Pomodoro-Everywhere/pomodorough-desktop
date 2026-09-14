@@ -16,6 +16,7 @@ from pomodorough.storage_canonical_reconciliation import (
     SharedCoreReconciliationAdapter,
 )
 from pomodorough.storage_canonical_validation import CanonicalWireValidator
+from v2_core_double import V2EmulatingSharedCore
 
 
 def _empty_request() -> dict[str, object]:
@@ -67,7 +68,11 @@ def _canonical_response(request: dict[str, object]) -> dict[str, object]:
 class CanonicalStorageContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.temporary.name) / "state.sqlite3")
+        # Pinned bundle predates reconcile.rebase.v2 (see v2_core_double).
+        self.store = Store(
+            Path(self.temporary.name) / "state.sqlite3",
+            shared_core=V2EmulatingSharedCore(),
+        )
 
     def tearDown(self) -> None:
         self.store.close()

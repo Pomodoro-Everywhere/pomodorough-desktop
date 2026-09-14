@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import MappingProxyType
@@ -26,6 +27,51 @@ from pomodorough.sentry_monitoring import (
 )
 
 DSN = "https://public@example.ingest.sentry.io/1"
+
+
+class SerializedEnvelopePrivacyTests(unittest.TestCase):
+    def test_production_init_drops_hostname_from_real_sdk_envelopes(self) -> None:
+        script = textwrap.dedent('''
+            import json
+            from unittest.mock import patch
+            import sentry_sdk
+            from sentry_sdk.transport import Transport
+            from pomodorough.sentry_monitoring import init_sentry
+
+            class MemoryTransport(Transport):
+                def __init__(self):
+                    super().__init__()
+                    self.envelopes = []
+
+                def capture_envelope(self, envelope):
+                    self.envelopes.append(envelope.serialize())
+
+            transport = MemoryTransport()
+            with (
+                patch("sentry_sdk.transport.make_transport", return_value=transport),
+                patch("sentry_sdk.client.make_transport", return_value=transport),
+                patch("socket.gethostname", return_value="private-host-sentinel"),
+                patch("socket.socket.connect", side_effect=AssertionError("network")),
+            ):
+                assert init_sentry(dsn="https://public@example.ingest.sentry.io/1")
+                assert sentry_sdk.get_client().options["server_name"] == ""
+                sentry_sdk.capture_message("safe diagnostic")
+                sentry_sdk.capture_event({
+                    "message": "explicit diagnostic",
+                    "server_name": "explicit-host-sentinel",
+                })
+                sentry_sdk.flush()
+                assert len(transport.envelopes) == 2
+                for envelope in transport.envelopes:
+                    assert b"private-host-sentinel" not in envelope
+                    assert b"explicit-host-sentinel" not in envelope
+                    event = json.loads(envelope.splitlines()[2])
+                    assert "server_name" not in event
+                    assert event["message"].endswith("diagnostic")
+                sentry_sdk.get_client().close()
+        ''')
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 # Hermetic isolation: point the packaged-default seam at a missing file so
 # a release-baked `sentry_dsn_default` resource cannot leak into

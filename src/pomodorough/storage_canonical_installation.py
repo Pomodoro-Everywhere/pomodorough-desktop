@@ -77,6 +77,17 @@ class CanonicalInstallationDependencies(Protocol):
 
     def _set_meta(self, key: str, value: Any) -> None: ...
 
+    def _retire_delivery_proof(self, retired: dict[str, list[str]]) -> None: ...
+
+    def _set_canonical_head(self, wall_ms: int, counter: int) -> None: ...
+
+    def _project_canonical_with_pending(
+        self,
+        canonical: dict[str, Any],
+        pending: dict[str, list[dict[str, Any]]],
+        trusted_response_ms: int,
+    ) -> Any: ...
+
     def _set_trusted_time_anchor(self, anchor: dict[str, int]) -> None: ...
 
     def get_meta(self, key: str, default: Any = None) -> Any: ...
@@ -107,6 +118,7 @@ class CanonicalInstallationHooks(Protocol):
         canonical: dict[str, Any],
         trusted_response_ms: int,
         expected: dict[str, Any] | None,
+        safe_pending: dict[str, list[dict[str, Any]]] | None = None,
     ) -> Any: ...
 
     def _install_projected_settings(self, projection: Any) -> None: ...
@@ -237,6 +249,7 @@ class AtomicCanonicalInstaller:
         clock_sample: dict[str, int] | None,
         trusted_response_ms: int,
         expected_projection: dict[str, Any] | None = None,
+        safe_pending: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         pending = self._dependencies._preflight_pending_queues(require_clock_coverage=False)
         merged_clock = self._hooks._merged_install_clock(
@@ -244,13 +257,16 @@ class AtomicCanonicalInstaller:
         )
         self._hooks._clear_stale_timer_ownership(canonical, pending)
         projection = self._hooks._install_projection(
-            canonical, trusted_response_ms, expected_projection
+            canonical, trusted_response_ms, expected_projection, safe_pending
         )
         self._hooks._install_projected_settings(projection)
         self._hooks._install_snapshot(canonical, user, preserve_known_tasks)
         self._dependencies._set_meta("autoStartLegacyDefaultUnknown", False)
         self._dependencies._set_meta(
             "hlc", {"wallMs": merged_clock[0], "counter": merged_clock[1]}
+        )
+        self._dependencies._set_canonical_head(
+            canonical["serverHlcWallMs"], canonical["serverHlcCounter"]
         )
         if clock_sample is not None:
             self._dependencies._set_meta("serverClockSample", clock_sample)
@@ -323,15 +339,22 @@ class AtomicCanonicalInstaller:
         canonical: dict[str, Any],
         trusted_response_ms: int,
         expected: dict[str, Any] | None,
+        safe_pending: dict[str, list[dict[str, Any]]] | None = None,
     ) -> Any:
-        settings = self._dependencies._normalize_settings(self._dependencies.get_meta("settings", {}))
-        projection_settings = deepcopy(settings)
-        projection_settings["durationsMs"] = canonical["durationsMs"]
-        projection = self._dependencies._project_operation(
-            projection_settings,
-            now=utc_timestamp(trusted_response_ms),
-            base=canonical,
-        )
+        if safe_pending is not None:
+            projection = self._dependencies._project_canonical_with_pending(
+                canonical, safe_pending, trusted_response_ms
+            )
+        else:
+            settings = self._dependencies._normalize_settings(
+                self._dependencies.get_meta("settings", {}))
+            projection_settings = deepcopy(settings)
+            projection_settings["durationsMs"] = canonical["durationsMs"]
+            projection = self._dependencies._project_operation(
+                projection_settings,
+                now=utc_timestamp(trusted_response_ms),
+                base=canonical,
+            )
         actual = {
             "canonicalTimer": projection.canonical_timer,
             "history": projection.history,
@@ -452,6 +475,7 @@ class AtomicCanonicalInstaller:
             clock_sample=clock_sample,
             trusted_response_ms=trusted_response_ms,
             expected_projection=reconciliation["projection"],
+            safe_pending=reconciliation["projectionPending"],
         )
         self._dependencies._prune_command_physical_times()
         return notices
@@ -520,6 +544,7 @@ class AtomicCanonicalInstaller:
             clock_sample=clock_sample,
             trusted_response_ms=trusted_response_ms,
             expected_projection=reconciliation["projection"],
+            safe_pending=reconciliation["projectionPending"],
         )
         self._dependencies._prune_command_physical_times()
         return notices
@@ -567,11 +592,27 @@ class AtomicCanonicalInstaller:
 
     def _clear_keep_remote_queues(self, queue_ids: dict[str, list[str]]) -> None:
         self._hooks._delete_resolution_queue_ids(queue_ids)
+        retired = dict(queue_ids)
         if "autoStartOperations" not in queue_ids:
+            retired["autoStartOperations"] = self._pending_ids(
+                "pending_auto_start_operations"
+            )
             self._dependencies.connection.execute("DELETE FROM pending_auto_start_operations")
         if "selectedTaskOperations" not in queue_ids:
+            retired["selectedTaskOperations"] = self._pending_ids(
+                "pending_selected_task_operations"
+            )
             self._dependencies.connection.execute(
                 "DELETE FROM pending_selected_task_operations"
             )
+        self._dependencies._retire_delivery_proof(retired)
         self._dependencies.connection.execute("DELETE FROM pending_auto_breaks")
         self._dependencies.connection.execute("DELETE FROM pending_auto_break_starts")
+
+    def _pending_ids(self, table: str) -> list[str]:
+        return [
+            str(row["id"])
+            for row in self._dependencies.connection.execute(
+                f"SELECT id FROM {table}"
+            )
+        ]

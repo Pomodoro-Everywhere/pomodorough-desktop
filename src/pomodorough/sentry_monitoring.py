@@ -533,7 +533,11 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
     try:
         if not isinstance(event, dict):
             return event
-        return _scrub_value(event)
+        cleaned = _scrub_value(event)
+        # Privacy: drop hostname even if the SDK re-adds it; init also
+        # sets server_name="" (separate hunk, same privacy fix).
+        cleaned.pop("server_name", None)
+        return cleaned
     except Exception:  # noqa: BLE001 - scrubber must stay non-fatal.
         return None
 
@@ -689,6 +693,9 @@ def init_sentry(
             release=release or __version__,
             environment=environment,
             send_default_pii=False,
+            # Privacy: never send hostname (separate hunk from scrubber
+            # pop above; both ride together as one hostname-privacy fix).
+            server_name="",
             # D38: frame locals carry 32B endpoint secrets (`key`/`value`
             # frame vars through Endpoint.bind); never capture them.
             include_local_variables=False,

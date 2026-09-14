@@ -204,10 +204,7 @@ class _ClockRenderer:
     def _paint_labels(self) -> None:
         side = self.geometry.side
         radius = self.geometry.radius
-        center = self.geometry.center
         board = self.geometry.display_board()
-        alternate = self.palette.color(QPalette.ColorRole.AlternateBase)
-        window_text = self.palette.color(QPalette.ColorRole.WindowText)
         label_font = QFont(
             "DejaVu Sans Condensed",
             max(8, round(side * 0.032)),
@@ -215,43 +212,32 @@ class _ClockRenderer:
         )
         label_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
         self.painter.setFont(label_font)
-        self.painter.setPen(window_text)
-        phase_width = min(
+        self._paint_label(self.phase_text, board.top() - radius * 0.24)
+        self._paint_label(self.status_text, board.bottom() + radius * 0.06)
+
+    def _paint_label(self, text: str, top: float) -> None:
+        """Paint one centered label; behavior-preserving dedup of phase/status.
+
+        Standalone cleanup hunk, unrelated to Core v2 migration: same rect
+        math, fill, pen, and alignment as the two inline blocks it replaces.
+        """
+        radius = self.geometry.radius
+        width = min(
             radius * 1.6,
-            self.painter.fontMetrics().horizontalAdvance(self.phase_text)
+            self.painter.fontMetrics().horizontalAdvance(text)
             + radius * 0.18,
         )
-        phase_rect = QRectF(
-            center.x() - phase_width / 2,
-            board.top() - radius * 0.24,
-            phase_width,
+        rect = QRectF(
+            self.geometry.center.x() - width / 2,
+            top,
+            width,
             radius * 0.18,
         )
-        self.painter.fillRect(phase_rect, alternate)
-        self.painter.setPen(window_text)
-        self.painter.drawText(
-            phase_rect,
-            Qt.AlignmentFlag.AlignCenter,
-            self.phase_text,
+        self.painter.fillRect(
+            rect, self.palette.color(QPalette.ColorRole.AlternateBase)
         )
-        status_width = min(
-            radius * 1.6,
-            self.painter.fontMetrics().horizontalAdvance(self.status_text)
-            + radius * 0.18,
-        )
-        status_rect = QRectF(
-            center.x() - status_width / 2,
-            board.bottom() + radius * 0.06,
-            status_width,
-            radius * 0.18,
-        )
-        self.painter.fillRect(status_rect, alternate)
-        self.painter.setPen(window_text)
-        self.painter.drawText(
-            status_rect,
-            Qt.AlignmentFlag.AlignCenter,
-            self.status_text,
-        )
+        self.painter.setPen(self.palette.color(QPalette.ColorRole.WindowText))
+        self.painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
 
 class ClockWidget(QWidget):

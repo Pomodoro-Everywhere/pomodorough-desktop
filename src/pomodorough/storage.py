@@ -43,6 +43,7 @@ from .storage_model import (
     ACKNOWLEDGEMENT_OUTCOMES as ACKNOWLEDGEMENT_OUTCOMES,
     CANONICAL_DURATION_MAX_MS as CANONICAL_DURATION_MAX_MS,
     COMMAND_TYPES as COMMAND_TYPES,
+    DELIVERY_QUEUE_DOMAINS as DELIVERY_QUEUE_DOMAINS,
     DURATION_MIN_MS as DURATION_MIN_MS,
     MAX_CLOCK_CONTINUITY_DRIFT_MS as MAX_CLOCK_CONTINUITY_DRIFT_MS,
     MAX_CLOCK_SKEW_MS as MAX_CLOCK_SKEW_MS,
@@ -132,6 +133,7 @@ _IROH_SCHEMA_STATEMENTS = (
         endpoint_ticket TEXT NOT NULL,
         device_id TEXT,
         display_name TEXT,
+        capabilities TEXT,
         last_seen_at_ms INTEGER,
         PRIMARY KEY(room_id, endpoint_id)
     )""",
@@ -263,6 +265,7 @@ class Store:
             read_meta=self.get_meta,
             load_state=self.load,
             replace_meta=self.set_meta,
+            retire_delivery_proof=self._retire_delivery_proof_locked,
         )
 
     def _canonical_dependencies(self) -> CanonicalStorageDependencies:
@@ -287,12 +290,18 @@ class Store:
             _immediate_transaction=self._immediate_transaction,
             _preflight_pending_queues=self._preflight_pending_queues,
             _project_operation=self._project_operation,
+            _project_canonical_with_pending=self._project_canonical_with_pending,
+            _set_canonical_head=self._set_canonical_head_locked,
+            _retire_delivery_proof=self._retire_delivery_proof_locked,
             _prune_command_physical_times=self._prune_command_physical_times,
             _set_trusted_time_anchor=lambda anchor: self._set_trusted_time_anchor(anchor),
             pending_resolution=self._sync_storage.pending_resolution,
             pending_sync=self._sync_storage.pending_sync,
             _command_physical_times=self._command_physical_times,
             _validated_projection_state=self._validated_projection_state,
+            delivery_proof=self.delivery_proof,
+            never_sent_claim=self.never_sent_claim,
+            drop_delivery_proof=self._drop_delivery_proof_locked,
         )
 
     def _open_database(self, *, restrict_existing_parent: bool) -> None:
@@ -323,12 +332,25 @@ class Store:
         ):
             self._migrate_pending_command_dependency()
             self._migrate_auto_break_phase_version()
+            self._drop_legacy_task_retargets()
             for statement in _IROH_SCHEMA_STATEMENTS:
                 self.connection.execute(statement)
+            self._migrate_iroh_peer_capabilities()
             self._migrated_iroh_capabilities = (
                 self._migrate_plaintext_iroh_capabilities(secrets)
             )
             self._set_meta("irohSchemaVersion", 1)
+
+    def _drop_legacy_task_retargets(self) -> None:
+        """Delete pre-immutable local-only retarget markers.
+
+        Retarget is an immutable queued operation now; the legacy
+        taskRetargets map (plus its Start rewrites) must not survive
+        beside it. No migration of values: markers were local-only.
+        """
+        self.connection.execute(
+            "DELETE FROM meta WHERE key = 'taskRetargets'"
+        )
 
     def _migrate_pending_command_dependency(self) -> None:
         columns = {
@@ -355,6 +377,21 @@ class Store:
             self.connection.execute(
                 "ALTER TABLE pending_auto_break_starts ADD COLUMN "
                 "selected_phase_version INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _migrate_iroh_peer_capabilities(self) -> None:
+        """Add nullable JSON capabilities to pre-retarget peer rows.
+
+        Missing means legacy/unknown: treated as no retarget-v1 until
+        the peer re-hellos with an explicit capability list.
+        """
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(iroh_peers)")
+        }
+        if "capabilities" not in columns:
+            self.connection.execute(
+                "ALTER TABLE iroh_peers ADD COLUMN capabilities TEXT"
             )
 
     def close(self) -> None:
@@ -571,6 +608,7 @@ class Store:
         device_id: str | None,
         display_name: str | None,
         last_seen_at_ms: int | None = None,
+        capabilities: list[str] | None = None,
     ) -> None:
         self._replication_storage.upsert_iroh_peer(
             room_id,
@@ -579,6 +617,15 @@ class Store:
             device_id,
             display_name,
             last_seen_at_ms,
+            capabilities,
+        )
+
+    def iroh_peers_support(
+        self, room_id: str, capability: str
+    ) -> bool:
+        """Whether every known room peer advertises a capability."""
+        return self._replication_storage.iroh_peers_support(
+            room_id, capability
         )
 
     def iroh_peers(self, room_id: str) -> list[dict[str, Any]]:
@@ -678,6 +725,8 @@ class Store:
             self._migrate_legacy_preferences(settings, snapshot, snapshot_had_auto_start)
             self._reconcile_auto_start_setting(settings, snapshot)
             self._repair_command_physical_times()
+            self._repair_delivery_proof()
+            self._repair_canonical_head()
 
     @staticmethod
     def _initial_meta_defaults() -> dict[str, Any]:
@@ -714,6 +763,8 @@ class Store:
             },
             "pendingSync": None,
             "pendingResolution": None,
+            "deliveryProof": {domain: [] for domain in DELIVERY_QUEUE_DOMAINS},
+            "canonicalHead": None,
             "replicationMode": "centralized",
             "activeIrohRoomId": None,
         }
@@ -777,31 +828,65 @@ class Store:
                 settings["autoStartBreaks"] = projected
                 self._set_meta("settings", settings)
 
+    def _repair_delivery_proof(self) -> None:
+        try:
+            proof = self.delivery_proof()
+        except (ValueError, KeyError, TypeError):
+            proof = {domain: [] for domain in DELIVERY_QUEUE_DOMAINS}
+        pending_ids = self._pending_ids_by_domain()
+        repaired = {
+            domain: [item for item in proof.get(domain, [])
+                     if item in pending_ids.get(domain, set())]
+            for domain in DELIVERY_QUEUE_DOMAINS
+        }
+        if repaired != self.get_meta("deliveryProof", {}):
+            self._set_meta("deliveryProof", repaired)
+
+    def _pending_ids_by_domain(self) -> dict[str, set[str]]:
+        tables = {
+            "commands": "pending_commands",
+            "taskOperations": "pending_task_operations",
+            "durationOperations": "pending_duration_operations",
+            "autoStartOperations": "pending_auto_start_operations",
+            "selectedTaskOperations": "pending_selected_task_operations",
+        }
+        return {
+            domain: {str(row["id"]) for row in
+                     self.connection.execute(f"SELECT id FROM {table}")}
+            for domain, table in tables.items()
+        }
+
+    def _repair_canonical_head(self) -> None:
+        if self.get_meta("canonicalHead", None) is None:
+            return
+        if self.canonical_head() is None:
+            self._set_meta("canonicalHead", None)
+
     def _repair_command_physical_times(self) -> None:
-            physical_times = self.get_meta("commandPhysicalTimes", {})
-            if not isinstance(physical_times, dict):
-                physical_times = {}
-            pending_ids = set()
-            for row in self.connection.execute(
-                "SELECT id, payload FROM pending_commands"
-            ):
-                command_id = str(row["id"])
-                pending_ids.add(command_id)
-                if command_id in physical_times:
-                    continue
-                try:
-                    command = json.loads(row["payload"])
-                    occurred_ms = parse_timestamp_ms(command.get("occurredAt"))
-                except (AttributeError, TypeError, json.JSONDecodeError):
-                    occurred_ms = None
-                if occurred_ms is not None:
-                    physical_times[command_id] = occurred_ms
-            physical_times = {
-                command_id: value
-                for command_id, value in physical_times.items()
-                if command_id in pending_ids
-            }
-            self._set_meta("commandPhysicalTimes", physical_times)
+        physical_times = self.get_meta("commandPhysicalTimes", {})
+        if not isinstance(physical_times, dict):
+            physical_times = {}
+        pending_ids = set()
+        for row in self.connection.execute(
+            "SELECT id, payload FROM pending_commands"
+        ):
+            command_id = str(row["id"])
+            pending_ids.add(command_id)
+            if command_id in physical_times:
+                continue
+            try:
+                command = json.loads(row["payload"])
+                occurred_ms = parse_timestamp_ms(command.get("occurredAt"))
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                occurred_ms = None
+            if occurred_ms is not None:
+                physical_times[command_id] = occurred_ms
+        physical_times = {
+            command_id: value
+            for command_id, value in physical_times.items()
+            if command_id in pending_ids
+        }
+        self._set_meta("commandPhysicalTimes", physical_times)
 
     @staticmethod
     def _normalize_settings(settings: Any) -> dict[str, Any]:
@@ -1291,6 +1376,73 @@ class Store:
             (key, json.dumps(value, separators=(",", ":"))),
         )
 
+    def delivery_proof(self) -> dict[str, list[str]]:
+        """Durable never-sent proof by queue domain.
+
+        Records without proof are possibly delivered. Proof is written in
+        the same allocation transaction as the operation and retired
+        atomically when the exact outgoing payload is persisted.
+        """
+        return self._normalized_delivery_proof(self.get_meta("deliveryProof", {}))
+
+    @staticmethod
+    def _normalized_delivery_proof(value: Any) -> dict[str, list[str]]:
+        proof: dict[str, list[str]] = {}
+        source = value if isinstance(value, dict) else {}
+        for domain in DELIVERY_QUEUE_DOMAINS:
+            items = source.get(domain, [])
+            proof[domain] = [item for item in items if isinstance(item, str) and item]
+        return proof
+
+    def _mark_never_sent_locked(self, domain: str, operation_id: str) -> None:
+        proof = self.delivery_proof()
+        if operation_id not in proof[domain]:
+            proof[domain].append(operation_id)
+        self._set_meta("deliveryProof", proof)
+
+    def _retire_delivery_proof_locked(self, retired: dict[str, list[str]]) -> None:
+        proof = self.delivery_proof()
+        for domain, ids in retired.items():
+            if domain not in proof:
+                continue
+            claimed = {item for item in ids if isinstance(item, str)}
+            proof[domain] = [item for item in proof[domain] if item not in claimed]
+        self._set_meta("deliveryProof", proof)
+
+    def _drop_delivery_proof_locked(self, domain: str, operation_id: str) -> None:
+        proof = self.delivery_proof()
+        if operation_id in proof.get(domain, []):
+            proof[domain] = [item for item in proof[domain] if item != operation_id]
+            self._set_meta("deliveryProof", proof)
+
+    def canonical_head(self) -> tuple[int, int] | None:
+        """Covering server HLC bound for the persisted canonical snapshot."""
+        value = self.get_meta("canonicalHead", None)
+        if not isinstance(value, dict):
+            return None
+        wall, counter = value.get("wallMs"), value.get("counter")
+        if isinstance(wall, bool) or not isinstance(wall, int):
+            return None
+        if isinstance(counter, bool) or not isinstance(counter, int):
+            return None
+        if not 0 <= wall <= MAX_SAFE_INTEGER or not 0 <= counter <= MAX_SAFE_INTEGER:
+            return None
+        return wall, counter
+
+    def _set_canonical_head_locked(self, wall_ms: int, counter: int) -> None:
+        self._set_meta("canonicalHead", {"wallMs": wall_ms, "counter": counter})
+
+    def never_sent_claim(self, sent: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Derive v2 neverSent from durable proof, never from sent absence."""
+        proof = self.delivery_proof()
+        claim: dict[str, list[str]] = {}
+        for domain in DELIVERY_QUEUE_DOMAINS:
+            sent_ids = {item for item in sent.get(domain, []) if isinstance(item, str)}
+            ids = [item for item in proof[domain] if item not in sent_ids]
+            if ids:
+                claim[domain] = ids
+        return claim
+
     @property
     def device_id(self) -> str:
         # D57: boundary-capture contract — this property never captures;
@@ -1510,26 +1662,53 @@ class Store:
             raise ValueError("Pending timer command duration is invalid.") from error
         observed_ms = command.get("observedElapsedMs")
         task_id = command.get("taskId")
+        command_type = command.get("type")
+        if command_type == "retarget":
+            self._validate_retarget_command(
+                command, row, sequence, planned_ms, observed_ms, task_id)
+            self._operation_clock(command)
+            return
         if (
             not self._valid_identity(command.get("id"))
             or command["id"] != row["id"]
             or sequence != row["device_sequence"]
             or not self._valid_identity(command.get("timerId"))
-            or command.get("type") not in COMMAND_TYPES
+            or command_type not in COMMAND_TYPES
             or command.get("phase") not in PHASES
             or isinstance(observed_ms, bool)
             or not isinstance(observed_ms, int)
             or not 0 <= observed_ms <= planned_ms
-            or command.get("type") == "start"
+            or command_type == "start"
             and observed_ms != 0
             or not isinstance(task_id, (str, type(None)))
             or isinstance(task_id, str)
             and not task_id
             or task_id is not None
-            and (command.get("type") != "start" or command.get("phase") != "focus")
+            and (command_type != "start" or command.get("phase") != "focus")
         ):
             raise ValueError("Pending timer command is invalid.")
         self._operation_clock(command)
+
+    def _validate_retarget_command(
+        self, command: dict[str, Any], row: sqlite3.Row, sequence: int,
+        planned_ms: int, observed_ms: Any, task_id: Any,
+    ) -> None:
+        """Retarget requires explicit task attribution, including null."""
+        if (
+            not self._valid_identity(command.get("id"))
+            or command["id"] != row["id"]
+            or sequence != row["device_sequence"]
+            or not self._valid_identity(command.get("timerId"))
+            or command.get("phase") != "focus"
+            or isinstance(observed_ms, bool)
+            or not isinstance(observed_ms, int)
+            or not 0 <= observed_ms <= planned_ms
+            or "taskId" not in command
+            or not isinstance(task_id, (str, type(None)))
+            or isinstance(task_id, str)
+            and not task_id
+        ):
+            raise ValueError("Pending timer command is invalid.")
 
     def _validate_pending_task_operation(
         self, operation: dict[str, Any], row: sqlite3.Row
@@ -1752,44 +1931,23 @@ class Store:
                 now_ms,
                 use_server_clock=use_server_clock,
             )
-            try:
-                self._retarget_active_focus_task_locked(task_id, now_ms)
-            except (OSError, sqlite3.Error) as error:
-                # D46: retarget marker is local-only best-effort; a read
-                # failure must not roll back the primary selected-task write.
-                # Infra still reports to Sentry; validation stays silent.
-                capture_exception(error)
-            except (ValueError, KeyError):
-                # validation stays silent
-                pass
+            self._queue_retarget_for_active_focus_locked(task_id, now_ms)
             self._capture_iroh_after_mutation_locked()
         return operation
 
-    def task_retargets(self) -> dict[str, Any]:
-        """Local-only active-timer retarget markers, like Apple legacy map."""
-        value = self.get_meta("taskRetargets", {})
-        return dict(value) if isinstance(value, dict) else {}
-
-    def retargeted_task_id(self, timer_id: str) -> tuple[bool, str | None]:
-        retargets = self.task_retargets()
-        if not isinstance(timer_id, str) or timer_id not in retargets:
-            return False, None
-        task_id = retargets[timer_id]
-        return True, task_id if isinstance(task_id, str) and task_id else None
-
-    def _retarget_active_focus_task_locked(
+    def _queue_retarget_for_active_focus_locked(
         self, task_id: str | None, now_ms: int
     ) -> None:
+        """Queue one immutable retarget for the active focus timer.
+
+        Never rewrites a pending Start. Explicit null unassigns. Repeating
+        the current assignment is valid. Non-focus, inactive, or missing
+        timers queue no retarget; Core ignores such targets on reduce.
+        """
         timer = self._active_focus_timer_locked(now_ms)
         if timer is None:
             return
-        timer_id = str(timer.get("id"))
-        retargets = self.get_meta("taskRetargets", {})
-        if not isinstance(retargets, dict):
-            retargets = {}
-        retargets[timer_id] = task_id
-        self._set_meta("taskRetargets", retargets)
-        self._rewrite_pending_start_task_locked(timer_id, task_id)
+        self._persist_retarget_command_locked(timer, task_id, now_ms)
 
     def _active_focus_timer_locked(self, now_ms: int) -> dict[str, Any] | None:
         try:
@@ -1817,26 +1975,63 @@ class Store:
             return None
         return timer
 
-    def _rewrite_pending_start_task_locked(
-        self, timer_id: str, task_id: str | None
-    ) -> None:
-        for row in self.connection.execute(
-            "SELECT id, payload FROM pending_commands"
-        ):
-            try:
-                payload = json.loads(row["payload"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if payload.get("timerId") != timer_id or payload.get("type") != "start":
-                continue
-            if task_id is None:
-                payload.pop("taskId", None)
-            else:
-                payload["taskId"] = task_id
-            self.connection.execute(
-                "UPDATE pending_commands SET payload = ? WHERE id = ?",
-                (json.dumps(payload, separators=(",", ":")), row["id"]),
-            )
+    def _persist_retarget_command_locked(
+        self, timer: dict[str, Any], task_id: str | None, now_ms: int
+    ) -> dict[str, Any]:
+        timer_id = str(timer.get("id"))
+        if not timer_id:
+            raise ValueError("No active focus timer is available for retarget.")
+        trusted_ms, sequences, clocks = self._reserve_generation(
+            now_ms, sequence_count=1, clock_count=1)
+        command_id = self._reserve_uuid7_ids(clocks[0][0], 1)[0]
+        return self._insert_retarget_command(
+            timer_id, timer, task_id, now_ms, trusted_ms, sequences[0],
+            clocks[0], command_id,
+        )
+
+    def _insert_retarget_command(
+        self, timer_id: str, timer: dict[str, Any], task_id: str | None,
+        now_ms: int, trusted_ms: int, sequence: int, clock: tuple[int, int],
+        command_id: str,
+    ) -> dict[str, Any]:
+        planned_ms = self._duration_ms(
+            timer.get("plannedDurationMs"), maximum=CANONICAL_DURATION_MAX_MS
+        )
+        observed_ms = self._retarget_observed_ms(timer, now_ms, planned_ms)
+        command: dict[str, Any] = {
+            "id": command_id,
+            "deviceSequence": sequence,
+            "timerId": timer_id,
+            "type": "retarget",
+            "phase": "focus",
+            "plannedDurationMs": planned_ms,
+            "occurredAt": utc_timestamp(trusted_ms),
+            "hlcWallMs": clock[0],
+            "hlcCounter": clock[1],
+            "observedElapsedMs": observed_ms,
+            "taskId": task_id,
+        }
+        self._project_timer_command(command, self._normalize_settings(
+            self.get_meta("settings", {})))
+        self.connection.execute(
+            "INSERT INTO pending_commands("
+            "id, device_sequence, payload, depends_on_command_id) VALUES (?, ?, ?, ?)",
+            (command["id"], sequence,
+             json.dumps(command, separators=(",", ":")), None),
+        )
+        self._record_command_physical_time(command["id"], now_ms)
+        self._mark_never_sent_locked("commands", command["id"])
+        self._set_meta("deviceSequence", sequence)
+        self._set_meta("hlc", {"wallMs": clock[0], "counter": clock[1]})
+        return command
+
+    @staticmethod
+    def _retarget_observed_ms(timer: dict[str, Any], now_ms: int, planned_ms: int) -> int:
+        try:
+            observed = round(elapsed_ms(timer, now_ms))
+        except (TypeError, ValueError, KeyError):
+            observed = 0
+        return max(0, min(int(observed), planned_ms))
 
     def queue_command(
         self, command_type: str, timer: dict[str, Any] | None, selected_phase: str,
@@ -2137,6 +2332,7 @@ class Store:
             ),
         )
         self._record_command_physical_time(command["id"], timer_now_ms)
+        self._mark_never_sent_locked("commands", command["id"])
         self._apply_timer_command_side_effects(command, timer)
         self._set_meta("deviceSequence", sequence)
         self._set_meta(
@@ -2151,7 +2347,7 @@ class Store:
         sequence: int, clock: tuple[int, int], command_id: str,
         dependency: str | None,
     ) -> tuple[dict[str, Any], str | None]:
-        if command_type not in COMMAND_TYPES:
+        if command_type not in COMMAND_TYPES or command_type == "retarget":
             raise ValueError("Unsupported timer command.")
         wall_ms, counter = clock
         starting = command_type == "start"
@@ -2331,6 +2527,7 @@ class Store:
                 "INSERT INTO pending_task_operations(id, payload) VALUES (?, ?)",
                 (operation["id"], json.dumps(operation, separators=(",", ":"))),
             )
+            self._mark_never_sent_locked("taskOperations", operation["id"])
             self._remember_known_task(normalized)
             self._set_meta("hlc", {"wallMs": operation["hlcWallMs"],
                                    "counter": operation["hlcCounter"]})
@@ -2513,15 +2710,98 @@ class Store:
         """Return fail-closed synchronized state from production SharedCore."""
         state = self.load(projection=True) if state is None else state
         projection_base = state.get("projectionSnapshot", state["snapshot"])
-        pending_commands = state.get("projectionPending", state["pending"])
+        safe_state, safe_commands = self._safe_projection_state(state)
         projection_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         return self._project_operation(
-            self._normalize_settings(state["settings"]),
+            self._normalize_settings(safe_state["settings"]),
             now=utc_timestamp(projection_now_ms),
             base=projection_base,
-            state=state,
-            pending_commands=pending_commands,
+            state=safe_state,
+            pending_commands=safe_commands,
         )
+
+    def _safe_projection_state(
+        self, state: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
+        """Filter every domain to its safe optimistic subset.
+
+        A domain projects only when every retained operation carries
+        never-sent proof and its clock strictly exceeds the canonical head.
+        Older, possibly delivered work stays available for exact retry but
+        never overwrites the newer canonical snapshot. Without a
+        trustworthy covering head, no filtering applies yet.
+        """
+        head = self.canonical_head()
+        if head is None:
+            return state, state.get("projectionPending", state.get("pending"))
+        proof = self.delivery_proof()
+        safe_state = dict(state)
+        safe_state["pendingTasks"] = self._safe_domain_queue(
+            proof.get("taskOperations", []), state.get("pendingTasks", []), head)
+        safe_state["pendingDurations"] = self._safe_domain_queue(
+            proof.get("durationOperations", []), state.get("pendingDurations", []),
+            head)
+        safe_state["pendingAutoStarts"] = self._safe_domain_queue(
+            proof.get("autoStartOperations", []), state.get("pendingAutoStarts", []),
+            head)
+        safe_state["pendingSelectedTasks"] = self._safe_domain_queue(
+            proof.get("selectedTaskOperations", []),
+            state.get("pendingSelectedTasks", []), head)
+        commands = state.get("projectionPending", state["pending"])
+        safe_commands = self._safe_domain_queue(
+            proof.get("commands", []), commands, head)
+        return safe_state, safe_commands
+
+    @staticmethod
+    def _safe_domain_queue(
+        proof_ids: list[str], operations: list[dict[str, Any]],
+        head: tuple[int, int],
+    ) -> list[dict[str, Any]]:
+        if not operations:
+            return []
+        proof = set(proof_ids)
+        for operation in operations:
+            clock = (int(operation.get("hlcWallMs", 0)),
+                     int(operation.get("hlcCounter", 0)))
+            if str(operation.get("id", "")) not in proof or not clock > head:
+                return []
+        return operations
+
+    def _project_canonical_with_pending(
+        self,
+        canonical: dict[str, Any],
+        pending: dict[str, list[dict[str, Any]]],
+        trusted_response_ms: int,
+    ) -> ProjectionApplyV2:
+        """Replay Core's safe projectionPending against the canonical base."""
+        settings = self._normalize_settings(self.get_meta("settings", {}))
+        projection_settings = deepcopy(settings)
+        projection_settings["durationsMs"] = canonical["durationsMs"]
+        with_device = {
+            domain: [self._with_device_id(item) for item in operations]
+            for domain, operations in pending.items()
+        }
+        projection_input = self._projection_input(
+            canonical, projection_settings, self._renamed_projection_pending(
+                with_device), utc_timestamp(trusted_response_ms))
+        core = self._shared_core if self._shared_core is not None else (
+            _default_shared_core())
+        try:
+            return apply_projection_v2(core, projection_input)
+        except SharedCoreOperationError as error:
+            raise ValueError(str(error)) from error
+
+    @staticmethod
+    def _renamed_projection_pending(
+        pending: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "commands": pending.get("commands", []),
+            "taskOperations": pending.get("taskOperations", []),
+            "durationOperations": pending.get("durationOperations", []),
+            "autoStartOperations": pending.get("autoStartOperations", []),
+            "selectedTaskOperations": pending.get("selectedTaskOperations", []),
+        }
 
     def projected_settings(
         self,
@@ -2555,38 +2835,24 @@ class Store:
         projection: ProjectionApplyV2,
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Annotate core history with pending flag and local retarget markers."""
+        """Annotate core history with the pending marker.
+
+        Task attribution comes from the authoritative Core projection,
+        which includes immutable retarget operations. No client overlay
+        rewrites history taskIds.
+        """
         pending_timer_ids = {
             command.get("timerId")
             for command in state["pending"]
             if isinstance(command.get("timerId"), str)
         }
-        try:
-            retargets = self.task_retargets()
-        except (OSError, sqlite3.Error) as error:
-            # Infra failure reports to Sentry; history falls back unretargeted.
-            capture_exception(error)
-            retargets = {}
-        except (ValueError, KeyError):
-            # validation stays silent
-            retargets = {}
         history: list[dict[str, Any]] = []
         for item in projection.history:
-            timer_id = item.get("timerId")
-            needs_retarget = isinstance(timer_id, str) and timer_id in retargets
-            needs_pending = timer_id in pending_timer_ids
-            if not needs_retarget and not needs_pending:
+            if item.get("timerId") not in pending_timer_ids:
                 history.append(item)
                 continue
             resolved = dict(item)
-            if needs_retarget:
-                retargeted = retargets[timer_id]
-                if isinstance(retargeted, str) and retargeted:
-                    resolved["taskId"] = retargeted
-                else:
-                    resolved.pop("taskId", None)
-            if needs_pending:
-                resolved["pending"] = True
+            resolved["pending"] = True
             history.append(resolved)
         return history
 
@@ -2779,6 +3045,10 @@ class Store:
         self, operation: dict[str, Any], settings: dict[str, Any], bootstrap: bool
     ) -> None:
         projected_durations = self._project_duration_operation(operation, settings)
+        replaced = self.connection.execute(
+            "SELECT id FROM pending_duration_operations WHERE phase = ?",
+            (operation["phase"],),
+        ).fetchone()
         self.connection.execute(
             "INSERT INTO pending_duration_operations(id, phase, payload) "
             "VALUES (?, ?, ?) ON CONFLICT(phase) DO UPDATE SET "
@@ -2789,6 +3059,9 @@ class Store:
                 json.dumps(operation, separators=(",", ":")),
             ),
         )
+        if replaced is not None and str(replaced["id"]) != operation["id"]:
+            self._drop_delivery_proof_locked("durationOperations", str(replaced["id"]))
+        self._mark_never_sent_locked("durationOperations", operation["id"])
         settings["durationsMs"] = projected_durations
         settings["durations"] = {
             item_phase: self._display_minutes(item_duration)
@@ -2839,6 +3112,7 @@ class Store:
             "INSERT INTO pending_auto_start_operations(id, payload) VALUES (?, ?)",
             (operation["id"], json.dumps(operation, separators=(",", ":"))),
         )
+        self._mark_never_sent_locked("autoStartOperations", operation["id"])
         settings["autoStartBreaks"] = projected_enabled
         self._set_meta("settings", settings)
         if not bootstrap:
@@ -2880,6 +3154,7 @@ class Store:
             "INSERT INTO pending_selected_task_operations(id, payload) VALUES (?, ?)",
             (operation["id"], json.dumps(operation, separators=(",", ":"))),
         )
+        self._mark_never_sent_locked("selectedTaskOperations", operation["id"])
         settings["selectedTaskId"] = projected_task_id
         self._set_meta("settings", settings)
         if not bootstrap:
@@ -3100,6 +3375,10 @@ class Store:
                 self._reset_iroh_account_data(room_id)
                 return
             self._clear_account_queues()
+            self._set_meta(
+                "deliveryProof",
+                {domain: [] for domain in DELIVERY_QUEUE_DOMAINS})
+            self._set_meta("canonicalHead", None)
             self._set_meta("commandPhysicalTimes", {})
             self._set_meta("centralizedTimerOwnership", None)
             self._set_meta("pendingSync", None)

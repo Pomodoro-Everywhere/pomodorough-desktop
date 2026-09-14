@@ -1,4 +1,4 @@
-"""Retarget best-effort fallbacks must capture infra, stay silent on validation."""
+"""Immutable retarget must persist as an operation, never as an overlay."""
 
 from __future__ import annotations
 
@@ -40,90 +40,38 @@ def _active_timer() -> dict:
     }
 
 
-class TerminalLoadRetargetsTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.temporary.name) / "state.sqlite3")
-        self.timer = LocalTimer(self.store)
-
-    def tearDown(self) -> None:
-        self.store.close()
-        self.temporary.cleanup()
-
-    def test_infra_captures_and_falls_back_empty(self) -> None:
-        for error in INFRA_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.terminal.capture_exception",
-                ) as capture,
-            ):
-                self.assertEqual(self.timer._load_retargets(), {})
-                capture.assert_called_once()
-                self.assertIs(capture.call_args[0][0], error)
-
-    def test_validation_stays_silent(self) -> None:
-        for error in VALIDATION_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.terminal.capture_exception",
-                ) as capture,
-            ):
-                self.assertEqual(self.timer._load_retargets(), {})
-                capture.assert_not_called()
-
-
 class TerminalResolvedTaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temporary.name) / "state.sqlite3")
         self.timer = LocalTimer(self.store)
-        self.timer._cached_retargets = None
 
     def tearDown(self) -> None:
         self.store.close()
         self.temporary.cleanup()
 
-    def test_infra_captures_and_keeps_timer_task(self) -> None:
-        for error in INFRA_ERRORS:
-            with (
-                patch.object(
-                    self.store, "retargeted_task_id", side_effect=error
-                ),
-                patch(
-                    "pomodorough.terminal.capture_exception",
-                ) as capture,
-            ):
-                result = self.timer._resolved_timer_task_id(
-                    _active_timer(), retargets=False
-                )
-                self.assertEqual(result, "task-original")
-                capture.assert_called_once()
-                self.assertIs(capture.call_args[0][0], error)
+    def test_resolution_uses_projection_task_without_overlay(self) -> None:
+        resolve = LocalTimer._resolved_timer_task_id
+        self.assertEqual(resolve(_active_timer()), "task-original")
+        self.assertIsNone(resolve({**_active_timer(), "taskId": None}))
+        self.assertIsNone(
+            resolve({**_active_timer(), "phase": "short_break"})
+        )
+        self.assertIsNone(resolve({"phase": "focus"}))
 
-    def test_validation_stays_silent(self) -> None:
-        for error in VALIDATION_ERRORS:
-            with (
-                patch.object(
-                    self.store, "retargeted_task_id", side_effect=error
-                ),
-                patch(
-                    "pomodorough.terminal.capture_exception",
-                ) as capture,
-            ):
-                result = self.timer._resolved_timer_task_id(
-                    _active_timer(), retargets=False
-                )
-                self.assertEqual(result, "task-original")
-                capture.assert_not_called()
+    def test_metrics_use_projection_task(self) -> None:
+        self.timer.known_tasks = {
+            "task-original": {"id": "task-original", "title": "Orig"},
+        }
+        metrics = self.timer._timer_metrics(
+            {**_active_timer(), "plannedDurationMs": 1_500_000},
+            1_000,
+        )
+        self.assertEqual(metrics["taskId"], "task-original")
+        self.assertEqual(metrics["taskTitle"], "Orig")
 
 
-class TerminalRetargetCacheTests(unittest.TestCase):
+class TerminalRetargetOperationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temporary.name) / "state.sqlite3")
@@ -133,43 +81,7 @@ class TerminalRetargetCacheTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def test_cached_metrics_avoid_per_frame_db(self) -> None:
-        cached = {"timer-retarget-1": "task-retargeted"}
-        self.timer._cached_retargets = cached
-        self.timer.known_tasks = {
-            "task-original": {"id": "task-original", "title": "Orig"},
-            "task-retargeted": {"id": "task-retargeted", "title": "New"},
-        }
-        with (
-            patch.object(
-                self.store,
-                "retargeted_task_id",
-                side_effect=AssertionError("per-frame DB hit"),
-            ),
-            patch.object(
-                self.store,
-                "task_retargets",
-                side_effect=AssertionError("per-frame DB hit"),
-            ),
-        ):
-            resolved = self.timer._resolved_timer_task_id(_active_timer())
-            self.assertEqual(resolved, "task-retargeted")
-            metrics = self.timer._timer_metrics(
-                {**_active_timer(), "plannedDurationMs": 1_500_000},
-                1_000,
-            )
-            self.assertEqual(metrics["taskId"], "task-retargeted")
-
-    def test_retarget_from_map_edges(self) -> None:
-        resolve = LocalTimer._retarget_from_map
-        self.assertEqual(resolve("t", "orig", {}), "orig")
-        self.assertEqual(resolve("t", "orig", {"t": "new"}), "new")
-        self.assertIsNone(resolve("t", "orig", {"t": None}))
-        self.assertIsNone(resolve("t", "orig", {"t": ""}))
-        self.assertIsNone(resolve("t", "orig", {"t": 123}))
-        self.assertIsNone(resolve("t", None, {"t": None}))
-
-    def test_reload_caches_markers(self) -> None:
+    def test_reload_reflects_immutable_retarget(self) -> None:
         first = task_from_title("Cache first")
         second = task_from_title("Cache second")
         self.store.queue_task_operation("upsert", first, now_ms=1)
@@ -185,9 +97,15 @@ class TerminalRetargetCacheTests(unittest.TestCase):
         )
         self.store.set_selected_task_id(second["id"], now_ms=5)
         self.timer.reload(now_ms=5)
-        self.assertEqual(
-            self.timer._cached_retargets.get(start["timerId"]), second["id"]
-        )
+        state = self.timer.state(now_ms=5)
+        self.assertEqual(state["taskId"], second["id"])
+        pending = self.store.load()["pending"]
+        starts = [c for c in pending if c["type"] == "start"]
+        self.assertEqual(starts[0].get("taskId"), first["id"])
+        retargets = [c for c in pending if c["type"] == "retarget"]
+        self.assertEqual(len(retargets), 1)
+        self.assertEqual(retargets[0].get("timerId"), start["timerId"])
+        self.assertEqual(retargets[0].get("taskId"), second["id"])
 
 
 class StorageRetargetSentryTests(unittest.TestCase):
@@ -199,83 +117,43 @@ class StorageRetargetSentryTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def test_set_selected_task_infra_captures_keeps_write(self) -> None:
+    def test_set_selected_task_retarget_failure_rolls_back(self) -> None:
         task = task_from_title("Retarget keep task")
         self.store.queue_task_operation("upsert", task, now_ms=1)
-        for error in INFRA_ERRORS:
+        self.store.set_selected_task_id(task["id"], now_ms=2)
+        start_settings = self.store.load()["settings"]
+        self.store.queue_command(
+            "start",
+            None,
+            "focus",
+            start_settings["durationsMs"],
+            task["id"],
+            now_ms=3,
+        )
+        before = self.store.load()
+        for error in INFRA_ERRORS + VALIDATION_ERRORS:
             with (
                 patch.object(
                     Store,
-                    "_retarget_active_focus_task_locked",
+                    "_persist_retarget_command_locked",
                     side_effect=error,
                 ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
+                self.assertRaises(type(error)),
             ):
-                self.store.set_selected_task_id(task["id"], now_ms=1_000)
-                capture.assert_called_once()
-                self.assertIs(capture.call_args[0][0], error)
-                settings = self.store.load()["settings"]
-                self.assertEqual(settings["selectedTaskId"], task["id"])
+                self.store.set_selected_task_id(None, now_ms=1_000)
+            self.assertEqual(self.store.load(), before)
 
-    def test_set_selected_task_validation_silent_keeps_write(self) -> None:
-        task = task_from_title("Retarget keep task")
-        self.store.queue_task_operation("upsert", task, now_ms=1)
-        for error in VALIDATION_ERRORS:
-            with (
-                patch.object(
-                    Store,
-                    "_retarget_active_focus_task_locked",
-                    side_effect=error,
-                ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
-            ):
-                self.store.set_selected_task_id(task["id"], now_ms=2_000)
-                capture.assert_not_called()
-                settings = self.store.load()["settings"]
-                self.assertEqual(settings["selectedTaskId"], task["id"])
-
-    def test_projected_history_infra_captures_falls_back(self) -> None:
-        projection = SimpleNamespace(history=[])
-        for error in INFRA_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
-            ):
-                self.assertEqual(
-                    self.store.projected_history(
-                        projection, {"pending": []}
-                    ),
-                    [],
-                )
-                capture.assert_called_once()
-                self.assertIs(capture.call_args[0][0], error)
-
-    def test_projected_history_validation_silent(self) -> None:
-        projection = SimpleNamespace(history=[])
-        for error in VALIDATION_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
-            ):
-                self.assertEqual(
-                    self.store.projected_history(
-                        projection, {"pending": []}
-                    ),
-                    [],
-                )
-                capture.assert_not_called()
+    def test_projected_history_marks_pending_without_overlay(self) -> None:
+        history = [{"timerId": "t-keep", "taskId": "orig"}]
+        projection = SimpleNamespace(history=history)
+        result = self.store.projected_history(projection, {"pending": []})
+        self.assertEqual(result, history)
+        result = self.store.projected_history(
+            projection, {"pending": [{"timerId": "t-keep"}]}
+        )
+        self.assertEqual(
+            result, [{"timerId": "t-keep", "taskId": "orig", "pending": True}]
+        )
 
     def test_active_focus_fallback_infra_captures_none(self) -> None:
         for error in INFRA_ERRORS:
@@ -312,38 +190,6 @@ class StorageRetargetSentryTests(unittest.TestCase):
                 self.assertIsNone(
                     self.store._active_focus_timer_locked(1_000)
                 )
-                capture.assert_not_called()
-
-    def test_projected_history_fallback_preserves_items(self) -> None:
-        history = [{"timerId": "t-keep", "taskId": "orig"}]
-        projection = SimpleNamespace(history=history)
-        for error in INFRA_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
-            ):
-                result = self.store.projected_history(
-                    projection, {"pending": []}
-                )
-                self.assertEqual(result, history)
-                capture.assert_called_once()
-        for error in VALIDATION_ERRORS:
-            with (
-                patch.object(
-                    self.store, "task_retargets", side_effect=error
-                ),
-                patch(
-                    "pomodorough.storage.capture_exception",
-                ) as capture,
-            ):
-                result = self.store.projected_history(
-                    projection, {"pending": []}
-                )
-                self.assertEqual(result, history)
                 capture.assert_not_called()
 
     def test_active_focus_fallback_success_returns_snapshot(self) -> None:

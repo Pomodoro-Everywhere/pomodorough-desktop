@@ -177,6 +177,7 @@ class SyncStorageBranchTests(unittest.TestCase):
             read_meta=self.store.get_meta,
             load_state=Mock(),
             replace_meta=self.store.set_meta,
+            retire_delivery_proof=Mock(),
         )
         self.sync = SyncStorage(dependencies)
 

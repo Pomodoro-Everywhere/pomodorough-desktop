@@ -52,6 +52,7 @@ class SyncStorageDependencies:
     read_meta: Callable[..., Any]
     load_state: Callable[..., dict[str, Any]]
     replace_meta: Callable[[str, Any], None]
+    retire_delivery_proof: Callable[[dict[str, list[str]]], None]
 
 
 class SyncStorage:
@@ -106,6 +107,11 @@ class SyncStorage:
                 ),
             }
             self._dependencies.write_meta("pendingSync", payload)
+            self._dependencies.retire_delivery_proof(
+                {key: [item["id"] for item in payload[key]]
+                 for key in ("commands", "taskOperations", "durationOperations",
+                             "autoStartOperations", "selectedTaskOperations")}
+            )
         return payload
 
     def pending_sync(self) -> dict[str, Any] | None:
@@ -443,7 +449,17 @@ class SyncStorage:
                 "pendingResolution",
                 {"owner": user, "request": request, "queueIds": queue_ids},
             )
+            self._retire_outbound_proof(outbound)
         return request
+
+    def _retire_outbound_proof(self, outbound: dict[str, Any]) -> None:
+        """Retire never-sent proof for the exact published payload."""
+        self._dependencies.retire_delivery_proof(
+            {key: [item["id"] for item in outbound.get(key, [])]
+             for key in ("commands", "taskOperations", "durationOperations",
+                         "autoStartOperations", "selectedTaskOperations")
+             if key in outbound}
+        )
 
     @staticmethod
     def _validated_resolution_identity(user, expected_revision, strategy) -> str:

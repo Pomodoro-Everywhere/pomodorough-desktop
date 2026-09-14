@@ -42,6 +42,9 @@ class ReplicationStorageDependencies(Protocol):
     def _preflight_pending_queues(self) -> dict[str, Any]: ...
     def _project_operation(self, *args: Any, **kwargs: Any) -> Any: ...
     def _queue_command(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+    def _retire_delivery_proof_locked(
+        self, retired: dict[str, list[str]]
+    ) -> None: ...
     def _reserve_generation(
         self,
         physical_now_ms: int,
@@ -98,6 +101,7 @@ def _assemble_transactions(
             secret_store=dependencies._iroh_secret_store,
             read_meta=dependencies.get_meta,
             write_meta=dependencies._set_meta,
+            retire_delivery_proof=dependencies._retire_delivery_proof_locked,
             immediate_transaction=dependencies._immediate_transaction,
             normalize_settings=dependencies._normalize_settings,
             preflight_pending_queues=dependencies._preflight_pending_queues,
@@ -160,6 +164,7 @@ def _bind_component_interfaces(facade: ReplicationStorage) -> None:
     facade.missing_iroh_references = facade._transactions.missing_references
     facade.upsert_iroh_peer = facade._transactions.upsert_peer
     facade.iroh_peers = facade._transactions.peers
+    facade.iroh_peers_support = facade._transactions.peers_support
     facade.has_pending_auto_break = facade._transactions.has_pending_auto_break
     facade._projected_local_genesis = facade._projection.projected_local_genesis
 
@@ -179,6 +184,7 @@ class ReplicationStorage:
     missing_iroh_references: Callable[..., list[dict[str, str]]]
     upsert_iroh_peer: Callable[..., None]
     iroh_peers: Callable[[str], list[dict[str, Any]]]
+    iroh_peers_support: Callable[[str, str], bool]
     has_pending_auto_break: Callable[[], bool]
 
     def __init__(

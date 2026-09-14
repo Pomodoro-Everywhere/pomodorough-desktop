@@ -200,6 +200,14 @@ class ReplicatedStateProjection:
             commandPhysicalTimes={},
             pendingSync=None,
             pendingResolution=None,
+            deliveryProof={
+                "commands": [],
+                "taskOperations": [],
+                "durationOperations": [],
+                "autoStartOperations": [],
+                "selectedTaskOperations": [],
+            },
+            canonicalHead=None,
         )
         for table in workspace["tables"]:
             workspace["tables"][table] = []

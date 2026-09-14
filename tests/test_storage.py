@@ -35,6 +35,7 @@ from pomodorough.storage import (
     parse_timestamp_ms,
     utc_timestamp,
 )
+from v2_core_double import V2EmulatingSharedCore
 
 
 def _serialize_logical_database(connection: sqlite3.Connection) -> bytes:
@@ -168,7 +169,9 @@ class StorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "state.sqlite3"
-        self.store = Store(self.path)
+        # Pinned bundle predates reconcile.rebase.v2; client tests run
+        # against the spec-derived double (see tests/v2_core_double.py).
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
 
     def tearDown(self) -> None:
         self.store.close()
@@ -746,7 +749,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(ownership["timerId"], running["id"])
         self.assertEqual(ownership["deviceId"], self.store.device_id)
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
 
         self.assertEqual(self.store.get_meta("centralizedTimerOwnership"), ownership)
         self.store.reset_account_data()
@@ -795,7 +798,7 @@ class StorageTests(unittest.TestCase):
         )
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         restarted = self.store.load()
         restarted_timer, restarted_history = rebuild_optimistic(
             restarted["snapshot"].get("canonicalTimer"),
@@ -847,7 +850,7 @@ class StorageTests(unittest.TestCase):
 
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertIsNone(self.store.get_meta("centralizedTimerOwnership"))
 
     @staticmethod
@@ -1179,7 +1182,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(request["taskOperations"], [operation])
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         retry = self.store.prepare_resolution(user, 99, "keep_remote")
         self.assertEqual(retry, request)
         self.assertEqual(self.store.pending_resolution("user-1")["request"], request)
@@ -1395,7 +1398,7 @@ class StorageTests(unittest.TestCase):
         request = self.store.sync_payload()
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(self.store.sync_payload(), request)
         response = self._canonical_response(request, revision=1, tasks=[task])
 
@@ -1407,7 +1410,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(request["taskOperations"], [operation])
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         after_apply = self.store.sync_payload()
         self.assertEqual(after_apply["commands"], [])
         self.assertEqual(after_apply["taskOperations"], [])
@@ -1431,7 +1434,7 @@ class StorageTests(unittest.TestCase):
             self.store.discard_pending_resolution(user["id"], stale["requestId"])
         )
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
 
         self.assertIsNone(self.store.pending_resolution(user["id"]))
         self.assertEqual(self.store.load()["pendingTasks"], [operation])
@@ -1581,7 +1584,7 @@ class StorageTests(unittest.TestCase):
                     },
                 )
 
-    def test_resolution_deletes_only_captured_queue_ids_and_rebases_newer_work(
+    def test_resolution_deletes_only_captured_queue_ids_and_retains_newer_work(
         self,
     ) -> None:
         user = {"id": "user-1"}
@@ -1683,33 +1686,22 @@ class StorageTests(unittest.TestCase):
                 )
                 for operations, original in retained:
                     self.assertEqual(len(operations), 1)
-                    self.assertEqual(
-                        self._operation_intent(operations[0]),
-                        self._operation_intent(original),
-                    )
-                    self.assertGreater(
-                        (
-                            operations[0]["hlcWallMs"],
-                            operations[0]["hlcCounter"],
-                        ),
-                        (
-                            response["serverHlcWallMs"],
-                            response["serverHlcCounter"],
-                        ),
-                    )
-                timer, _history = rebuild_optimistic(
-                    loaded["snapshot"]["canonicalTimer"],
-                    loaded["snapshot"]["history"],
-                    loaded["pending"],
+                    # Immutable contract: out-of-band work without durable
+                    # never-sent proof is retained byte-identical, never
+                    # rebased past the canonical head.
+                    self.assertEqual(operations, [original])
+                # Proof-less work stays available for exact retry but is
+                # excluded from the safe optimistic projection.
+                projection = self.store.projected_state(
+                    now_ms=3_000, state=self.store.load(projection=True)
                 )
-                self.assertEqual(timer["id"], new_command["timerId"])
+                self.assertIsNone(projection.canonical_timer)
                 self.assertEqual(
-                    rebuild_tasks(
-                        loaded["snapshot"]["tasks"], loaded["pendingTasks"]
-                    ),
-                    [new_task_value],
+                    self.store.projected_settings(
+                        self.store.load(), projection
+                    )["durationsMs"]["focus"],
+                    25 * 60_000,
                 )
-                self.assertEqual(loaded["settings"]["durations"]["focus"], 35)
                 self.assertIsNone(loaded["pendingResolution"])
 
     def test_resolution_operation_limit_accepts_4096_and_rejects_4097(self) -> None:
@@ -2186,7 +2178,7 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("pendingSync", legacy_request)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         retry = self.store.sync_payload()
         self.assertEqual(
             retry["autoStartOperations"],
@@ -2213,7 +2205,7 @@ class StorageTests(unittest.TestCase):
         )
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         bootstrap_retry = self.store.prepare_resolution(user, 99, "keep_remote")
         self.assertEqual(
             bootstrap_retry["autoStartOperations"],
@@ -2295,7 +2287,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(loaded["snapshot"]["tasks"], [])
         self.assertEqual(loaded["snapshot"]["knownTasks"], [task])
 
-    def test_task_sync_batches_rebases_and_applies_remote_deletion(self) -> None:
+    def test_task_sync_batches_retain_and_apply_remote_deletion(self) -> None:
         operations = []
         tasks = []
         for index in range(257):
@@ -2338,7 +2330,10 @@ class StorageTests(unittest.TestCase):
         for operation_count, expected_batch_sizes in cases.items():
             with self.subTest(operation_count=operation_count):
                 with tempfile.TemporaryDirectory() as root:
-                    store = Store(Path(root) / "batch.sqlite3")
+                    store = Store(
+                        Path(root) / "batch.sqlite3",
+                        shared_core=V2EmulatingSharedCore(),
+                    )
                     try:
                         tasks = [
                             task_from_title(
@@ -2376,7 +2371,7 @@ class StorageTests(unittest.TestCase):
                     finally:
                         store.close()
 
-    def test_task_sync_rebases_same_task_operation_queued_during_request(self) -> None:
+    def test_task_sync_retains_same_task_operation_queued_during_request(self) -> None:
         task = task_from_title("Same task")
         sent = self.store.queue_task_operation("upsert", task, now_ms=1)
         request = self.store.sync_payload()
@@ -2531,20 +2526,26 @@ class StorageTests(unittest.TestCase):
             "short_break": 5 * 60_000,
             "long_break": 15 * 60_000,
         }
-        core = _DelegatingRecordingSharedCore()
-        self.store._shared_core = core
+        core = self.store._shared_core
+        assert isinstance(core, V2EmulatingSharedCore)
 
         self.store.apply_sync(response, request)
 
         _operation, input_value, core_output = next(
-            call for call in core.calls if call[0] == "reconcile.rebase.v1"
+            call for call in core.calls if call[0] == "reconcile.rebase.v2"
         )
         self.assertEqual(
-            set(input_value), {"local", "sent", "response", "timerDependencies"}
+            set(input_value),
+            {"local", "sent", "neverSent", "response", "timerDependencies"},
         )
         self.assertNotIn("serverTimeMs", input_value["response"])
         self.assertEqual(
             input_value["sent"]["durationOperations"], [{"id": sent["id"]}]
+        )
+        # The claimed batch retired its proof; only the retained task op
+        # keeps never-sent proof derived from durable state.
+        self.assertEqual(
+            input_value["neverSent"], {"taskOperations": [retained["id"]]}
         )
         self.assertEqual(
             input_value["local"]["taskOperations"][0]["deviceId"],
@@ -2563,7 +2564,7 @@ class StorageTests(unittest.TestCase):
         before = self.store.load()
         before_sync = self.store.get_meta("pendingSync")
         self.store._shared_core = _OperationOverrideSharedCore(
-            "reconcile.rebase.v1", {"revision": 1}
+            "reconcile.rebase.v2", {"revision": 1}
         )
 
         with self.assertRaisesRegex(ValueError, "invalid reconciliation"):
@@ -2584,7 +2585,7 @@ class StorageTests(unittest.TestCase):
         before = self.store.load()
         before_resolution = self.store.get_meta("pendingResolution")
         self.store._shared_core = _OperationOverrideSharedCore(
-            "reconcile.rebase.v1", {"revision": 1}
+            "reconcile.rebase.v2", {"revision": 1}
         )
 
         with self.assertRaisesRegex(ValueError, "invalid reconciliation"):
@@ -2697,7 +2698,9 @@ class StorageTests(unittest.TestCase):
                 return Store._canonical_durations(durations_ms)
 
         def apply_from_second_connection() -> None:
-            store = BlockingStore(self.path)
+            store = BlockingStore(
+                self.path, shared_core=V2EmulatingSharedCore()
+            )
             apply_ready.set()
             start_apply.wait()
             try:
@@ -2865,7 +2868,7 @@ class StorageTests(unittest.TestCase):
                 "pomodorough.storage.time.monotonic_ns", return_value=11_100_000_000
             ),
         ):
-            self.store = Store(self.path)
+            self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         with (
             patch(
                 "pomodorough.storage.time.time",
@@ -2923,7 +2926,7 @@ class StorageTests(unittest.TestCase):
                 "pomodorough.storage.time.monotonic_ns", return_value=11_100_000_000
             ),
         ):
-            self.store = Store(self.path)
+            self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
 
         self.assertIsNone(self.store.get_meta("serverClockSample"))
         with (
@@ -2945,7 +2948,7 @@ class StorageTests(unittest.TestCase):
         for index, device_skew_ms in enumerate((-3_600_000, 3_600_000), start=1):
             with self.subTest(device_skew_ms=device_skew_ms):
                 path = Path(self.temporary.name) / f"skew-{index}.sqlite3"
-                store = Store(path)
+                store = Store(path, shared_core=V2EmulatingSharedCore())
                 try:
                     request = store.sync_payload()
                     response = self._canonical_response(request, revision=1)
@@ -3340,7 +3343,7 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(self.store.sync_payload()["taskOperations"], [retained])
 
-    def test_sync_rebases_every_retained_domain_after_canonical_clock(self) -> None:
+    def test_sync_retains_exact_newer_work_without_rebasing(self) -> None:
         sent_task = task_from_title("Sent canonical task")
         sent = self.store.queue_task_operation("upsert", sent_task, now_ms=1_000)
         request = self.store.sync_payload()
@@ -3396,12 +3399,19 @@ class StorageTests(unittest.TestCase):
                 retained_auto_start["id"],
             },
         )
-        self.assertTrue(
-            all(
-                (item["hlcWallMs"], item["hlcCounter"]) > (250_000, 10)
-                for item in retained
-            )
+        # Immutable contract: retained payloads keep their exact clocks and
+        # occurrence times; v2 never rebases them past the canonical head.
+        self.assertEqual(
+            {item["id"]: item for item in retained},
+            {
+                retained_command["id"]: retained_command,
+                retained_task["id"]: retained_task,
+                retained_duration["id"]: retained_duration,
+                retained_auto_start["id"]: retained_auto_start,
+            },
         )
+        # Every retained operation is older than the canonical head, so the
+        # safe optimistic projection stays on the canonical base.
         self.assertEqual(
             {item["id"]: item["occurredAt"] for item in retained},
             {
@@ -3416,6 +3426,7 @@ class StorageTests(unittest.TestCase):
             2_000,
         )
         self.assertEqual(request["taskOperations"], [sent])
+        self.assertEqual(self.store.canonical_head(), (250_000, 10))
         next_request = self.store.sync_payload()
         self.assertEqual(
             {
@@ -3430,14 +3441,15 @@ class StorageTests(unittest.TestCase):
             },
             {item["id"] for item in retained},
         )
+        # Unsafe work remains available for exact retry but does not
+        # overwrite the newer canonical snapshot.
         self.assertEqual(
-            loaded["settings"]["durationsMs"]["focus"],
-            retained_duration["durationMs"],
+            loaded["settings"]["durationsMs"]["focus"], 25 * 60_000
         )
-        self.assertTrue(loaded["settings"]["autoStartBreaks"])
+        self.assertFalse(loaded["settings"]["autoStartBreaks"])
 
-    def test_shared_core_rebases_retained_operation_beyond_trusted_time(self) -> None:
-        sent = self.store.queue_task_operation(
+    def test_retained_operation_beyond_trusted_time_fails_closed(self) -> None:
+        self.store.queue_task_operation(
             "upsert", task_from_title("Sent rollback"), now_ms=1_000
         )
         request = self.store.sync_payload()
@@ -3458,26 +3470,24 @@ class StorageTests(unittest.TestCase):
         )
         self.store.connection.commit()
         response = self._canonical_response(request, revision=1)
+        before = self.store.load()
+        before_sync = self.store.get_meta("pendingSync")
 
-        self.store.apply_sync(
-            response,
-            request,
-            request_physical_ms=1_000,
-            received_physical_ms=1_000,
-            request_monotonic_ms=0,
-            received_monotonic_ms=0,
-        )
+        with self.assertRaisesRegex(
+            ValueError, "trusted-time limit"
+        ):
+            self.store.apply_sync(
+                response,
+                request,
+                request_physical_ms=1_000,
+                received_physical_ms=1_000,
+                request_monotonic_ms=0,
+                received_monotonic_ms=0,
+            )
 
-        rebased = self.store.load()["pendingTasks"]
-        self.assertEqual(len(rebased), 1)
-        self.assertEqual(rebased[0]["id"], retained["id"])
-        self.assertEqual(rebased[0]["occurredAt"], utc_timestamp(1_000))
-        self.assertEqual(
-            (rebased[0]["hlcWallMs"], rebased[0]["hlcCounter"]),
-            (1_000, 1),
-        )
-        self.assertEqual(self.store.sync_payload()["taskOperations"], rebased)
-        self.assertNotIn(sent, rebased)
+        # Delivery-policy failures preserve queues and the claimed request.
+        self.assertEqual(self.store.load(), before)
+        self.assertEqual(self.store.get_meta("pendingSync"), before_sync)
 
     def test_persisted_server_time_uncertainty_is_validated(self) -> None:
         self.store.set_meta(
@@ -4276,7 +4286,7 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("durationMigrationComplete", False)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         loaded = self.store.load()
         self.assertEqual(
             loaded["settings"]["durations"],
@@ -4305,7 +4315,7 @@ class StorageTests(unittest.TestCase):
         )
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(
             self.store.load()["pendingDurations"][0]["id"], operation_id
         )
@@ -4387,7 +4397,7 @@ class StorageTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         loaded = self.store.load()
 
         self.assertTrue(loaded["settings"]["autoStartBreaks"])
@@ -4415,7 +4425,7 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("autoStartMigrationComplete", False)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         loaded = self.store.load()
         self.assertTrue(loaded["settings"]["autoStartBreaks"])
         self.assertEqual(len(loaded["pendingAutoStarts"]), 1)
@@ -4439,7 +4449,7 @@ class StorageTests(unittest.TestCase):
         )
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
 
     def test_legacy_selected_task_migration_queues_choice_once(self) -> None:
@@ -4453,7 +4463,7 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("selectedTaskMigrationComplete", False)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         loaded = self.store.load()
         self.assertEqual(loaded["settings"]["selectedTaskId"], task["id"])
         self.assertEqual(len(loaded["pendingSelectedTasks"]), 1)
@@ -4465,7 +4475,7 @@ class StorageTests(unittest.TestCase):
         )
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(self.store.load()["pendingSelectedTasks"], [operation])
 
     def test_legacy_selected_task_migration_waits_for_pending_resolution(
@@ -4482,13 +4492,13 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("selectedTaskMigrationComplete", False)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertFalse(self.store.get_meta("selectedTaskMigrationComplete"))
         self.assertEqual(self.store.load()["pendingSelectedTasks"], [])
 
         self.store.clear_pending_resolution()
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         loaded = self.store.load()
         self.assertTrue(self.store.get_meta("selectedTaskMigrationComplete"))
         self.assertEqual(len(loaded["pendingSelectedTasks"]), 1)
@@ -4506,7 +4516,7 @@ class StorageTests(unittest.TestCase):
         self.store.set_meta("autoStartMigrationComplete", False)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertTrue(self.store.get_meta("autoStartLegacyDefaultUnknown"))
         request = self.store.prepare_resolution(
             {"id": "user-1"}, 1, "replace_remote"
@@ -4542,7 +4552,7 @@ class StorageTests(unittest.TestCase):
         )
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(
             self.store.load()["pendingAutoStarts"], [enabled, disabled]
         )
@@ -4580,7 +4590,7 @@ class StorageTests(unittest.TestCase):
         )
         self.assertTrue(self.store.load()["settings"]["autoStartBreaks"])
 
-    def test_auto_start_sync_batches_257_operations_and_rebases(self) -> None:
+    def test_auto_start_sync_batches_257_operations_and_retains(self) -> None:
         operations = [
             self.store.set_auto_start_breaks(index % 2 == 0, now_ms=1_000)
             for index in range(257)
@@ -4643,7 +4653,7 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(project_auto_start_breaks(True, operations))
         self.assertTrue(project_auto_start_breaks(False, operations[:2]))
 
-    def test_auto_start_sync_rebases_toggle_created_in_flight(self) -> None:
+    def test_auto_start_sync_retains_toggle_created_in_flight(self) -> None:
         sent = self.store.set_auto_start_breaks(True, now_ms=1_000)
         request = self.store.sync_payload()
         replacement = self.store.set_auto_start_breaks(False, now_ms=2_000)
@@ -4689,7 +4699,7 @@ class StorageTests(unittest.TestCase):
         )
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         retry = self.store.prepare_resolution(user, 99, "keep_remote")
         self.assertEqual(retry, legacy_request)
         self.assertNotIn("autoStartOperations", retry)
@@ -4961,10 +4971,9 @@ class StorageTests(unittest.TestCase):
             self._operation_intent(resent[0]),
             self._operation_intent(generated),
         )
-        self.assertGreater(
-            (resent[0]["hlcWallMs"], resent[0]["hlcCounter"]),
-            (response["serverHlcWallMs"], response["serverHlcCounter"]),
-        )
+        # Immutable contract: the retained break keeps its exact clock for
+        # byte-identical retry instead of rebasing past the head.
+        self.assertEqual(resent[0], generated)
         self.assertFalse(self.store.load()["settings"]["autoStartBreaks"])
 
     def test_duplicate_second_instance_finish_converges_without_resending_break(
@@ -5127,7 +5136,7 @@ class StorageTests(unittest.TestCase):
                                     )
                                 if restarts_before_http:
                                     self.store.close()
-                                    self.store = Store(self.path)
+                                    self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
                                 request = self.store.sync_payload()
                                 self.assertNotIn(generated, request["commands"])
                                 canonical_timer, local_history = (
@@ -5169,13 +5178,13 @@ class StorageTests(unittest.TestCase):
                                 ]
                                 if loses_response:
                                     self.store.close()
-                                    self.store = Store(self.path)
+                                    self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
                                     self.assertEqual(
                                         self.store.sync_payload(), request
                                     )
                                 self.store.apply_sync(response, request)
                                 self.store.close()
-                                self.store = Store(self.path)
+                                self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
                                 released = [
                                     command
                                     for command in self.store.load()["pending"]
@@ -5579,7 +5588,7 @@ class StorageTests(unittest.TestCase):
         )
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(self.store.sync_payload(), request)
         self.assertEqual(
             self.store.provisional_auto_break_timer_ids(), {generated["timerId"]}
@@ -5884,7 +5893,7 @@ class StorageTests(unittest.TestCase):
         before = len(self.store.load()["pending"])
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertTrue(self.store.has_pending_auto_break())
         started = self.store.process_auto_break(
             require_canonical=False, now_ms=3_000
@@ -5893,7 +5902,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(self.store.load()["pending"]), before + 1)
         self.store.close()
 
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertFalse(self.store.has_pending_auto_break())
         self.assertEqual(
             self.store.process_auto_break(require_canonical=False, now_ms=4_000), []
@@ -5935,7 +5944,7 @@ class StorageTests(unittest.TestCase):
         response["canonicalTimer"] = canonical_timer
         self.store.apply_sync(response, request)
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
 
         self.assertEqual(
             self.store.process_auto_break(require_canonical=False, now_ms=3_000), []
@@ -6197,7 +6206,7 @@ class StorageTests(unittest.TestCase):
         operation = self.store.set_auto_start_breaks(True, now_ms=1_000)
         request = self.store.sync_payload()
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(
             self.store.sync_payload()["autoStartOperations"],
             self._wire_preference_operations([operation]),
@@ -6297,7 +6306,7 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(loaded["settings"]["autoStartBreaks"])
 
         self.store.close()
-        self.store = Store(self.path)
+        self.store = Store(self.path, shared_core=V2EmulatingSharedCore())
         self.assertEqual(self.store.load()["pendingDurations"], [])
 
 

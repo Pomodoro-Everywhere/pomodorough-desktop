@@ -25,6 +25,7 @@ class ReplicationTransactionDependencies:
     secret_store: Any
     read_meta: Callable[[str, Any], Any]
     write_meta: Callable[[str, Any], None]
+    retire_delivery_proof: Callable[[dict[str, list[str]]], None]
     immediate_transaction: Callable[[], AbstractContextManager[None]]
     normalize_settings: Callable[[Any], dict[str, Any]]
     preflight_pending_queues: Callable[[], dict[str, Any]]
@@ -36,6 +37,82 @@ class ReplicationTransactionDependencies:
     records: IrohRecordPersistence
     projection: ReplicatedStateProjection
     break_planner: GeneratedBreakPlanner
+
+
+def _validated_peer_capabilities(
+    capabilities: list[str] | None,
+) -> str | None:
+    """Serialize hello capabilities; None means legacy/unknown peer."""
+    if capabilities is None:
+        return None
+    if (
+        not isinstance(capabilities, list)
+        or len(capabilities) > 16
+        or any(
+            not isinstance(item, str) or not 1 <= len(item) <= 64
+            for item in capabilities
+        )
+        or len(set(capabilities)) != len(capabilities)
+    ):
+        raise ValueError("Iroh peer capabilities are invalid.")
+    return json.dumps(capabilities, separators=(",", ":"))
+
+
+def _parsed_peer_capabilities(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Saved Iroh peer capabilities are invalid.") from error
+    if (
+        not isinstance(parsed, list)
+        or any(not isinstance(item, str) for item in parsed)
+    ):
+        raise ValueError("Saved Iroh peer capabilities are invalid.")
+    return parsed
+
+
+def _validate_peer_metadata(
+    endpoint_id: str, endpoint_ticket: str, display_name: str | None
+) -> None:
+    from .iroh_protocol import MAX_ENDPOINT_TICKET
+    if (
+        not endpoint_id
+        or not endpoint_ticket
+        or len(endpoint_ticket.encode()) > MAX_ENDPOINT_TICKET
+        or display_name is not None
+        and not 1 <= len(display_name) <= 64
+    ):
+        raise ValueError("Iroh peer metadata is invalid.")
+
+
+def _held_back_ids(
+    records: list[dict[str, Any]], publishable: list[dict[str, Any]]
+) -> dict[str, set[str]]:
+    """Map held-back records to pending-table IDs for workspace retain."""
+    published = {
+        (record.get("domain"), record.get("operation", {}).get("id"))
+        for record in publishable
+    }
+    table_for = {
+        "timer": "pending_commands",
+        "task": "pending_task_operations",
+        "duration": "pending_duration_operations",
+        "autoStart": "pending_auto_start_operations",
+        "selectedTask": "pending_selected_task_operations",
+    }
+    held_ids: dict[str, set[str]] = {}
+    for record in records:
+        key = (record.get("domain"), record.get("operation", {}).get("id"))
+        if key in published:
+            continue
+        table = table_for.get(str(record.get("domain", "")))
+        operation_id = record.get("operation", {}).get("id")
+        if table is None or not isinstance(operation_id, str):
+            continue
+        held_ids.setdefault(table, set()).add(operation_id)
+    return held_ids
 
 
 class ReplicationTransactionCoordinator:
@@ -103,22 +180,88 @@ class ReplicationTransactionCoordinator:
 
     def capture_local_records_locked(self, room_id: str) -> bool:
         records = self._pending_records()
-        if not records:
+        publishable = self._publishable_records(records, room_id)
+        if not publishable:
             self._dependencies.workspace.save_room(
                 room_id,
                 self._dependencies.workspace.capture(),
             )
             return False
-        self._dependencies.records.insert_locked(room_id, records)
-        self._clear_captured_queues(records)
+        self._dependencies.records.insert_locked(room_id, publishable)
+        self._clear_captured_queues(publishable)
+        capture = self._dependencies.workspace.capture()
+        held_snapshot = deepcopy(capture)
         projection = self._dependencies.projection.project_room(room_id)
         workspace = self._dependencies.projection.workspace_with_projection(
-            self._dependencies.workspace.capture(),
+            capture,
             projection,
         )
+        self._retain_held_back(workspace, held_snapshot, records, publishable)
         self._dependencies.workspace.save_room(room_id, workspace)
         self._dependencies.workspace.restore(workspace)
         return True
+
+    def _retain_held_back(
+        self,
+        workspace: dict[str, Any],
+        capture: dict[str, Any],
+        records: list[dict[str, Any]],
+        publishable: list[dict[str, Any]],
+    ) -> None:
+        """Keep held-back retarget rows through the room workspace swap."""
+        held_ids = _held_back_ids(records, publishable)
+        if not held_ids:
+            return
+        capture_tables = capture.get("tables", {})
+        workspace_tables = workspace.get("tables", {})
+        for table, ids in held_ids.items():
+            workspace_tables[table] = [
+                row for row in capture_tables.get(table, [])
+                if str(row.get("id")) in ids
+            ]
+        capture_physical = capture.get("metadata", {}).get(
+            "commandPhysicalTimes", {}
+        )
+        if isinstance(capture_physical, dict):
+            workspace["metadata"]["commandPhysicalTimes"] = {
+                key: value for key, value in capture_physical.items()
+                if key in held_ids.get("pending_commands", set())
+            }
+        self._retain_held_back_clock(workspace, capture)
+
+    def _retain_held_back_clock(
+        self, workspace: dict[str, Any], capture: dict[str, Any]
+    ) -> None:
+        """Keep the newer HLC so held-back clocks stay covered."""
+        try:
+            before = workspace["metadata"]["hlc"]
+            after = capture["metadata"]["hlc"]
+            before_key = (int(before["wallMs"]), int(before["counter"]))
+            after_key = (int(after["wallMs"]), int(after["counter"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        if after_key > before_key:
+            workspace["metadata"]["hlc"] = after
+
+    def _publishable_records(
+        self, records: list[dict[str, Any]], room_id: str
+    ) -> list[dict[str, Any]]:
+        """Hold back retargets until every known peer supports retarget-v1.
+
+        Legacy/unknown peers would reject the new timer type, so the
+        retarget stays queued locally for exact retry after the last
+        peer upgrades. All other domains publish normally.
+        """
+        if self.peers_support(room_id, "retarget-v1"):
+            return records
+        return [
+            record
+            for record in records
+            if not (
+                record.get("domain") == "timer"
+                and record.get("operation", {}).get("type") == "retarget"
+            )
+        ]
 
     def _pending_records(self) -> list[dict[str, Any]]:
         pending = self._dependencies.preflight_pending_queues()
@@ -144,24 +287,67 @@ class ReplicationTransactionCoordinator:
         return records
 
     def _clear_captured_queues(self, records: list[dict[str, Any]]) -> None:
-        command_ids = [
-            record["operation"]["id"]
-            for record in records
-            if record["domain"] == "timer"
-        ]
+        retired: dict[str, list[str]] = {
+            "commands": [],
+            "taskOperations": [],
+            "durationOperations": [],
+            "autoStartOperations": [],
+            "selectedTaskOperations": [],
+        }
+        domains = {
+            "timer": "commands",
+            "task": "taskOperations",
+            "duration": "durationOperations",
+            "autoStart": "autoStartOperations",
+            "selectedTask": "selectedTaskOperations",
+        }
+        for record in records:
+            domain = domains.get(record.get("domain", ""))
+            operation_id = record.get("operation", {}).get("id")
+            if domain is not None and isinstance(operation_id, str):
+                retired[domain].append(operation_id)
+        self._dependencies.retire_delivery_proof(retired)
+        self._delete_published_ids(retired)
         connection = self._dependencies.connection
-        connection.execute("DELETE FROM pending_commands")
-        connection.execute("DELETE FROM pending_task_operations")
-        connection.execute("DELETE FROM pending_duration_operations")
-        connection.execute("DELETE FROM pending_auto_start_operations")
-        connection.execute("DELETE FROM pending_selected_task_operations")
         connection.executemany(
             "DELETE FROM pending_phase_advances WHERE finish_command_id = ?",
-            ((identifier,) for identifier in command_ids),
+            ((identifier,) for identifier in retired["commands"]),
         )
         connection.execute("DELETE FROM pending_auto_break_starts")
-        self._dependencies.write_meta("commandPhysicalTimes", {})
+        self._prune_published_physical_times(retired["commands"])
         self._dependencies.write_meta("pendingSync", None)
+
+    def _delete_published_ids(self, retired: dict[str, list[str]]) -> None:
+        """Delete only published queue rows; held-back retargets stay."""
+        tables = {
+            "commands": "pending_commands",
+            "taskOperations": "pending_task_operations",
+            "durationOperations": "pending_duration_operations",
+            "autoStartOperations": "pending_auto_start_operations",
+            "selectedTaskOperations": "pending_selected_task_operations",
+        }
+        connection = self._dependencies.connection
+        for domain, table in tables.items():
+            ids = retired.get(domain, [])
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"DELETE FROM {table} WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+
+    def _prune_published_physical_times(self, command_ids: list[str]) -> None:
+        if not command_ids:
+            return
+        physical = self._dependencies.read_meta("commandPhysicalTimes", {})
+        if not isinstance(physical, dict):
+            return
+        published = set(command_ids)
+        remaining = {
+            key: value for key, value in physical.items() if key not in published
+        }
+        if remaining != physical:
+            self._dependencies.write_meta("commandPhysicalTimes", remaining)
 
     def project_expiry(self, now_ms: int | None = None) -> bool:
         room_id = self._active_room_id()
@@ -299,17 +485,12 @@ class ReplicationTransactionCoordinator:
         display_name: str | None,
         last_seen_at_ms: int | None,
         secret_mutations: SecretMutationJournal,
+        capabilities: list[str] | None = None,
     ) -> None:
-        from .iroh_protocol import MAX_ENDPOINT_TICKET, MAX_PEERS
+        from .iroh_protocol import MAX_PEERS
 
-        if (
-            not endpoint_id
-            or not endpoint_ticket
-            or len(endpoint_ticket.encode()) > MAX_ENDPOINT_TICKET
-            or display_name is not None
-            and not 1 <= len(display_name) <= 64
-        ):
-            raise ValueError("Iroh peer metadata is invalid.")
+        _validate_peer_metadata(endpoint_id, endpoint_ticket, display_name)
+        stored_capabilities = _validated_peer_capabilities(capabilities)
         exists = self._dependencies.connection.execute(
             "SELECT 1 FROM iroh_peers WHERE room_id = ? AND endpoint_id = ?",
             (room_id, endpoint_id),
@@ -326,17 +507,22 @@ class ReplicationTransactionCoordinator:
             endpoint_ticket.encode("utf-8"),
         )
         self._dependencies.connection.execute(
-            "INSERT INTO iroh_peers(room_id, endpoint_id, endpoint_ticket, device_id, "
-            "display_name, last_seen_at_ms) VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO iroh_peers(room_id, endpoint_id, endpoint_ticket, "
+            "device_id, display_name, capabilities, last_seen_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(room_id, endpoint_id) DO UPDATE SET "
-            "endpoint_ticket = excluded.endpoint_ticket, device_id = excluded.device_id, "
-            "display_name = excluded.display_name, last_seen_at_ms = excluded.last_seen_at_ms",
+            "endpoint_ticket = excluded.endpoint_ticket, "
+            "device_id = excluded.device_id, "
+            "display_name = excluded.display_name, "
+            "capabilities = excluded.capabilities, "
+            "last_seen_at_ms = excluded.last_seen_at_ms",
             (
                 room_id,
                 endpoint_id,
                 f"secure:{ticket_key}",
                 device_id,
                 display_name,
+                stored_capabilities,
                 last_seen_at_ms,
             ),
         )
@@ -349,8 +535,9 @@ class ReplicationTransactionCoordinator:
         device_id: str | None,
         display_name: str | None,
         last_seen_at_ms: int | None = None,
+        capabilities: list[str] | None = None,
     ) -> None:
-        with SecretMutationJournal(self._dependencies.secret_store) as secret_mutations:
+        with SecretMutationJournal(self._dependencies.secret_store) as mutations:
             with self._dependencies.immediate_transaction():
                 self.upsert_peer_locked(
                     room_id,
@@ -359,14 +546,15 @@ class ReplicationTransactionCoordinator:
                     device_id,
                     display_name,
                     last_seen_at_ms,
-                    secret_mutations,
+                    mutations,
+                    capabilities,
                 )
 
     def peers(self, room_id: str) -> list[dict[str, Any]]:
         peers = []
         for row in self._dependencies.connection.execute(
             "SELECT endpoint_id, endpoint_ticket, device_id, display_name, "
-            "last_seen_at_ms FROM iroh_peers WHERE room_id = ? "
+            "capabilities, last_seen_at_ms FROM iroh_peers WHERE room_id = ? "
             "ORDER BY last_seen_at_ms DESC, endpoint_id",
             (room_id,),
         ):
@@ -386,10 +574,27 @@ class ReplicationTransactionCoordinator:
                     "endpointTicket": endpoint_ticket,
                     "deviceId": row["device_id"],
                     "displayName": row["display_name"],
+                    "capabilities": _parsed_peer_capabilities(
+                        row["capabilities"] if "capabilities" in row.keys() else None
+                    ),
                     "lastSeenAtMs": row["last_seen_at_ms"],
                 }
             )
         return peers
+
+    def peers_support(self, room_id: str, capability: str) -> bool:
+        """True when every known peer explicitly advertises a capability.
+
+        Missing (legacy/unknown) counts as unsupported: retarget records
+        must not be published into a room with legacy peers. Rollout
+        ordering is upgrade-all-devices-first; held-back retargets stay
+        queued locally for exact retry after the last peer upgrades.
+        """
+        return all(
+            isinstance(peer.get("capabilities"), list)
+            and capability in peer["capabilities"]
+            for peer in self.peers(room_id)
+        )
 
     def has_pending_auto_break(self) -> bool:
         return (

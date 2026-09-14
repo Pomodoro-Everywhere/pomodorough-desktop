@@ -222,7 +222,7 @@ class D55HelperContractTests(unittest.TestCase):
                 raise error
 
             with patch(
-                "pomodorough.terminal.capture_exception",
+                "pomodorough.storage.capture_exception",
             ) as capture:
                 with self.assertRaises(type(error)):
                     timer._store_action(failing)
@@ -237,7 +237,7 @@ class D55HelperContractTests(unittest.TestCase):
             timer.resolution_pending = False
             timer.store.has_pending_auto_break.side_effect = error
             with patch(
-                "pomodorough.terminal.capture_exception",
+                "pomodorough.storage.capture_exception",
             ) as capture:
                 with self.assertRaises(type(error)):
                     timer._process_pending_auto_break(False, 0, 0)

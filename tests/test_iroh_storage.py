@@ -370,6 +370,7 @@ class IrohStorageTests(unittest.TestCase):
         central_task = task_from_title("Central task")
         self.store.queue_task_operation("upsert", central_task, now_ms=1_000)
         self.store.set_selected_task_id(central_task["id"], now_ms=2_000)
+        central_proof = self.store.delivery_proof()
         central_before = self.store.load()
         secret = bytes(reversed(range(32)))
         room_id = room_id_for_secret(secret)
@@ -394,11 +395,20 @@ class IrohStorageTests(unittest.TestCase):
         self.store.insert_remote_iroh_records(room_id, [genesis])
         self.store.activate_joined_iroh_room(room_id)
         self.assertEqual(self.store.load()["settings"]["selectedTaskId"], room_task["id"])
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {domain: [] for domain in central_proof},
+        )
 
         self.store.leave_iroh_room()
         self.assertEqual(self.store.load(), central_before)
+        self.assertEqual(self.store.delivery_proof(), central_proof)
         self.store.set_replication_mode("iroh")
         self.assertEqual(self.store.load()["settings"]["selectedTaskId"], room_task["id"])
+        self.assertEqual(
+            self.store.delivery_proof(),
+            {domain: [] for domain in central_proof},
+        )
 
     def test_account_clear_preserves_room_selected_task_and_scrubs_return_workspace(self) -> None:
         central_task = task_from_title("Account task")

@@ -18,6 +18,7 @@ from pomodorough.localization import Strings
 from pomodorough.storage import Store, utc_timestamp
 from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
+from v2_core_double import V2EmulatingSharedCore
 
 
 def wire_preference_operation(operation: dict[str, object]) -> dict[str, object]:
@@ -143,6 +144,8 @@ class MainWindowDurationTests(unittest.TestCase):
         self.store = Store(
             Path(self.temporary.name) / "state.sqlite3",
             iroh_secret_store=MemorySecretStore(),
+            # Pinned bundle predates reconcile.rebase.v2 (see v2_core_double).
+            shared_core=V2EmulatingSharedCore(),
         )
         self.cloud = FakeCloud()
         with patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
@@ -1057,12 +1060,16 @@ class MainWindowDurationTests(unittest.TestCase):
     def test_signed_in_terminal_provisional_break_converges_through_ui_sync(
         self,
     ) -> None:
+        # Scenario clocks stay near wall-clock time so the never-sent
+        # provisional break remains projectable under the immutable
+        # ordering rule (strictly newer than the canonical head).
+        base_ms = int(time.time() * 1000)
         self.store.set_user({"id": "user-1"})
-        self.store.set_auto_start_breaks(True, now_ms=100)
+        self.store.set_auto_start_breaks(True, now_ms=base_ms - 4_000)
         terminal = LocalTimer(self.store)
-        terminal.issue("start", minutes=1, now_ms=1_000)
-        terminal.issue("finish", now_ms=61_000)
-        terminal.state(now_ms=61_000)
+        terminal.issue("start", minutes=1, now_ms=base_ms - 3_000)
+        terminal.issue("finish", now_ms=base_ms - 2_000)
+        terminal.state(now_ms=base_ms - 1_000)
         pending = self.store.load()["pending"]
         generated = pending[-1]
 
@@ -1133,19 +1140,20 @@ class MainWindowDurationTests(unittest.TestCase):
         self,
     ) -> None:
         self.store.set_user({"id": "user-1"})
-        self.store.set_auto_start_breaks(True, now_ms=100)
+        base_ms = int(time.time() * 1000)
+        self.store.set_auto_start_breaks(True, now_ms=base_ms)
         settings = self.store.load()["settings"]
         self.store.queue_command(
-            "start", None, "focus", settings["durationsMs"], now_ms=1_000
+            "start", None, "focus", settings["durationsMs"], now_ms=base_ms + 1_000
         )
         running, _history = rebuild_optimistic(
             None, [], self.store.load()["pending"]
         )
         self.store.queue_command(
-            "finish", running, "focus", settings["durationsMs"], now_ms=2_000
+            "finish", running, "focus", settings["durationsMs"], now_ms=base_ms + 2_000
         )
         provisional = self.store.process_auto_break(
-            require_canonical=False, now_ms=3_000
+            require_canonical=False, now_ms=base_ms + 3_000
         )[0]
         self.window._load_state()
         self.window._render()
@@ -1327,8 +1335,12 @@ class MainWindowDurationTests(unittest.TestCase):
             now_ms=self.window._projection_now_ms
         )
         self.assertEqual(clear["type"], "clear")
+        # Immutable contract: the auto-claimed clear is possibly delivered,
+        # so it stays available for exact retry without optimistic replay.
+        self.assertNotIn(clear["id"], projection.timer_outcomes)
         self.assertEqual(
-            projection.timer_outcomes[clear["id"]]["outcome"], "applied"
+            [command["id"] for command in self.store.pending_sync()["commands"]],
+            [clear["id"]],
         )
         self.assertIsNone(projection.canonical_timer)
         self.assertIsNone(self.window.timer)
@@ -1995,23 +2007,12 @@ class MainWindowDurationTests(unittest.TestCase):
 
         retained = self.store.load()["pendingDurations"]
         self.assertEqual(len(retained), 1)
-        self.assertEqual(
-            {
-                key: value
-                for key, value in retained[0].items()
-                if key not in {"occurredAt", "hlcWallMs", "hlcCounter"}
-            },
-            {
-                key: value
-                for key, value in replacement.items()
-                if key not in {"occurredAt", "hlcWallMs", "hlcCounter"}
-            },
-        )
-        self.assertGreater(
-            (retained[0]["hlcWallMs"], retained[0]["hlcCounter"]),
-            (response["serverHlcWallMs"], response["serverHlcCounter"]),
-        )
-        self.assertEqual(self.window.duration_spins["focus"].value(), 27)
+        # Immutable contract: the in-flight edit is retained byte-identical
+        # for exact retry instead of rebasing past the canonical head.
+        self.assertEqual(retained, [replacement])
+        # A possibly-delivered-or-older edit stays available for retry but
+        # does not overwrite the newer canonical snapshot.
+        self.assertEqual(self.window.duration_spins["focus"].value(), 30)
         self.assertEqual(
             self.cloud.payloads[-1]["durationOperations"], retained
         )

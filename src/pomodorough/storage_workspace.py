@@ -19,6 +19,8 @@ _METADATA_KEYS = (
     "autoStartLegacyDefaultUnknown",
     "pendingSync",
     "pendingResolution",
+    "deliveryProof",
+    "canonicalHead",
 )
 
 _TABLE_COLUMNS = {
@@ -113,7 +115,10 @@ class WorkspacePersistence:
             )
 
     def restore_metadata(self, metadata: dict[str, Any]) -> None:
-        for key, value in metadata.items():
+        # Older saved workspaces have no delivery proof or canonical head;
+        # never inherit another workspace's delivery claims.
+        defaults = {"deliveryProof": None, "canonicalHead": None}
+        for key, value in {**defaults, **metadata}.items():
             if key in _METADATA_KEYS:
                 self._write_meta(key, value)
 
@@ -167,6 +172,14 @@ class WorkspacePersistence:
             "user": None,
         }
         metadata["autoStartLegacyDefaultUnknown"] = False
+        metadata["deliveryProof"] = {
+            "commands": [],
+            "taskOperations": [],
+            "durationOperations": [],
+            "autoStartOperations": [],
+            "selectedTaskOperations": [],
+        }
+        metadata["canonicalHead"] = None
 
     @staticmethod
     def serialize(workspace: dict[str, Any]) -> str:

@@ -321,11 +321,12 @@ def _valid_peer_timer(operation: dict[str, Any]) -> None:
     planned = operation.get("plannedDurationMs")
     observed = operation.get("observedElapsedMs")
     task_id = operation.get("taskId")
+    command_type = operation.get("type")
     if (
         isinstance(sequence, bool)
         or not isinstance(sequence, int)
         or not 1 <= sequence <= MAX_SAFE_INTEGER
-        or operation.get("type") not in {"start", "pause", "resume", "finish", "cancel", "clear"}
+        or command_type not in {"start", "pause", "resume", "finish", "cancel", "clear", "retarget"}
         or operation.get("phase") not in {"focus", "short_break", "long_break"}
         or isinstance(planned, bool)
         or not isinstance(planned, int)
@@ -335,9 +336,14 @@ def _valid_peer_timer(operation: dict[str, Any]) -> None:
         or not -MAX_SAFE_INTEGER <= observed <= MAX_SAFE_INTEGER
         or task_id is not None and (
             not valid_identifier(task_id)
-            or operation.get("type") != "start"
+            or command_type not in {"start", "retarget"}
             or operation.get("phase") != "focus"
         )
+    ):
+        raise IrohProtocolError("Timer operation is invalid.")
+    if command_type == "retarget" and (
+        "taskId" not in operation
+        or operation.get("phase") != "focus"
     ):
         raise IrohProtocolError("Timer operation is invalid.")
     _valid_peer_clock(operation)
@@ -618,10 +624,22 @@ def _valid_cursor(cursor: Any) -> bool:
     return _valid_reference({"domain": domain, "id": identifier})
 
 
+PEER_CAPABILITIES = ("retarget-v1",)
+
+
 def _validate_hello_message(message: dict[str, Any], base: set[str]) -> None:
     required = base | {"deviceId", "endpointTicket", "platform"}
-    _exact_keys(message, required, {"displayName"})
+    _exact_keys(message, required, {"displayName", "capabilities"})
     display_name = message.get("displayName")
+    capabilities = message.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list)
+        or len(capabilities) > 16
+        or any(not isinstance(item, str) or not 1 <= len(item) <= 64
+               for item in capabilities)
+        or len(set(capabilities)) != len(capabilities)
+    ):
+        raise IrohProtocolError("Hello fields are invalid.")
     if (
         not valid_identifier(message["deviceId"])
         or not isinstance(message["endpointTicket"], str)

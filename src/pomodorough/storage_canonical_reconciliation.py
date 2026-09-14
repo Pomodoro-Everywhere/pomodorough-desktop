@@ -1,3 +1,14 @@
+"""Canonical reconciliation against the authoritative SharedCore.
+
+Production requires a v2-capable bundle (``reconcile.rebase.v2``). There is
+no v1 fallback by design: a bundle that answers v2 with "unsupported
+shared-core operation" fails closed, preserving queues and the claimed
+request for recovery after a Core upgrade. Contract tests that need v2
+today run against the test-only double in ``tests/v2_core_double.py``,
+which emulates delivery mechanics on top of the real v1/projection and
+must never be mistaken for authoritative Core behavior.
+"""
+
 from __future__ import annotations
 
 import json
@@ -95,6 +106,12 @@ class CanonicalReconciliationDependencies(Protocol):
     def device_id(self) -> str: ...
 
     def shared_core(self) -> Any: ...
+
+    def delivery_proof(self) -> dict[str, list[str]]: ...
+
+    def never_sent_claim(self, sent: dict[str, list[str]]) -> dict[str, list[str]]: ...
+
+    def drop_delivery_proof(self, domain: str, operation_id: str) -> None: ...
 
     def _command_physical_times(self) -> dict[str, int]: ...
 
@@ -303,6 +320,7 @@ def reconciliation_output_fields() -> set[str]:
         "durationsMs",
         "autoStartBreaks",
         "selectedTaskId",
+        "projectionPending",
     }
 
 
@@ -452,16 +470,32 @@ class SharedCoreReconciliationAdapter:
 
         queue_keys = tuple(_QUEUE_OUTPUT_KEYS)
         response = self._hooks._core_canonical_response(canonical)
+        sent = {
+            key: [{"id": item["id"]} for item in request.get(key, [])]
+            for key in queue_keys
+        }
+        sent_ids = {
+            key: [item["id"] for item in sent[key]] for key in queue_keys
+        }
+        never_sent = self._dependencies.never_sent_claim(sent_ids)
+        local_ids = {
+            key: {str(item["id"]) for item in pending[key]} for key in queue_keys
+        }
+        never_sent = {
+            domain: [item for item in ids if item in local_ids.get(domain, set())]
+            for domain, ids in never_sent.items()
+        }
+        never_sent = {
+            domain: ids for domain, ids in never_sent.items() if ids
+        }
         return (
             {
                 "local": {
                     key: [with_device_id(item) for item in pending[key]]
                     for key in queue_keys
                 },
-                "sent": {
-                    key: [{"id": item["id"]} for item in request.get(key, [])]
-                    for key in queue_keys
-                },
+                "sent": sent,
+                "neverSent": never_sent,
                 "response": response,
                 "timerDependencies": self._hooks._core_timer_dependencies(pending),
             },
@@ -540,6 +574,9 @@ class SharedCoreReconciliationAdapter:
         normalized = self._hooks._normalized_reconciliation_queues(
             value, _QUEUE_OUTPUT_KEYS, invalid
         )
+        projection_pending = self._validated_projection_pending(
+            value, normalized, invalid
+        )
         local = {
             domain: {str(item["id"]): item for item in pending[domain]}
             for domain in _QUEUE_OUTPUT_KEYS
@@ -558,12 +595,53 @@ class SharedCoreReconciliationAdapter:
         )
         return {
             "queues": normalized,
+            "projectionPending": projection_pending,
             "dependencies": dependencies,
             "promoted": set(promoted),
             "dropped": set(dropped),
             "droppedTimerIds": set(timer_ids),
             "projection": projection,
         }
+
+    def _validated_projection_pending(
+        self,
+        value: dict[str, Any],
+        normalized: dict[str, list[dict[str, Any]]],
+        invalid: ValueError,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Validate v2 safe optimistic queues against retained pending.
+
+        Each domain is either the full retained queue or empty. A partial
+        safe subset is never valid; one unsafe operation excludes the
+        whole domain without deleting it from pending.
+        """
+        raw = value.get("projectionPending")
+        if not isinstance(raw, dict) or set(raw) != set(_QUEUE_OUTPUT_KEYS):
+            raise invalid
+        validated: dict[str, list[dict[str, Any]]] = {}
+        try:
+            for domain in _QUEUE_OUTPUT_KEYS:
+                items = raw[domain]
+                if not isinstance(items, list):
+                    raise invalid
+                retained = {str(item["id"]): item for item in normalized[domain]}
+                if not items:
+                    validated[domain] = []
+                    continue
+                if len(items) != len(normalized[domain]):
+                    raise invalid
+                checked = [
+                    self._hooks._normalized_core_queue_operation(domain, item)
+                    for item in items
+                ]
+                for item in checked:
+                    original = retained.get(str(item["id"]))
+                    if original is None or original != item:
+                        raise invalid
+                validated[domain] = checked
+        except ValueError as error:
+            raise invalid from error
+        return validated
 
     def _normalized_reconciliation_queues(
         self,
@@ -621,9 +699,25 @@ class SharedCoreReconciliationAdapter:
             self._hooks._persist_reconciliation_queue(
                 table, pending[domain], result["queues"][domain]
             )
+        self._drop_consumed_delivery_proof(result, pending)
         self._hooks._persist_reconciliation_dependencies(result)
         self._hooks._reconcile_removed_auto_break_starts(result, pending)
         self._dependencies._preflight_pending_queues(require_clock_coverage=False)
+
+    def _drop_consumed_delivery_proof(
+        self,
+        result: dict[str, Any],
+        pending: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        retained_ids = {
+            domain: {str(item["id"]) for item in result["queues"][domain]}
+            for domain in _QUEUE_TABLES
+        }
+        for domain, operations in pending.items():
+            for operation in operations:
+                operation_id = str(operation["id"])
+                if operation_id not in retained_ids.get(domain, set()):
+                    self._dependencies.drop_delivery_proof(domain, operation_id)
 
     def _persist_reconciliation_queue(
         self,
@@ -631,6 +725,19 @@ class SharedCoreReconciliationAdapter:
         originals: list[dict[str, Any]],
         retained_operations: list[dict[str, Any]],
     ) -> None:
+        """Consume acknowledgements without rewriting retained operations.
+
+        Retained operations keep their exact identities, clocks, and
+        occurrences for durable retry. Core's accepted generated-break
+        normalization may adjust a retained break batch's phase, planned
+        duration, and observed elapsed time; any other retained rewrite
+        is a delivery-policy error, not an update.
+        """
+        allowed = (
+            {"phase", "plannedDurationMs", "observedElapsedMs"}
+            if table == "pending_commands"
+            else set()
+        )
         retained = {
             str(operation["id"]): operation for operation in retained_operations
         }
@@ -641,7 +748,14 @@ class SharedCoreReconciliationAdapter:
                 self._dependencies.connection.execute(
                     f"DELETE FROM {table} WHERE id = ?", (operation_id,)
                 )
-            else:
+            elif any(
+                original.get(key) != operation.get(key)
+                for key in (set(original) | set(operation)) - allowed
+            ):
+                raise ValueError(
+                    "Shared core rewrote a retained operation payload."
+                )
+            elif operation != original:
                 payload = json.dumps(operation, separators=(",", ":"))
                 self._dependencies.connection.execute(
                     f"UPDATE {table} SET payload = ? WHERE id = ?",
@@ -723,9 +837,20 @@ class SharedCoreReconciliationAdapter:
         )
         core = self._dependencies.shared_core() or _default_shared_core()
         try:
-            value = core.dispatch("reconcile.rebase.v1", input_value)
+            value = core.dispatch("reconcile.rebase.v2", input_value)
         except SharedCoreOperationError as error:
             # D68: only operation rejection is validation; load/ABI stay infra.
+            # Delivery-policy and causal-order errors preserve queues and
+            # the claimed request for recovery; never retry a modified
+            # payload under an existing ID.
+            # Immutable contract: no v1 fallback. An unsupported-v2 bundle
+            # fails closed until the pinned Core is upgraded.
+            if "unsupported shared-core operation" in str(error.detail):
+                raise ValueError(
+                    "SharedCore bundle lacks reconcile.rebase.v2 "
+                    f"({error.detail}); upgrade pinned Core, "
+                    "no v1 fallback by design."
+                ) from error
             raise ValueError(str(error)) from error
         result = self._hooks._validated_reconciliation_output(
             value, canonical, request, pending
