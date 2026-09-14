@@ -214,7 +214,7 @@ jobs:
           QT_QPA_PLATFORM=offscreen \
             .release-wheel/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-wheel/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
-          QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m pytest tests -v
+          POMODOROUGH_SENTRY_DISABLE=1 QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m pytest tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
             timeout 30s .release-wheel/bin/pomodorough \
@@ -233,7 +233,7 @@ jobs:
           QT_QPA_PLATFORM=offscreen \
             .release-sdist/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-sdist/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
-          QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m pytest tests -v
+          POMODOROUGH_SENTRY_DISABLE=1 QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m pytest tests -v
           POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
             timeout 30s .release-sdist/bin/pomodorough \
