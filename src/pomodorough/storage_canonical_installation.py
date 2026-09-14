@@ -179,6 +179,7 @@ class CanonicalInstallationHooks(Protocol):
         clock_sample: dict[str, int] | None,
         trusted_response_ms: int,
         expected_projection: dict[str, Any] | None = None,
+        safe_pending: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None: ...
 
     def _validated_pending_resolution_apply(

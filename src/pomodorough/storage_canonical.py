@@ -53,6 +53,22 @@ class _SetTrustedTimeAnchorCallback(Protocol):
     def __call__(self, anchor: dict[str, int]) -> None: ...
 
 
+class _SetCanonicalHeadCallback(Protocol):
+    def __call__(self, wall_ms: int, counter: int) -> None: ...
+
+
+class _RetireDeliveryProofCallback(Protocol):
+    def __call__(self, retired: dict[str, list[str]]) -> None: ...
+
+
+class _NeverSentClaimCallback(Protocol):
+    def __call__(self, sent: dict[str, list[str]]) -> dict[str, list[str]]: ...
+
+
+class _DropDeliveryProofCallback(Protocol):
+    def __call__(self, domain: str, operation_id: str) -> None: ...
+
+
 class _ValidatedProjectionStateCallback(Protocol):
     def __call__(
         self,
@@ -88,8 +104,8 @@ class CanonicalStorageDependencies:
     _preflight_pending_queues: Callable[..., dict[str, Any]]
     _project_operation: Callable[..., Any]
     _project_canonical_with_pending: Callable[..., Any]
-    _set_canonical_head: Callable[[int, int], None]
-    _retire_delivery_proof: Callable[[dict[str, list[str]]], None]
+    _set_canonical_head: _SetCanonicalHeadCallback
+    _retire_delivery_proof: _RetireDeliveryProofCallback
     _prune_command_physical_times: Callable[[], None]
     _set_trusted_time_anchor: _SetTrustedTimeAnchorCallback
     pending_resolution: Callable[..., dict[str, Any] | None]
@@ -97,8 +113,8 @@ class CanonicalStorageDependencies:
     _command_physical_times: Callable[[], dict[str, int]]
     _validated_projection_state: _ValidatedProjectionStateCallback
     delivery_proof: Callable[[], dict[str, list[str]]]
-    never_sent_claim: Callable[[dict[str, list[str]]], dict[str, list[str]]]
-    drop_delivery_proof: Callable[[str, str], None]
+    never_sent_claim: _NeverSentClaimCallback
+    drop_delivery_proof: _DropDeliveryProofCallback
 
 
 _COMPONENT_TYPES = {
