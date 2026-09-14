@@ -77,8 +77,8 @@ class _ClockRenderer:
 
     def paint(self) -> None:
         self._paint_face()
-        self._paint_ticks()
         self._paint_progress()
+        self._paint_ticks()
         self._paint_pointer()
         self._paint_display()
         self._paint_labels()
