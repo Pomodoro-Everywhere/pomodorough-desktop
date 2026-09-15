@@ -2,7 +2,7 @@
 
 Covers in-flight acknowledgement, lost-response retry, restart recovery,
 already-synced Start convergence, peer/Iroh capture, and history
-convergence. The pinned production bundle (Core 0.40.0) serves v2, so the
+convergence. The pinned production bundle (Core 0.41.0) serves v2, so the
 production-bundle tests run against the real SharedCore; the client-glue
 tests keep the spec-derived double (tests/v2_core_double.py) for delivery
 mechanics, and one stub test pins fail-closed behavior for stale bundles
@@ -474,7 +474,7 @@ class ProductionBundleV2Tests(unittest.TestCase):
         from pomodorough.shared_core import SharedCore
 
         version = SharedCore().dispatch("core.version", {})
-        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.40.0"})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.41.0"})
         temporary = tempfile.TemporaryDirectory()
         try:
             store = Store(Path(temporary.name) / "state.sqlite3")
@@ -639,7 +639,7 @@ class DoubleVsAuthoritativeTests(unittest.TestCase):
         from pomodorough.shared_core import SharedCore
 
         version = SharedCore().dispatch("core.version", {})
-        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.40.0"})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.41.0"})
         core = V2EmulatingSharedCore()
         local = {
             "commands": [],
