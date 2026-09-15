@@ -8,9 +8,11 @@ WORKFLOW = Path(__file__).parents[1] / ".github/workflows/release.yml"
 DEPENDENCIES = {
     "ci": ["validate-release"],
     "package": ["validate-release"],
+    "test-wheel": ["package"],
+    "test-sdist": ["package"],
     "flatpak": ["validate-release"],
     "windows": ["validate-release"],
-    "release": ["ci", "package", "flatpak", "windows"],
+    "release": ["ci", "package", "test-wheel", "test-sdist", "flatpak", "windows"],
     "homebrew": ["release"],
 }
 
@@ -33,7 +35,9 @@ def test_packaging_overlaps_ci_but_publication_requires_all_gates():
     assert_release_dependencies(WORKFLOW.read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize("gate", ["ci", "package", "flatpak", "windows"])
+@pytest.mark.parametrize(
+    "gate", ["ci", "package", "test-wheel", "test-sdist", "flatpak", "windows"]
+)
 def test_missing_publication_gate_is_rejected(gate):
     workflow = WORKFLOW.read_text(encoding="utf-8")
     changed = workflow.replace(f"      - {gate}\n", "", 1)
@@ -50,6 +54,16 @@ def test_serial_packaging_dependency_is_rejected(job):
     )
     with pytest.raises(AssertionError, match=f"Wrong dependencies: {job}"):
         assert_release_dependencies(changed)
+
+
+@pytest.mark.parametrize("job", ["test-wheel", "test-sdist"])
+def test_parallel_distribution_tests_depend_on_package(job):
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    start = workflow.index(f"  {job}:\n")
+    assert "    needs: package\n" in workflow[start : start + 500]
+    other = "test-sdist" if job == "test-wheel" else "test-wheel"
+    job_block = re.findall(rf"(?ms)^  {job}:\n(.*?)(?=^  \S|\Z)", workflow)[0]
+    assert other not in job_block
 
 
 @pytest.mark.parametrize("job", DEPENDENCIES)

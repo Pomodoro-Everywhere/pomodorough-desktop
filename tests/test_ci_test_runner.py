@@ -63,7 +63,12 @@ def assert_full_suite_environment(workflow: str, test_step: str, install_step: s
     assert workflow_environment(workflow, 0).keys() <= {
         "CORE_COMMIT", "CORE_RELEASE_TAG", "CORE_SHA256", "RELEASE_TAG",
     }, "Unreviewed workflow environment"
-    job_name = "tests" if python == "python" else "package"
+    if python == "python":
+        job_name = "tests"
+    elif test_step == "Install and test wheel":
+        job_name = "test-wheel"
+    else:
+        job_name = "test-sdist"
     matches = re.findall(rf"(?ms)^  {job_name}:\n(.*?)(?=^  \S|\Z)", jobs)
     assert len(matches) == 1, "Unsupported full-suite job"
     job = matches[0]
@@ -76,6 +81,10 @@ def assert_full_suite_environment(workflow: str, test_step: str, install_step: s
     assert workflow_environment(workflow_step(job, test_step), 8) == (
         expected if python == "python" else {}
     ), "Unreviewed test environment"
+    if python != "python":
+        assert "    needs: package\n" in job, "Parallel distribution test must follow package build"
+        assert "name: release-python" in job, "Parallel distribution test must share dist/ artifact"
+        assert "path: dist" in job, "Parallel distribution test must share dist/ artifact"
 
 
 def full_test_command(step: str) -> list[str]:
@@ -216,7 +225,8 @@ def test_ci_runner_rejects_install_or_environment_drift(before, after):
     (0, "  tests:\n", '    env:\n      PYTHONWARNINGS: ignore\n'),
     (0, "  tests:\n", '    env:\n      PYTHONPATH: /tmp/alternate\n'),
     (1, "env:\n", '  PYTEST_ADDOPTS: "-x"\n'),
-    (2, "  package:\n", '    env:\n      PYTEST_ADDOPTS: "-k test_function"\n'),
+    (2, "  test-sdist:\n", '    env:\n      PYTEST_ADDOPTS: "-k test_function"\n'),
+    (1, "  test-wheel:\n", '    env:\n      PYTEST_ADDOPTS: "-x"\n'),
     (1, "      - name: Install and test wheel\n", '        env:\n          PYTEST_ADDOPTS: "-x"\n'),
     (2, "      - name: Install and test source distribution\n",
      '        env:\n          PYTEST_ADDOPTS: "-k test_function"\n'),

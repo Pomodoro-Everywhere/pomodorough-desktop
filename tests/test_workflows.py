@@ -154,9 +154,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(f'CORE_SHA256: "{CORE_SHA256}"', workflow)
         self.assertIn("repository: Pomodoro-Everywhere/pomodorough-core", workflow)
         self.assertIn("ref: ${{ env.CORE_COMMIT }}", workflow)
-        self.assertIn(
+        self.assertNotIn(
             "cargo +1.97.1 test --all-targets --locked",
-            workflow,
+            rebuild_step,
         )
         self.assertIn(
             "cargo +1.97.1 build --release --target wasm32-unknown-unknown --locked",
