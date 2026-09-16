@@ -35,6 +35,56 @@ from .localization import Strings
 from .timer_view import ClockWidget, ceiling_minutes
 
 
+def _default_duration_minutes(phase: str) -> int:
+    definition = PHASES.get(phase, {})
+    try:
+        return int(definition.get("default_minutes", 25))
+    except (TypeError, ValueError):
+        return 25
+
+
+def _duration_minutes(settings: dict[str, Any], phase: str) -> int:
+    durations = settings.get("durations") if isinstance(settings, dict) else None
+    raw = durations.get(phase) if isinstance(durations, dict) else None
+    try:
+        minutes = int(raw) if not isinstance(raw, bool) else 0
+    except (TypeError, ValueError):
+        minutes = 0
+    if 1 <= minutes <= 180:
+        return minutes
+    return _default_duration_minutes(phase)
+
+
+def _default_durations_ms() -> dict[str, int]:
+    return {
+        phase: _default_duration_minutes(phase) * 60_000 for phase in PHASES
+    }
+
+
+def _coerced_durations_ms(settings: dict[str, Any]) -> dict[str, int]:
+    raw = settings.get("durationsMs") if isinstance(settings, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    resolved = _default_durations_ms()
+    for phase in PHASES:
+        try:
+            value = int(raw[phase]) if not isinstance(raw.get(phase), bool) else 0
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 60_000 <= value <= 10_800_000 and value % 60_000 == 0:
+            resolved[phase] = value
+    return resolved
+
+
+def _coerced_planned_ms(timer: dict[str, Any], fallback_ms: int) -> int:
+    try:
+        planned = int(timer.get("plannedDurationMs"))
+    except (TypeError, ValueError):
+        return max(1, fallback_ms)
+    if isinstance(timer.get("plannedDurationMs"), bool) or planned <= 0:
+        return max(1, fallback_ms)
+    return planned
+
+
 @dataclass(frozen=True)
 class TimerRenderState:
     source_timer: dict[str, Any]
@@ -139,12 +189,14 @@ class TimerScreen(QWidget):
         self.task_selector_panel = QFrame()
         self.task_selector_panel.setObjectName("taskSelector")
         self.task_selector_panel.setMinimumWidth(190)
-        self.task_selector_panel.setMaximumHeight(76)
+        # Med: no fixed maximum height; the layout size hint (font
+        # metrics) drives height so localized/large fonts never clip.
         layout = QHBoxLayout(self.task_selector_panel)
         layout.setContentsMargins(8, 5, 8, 7)
         layout.setSpacing(8)
         label = QLabel(self.strings.text("task.focus").upper())
         label.setObjectName("microLabel")
+        label.setWordWrap(True)
         self.task_combo = QComboBox()
         self.task_combo.setAccessibleName(self.strings.text("task.focus"))
         self.task_combo.currentIndexChanged.connect(self.task_selection_changed)
@@ -218,7 +270,7 @@ class TimerScreen(QWidget):
             )
             spin.setRange(1, 180)
             spin.setSuffix(self.strings.text("pattern.minutes_suffix"))
-            spin.setValue(int(settings["durations"][phase]))
+            spin.setValue(_duration_minutes(settings, phase))
             spin.valueChanged.connect(
                 lambda value, key=phase: self.duration_changed.emit(key, value)
             )
@@ -341,15 +393,21 @@ class TimerScreen(QWidget):
         display_phase = (
             preview_phase if preview_phase in PHASES else selected_phase
         )
+        if display_phase not in PHASES:
+            display_phase = "focus"
+        durations_ms = _coerced_durations_ms(settings)
         timer = timer_for_display(
             source_timer,
             display_phase,
-            settings["durationsMs"],
+            durations_ms,
         )
-        elapsed = elapsed_ms(timer, now_ms)
+        try:
+            elapsed = elapsed_ms(timer, now_ms)
+        except (TypeError, ValueError):
+            elapsed = 0
         if status == "cancelled":
             elapsed = 0
-        planned = max(1, int(timer["plannedDurationMs"]))
+        planned = _coerced_planned_ms(timer, durations_ms[display_phase])
         return TimerRenderState(
             source_timer,
             timer,
@@ -531,7 +589,7 @@ class TimerScreen(QWidget):
     def refresh_duration_spins(self, settings: dict[str, Any]) -> None:
         for phase, spin in self.duration_spins.items():
             previous = spin.blockSignals(True)
-            spin.setValue(int(settings["durations"][phase]))
+            spin.setValue(_duration_minutes(settings, phase))
             spin.blockSignals(previous)
 
     def refresh_auto_breaks(self, settings: dict[str, Any]) -> None:

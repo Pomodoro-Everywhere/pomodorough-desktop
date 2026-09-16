@@ -12,12 +12,41 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
 )
 
 from .localization import Strings
 
 PRIVACY_POLICY_URL = "https://pomodorough.egigoka.me/privacy"
+
+
+def _coerce_count(value: Any) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _short_room_id(room: dict[str, Any]) -> str:
+    raw = room.get("roomId")
+    if isinstance(raw, str) and raw:
+        return raw[:10].upper()
+    return "?"
+
+
+def _make_invite_field_growable(field: QPlainTextEdit) -> None:
+    # Med: invite tickets vary in length; derive the minimum from font
+    # metrics and let the layout grow the field instead of clipping.
+    field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    try:
+        frame = field.frameWidth() * 2
+        margin = int(field.document().documentMargin() * 2)
+        field.setMinimumHeight(
+            field.fontMetrics().lineSpacing() * 3 + frame + margin
+        )
+    except RuntimeError:
+        pass
 
 
 class NetworkScreen(QFrame):
@@ -174,7 +203,7 @@ class NetworkScreen(QFrame):
         self.invite_input.setAccessibleName(
             self.strings.text("network.invite_accessible")
         )
-        self.invite_input.setMaximumHeight(70)
+        _make_invite_field_growable(self.invite_input)
         self.join_room_button = QPushButton(self.strings.text("network.join_room"))
         self.join_room_button.setAccessibleName(
             self.strings.text("network.join_room_accessible")
@@ -194,7 +223,7 @@ class NetworkScreen(QFrame):
         self.invite_output.setAccessibleName(
             self.strings.text("network.invite_output_accessible")
         )
-        self.invite_output.setMaximumHeight(70)
+        _make_invite_field_growable(self.invite_output)
         self.copy_invite_button = QPushButton(self.strings.text("network.copy_invite"))
         self.copy_invite_button.setAccessibleName(
             self.strings.text("network.copy_invite_accessible")
@@ -318,9 +347,15 @@ class NetworkScreen(QFrame):
         room: dict[str, Any],
         iroh_details: dict[str, Any],
     ) -> None:
-        peer_count = int(iroh_details.get("peerCount", room["peerCount"]))
-        operation_count = int(
-            iroh_details.get("operationCount", room["operationCount"])
+        if not isinstance(room, dict):
+            room = {}
+        if not isinstance(iroh_details, dict):
+            iroh_details = {}
+        peer_count = _coerce_count(
+            iroh_details.get("peerCount", room.get("peerCount", 0))
+        )
+        operation_count = _coerce_count(
+            iroh_details.get("operationCount", room.get("operationCount", 0))
         )
         conflict = iroh_details.get("conflict", room.get("conflict"))
         self.leave_room_button.setText(
@@ -333,11 +368,16 @@ class NetworkScreen(QFrame):
             if conflict
             else self.strings.text("network.leave_accessible")
         )
-        name = room.get("roomName") or self.strings.text("network.unnamed_room")
+        raw_name = room.get("roomName")
+        name = (
+            raw_name
+            if isinstance(raw_name, str) and raw_name
+            else self.strings.text("network.unnamed_room")
+        )
         details = self.strings.text(
             "network.room_details",
             name=name.upper(),
-            room_id=room["roomId"][:10].upper(),
+            room_id=_short_room_id(room),
             peers=peer_count,
             records=operation_count,
         )

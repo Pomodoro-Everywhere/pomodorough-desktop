@@ -190,10 +190,17 @@ class TimerInteractionController:
         context: TimerInteractionContext,
         timer: dict[str, Any],
     ) -> tuple[TimerInteractionContext, dict[str, Any]]:
-        if timer.get("status") == "running" and elapsed_ms(
-            timer,
-            context.store.effective_timer_now_ms(timer),
-        ) >= int(timer["plannedDurationMs"]):
+        if timer.get("status") != "running":
+            return context, timer
+        try:
+            now_ms = context.store.effective_timer_now_ms(timer)
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            # Tick clock guarded; infra reports, keep last-known clock.
+            capture_exception(error)
+            return context, timer
+        except ValueError:
+            return context, timer
+        if elapsed_ms(timer, now_ms) >= int(timer["plannedDurationMs"]):
             self._ports.apply_outcome(done(LoadState()))
             context = self._context()
             timer = self._current_timer_value(context)

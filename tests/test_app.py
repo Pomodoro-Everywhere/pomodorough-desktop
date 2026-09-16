@@ -31,9 +31,16 @@ class AppLifecycleTests(unittest.TestCase):
             patch.object(app_module, "QTimer"),
             patch.object(app_module.signal, "signal"),
         ):
-            result = app_module.main()
+            with patch("builtins.print") as printed:
+                result = app_module.main()
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, app_module.SECOND_INSTANCE_EXIT_CODE)
+        self.assertNotEqual(result, 0)
+        printed.assert_called_once()
+        self.assertEqual(
+            printed.call_args.args[0], app_module.SECOND_INSTANCE_MESSAGE
+        )
+        self.assertIs(printed.call_args.kwargs["file"], app_module.sys.stderr)
         lock.tryLock.assert_called_once_with(0)
         store_type.assert_not_called()
         application.exec.assert_not_called()

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from pomodorough import __version__, sentry_monitoring
 from pomodorough.sentry_monitoring import (
+    POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR,
     POMODOROUGH_SENTRY_DISABLE_ENV_VAR,
     POMODOROUGH_SENTRY_DSN_ENV_VAR,
     POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR,
@@ -53,7 +54,7 @@ class SerializedEnvelopePrivacyTests(unittest.TestCase):
                 patch("socket.gethostname", return_value="private-host-sentinel"),
                 patch("socket.socket.connect", side_effect=AssertionError("network")),
             ):
-                assert init_sentry(dsn="https://public@example.ingest.sentry.io/1")
+                assert init_sentry(dsn="https://public@example.ingest.sentry.io/1", force=True)
                 assert sentry_sdk.get_client().options["server_name"] == ""
                 sentry_sdk.capture_message("safe diagnostic")
                 sentry_sdk.capture_event({
@@ -174,17 +175,17 @@ class ResolveDsnTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
 
 class InitSentryTests(unittest.TestCase):
     def test_missing_dsn_is_noop(self) -> None:
-        self.assertFalse(init_sentry(dsn=None))
-        self.assertFalse(init_sentry(dsn="   "))
+        self.assertFalse(init_sentry(dsn=None, force=True))
+        self.assertFalse(init_sentry(dsn="   ", force=True))
 
     def test_missing_sdk_is_non_fatal(self) -> None:
         with patch.dict(sys.modules, {"sentry_sdk": None}):
-            self.assertFalse(init_sentry(dsn=DSN))
+            self.assertFalse(init_sentry(dsn=DSN, force=True))
 
     def test_init_uses_release_and_production(self) -> None:
         sdk = MagicMock()
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertTrue(init_sentry(dsn=DSN))
+            self.assertTrue(init_sentry(dsn=DSN, force=True))
         _, kwargs = sdk.init.call_args
         self.assertEqual(kwargs["dsn"], DSN)
         self.assertEqual(kwargs["release"], __version__)
@@ -198,13 +199,13 @@ class InitSentryTests(unittest.TestCase):
             patch.dict(sys.modules, {"sentry_sdk": sdk}),
             patch("sys.stderr"),
         ):
-            self.assertFalse(init_sentry(dsn=DSN))
+            self.assertFalse(init_sentry(dsn=DSN, force=True))
 
     def test_from_environment_end_to_end(self) -> None:
         sdk = MagicMock()
         env = {SENTRY_DSN_ENV_VAR: DSN}
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertTrue(init_sentry_from_environment(env=env))
+            self.assertTrue(init_sentry_from_environment(env=env, force=True))
         sdk.init.assert_called_once()
 
     def test_from_environment_without_dsn_skips_sdk(self) -> None:
@@ -212,7 +213,7 @@ class InitSentryTests(unittest.TestCase):
             patch.object(sentry_monitoring, "resolve_dsn", return_value=None),
             patch.dict(sys.modules, {"sentry_sdk": None}),
         ):
-            self.assertFalse(init_sentry_from_environment(env={}))
+            self.assertFalse(init_sentry_from_environment(env={}, force=True))
 
     def test_import_has_no_sdk_side_effects(self) -> None:
         script = (
@@ -378,7 +379,7 @@ class OptOutTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
         sdk = MagicMock()
         env = {POMODOROUGH_SENTRY_DISABLE_ENV_VAR: "1", SENTRY_DSN_ENV_VAR: DSN}
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertFalse(init_sentry_from_environment(env=env))
+            self.assertFalse(init_sentry_from_environment(env=env, force=True))
         sdk.init.assert_not_called()
 
     def test_readme_discloses_telemetry_and_opt_out(self) -> None:
@@ -604,7 +605,7 @@ class ScrubberTests(unittest.TestCase):
     def test_before_send_is_wired_into_init(self) -> None:
         sdk = MagicMock()
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertTrue(init_sentry(dsn=DSN))
+            self.assertTrue(init_sentry(dsn=DSN, force=True))
         _, kwargs = sdk.init.call_args
         self.assertIs(kwargs["before_send"], scrub_sentry_event)
         scrubbed = kwargs["before_send"](dict(_ADVERSARIAL_EVENT), {})
@@ -719,7 +720,7 @@ class BreadcrumbHookTests(unittest.TestCase):
     def test_before_breadcrumb_is_wired_into_init(self) -> None:
         sdk = MagicMock()
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertTrue(init_sentry(dsn=DSN))
+            self.assertTrue(init_sentry(dsn=DSN, force=True))
         _, kwargs = sdk.init.call_args
         self.assertIs(kwargs["before_breadcrumb"], scrub_sentry_breadcrumb)
         scrubbed = kwargs["before_breadcrumb"](
@@ -886,8 +887,8 @@ class D29DsnFormatTests(_HermeticPackagedDefaultMixin, unittest.TestCase):
     def test_init_rejects_malformed_dsn(self) -> None:
         sdk = MagicMock()
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertFalse(init_sentry(dsn="not-a-dsn"))
-            self.assertFalse(init_sentry(dsn="https://public@example/abc"))
+            self.assertFalse(init_sentry(dsn="not-a-dsn", force=True))
+            self.assertFalse(init_sentry(dsn="https://public@example/abc", force=True))
         sdk.init.assert_not_called()
 
 
@@ -898,6 +899,9 @@ class D29CaptureFallbackTests(unittest.TestCase):
             sdk = MagicMock()
             sdk.capture_exception.side_effect = RuntimeError("sentry down")
             with (
+                patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ),
                 patch.dict(sys.modules, {"sentry_sdk": sdk}),
                 patch("sys.stderr", new_callable=io.StringIO) as stderr,
             ):
@@ -913,7 +917,12 @@ class D29CaptureFallbackTests(unittest.TestCase):
         sentry_monitoring.reset_capture_fallback_count()
         try:
             sdk = MagicMock()
-            with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            with (
+                patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ),
+                patch.dict(sys.modules, {"sentry_sdk": sdk}),
+            ):
                 sentry_monitoring.capture_exception(RuntimeError("boom"))
             self.assertEqual(sentry_monitoring.capture_fallback_count(), 0)
         finally:
@@ -974,9 +983,9 @@ class D29ExceptionHandlersTests(unittest.TestCase):
                     return_value=True,
                 ) as qt_install,
             ):
-                self.assertTrue(init_sentry(dsn=DSN))
+                self.assertTrue(init_sentry(dsn=DSN, force=True))
                 first_hook = sys.excepthook
-                self.assertTrue(init_sentry(dsn=DSN))
+                self.assertTrue(init_sentry(dsn=DSN, force=True))
                 self.assertIs(sys.excepthook, first_hook)
                 self.assertEqual(qt_install.call_count, 2)
             error = RuntimeError("uncaught-after-init")
@@ -994,7 +1003,12 @@ class D29ExceptionHandlersTests(unittest.TestCase):
             sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = Mock()
             sentry_monitoring._QT_MESSAGE_HANDLER_INSTALLED = False
             sdk = MagicMock()
-            with patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            with (
+                patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ),
+                patch.dict(sys.modules, {"sentry_sdk": sdk}),
+            ):
                 sentry_monitoring._sentry_qt_message_handler(
                     QtMsgType.QtFatalMsg, None,
                     "crash alice@example.com 10.0.0.5",
@@ -1311,7 +1325,7 @@ class D38FrameVarsScrubTests(unittest.TestCase):
     def test_init_disables_local_variables(self) -> None:
         sdk = MagicMock()
         with patch.dict(sys.modules, {"sentry_sdk": sdk}):
-            self.assertTrue(init_sentry(dsn=DSN))
+            self.assertTrue(init_sentry(dsn=DSN, force=True))
         _, kwargs = sdk.init.call_args
         self.assertFalse(kwargs["include_local_variables"])
 
@@ -1425,6 +1439,211 @@ class D40SecretParamScrubTests(unittest.TestCase):
         payload = json.dumps(scrub_sentry_event({"message": '{"next":"1"}'}, None))
         self.assertIn("1", payload)
         self.assertNotIn("[Filtered]", payload)
+
+
+class TestRunnerGateTests(unittest.TestCase):
+    def test_pytest_present_blocks_explicit_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                self.assertFalse(init_sentry(dsn=DSN))
+        sdk.init.assert_not_called()
+
+    def test_unittest_only_blocks_explicit_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules):
+            sys.modules.pop("pytest", None)
+            self.assertIn("unittest", sys.modules)
+            sys.modules["sentry_sdk"] = sdk
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                self.assertFalse(init_sentry(dsn=DSN))
+        sdk.init.assert_not_called()
+
+    def test_absence_allows_explicit_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules):
+            sys.modules.pop("pytest", None)
+            sys.modules.pop("unittest", None)
+            sys.modules["sentry_sdk"] = sdk
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                self.assertTrue(init_sentry(dsn=DSN, force=False))
+        sdk.init.assert_called_once()
+
+    def test_opt_in_allows_explicit_init(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+            with patch.dict(os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}):
+                self.assertTrue(init_sentry(dsn=DSN))
+        sdk.init.assert_called_once()
+
+    def test_opt_out_values_still_block(self) -> None:
+        for raw in ("0", "false", "", "no"):
+            with self.subTest(raw=raw):
+                sdk = MagicMock()
+                with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                    with patch.dict(
+                        os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: raw}
+                    ):
+                        self.assertFalse(init_sentry(dsn=DSN))
+                sdk.init.assert_not_called()
+
+    def test_force_bypasses_runner_gate(self) -> None:
+        sdk = MagicMock()
+        with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                self.assertTrue(init_sentry(dsn=DSN, force=True))
+        sdk.init.assert_called_once()
+
+    def test_from_environment_blocked_without_sdk_import(self) -> None:
+        env = {SENTRY_DSN_ENV_VAR: DSN}
+        path = Path("/nonexistent-sentry-gate.json")
+        with patch.dict(sys.modules):
+            sys.modules.pop("sentry_sdk", None)
+            sys.modules["pytest"] = MagicMock()
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                self.assertFalse(init_sentry(dsn=DSN))
+                self.assertFalse(init_sentry_from_environment(env=env, config_path=path))
+                self.assertNotIn("sentry_sdk", sys.modules)
+
+    def test_from_environment_opt_in_via_explicit_env(self) -> None:
+        sdk = MagicMock()
+        env = {
+            SENTRY_DSN_ENV_VAR: DSN,
+            POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1",
+        }
+        with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                path = Path("/nonexistent-sentry-gate.json")
+                self.assertTrue(init_sentry_from_environment(env=env, config_path=path))
+        sdk.init.assert_called_once()
+
+    def test_from_environment_force_bypasses_gate(self) -> None:
+        sdk = MagicMock()
+        env = {SENTRY_DSN_ENV_VAR: DSN}
+        with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+            with patch.dict(os.environ):
+                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                path = Path("/nonexistent-sentry-gate.json")
+                self.assertTrue(
+                    init_sentry_from_environment(env=env, config_path=path, force=True)
+                )
+        sdk.init.assert_called_once()
+
+
+class TestRunnerCaptureSilenceTests(unittest.TestCase):
+    def test_capture_exception_silent_under_runner(self) -> None:
+        sentry_monitoring.reset_capture_fallback_count()
+        try:
+            sdk = MagicMock()
+            error = RuntimeError("boom")
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(os.environ):
+                    os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                    sentry_monitoring.capture_exception(error)
+            sdk.capture_exception.assert_not_called()
+            self.assertEqual(sentry_monitoring.capture_fallback_count(), 0)
+        finally:
+            sentry_monitoring.reset_capture_fallback_count()
+
+    def test_capture_exception_opt_in_forwards(self) -> None:
+        sentry_monitoring.reset_capture_fallback_count()
+        try:
+            sdk = MagicMock()
+            error = RuntimeError("boom")
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ):
+                    sentry_monitoring.capture_exception(error)
+            sdk.capture_exception.assert_called_once_with(error)
+            self.assertEqual(sentry_monitoring.capture_fallback_count(), 0)
+        finally:
+            sentry_monitoring.reset_capture_fallback_count()
+
+    def test_qt_handler_silent_but_chains(self) -> None:
+        from PySide6.QtCore import QtMsgType
+
+        previous = Mock()
+        saved = sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER
+        sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = previous
+        try:
+            sdk = MagicMock()
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(os.environ):
+                    os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                    sentry_monitoring._sentry_qt_message_handler(
+                        QtMsgType.QtFatalMsg, None, "crash",
+                    )
+            sdk.capture_message.assert_not_called()
+            previous.assert_called_once_with(QtMsgType.QtFatalMsg, None, "crash")
+        finally:
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = saved
+
+    def test_qt_handler_opt_in_reports_and_chains(self) -> None:
+        from PySide6.QtCore import QtMsgType
+
+        previous = Mock()
+        saved = sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER
+        sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = previous
+        try:
+            sdk = MagicMock()
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ):
+                    sentry_monitoring._sentry_qt_message_handler(
+                        QtMsgType.QtFatalMsg, None, "crash",
+                    )
+            sdk.capture_message.assert_called_once_with("crash")
+            previous.assert_called_once_with(QtMsgType.QtFatalMsg, None, "crash")
+        finally:
+            sentry_monitoring._ORIGINAL_QT_MESSAGE_HANDLER = saved
+
+    def test_sys_excepthook_silent_but_chains(self) -> None:
+        sentry_monitoring.reset_capture_fallback_count()
+        previous = Mock()
+        saved = sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK
+        sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = previous
+        try:
+            sdk = MagicMock()
+            error = RuntimeError("uncaught")
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(os.environ):
+                    os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+                    sentry_monitoring._sentry_sys_excepthook(
+                        RuntimeError, error, None
+                    )
+            sdk.capture_exception.assert_not_called()
+            previous.assert_called_once_with(RuntimeError, error, None)
+            self.assertEqual(sentry_monitoring.capture_fallback_count(), 0)
+        finally:
+            sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = saved
+            sentry_monitoring.reset_capture_fallback_count()
+
+    def test_sys_excepthook_opt_in_reports_and_chains(self) -> None:
+        previous = Mock()
+        saved = sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK
+        sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = previous
+        try:
+            sdk = MagicMock()
+            error = RuntimeError("uncaught")
+            with patch.dict(sys.modules, {"pytest": MagicMock(), "sentry_sdk": sdk}):
+                with patch.dict(
+                    os.environ, {POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR: "1"}
+                ):
+                    sentry_monitoring._sentry_sys_excepthook(
+                        RuntimeError, error, None
+                    )
+            sdk.capture_exception.assert_called_once_with(error)
+            previous.assert_called_once_with(RuntimeError, error, None)
+        finally:
+            sentry_monitoring._ORIGINAL_SYS_EXCEPTHOOK = saved
 
 
 if __name__ == "__main__":

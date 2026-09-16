@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QSystemTr
 
 from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.localization import Strings
+from pomodorough.shared_core import SharedCoreError
 from pomodorough.storage import Store, utc_timestamp
 from pomodorough.terminal import LocalTimer
 from pomodorough.ui import MainWindow
@@ -1486,6 +1488,50 @@ class MainWindowDurationTests(unittest.TestCase):
             self.window._tick()
         self.assertEqual(self.window.timer["status"], "completed")
 
+    def test_render_keeps_clock_on_effective_now_infra_failure(self) -> None:
+        self.window._load_state()
+        self.window._render()
+        before = self.window.clock.time_text
+        for error in (
+            OSError("clock boom"),
+            sqlite3.Error("db boom"),
+            SharedCoreError("core boom"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(
+                        self.store,
+                        "effective_timer_now_ms",
+                        side_effect=error,
+                    ),
+                    patch(
+                        "pomodorough.ui_views.capture_exception",
+                    ) as capture,
+                ):
+                    self.window._render()
+                capture.assert_called_once_with(error)
+                self.assertEqual(self.window.clock.time_text, before)
+
+    def test_render_keeps_clock_on_effective_now_validation_failure(
+        self,
+    ) -> None:
+        self.window._load_state()
+        self.window._render()
+        before = self.window.clock.time_text
+        with (
+            patch.object(
+                self.store,
+                "effective_timer_now_ms",
+                side_effect=ValueError("bad clock"),
+            ),
+            patch(
+                "pomodorough.ui_views.capture_exception",
+            ) as capture,
+        ):
+            self.window._render()
+        capture.assert_not_called()
+        self.assertEqual(self.window.clock.time_text, before)
+
     def test_signed_in_sync_failure_schedules_offline_auto_break(self) -> None:
         self.store.set_user({"id": "user-1"})
         self.store.set_auto_start_breaks(True, now_ms=1)
@@ -1688,11 +1734,11 @@ class MainWindowDurationTests(unittest.TestCase):
 
         self.window._render_history()
 
-        self.assertEqual(self.window.history_count.text(), "8 of 10")
+        self.assertEqual(self.window.history_count.text(), "10 of 10")
         self.assertIn("completed, cancelled, and superseded", self.window.history_scope.text())
-        self.assertIn("Showing 8 of 10", self.window.history_list.accessibleDescription())
-        self.assertEqual(self.window.history_list.count(), 8)
-        rows = [self.window.history_list.item(index).text() for index in range(8)]
+        self.assertIn("Showing 10 of 10", self.window.history_list.accessibleDescription())
+        self.assertEqual(self.window.history_list.count(), 10)
+        rows = [self.window.history_list.item(index).text() for index in range(10)]
         self.assertIn("Completed", rows[0])
         self.assertIn("Retained title", rows[0])
         self.assertIn("Cancelled", rows[1])

@@ -303,5 +303,41 @@ class ScreenSignalTests(unittest.TestCase):
         )
 
 
+    def test_network_screen_tolerates_malformed_rooms(self) -> None:
+        screen = NetworkScreen(self.strings, "iroh")
+        base = {
+            "replication_mode": "iroh",
+            "iroh_status": "SYNC READY",
+            "invite": "",
+            "available": True,
+            "unavailable_reason": "",
+            "cloud_authenticated": False,
+            "cloud_deleting_account": False,
+        }
+        cases: list[tuple[dict, dict]] = [
+            ({}, {}),
+            ({"roomName": "Room"}, {}),
+            ({"roomId": None, "peerCount": None, "operationCount": None}, {}),
+            ({"roomId": 12345, "peerCount": "nope", "operationCount": object()}, {}),
+            ({"roomId": "", "peerCount": "3", "operationCount": "7"}, {}),
+            ({}, {"peerCount": "bad", "operationCount": None}),
+            ({"roomId": "abcdef1234567890", "roomName": 123}, {}),
+        ]
+        for room, details in cases:
+            with self.subTest(room=room, details=details):
+                screen.render(room=room, iroh_details=details, **base)
+                self.assertTrue(screen.network_details.text())
+        screen.render(room={}, iroh_details={}, **base)
+        self.assertIn("?", screen.network_details.text())
+        self.assertIn("PEERS 0", screen.network_details.text())
+        self.assertIn("RECORDS 0", screen.network_details.text())
+        screen.render(
+            room={"roomId": "abcdef1234567890", "peerCount": 2, "operationCount": 5},
+            iroh_details={},
+            **base,
+        )
+        self.assertIn("ABCDEF1234", screen.network_details.text())
+
+
 if __name__ == "__main__":
     unittest.main()

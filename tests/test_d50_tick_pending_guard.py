@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from pomodorough.controller_outcomes import EmitNotice, Render
+from pomodorough.shared_core import SharedCoreError
 from pomodorough.timer_interaction_controller import (
     TimerInteractionContext,
     TimerInteractionController,
@@ -108,6 +109,37 @@ class D50TickPendingGuardTests(unittest.TestCase):
         outcome = harness.controller.tick()
         harness.store.has_pending_auto_break.assert_called_once()
         self.assertEqual(_notices(outcome), [])
+
+    def test_tick_keeps_clock_on_effective_now_infra_failure(self) -> None:
+        for error in (
+            OSError("clock boom"),
+            sqlite3.Error("db boom"),
+            SharedCoreError("core boom"),
+        ):
+            harness = _harness(
+                user={"id": "user-1"}, authenticated=True, busy=False,
+            )
+            harness.store.effective_timer_now_ms.side_effect = error
+            with patch(
+                "pomodorough.timer_interaction_controller.capture_exception",
+            ) as capture:
+                outcome = harness.controller.tick()
+            capture.assert_called_once_with(error)
+            self.assertEqual(_notices(outcome), [])
+            self.assertIn(Render, tuple(map(type, outcome.effects)))
+
+    def test_tick_keeps_clock_on_effective_now_validation_failure(self) -> None:
+        harness = _harness(
+            user={"id": "user-1"}, authenticated=True, busy=False,
+        )
+        harness.store.effective_timer_now_ms.side_effect = ValueError("bad clock")
+        with patch(
+            "pomodorough.timer_interaction_controller.capture_exception",
+        ) as capture:
+            outcome = harness.controller.tick()
+        capture.assert_not_called()
+        self.assertEqual(_notices(outcome), [])
+        self.assertIn(Render, tuple(map(type, outcome.effects)))
 
 
 if __name__ == "__main__":

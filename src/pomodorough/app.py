@@ -31,10 +31,19 @@ def _close_store(store: Store) -> None:
         capture_exception(error)
 
 
+SECOND_INSTANCE_EXIT_CODE = 1
+SECOND_INSTANCE_MESSAGE = "Pomodorough is already running."
+
+
 def _instance_lock() -> QLockFile:
     data_home = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
     data_home.mkdir(parents=True, exist_ok=True)
     return QLockFile(str(data_home / "pomodorough.lock"))
+
+
+def _report_second_instance() -> int:
+    print(SECOND_INSTANCE_MESSAGE, file=sys.stderr)
+    return SECOND_INSTANCE_EXIT_CODE
 
 
 def main() -> int:
@@ -50,7 +59,7 @@ def main() -> int:
 
     instance_lock = _instance_lock()
     if not instance_lock.tryLock(0):
-        return 0
+        return _report_second_instance()
 
     try:
         store = Store()

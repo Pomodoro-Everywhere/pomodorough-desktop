@@ -251,6 +251,9 @@ class ClockWidget(QWidget):
         self.tick_count = 25
         self.dots = 0
         self.setAccessibleName(self.strings.text("status.timer_accessible"))
+        # Med: keyboard/screen-reader reachable; Tab focuses the dial and
+        # assistive tech announces name + description.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(170, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -298,3 +301,9 @@ class ClockWidget(QWidget):
             tick_count=self.tick_count,
             dots=self.dots,
         ).paint()
+        if self.hasFocus():
+            painter.setPen(
+                QPen(self.palette().color(QPalette.ColorRole.Highlight), 3)
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.rect().adjusted(2, 2, -2, -2))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -27,6 +28,7 @@ from .core import format_remaining
 from .network_screen import PRIVACY_POLICY_URL as PRIVACY_POLICY_URL, NetworkScreen
 from .secure_store import SecureStoreError, should_capture_secure_store_error
 from .sentry_monitoring import capture_exception
+from .shared_core import SharedCoreError
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
 
@@ -306,12 +308,14 @@ class MainWindowViewMixin:
 
     def _settings_toggled(self, visible: bool) -> None:
         self.timer_screen.set_settings_visible(visible)
-        # D76: settings panel needs ~310px beside the timer column; raise
-        # the window minimum while visible so controls do not clip.
-        # Scroll (settings_scroll) covers short heights.
+        # D76: settings panel needs room beside the timer column; derive
+        # the window minimum from layout size hints, capped to the
+        # available screen width so small displays never clip. Scroll
+        # (settings_scroll) covers short heights.
         if hasattr(self, "setMinimumWidth"):
             try:
-                self.setMinimumWidth(880 if visible else 600)
+                self.setMinimumWidth(self._settings_minimum_width(visible))
+                self.updateGeometry()
             except RuntimeError:
                 pass
         label = self.strings.text(
@@ -319,6 +323,37 @@ class MainWindowViewMixin:
         )
         self.settings_button.setToolTip(label)
         self.settings_button.setAccessibleName(label)
+
+    def _settings_minimum_width(self, visible: bool) -> int:
+        base = 600
+        if not visible:
+            return base
+        hint = self._settings_content_width_hint()
+        available = self._available_screen_width()
+        if available > 0:
+            return min(max(base, hint), available)
+        return max(base, hint)
+
+    def _settings_content_width_hint(self) -> int:
+        try:
+            hint = self.timer_screen.sizeHint().width()
+        except RuntimeError:
+            return 600
+        margins = self.outer_layout.contentsMargins()
+        chrome = margins.left() + margins.right() + 48
+        return hint + chrome
+
+    def _available_screen_width(self) -> int:
+        try:
+            screen = QApplication.primaryScreen()
+        except RuntimeError:
+            return 0
+        if screen is None:
+            return 0
+        try:
+            return screen.availableGeometry().width()
+        except RuntimeError:
+            return 0
 
     def _display_screen(self, index: int) -> None:
         self.page_stack.setCurrentIndex(index)
@@ -379,7 +414,7 @@ class MainWindowViewMixin:
 
     def _render_timer_state(self) -> TimerRenderState:
         source_timer = self._current_timer()
-        now_ms = self.store.effective_timer_now_ms(source_timer)
+        now_ms = self._guarded_timer_now_ms(source_timer)
         return self.timer_screen.presentation(
             source_timer,
             selected_phase=self._selected_phase(),
@@ -387,6 +422,27 @@ class MainWindowViewMixin:
             now_ms=now_ms,
             preview_phase=self._preview_completed_phase(source_timer, now_ms),
         )
+
+    def _guarded_timer_now_ms(self, source_timer: dict[str, Any]) -> int:
+        try:
+            now_ms = self.store.effective_timer_now_ms(source_timer)
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            # D50: render clock guarded; infra reports, keep last-known.
+            capture_exception(error)
+            return self._fallback_timer_now_ms()
+        except ValueError:
+            return self._fallback_timer_now_ms()
+        self._last_timer_now_ms = now_ms
+        return now_ms
+
+    def _fallback_timer_now_ms(self) -> int:
+        cached = getattr(self, "_last_timer_now_ms", None)
+        if isinstance(cached, int):
+            return cached
+        try:
+            return max(1, int(time.time() * 1000))
+        except (OSError, ValueError, TypeError, OverflowError):
+            return 1
 
     def _preview_completed_phase(
         self, source_timer: dict[str, Any], now_ms: int
@@ -552,7 +608,8 @@ class MainWindowViewMixin:
         QPushButton:hover { border-color: palette(highlight); }
         QPushButton:pressed { padding-top: 5px; padding-left: 9px; }
         QPushButton:focus { border: 3px solid palette(highlight); }
-        QPushButton:disabled { color: palette(text); border-color: palette(text); background: palette(button); }
+        QPushButton:disabled { color: palette(window-text); border-color: palette(dark); background: palette(midlight); }
+        QPushButton#primaryButton:disabled { color: palette(window-text); border-color: palette(dark); background: palette(midlight); }
         QPushButton#primaryButton { background: palette(highlight); color: palette(highlighted-text); min-height: 36px; font-size: 14px; }
         QPushButton#accountButton { border-color: palette(highlight); min-width: 72px; max-width: 150px; }
         QPushButton#accountButton[authenticated="true"] { min-width: 36px; max-width: 36px; min-height: 36px; max-height: 36px; padding: 0; }

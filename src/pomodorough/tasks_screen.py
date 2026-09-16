@@ -131,7 +131,7 @@ class TasksScreen(QFrame):
             self._render_task_row(
                 row,
                 task,
-                summaries[task["id"]],
+                self._summary_for(task, summaries),
                 mutations_enabled,
             )
         self.task_table.setVisible(bool(tasks))
@@ -146,7 +146,13 @@ class TasksScreen(QFrame):
         return (
             datetime.now().astimezone().date(),
             mutations_enabled,
-            tuple((task["id"], task["title"]) for task in tasks),
+            tuple(
+                (
+                    task.get("id") if isinstance(task, dict) else None,
+                    task.get("title") if isinstance(task, dict) else None,
+                )
+                for task in tasks
+            ),
             tuple(
                 (
                     item.get("id"),
@@ -160,9 +166,35 @@ class TasksScreen(QFrame):
             ),
         )
 
+    @staticmethod
+    def _coerce_count(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _summary_for(
+        task: dict[str, Any], summaries: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        # History-derived summaries may miss a task id (deleted/migrated
+        # tasks, clock skew across days); render a zero placeholder
+        # instead of raising KeyError mid-render.
+        task_id = task.get("id") if isinstance(task, dict) else None
+        summary = summaries.get(task_id)
+        if summary is None and task_id is not None:
+            summary = summaries.get(str(task_id))
+        if isinstance(summary, dict):
+            return summary
+        return {"finished": 0, "timeMs": 0}
+
     def _render_totals(self, summaries: dict[str, dict[str, Any]]) -> None:
-        total_finished = sum(summary["finished"] for summary in summaries.values())
-        total_ms = sum(summary["timeMs"] for summary in summaries.values())
+        total_finished = sum(
+            self._coerce_count(summary.get("finished")) for summary in summaries.values()
+        )
+        total_ms = sum(
+            self._coerce_count(summary.get("timeMs")) for summary in summaries.values()
+        )
         self.task_totals.setText(
             self.strings.text(
                 "task.totals",
@@ -179,28 +211,38 @@ class TasksScreen(QFrame):
         summary: dict[str, Any],
         mutations_enabled: bool,
     ) -> None:
-        self.task_table.setItem(row, 0, QTableWidgetItem(task["title"]))
-        count = QTableWidgetItem(str(summary["finished"]))
+        title = task.get("title") if isinstance(task, dict) else None
+        title = title if isinstance(title, str) and title else ""
+        task_id = task.get("id") if isinstance(task, dict) else None
+        task_id = task_id if isinstance(task_id, str) else ""
+        finished = summary.get("finished", 0) if isinstance(summary, dict) else 0
+        time_ms = summary.get("timeMs", 0) if isinstance(summary, dict) else 0
+        self.task_table.setItem(row, 0, QTableWidgetItem(title))
+        count = QTableWidgetItem(str(finished))
         count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.task_table.setItem(row, 1, count)
-        spent = QTableWidgetItem(self._format_task_time(summary["timeMs"]))
+        spent = QTableWidgetItem(self._format_task_time(time_ms))
         spent.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.task_table.setItem(row, 2, spent)
         delete = QPushButton(self.strings.text("task.delete"))
         delete.setObjectName("dangerButton")
         delete.setAccessibleName(
-            self.strings.text("task.delete_accessible", task=task["title"])
+            self.strings.text("task.delete_accessible", task=title)
         )
         delete.setEnabled(mutations_enabled)
         delete.clicked.connect(
-            lambda checked=False, task_id=task["id"]: self.delete_task_requested.emit(
+            lambda checked=False, task_id=task_id: self.delete_task_requested.emit(
                 task_id
             )
         )
         self.task_table.setCellWidget(row, 3, delete)
 
     def _format_task_time(self, milliseconds: int) -> str:
-        minutes = max(0, milliseconds) // 60_000
+        try:
+            total_ms = max(0, int(milliseconds))
+        except (TypeError, ValueError):
+            total_ms = 0
+        minutes = total_ms // 60_000
         hours, remaining = divmod(minutes, 60)
         if hours and remaining:
             return self.strings.text(

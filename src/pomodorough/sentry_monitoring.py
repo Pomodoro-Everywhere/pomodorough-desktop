@@ -29,6 +29,7 @@ _LOGGER = logging.getLogger(__name__)
 SENTRY_DSN_ENV_VAR = "SENTRY_DSN"
 POMODOROUGH_SENTRY_DSN_ENV_VAR = "POMODOROUGH_SENTRY_DSN"
 POMODOROUGH_SENTRY_DISABLE_ENV_VAR = "POMODOROUGH_SENTRY_DISABLE"
+POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR = "POMODOROUGH_SENTRY_ALLOW_IN_TESTS"
 POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE_ENV_VAR = (
     "POMODOROUGH_SENTRY_PACKAGED_DEFAULT_FILE"
 )
@@ -585,8 +586,12 @@ def capture_exception(error: BaseException | None = None) -> None:
     Reporting failure stays off stderr but is counted (D29): see
     ``capture_fallback_count``. This runs on hot background paths where
     stderr spam would drown real errors, unlike init_sentry which prints
-    once at startup where a developer sees it.
+    once at startup where a developer sees it. Under a test runner the
+    event is dropped before touching the SDK unless tests explicitly opt
+    in: init gates alone cannot stop a client initialized by other means.
     """
+    if _sentry_init_blocked(None):
+        return
     try:
         import sentry_sdk
 
@@ -612,11 +617,12 @@ def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
 
 def _sentry_qt_message_handler(mode: Any, context: Any, message: Any) -> None:
     """D29: report fatal/critical Qt messages, then chain to prior handler."""
+    emit = not _sentry_init_blocked(None)
     try:
         from PySide6.QtCore import QtMsgType
 
         fatal = (QtMsgType.QtFatalMsg, QtMsgType.QtCriticalMsg)
-        if mode in fatal:
+        if emit and mode in fatal:
             try:
                 import sentry_sdk
 
@@ -671,12 +677,31 @@ def install_exception_handlers() -> bool:
     return True
 
 
+def _running_under_test_runner() -> bool:
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+def _tests_opted_in(env: Mapping[str, str] | None) -> bool:
+    if env is not None and _is_truthy(
+        env.get(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR)
+    ):
+        return True
+    return _is_truthy(os.environ.get(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR))
+
+
+def _sentry_init_blocked(env: Mapping[str, str] | None) -> bool:
+    return _running_under_test_runner() and not _tests_opted_in(env)
+
+
 def init_sentry(
     *,
     dsn: str | None,
     release: str | None = None,
     environment: str = SENTRY_ENVIRONMENT,
+    force: bool = False,
 ) -> bool:
+    if not force and _sentry_init_blocked(None):
+        return False
     if _valid_dsn_or_none(dsn) is None:
         return False
     # D29: save the pre-SDK hook so our post-init hook replaces (not wraps)
@@ -724,12 +749,16 @@ def init_sentry_from_environment(
     config_path: Path | None = None,
     release: str | None = None,
     environment: str = SENTRY_ENVIRONMENT,
+    force: bool = False,
 ) -> bool:
     environment_map = env if env is not None else os.environ
+    if not force and _sentry_init_blocked(environment_map):
+        return False
     if sentry_disabled(env=environment_map, config_path=config_path):
         return False
     return init_sentry(
         dsn=resolve_dsn(env=environment_map, config_path=config_path),
         release=release,
         environment=environment,
+        force=force or _tests_opted_in(environment_map),
     )

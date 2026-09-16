@@ -467,14 +467,34 @@ class D76SettingsClippingTests(unittest.TestCase):
         self.assertTrue(self.window.right_panel.isVisible())
 
     def test_settings_visible_bumps_min_width(self) -> None:
+        base = 600
         self.window._settings_toggled(True)
         QApplication.processEvents()
-        self.assertGreaterEqual(self.window.minimumWidth(), 880)
+        hint = self.window._settings_content_width_hint()
+        available = self.window._available_screen_width()
+        expected_visible = self.window._settings_minimum_width(True)
+        if available > 0:
+            self.assertEqual(expected_visible, min(max(base, hint), available))
+        else:
+            self.assertEqual(expected_visible, max(base, hint))
+        self.assertEqual(self.window.minimumWidth(), expected_visible)
+        self.assertGreaterEqual(self.window.minimumWidth(), base)
+        if available > 0:
+            self.assertLessEqual(self.window.minimumWidth(), available)
         self.assertTrue(self.window.settings_scroll.isVisible())
         self.window._settings_toggled(False)
         QApplication.processEvents()
-        self.assertEqual(self.window.minimumWidth(), 600)
+        self.assertEqual(self.window.minimumWidth(), base)
+        self.assertEqual(self.window._settings_minimum_width(False), base)
         self.assertFalse(self.window.settings_scroll.isVisible())
+
+    def test_settings_minimum_width_caps_to_available_geometry(self) -> None:
+        with patch.object(self.window, "_settings_content_width_hint", return_value=2000):
+            with patch.object(self.window, "_available_screen_width", return_value=700):
+                self.assertEqual(self.window._settings_minimum_width(True), 700)
+            with patch.object(self.window, "_available_screen_width", return_value=0):
+                self.assertEqual(self.window._settings_minimum_width(True), 2000)
+        self.assertEqual(self.window._settings_minimum_width(False), 600)
 
     def test_settings_content_does_not_clip(self) -> None:
         self.window.timer_screen.set_settings_visible(True)

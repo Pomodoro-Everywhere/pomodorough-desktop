@@ -66,13 +66,15 @@ class ArrivalsScreen(QFrame):
         retained = [item for item in history if item.get("status") in TERMINAL_STATUSES]
         self._render_header(retained)
         self.history_list.clear()
-        for item in retained[:8]:
+        # Med: show every retained arrival; the list scrolls instead of
+        # hard-truncating at 8 rows.
+        for item in retained:
             self._render_item(item, known_tasks)
         if not retained:
             self._render_empty()
 
     def _render_header(self, retained: list[dict[str, Any]]) -> None:
-        displayed = min(8, len(retained))
+        displayed = len(retained)
         self.history_count.setText(
             self.strings.text(
                 "arrivals.count", displayed=displayed, total=len(retained)
