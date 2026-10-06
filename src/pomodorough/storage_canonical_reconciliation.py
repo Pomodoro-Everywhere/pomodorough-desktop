@@ -545,7 +545,16 @@ class SharedCoreReconciliationAdapter:
         allowed = set(required)
         if domain == "commands":
             allowed.add("taskId")
-        if set(value) < required or set(value) - allowed:
+        # Core 0.47 omits the empty title on delete task operations;
+        # older bundles still send title "" (normalized away below).
+        missing = required - set(value)
+        if missing and not (
+            domain == "taskOperations"
+            and value.get("type") == "delete"
+            and missing == {"title"}
+        ):
+            raise ValueError("Shared core returned invalid reconciliation queues.")
+        if set(value) - allowed:
             raise ValueError("Shared core returned invalid reconciliation queues.")
         operation = dict(value)
         if domain in {"commands", "taskOperations", "durationOperations"}:

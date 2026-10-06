@@ -969,6 +969,61 @@ class StorageTests(unittest.TestCase):
             "serverHlcCounter": 0,
         }
 
+    def _drain_sync_rounds(
+        self,
+        canonical_history: list[dict[str, object]],
+        task: dict[str, str],
+        durations_ms: dict[str, int],
+        canonical_timer: dict[str, object],
+        limit: int = 10,
+    ) -> None:
+        """Drive sync_payload/apply_sync until every queue drains.
+
+        Core batch planning releases dependency-closed prefixes, so one
+        apply rarely converges. Each round uses a live server clock so
+        retained future operations stay inside the trusted-time limit.
+        """
+        revision = 1
+        for _ in range(limit):
+            queued = self.store.load()
+            if not (
+                queued["pending"]
+                or queued["pendingTasks"]
+                or queued["pendingDurations"]
+                or queued["pendingAutoStarts"]
+                or queued["pendingSelectedTasks"]
+            ):
+                return
+            request = self.store.sync_payload()
+            self.assertTrue(
+                any(
+                    request.get(key)
+                    for key in (
+                        "commands",
+                        "taskOperations",
+                        "durationOperations",
+                        "autoStartOperations",
+                        "selectedTaskOperations",
+                    )
+                )
+            )
+            response = self._canonical_response(
+                request,
+                revision=revision,
+                history=canonical_history,
+                tasks=[task],
+                auto_start_breaks=True,
+            )
+            response["canonicalTimer"] = deepcopy(canonical_timer)
+            response["durationsMs"] = durations_ms
+            server_wall = int(time.time() * 1000)
+            response["serverHlcWallMs"] = server_wall
+            response["serverHlcCounter"] = 0
+            response["serverTime"] = utc_timestamp(server_wall)
+            self.store.apply_sync(response, request)
+            revision += 1
+        self.fail(f"sync did not drain within {limit} rounds")
+
     def _queue_completed_timer(self) -> None:
         settings = self.store.load()["settings"]
         start = self.store.queue_command(
@@ -1738,7 +1793,7 @@ class StorageTests(unittest.TestCase):
 
         self.store.reset_account_data()
         insert_task_operations(4_097)
-        with self.assertRaisesRegex(ValueError, "at most 4096 task operations"):
+        with self.assertRaisesRegex(ValueError, "exceeds Core aggregate limits"):
             self.store.prepare_resolution(user, 1, "merge")
 
         loaded = self.store.load()
@@ -4750,7 +4805,7 @@ class StorageTests(unittest.TestCase):
         )
         self.store._set_meta("hlc", {"wallMs": 4_096, "counter": 0})
         self.store.connection.commit()
-        with self.assertRaisesRegex(ValueError, "at most 4096 auto-start operations"):
+        with self.assertRaisesRegex(ValueError, "exceeds Core aggregate limits"):
             self.store.prepare_resolution({"id": "user-1"}, 2, "merge")
 
     def test_concurrent_auto_start_toggles_serialize_hlc_and_projection(self) -> None:
@@ -4993,7 +5048,10 @@ class StorageTests(unittest.TestCase):
         finally:
             other.close()
         request = self.store.sync_payload()
-        self.assertIn(duplicate, request["commands"])
+        # Core batch planning releases the dependency-closed prefix first;
+        # the duplicate and the withheld break follow once it is acked.
+        self.assertEqual(len(request["commands"]), 2)
+        self.assertNotIn(duplicate, request["commands"])
         canonical_timer, history = self._canonical_completion(request["commands"])
         response = self._canonical_response(
             request,
@@ -5001,8 +5059,19 @@ class StorageTests(unittest.TestCase):
             auto_start_breaks=True,
         )
         response["canonicalTimer"] = canonical_timer
-
         self.store.apply_sync(response, request)
+
+        second = self.store.sync_payload()
+        self.assertIn(duplicate, second["commands"])
+        canonical_timer, history = self._canonical_completion(second["commands"])
+        followup = self._canonical_response(
+            second,
+            revision=2,
+            history=history,
+            auto_start_breaks=True,
+        )
+        followup["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(followup, second)
 
         resent = self.store.sync_payload()["commands"]
         self.assertEqual(resent, [])
@@ -5749,7 +5818,9 @@ class StorageTests(unittest.TestCase):
             "start", None, "focus", settings["durationsMs"], now_ms=4_000
         )
         request = self.store.sync_payload()
-        self.assertIn(manual, request["commands"])
+        # Core batch planning holds the manual start behind the withheld
+        # auto-break barrier; it stays sendable and goes out next.
+        self.assertNotIn(manual, request["commands"])
         self.assertNotIn(generated, request["commands"])
         canonical_timer, history = self._canonical_completion(request["commands"])
         response = self._canonical_response(
@@ -5758,8 +5829,21 @@ class StorageTests(unittest.TestCase):
             auto_start_breaks=True,
         )
         response["canonicalTimer"] = canonical_timer
-
         self.store.apply_sync(response, request)
+
+        second = self.store.sync_payload()
+        self.assertIn(manual, second["commands"])
+        self.assertNotIn(generated, second["commands"])
+        canonical_timer, history = self._canonical_completion(second["commands"])
+        followup = self._canonical_response(
+            second,
+            revision=2,
+            history=history,
+            auto_start_breaks=True,
+        )
+        followup["canonicalTimer"] = canonical_timer
+
+        self.store.apply_sync(followup, second)
 
         self.assertEqual(canonical_timer["id"], manual["timerId"])
         self.assertNotIn(generated, self.store.load()["pending"])
@@ -5779,9 +5863,25 @@ class StorageTests(unittest.TestCase):
 
         request = self.store.sync_payload()
 
-        self.assertEqual(len(request["commands"]), 256)
+        # Core batch planning sends the dependency-closed prefix; the
+        # withheld auto-break start and everything behind its barrier wait.
+        self.assertEqual(len(request["commands"]), 2)
         self.assertNotIn(generated, request["commands"])
-        self.assertNotIn(manual[-1], request["commands"])
+        self.assertFalse(any(item in request["commands"] for item in manual))
+
+        canonical_timer, history = self._canonical_completion(request["commands"])
+        response = self._canonical_response(
+            request,
+            history=history,
+            auto_start_breaks=True,
+        )
+        response["canonicalTimer"] = canonical_timer
+        self.store.apply_sync(response, request)
+
+        released = self.store.sync_payload()
+        self.assertEqual(len(released["commands"]), 255)
+        self.assertNotIn(generated, released["commands"])
+        self.assertIn(manual[-1], released["commands"])
 
     def test_duplicate_finish_queued_in_flight_keeps_auto_break_trigger(self) -> None:
         self.store.set_auto_start_breaks(True, now_ms=100)
@@ -6143,54 +6243,21 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(all(item["taskId"] == task["id"] for item in focus_history))
         self.assertEqual(self.store.load()["settings"]["selectedTaskId"], task["id"])
 
-        request = self.store.sync_payload()
         canonical_history = []
         for item in completed:
             canonical_item = dict(item)
             canonical_item.pop("pending", None)
             canonical_item.pop("taskTitle", None)
             canonical_history.append(canonical_item)
-        response = self._canonical_response(
-            request,
-            revision=1,
-            history=canonical_history,
-            tasks=[task],
-            auto_start_breaks=True,
+        # size-exception: one atomic end-to-end auto-start cycle scenario;
+        # setup, multi-round drain, and convergence assertions form a single
+        # behavior arc that splitting would scatter across helpers.
+        self._drain_sync_rounds(
+            canonical_history, task, custom_durations, timer.timer
         )
-        response["canonicalTimer"] = deepcopy(timer.timer)
-        response["durationsMs"] = custom_durations
-        response["serverHlcWallMs"] = max(
-            operation["hlcWallMs"]
-            for key in (
-                "commands",
-                "taskOperations",
-                "durationOperations",
-                "autoStartOperations",
-            )
-            for operation in request[key]
-        )
-        response["serverTime"] = utc_timestamp(response["serverHlcWallMs"])
-        final_generated = next(
-            command
-            for command in self.store.load()["pending"]
-            if command["type"] == "start"
-            and command["timerId"] == timer.timer["id"]
-        )
-        self.store.apply_sync(response, request)
 
         loaded = self.store.load()
-        self.assertEqual(len(loaded["pending"]), 1)
-        self.assertEqual(
-            self._operation_intent(loaded["pending"][0]),
-            self._operation_intent(final_generated),
-        )
-        self.assertGreater(
-            (
-                loaded["pending"][0]["hlcWallMs"],
-                loaded["pending"][0]["hlcCounter"],
-            ),
-            (response["serverHlcWallMs"], response["serverHlcCounter"]),
-        )
+        self.assertEqual(loaded["pending"], [])
         self.assertEqual(self.store.sync_payload()["commands"], loaded["pending"])
         self.assertEqual(loaded["pendingTasks"], [])
         self.assertEqual(loaded["pendingDurations"], [])
