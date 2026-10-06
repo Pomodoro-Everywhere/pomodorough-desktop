@@ -50,3 +50,8 @@ pomodorough = [
     "resources/CORE_COMMIT",
     "resources/sentry_dsn_default",
 ]
+
+[tool.ruff]
+# The pinned-core checkout is third-party proof material for the rebuild
+# check, not project code; never lint it.
+exclude = ["pomodorough-core-source"]
