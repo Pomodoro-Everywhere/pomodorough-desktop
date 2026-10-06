@@ -2748,7 +2748,7 @@ class StorageTests(unittest.TestCase):
         class BlockingStore(Store):
             def _canonical_durations(self, durations_ms: object) -> dict[str, int]:
                 canonical_entered.set()
-                if not release_apply.wait(2):
+                if not release_apply.wait(15):
                     raise TimeoutError("test did not release sync transaction")
                 return Store._canonical_durations(durations_ms)
 
@@ -2786,12 +2786,14 @@ class StorageTests(unittest.TestCase):
         apply_thread.start()
         edit_thread.start()
         try:
-            self.assertTrue(apply_ready.wait(2))
-            self.assertTrue(edit_ready.wait(2))
+            # Readiness waits tolerate slow runners; they gate thread
+            # startup (including WASM engine load), not sync logic.
+            self.assertTrue(apply_ready.wait(15))
+            self.assertTrue(edit_ready.wait(15))
             start_apply.set()
-            self.assertTrue(canonical_entered.wait(2))
+            self.assertTrue(canonical_entered.wait(15))
             start_edit.set()
-            self.assertTrue(attempting_edit.wait(2))
+            self.assertTrue(attempting_edit.wait(15))
         finally:
             start_apply.set()
             start_edit.set()
@@ -3961,7 +3963,9 @@ class StorageTests(unittest.TestCase):
         thread = Thread(target=load_from_second_connection)
         thread.start()
         try:
-            self.assertTrue(reached_pending.wait(2))
+            # Readiness wait tolerates slow runners; it gates thread
+            # startup (including WASM engine load), not sync logic.
+            self.assertTrue(reached_pending.wait(15))
             self.store.apply_sync(response, request)
         finally:
             continue_load.set()
