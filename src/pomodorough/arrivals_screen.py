@@ -21,6 +21,7 @@ from .localization import Strings
 class ArrivalsScreen(QFrame):
     def __init__(self, strings: Strings, device_id: str) -> None:
         super().__init__()
+        self._render_signature: tuple[Any, ...] | None = None
         self.strings = strings
         self.setObjectName("ticket")
         layout = QVBoxLayout(self)
@@ -64,7 +65,13 @@ class ArrivalsScreen(QFrame):
         known_tasks: dict[str, dict[str, Any]],
     ) -> None:
         retained = [item for item in history if item.get("status") in TERMINAL_STATUSES]
+        signature = self._signature(retained, known_tasks)
+        if signature == self._render_signature:
+            return
+        self._render_signature = signature
         self._render_header(retained)
+        current_id = self._current_arrival_id()
+        scroll = self._scroll_position()
         self.history_list.clear()
         # Med: show every retained arrival; the list scrolls instead of
         # hard-truncating at 8 rows.
@@ -72,6 +79,51 @@ class ArrivalsScreen(QFrame):
             self._render_item(item, known_tasks)
         if not retained:
             self._render_empty()
+        self._restore_arrival(current_id, scroll)
+
+    def _signature(
+        self,
+        retained: list[dict[str, Any]],
+        known_tasks: dict[str, dict[str, Any]],
+    ) -> tuple[Any, ...]:
+        return tuple(
+            (
+                item.get("id"),
+                item.get("timerId"),
+                item.get("taskId"),
+                item.get("phase"),
+                item.get("status"),
+                item.get("plannedDurationMs"),
+                item.get("completedAt") or item.get("endedAt"),
+                item.get("pending"),
+                self._task_label(item.get("taskId"), known_tasks),
+            )
+            for item in retained
+        )
+
+    def _current_arrival_id(self) -> Any:
+        current = self.history_list.currentItem()
+        if current is None:
+            return None
+        return current.data(Qt.ItemDataRole.UserRole)
+
+    def _scroll_position(self) -> tuple[int, int]:
+        return (
+            self.history_list.verticalScrollBar().value(),
+            self.history_list.horizontalScrollBar().value(),
+        )
+
+    def _restore_arrival(
+        self, current_id: Any, scroll: tuple[int, int]
+    ) -> None:
+        if current_id is not None:
+            for row in range(self.history_list.count()):
+                item = self.history_list.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == current_id:
+                    self.history_list.setCurrentRow(row)
+                    break
+        self.history_list.verticalScrollBar().setValue(scroll[0])
+        self.history_list.horizontalScrollBar().setValue(scroll[1])
 
     def _render_header(self, retained: list[dict[str, Any]]) -> None:
         displayed = len(retained)
@@ -109,6 +161,7 @@ class ArrivalsScreen(QFrame):
             else "",
         )
         row = QListWidgetItem(text, self.history_list)
+        row.setData(Qt.ItemDataRole.UserRole, item.get("id"))
         row.setData(Qt.ItemDataRole.AccessibleTextRole, text.replace("\n", ", "))
 
     def _phase_label(self, phase: str) -> str:

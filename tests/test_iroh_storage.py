@@ -463,30 +463,37 @@ class IrohStorageTests(unittest.TestCase):
             for phase, next_phase in expected.items():
                 with self.subTest(auto_start=auto_start, phase=phase):
                     path = Path(self.temporary.name) / f"{auto_start}-{phase}.sqlite3"
-                    store = Store(path, iroh_secret_store=MemorySecretStore())
-                    try:
-                        store.create_iroh_room(bytes(range(32)))
-                        if auto_start:
-                            store.set_auto_start_breaks(True, now_ms=start_ms - 1)
-                        duration_ms = store.load()["settings"]["durationsMs"][phase]
-                        store.set_selected_phase(phase)
-                        store.queue_command(
-                            "start",
-                            None,
-                            phase,
-                            store.load()["settings"]["durationsMs"],
-                            now_ms=start_ms,
-                        )
+                    with patch("time.time", return_value=start_ms / 1000):
+                        store = Store(path, iroh_secret_store=MemorySecretStore())
+                        try:
+                            store.create_iroh_room(bytes(range(32)), now_ms=start_ms)
+                            if auto_start:
+                                store.set_auto_start_breaks(True, now_ms=start_ms - 1)
+                            duration_ms = store.load()["settings"]["durationsMs"][phase]
+                            store.set_selected_phase(phase)
+                            store.queue_command(
+                                "start",
+                                None,
+                                phase,
+                                store.load()["settings"]["durationsMs"],
+                                now_ms=start_ms,
+                            )
 
-                        self.assertTrue(
-                            store.project_iroh_expiry(start_ms + duration_ms)
-                        )
+                            self.assertFalse(
+                                store.project_iroh_expiry(start_ms + duration_ms - 1)
+                            )
+                            self.assertEqual(
+                                store.load()["settings"]["selectedPhase"], phase
+                            )
+                            self.assertTrue(
+                                store.project_iroh_expiry(start_ms + duration_ms)
+                            )
 
-                        self.assertEqual(
-                            store.load()["settings"]["selectedPhase"], next_phase
-                        )
-                    finally:
-                        store.close()
+                            self.assertEqual(
+                                store.load()["settings"]["selectedPhase"], next_phase
+                            )
+                        finally:
+                            store.close()
 
     def test_remote_batch_is_atomic_idempotent_and_conflicts_stop_room(self) -> None:
         room_id = self.store.create_iroh_room(bytes(range(32)))

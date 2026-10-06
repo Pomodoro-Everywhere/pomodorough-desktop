@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any, Protocol
 
@@ -274,6 +275,7 @@ class AtomicCanonicalInstaller:
         )
         self._hooks._install_projected_settings(projection)
         self._hooks._install_snapshot(canonical, user, preserve_known_tasks)
+        self._install_canonical_durations(canonical)
         self._dependencies._set_meta("autoStartLegacyDefaultUnknown", False)
         self._dependencies._set_meta(
             "hlc", {"wallMs": merged_clock[0], "counter": merged_clock[1]}
@@ -283,6 +285,18 @@ class AtomicCanonicalInstaller:
         )
         if clock_sample is not None:
             self._dependencies._set_meta("serverClockSample", clock_sample)
+
+    def _install_canonical_durations(self, canonical: dict[str, Any]) -> None:
+        """Persist canonical duration base apart from optimistic settings.
+
+        Already validated by _validated_sync_response. Written in the same
+        install transaction as snapshot/head. Filtered reopen replays safe
+        queues against this 25-minute base, not the optimistic 30. Matches
+        workspace.project.v1 base persistence.
+        """
+        self._dependencies._set_meta(
+            "canonicalDurationsMs", dict(canonical["durationsMs"])
+        )
 
     def _clear_stale_timer_ownership(
         self,
@@ -496,7 +510,7 @@ class AtomicCanonicalInstaller:
             expected_projection=reconciliation["projection"],
             safe_pending=reconciliation["projectionPending"],
         )
-        self._advance_selected_phase_for_remote_finish(canonical)
+        self._advance_selected_phase_for_remote_finish(canonical, previous.get("history", []))
         self._dependencies._prune_command_physical_times()
         return notices
 
@@ -562,27 +576,37 @@ class AtomicCanonicalInstaller:
         }
 
     def _latest_completed_source(
-        self, history: Any
+        self, history: Any, previous_history: Sequence[dict[str, Any]] = ()
     ) -> tuple[dict[str, Any], str, str] | None:
         if not isinstance(history, list) or not history:
             return None
-        best: dict[str, Any] | None = None
-        best_ms: int | None = None
-        best_stamp: str | None = None
+        completed = []
         for item in history:
             located = self._completed_stamp(item)
             if located is None:
                 continue
             stamp_ms, stamp = located
-            if best_ms is None or stamp_ms > best_ms:
-                best, best_ms, best_stamp = item, stamp_ms, stamp
-        if best is None or best_stamp is None or best_ms is None:
+            source = self._source_from_item(item, stamp)
+            if source is not None:
+                completed.append((stamp_ms, source))
+        if not completed:
             return None
-        source = self._source_from_item(best, best_stamp)
-        if source is None:
-            return None
-        day_start, day_end = generated_break_day_bounds(best_ms)
-        return source, day_start, day_end
+        # Core timer::projected_history orders terminal time descending, then
+        # timer ID ascending. Preserve that tie order, independent of wire order.
+        completed.sort(key=lambda item: (-item[0], item[1]["timerId"]))
+        newest_ms = completed[0][0]
+        for stamp_ms, source in completed:
+            if stamp_ms != newest_ms:
+                break  # Older backfill is not a new current completion.
+            if any(
+                item.get("status") == "completed"
+                and self._source_from_item(item, source["occurredAt"]) == source
+                for item in previous_history
+            ):
+                continue
+            day_start, day_end = generated_break_day_bounds(stamp_ms)
+            return source, day_start, day_end
+        return None
 
     def _remote_finish_selected_phase(
         self,
@@ -626,7 +650,7 @@ class AtomicCanonicalInstaller:
         return plan.selected_phase
 
     def _advance_selected_phase_for_remote_finish(
-        self, canonical: dict[str, Any]
+        self, canonical: dict[str, Any], previous_history: Sequence[dict[str, Any]] = ()
     ) -> None:
         if self._has_active_canonical_timer(canonical):
             return
@@ -634,7 +658,9 @@ class AtomicCanonicalInstaller:
             return
         if self._has_sendable_pending():
             return
-        located = self._latest_completed_source(canonical.get("history"))
+        # The persisted pre-install history consumes identities across restart.
+        # Resolution deliberately installs afresh, using the empty default.
+        located = self._latest_completed_source(canonical.get("history"), previous_history)
         if located is None:
             return
         source, day_start, day_end = located

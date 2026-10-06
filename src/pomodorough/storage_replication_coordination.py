@@ -87,34 +87,6 @@ def _validate_peer_metadata(
         raise ValueError("Iroh peer metadata is invalid.")
 
 
-def _held_back_ids(
-    records: list[dict[str, Any]], publishable: list[dict[str, Any]]
-) -> dict[str, set[str]]:
-    """Map held-back records to pending-table IDs for workspace retain."""
-    published = {
-        (record.get("domain"), record.get("operation", {}).get("id"))
-        for record in publishable
-    }
-    table_for = {
-        "timer": "pending_commands",
-        "task": "pending_task_operations",
-        "duration": "pending_duration_operations",
-        "autoStart": "pending_auto_start_operations",
-        "selectedTask": "pending_selected_task_operations",
-    }
-    held_ids: dict[str, set[str]] = {}
-    for record in records:
-        key = (record.get("domain"), record.get("operation", {}).get("id"))
-        if key in published:
-            continue
-        table = table_for.get(str(record.get("domain", "")))
-        operation_id = record.get("operation", {}).get("id")
-        if table is None or not isinstance(operation_id, str):
-            continue
-        held_ids.setdefault(table, set()).add(operation_id)
-    return held_ids
-
-
 class ReplicationTransactionCoordinator:
     def __init__(self, dependencies: ReplicationTransactionDependencies) -> None:
         self._dependencies = dependencies
@@ -190,58 +162,14 @@ class ReplicationTransactionCoordinator:
         self._dependencies.records.insert_locked(room_id, publishable)
         self._clear_captured_queues(publishable)
         capture = self._dependencies.workspace.capture()
-        held_snapshot = deepcopy(capture)
         projection = self._dependencies.projection.project_room(room_id)
         workspace = self._dependencies.projection.workspace_with_projection(
             capture,
             projection,
         )
-        self._retain_held_back(workspace, held_snapshot, records, publishable)
         self._dependencies.workspace.save_room(room_id, workspace)
         self._dependencies.workspace.restore(workspace)
         return True
-
-    def _retain_held_back(
-        self,
-        workspace: dict[str, Any],
-        capture: dict[str, Any],
-        records: list[dict[str, Any]],
-        publishable: list[dict[str, Any]],
-    ) -> None:
-        """Keep held-back retarget rows through the room workspace swap."""
-        held_ids = _held_back_ids(records, publishable)
-        if not held_ids:
-            return
-        capture_tables = capture.get("tables", {})
-        workspace_tables = workspace.get("tables", {})
-        for table, ids in held_ids.items():
-            workspace_tables[table] = [
-                row for row in capture_tables.get(table, [])
-                if str(row.get("id")) in ids
-            ]
-        capture_physical = capture.get("metadata", {}).get(
-            "commandPhysicalTimes", {}
-        )
-        if isinstance(capture_physical, dict):
-            workspace["metadata"]["commandPhysicalTimes"] = {
-                key: value for key, value in capture_physical.items()
-                if key in held_ids.get("pending_commands", set())
-            }
-        self._retain_held_back_clock(workspace, capture)
-
-    def _retain_held_back_clock(
-        self, workspace: dict[str, Any], capture: dict[str, Any]
-    ) -> None:
-        """Keep the newer HLC so held-back clocks stay covered."""
-        try:
-            before = workspace["metadata"]["hlc"]
-            after = capture["metadata"]["hlc"]
-            before_key = (int(before["wallMs"]), int(before["counter"]))
-            after_key = (int(after["wallMs"]), int(after["counter"]))
-        except (KeyError, TypeError, ValueError):
-            return
-        if after_key > before_key:
-            workspace["metadata"]["hlc"] = after
 
     def _publishable_records(
         self, records: list[dict[str, Any]], room_id: str

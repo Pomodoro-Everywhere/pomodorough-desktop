@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from pomodorough.core import task_from_title
 from pomodorough.storage import Store, utc_timestamp
@@ -371,33 +372,39 @@ class ReplicationStorageModuleTests(unittest.TestCase):
         self.assertIn(room_key, self.secrets.values)
 
     def test_remote_timer_owner_cannot_generate_local_auto_break(self) -> None:
-        room_id = self.store.create_iroh_room(bytes(range(32)))
         started_at_ms = 1_790_000_000_000
-        self.store.set_auto_start_breaks(True, now_ms=started_at_ms - 1)
-        duration_ms = self.store.load()["settings"]["durationsMs"]["focus"]
-        remote_start = {
-            "domain": "timer",
-            "deviceId": "device-remote",
-            "operation": {
-                "id": "command-remote-start",
-                "deviceSequence": 1,
-                "timerId": "timer-remote",
-                "type": "start",
-                "phase": "focus",
-                "plannedDurationMs": duration_ms,
-                "occurredAt": utc_timestamp(started_at_ms),
-                "hlcWallMs": started_at_ms,
-                "hlcCounter": 0,
-                "observedElapsedMs": 0,
-            },
-        }
-        self.store.insert_remote_iroh_records(room_id, [remote_start])
-        before = self.store.iroh_room(room_id)["operationCount"]
+        with patch("time.time", return_value=started_at_ms / 1000):
+            room_id = self.store.create_iroh_room(bytes(range(32)), now_ms=started_at_ms)
+            self.store.set_auto_start_breaks(True, now_ms=started_at_ms - 1)
+            duration_ms = self.store.load()["settings"]["durationsMs"]["focus"]
+            remote_start = {
+                "domain": "timer",
+                "deviceId": "device-remote",
+                "operation": {
+                    "id": "command-remote-start",
+                    "deviceSequence": 1,
+                    "timerId": "timer-remote",
+                    "type": "start",
+                    "phase": "focus",
+                    "plannedDurationMs": duration_ms,
+                    "occurredAt": utc_timestamp(started_at_ms),
+                    "hlcWallMs": started_at_ms,
+                    "hlcCounter": 0,
+                    "observedElapsedMs": 0,
+                },
+            }
+            self.store.insert_remote_iroh_records(room_id, [remote_start])
+            before = self.store.iroh_room(room_id)["operationCount"]
 
-        self.assertTrue(self.store.project_iroh_expiry(started_at_ms + duration_ms))
+            self.assertFalse(
+                self.store.project_iroh_expiry(started_at_ms + duration_ms - 1)
+            )
+            self.assertEqual(self.store.iroh_room(room_id)["operationCount"], before)
 
-        self.assertEqual(self.store.iroh_room(room_id)["operationCount"], before)
-        self.assertEqual(self.store.load()["pending"], [])
+            self.assertTrue(self.store.project_iroh_expiry(started_at_ms + duration_ms))
+
+            self.assertEqual(self.store.iroh_room(room_id)["operationCount"], before)
+            self.assertEqual(self.store.load()["pending"], [])
 
 
 if __name__ == "__main__":

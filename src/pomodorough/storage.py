@@ -403,6 +403,9 @@ class Store:
     def pending_sync(self) -> dict[str, Any] | None:
         return self._sync_storage.pending_sync()
 
+    def discard_saved_sync_claim(self, *, confirmed: bool = False) -> bool:
+        return self._sync_storage.discard_saved_sync_claim(confirmed=confirmed)
+
     def has_sendable_sync_operations(self) -> bool:
         return self._sync_storage.has_sendable_sync_operations()
 
@@ -765,6 +768,7 @@ class Store:
             "pendingResolution": None,
             "deliveryProof": {domain: [] for domain in DELIVERY_QUEUE_DOMAINS},
             "canonicalHead": None,
+            "canonicalDurationsMs": None,
             "replicationMode": "centralized",
             "activeIrohRoomId": None,
         }
@@ -1343,6 +1347,35 @@ class Store:
         if not isinstance(durations_ms, dict) or set(durations_ms) != set(PHASES):
             raise ValueError("Server returned invalid duration preferences.")
         return {phase: cls._duration_ms(durations_ms[phase]) for phase in PHASES}
+
+    def _canonical_base_durations(self) -> dict[str, int] | None:
+        """Persisted canonical base, never the optimistic settings.
+
+        Installed atomically with the snapshot/head on every sync and
+        resolution. Missing on pre-migration rows; callers fall back to
+        optimistic settings until the next authoritative install instead
+        of copying contaminated state. Mirrors workspace.project.v1 base.
+        """
+        try:
+            return self._canonical_durations(
+                self.get_meta("canonicalDurationsMs", None)
+            )
+        except ValueError:
+            return None
+
+    def _canonical_projection_settings(
+        self, settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        canonical = self._canonical_base_durations()
+        if canonical is None:
+            return settings
+        projected = dict(settings)
+        projected["durationsMs"] = dict(canonical)
+        projected["durations"] = {
+            phase: self._display_minutes(duration_ms)
+            for phase, duration_ms in canonical.items()
+        }
+        return projected
 
     def get_meta(self, key: str, default: Any = None) -> Any:
         row = self.connection.execute(
@@ -2707,13 +2740,23 @@ class Store:
         now_ms: int | None = None,
         state: dict[str, Any] | None = None,
     ) -> ProjectionApplyV2:
-        """Return fail-closed synchronized state from production SharedCore."""
+        """Return fail-closed synchronized state from production SharedCore.
+
+        Filtered queues replay against the persisted canonical duration
+        base, never optimistic settings. A suppressed unsafe 30-minute
+        operation then exposes canonical 25. Safe queues still replay
+        optimistically to 30. Falls back pre-migration. Matches
+        workspace.project.v1 replay of safe queues against original base.
+        """
         state = self.load(projection=True) if state is None else state
         projection_base = state.get("projectionSnapshot", state["snapshot"])
         safe_state, safe_commands = self._safe_projection_state(state)
         projection_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        base_settings = self._canonical_projection_settings(
+            self._normalize_settings(safe_state["settings"])
+        )
         return self._project_operation(
-            self._normalize_settings(safe_state["settings"]),
+            base_settings,
             now=utc_timestamp(projection_now_ms),
             base=projection_base,
             state=safe_state,

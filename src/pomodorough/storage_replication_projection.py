@@ -261,26 +261,46 @@ class ReplicatedStateProjection:
         workspace["metadata"].update(
             settings=settings,
             snapshot=self._projection_snapshot(projection, settings, known),
-            hlc={
-                "wallMs": projection["hlcWallMs"],
-                "counter": projection["hlcCounter"],
-            },
+            hlc=self._workspace_projection_clock(workspace, projection),
             serverClockSample=None,
-            commandPhysicalTimes={},
+            commandPhysicalTimes=self._pending_command_physical_times(workspace),
             pendingSync=None,
             pendingResolution=None,
         )
-        for table in (
-            "pending_commands",
-            "pending_task_operations",
-            "pending_duration_operations",
-            "pending_auto_start_operations",
-            "pending_selected_task_operations",
-            "pending_auto_break_starts",
-            "pending_phase_advances",
-        ):
+        # Capture retires published rows before projection. Remaining operation
+        # rows belong to the workspace, including capability-held retargets;
+        # expiry, remote refresh, and room activation must retain them verbatim.
+        for table in ("pending_auto_break_starts", "pending_phase_advances"):
             workspace["tables"][table] = []
         return workspace
+
+    @staticmethod
+    def _pending_command_physical_times(workspace: dict[str, Any]) -> dict[str, Any]:
+        pending_ids = {row["id"] for row in workspace["tables"]["pending_commands"]}
+        physical = workspace["metadata"].get("commandPhysicalTimes", {})
+        if not isinstance(physical, dict):
+            return {}
+        return {key: value for key, value in physical.items() if key in pending_ids}
+
+    @staticmethod
+    def _workspace_projection_clock(
+        workspace: dict[str, Any], projection: dict[str, Any]
+    ) -> dict[str, Any]:
+        projected = {"wallMs": projection["hlcWallMs"], "counter": projection["hlcCounter"]}
+        if not any(workspace["tables"].get(table) for table in (
+            "pending_commands", "pending_task_operations", "pending_duration_operations",
+            "pending_auto_start_operations", "pending_selected_task_operations",
+        )):
+            return projected
+        # Pending operations are absent from the room projection's HLC.
+        # Retain the covering clock, as capture_local_records_locked did.
+        try:
+            pending = workspace["metadata"]["hlc"]
+            pending_key = (int(pending["wallMs"]), int(pending["counter"]))
+            projected_key = (int(projected["wallMs"]), int(projected["counter"]))
+        except (KeyError, TypeError, ValueError):
+            return projected
+        return pending if pending_key > projected_key else projected
 
     @staticmethod
     def _projection_snapshot(

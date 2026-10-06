@@ -4,6 +4,7 @@ import argparse
 import curses
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,6 +16,9 @@ from .storage import Store
 from .terminal import InvalidAction, LocalTimer
 
 STORAGE_ERRORS = (OSError, sqlite3.Error, SharedCoreError)
+NOTICE_ERRORS = STORAGE_ERRORS + (InvalidAction, KeyError, TypeError, ValueError)
+INPUT_INTERVAL_SECONDS = 0.25
+FAILURE_REPORT_INTERVAL_SECONDS = 5.0
 
 
 def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings:
@@ -154,6 +158,32 @@ def _draw(
     screen.refresh()
 
 
+def _report_loop_failure(error: Exception, next_capture_at: float) -> float:
+    # One shared budget covers draw/action failures, changing error text, and
+    # intermittent recovery. Validation and curses failures stay notice-only.
+    now = time.monotonic()
+    if isinstance(error, STORAGE_ERRORS) and now >= next_capture_at:
+        capture_exception(error)
+        return now + FAILURE_REPORT_INTERVAL_SECONDS
+    return next_capture_at
+
+
+def _draw_failure(screen: Any, error: Exception, strings: Strings) -> None:
+    # This fallback must not read the timer, storage, or Core again.
+    try:
+        height, width = screen.getmaxyx()
+        screen.erase()
+        lines = (str(error) or type(error).__name__, strings.text("tui.keys_secondary"))
+        if width > 1:
+            for row, line in enumerate(lines[:height]):
+                screen.addnstr(row, 0, line, width - 1)
+        screen.refresh()
+    except curses.error:
+        # A resize/unavailable output may prevent even the fallback. Input
+        # still gets its turn; unexpected exceptions deliberately propagate.
+        pass
+
+
 def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None:
     strings = _timer_strings(timer, strings)
     try:
@@ -162,29 +192,32 @@ def _run(screen: Any, timer: LocalTimer, strings: Strings | None = None) -> None
         # Cosmetic only: terminals without cursor-visibility control run
         # fine with a visible cursor, so stay silent.
         pass
-    screen.timeout(250)
+    screen.timeout(round(INPUT_INTERVAL_SECONDS * 1000))
     message = ""
+    next_capture_at = float("-inf")
     while True:
+        started_at = time.monotonic()
+        failed = False
         try:
             _draw(screen, timer, message)
-            key = screen.getch()
-            if key == -1:
-                continue
+        except NOTICE_ERRORS + (curses.error,) as error:
+            failed = True
+            next_capture_at = _report_loop_failure(error, next_capture_at)
+            _draw_failure(screen, error, strings)
+        key = screen.getch()
+        if key != -1:
             message = ""
-            if not handle_key(timer, key):
-                return
-        except STORAGE_ERRORS as error:
-            # D49: infra failure reports to Sentry, still notice-only.
-            # D63: SharedCoreError (wasm load via _default_shared_core)
-            # is infra here too: capture + notice, loop survives.
-            capture_exception(error)
-            message = str(error)
-        except InvalidAction as error:
-            message = str(error)
-        except (KeyError, TypeError, ValueError) as error:
-            # D54: validation stays silent (no Sentry capture);
-            # corrupt settings/snapshot shows as notice, loop survives.
-            message = str(error)
+            try:
+                if not handle_key(timer, key):
+                    return
+            except NOTICE_ERRORS as error:
+                failed = True
+                next_capture_at = _report_loop_failure(error, next_capture_at)
+                message = str(error)
+        if failed:
+            # getch may return immediately for queued keys. Bound retries
+            # without double-waiting after its timeout or delaying quit.
+            time.sleep(max(0.0, INPUT_INTERVAL_SECONDS - (time.monotonic() - started_at)))
 
 
 def main(argv: Sequence[str] | None = None, *, locale: str | None = None) -> int:

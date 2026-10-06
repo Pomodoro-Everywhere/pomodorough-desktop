@@ -258,12 +258,20 @@ class MainWindowViewMixin:
             QShortcut(QKeySequence("Ctrl+Shift+F"), self),
             *(QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self) for index in range(4)),
         ]
+        self.shortcuts[0].setAutoRepeat(False)
+        QApplication.instance().focusChanged.connect(self._update_space_shortcut)
+        self._update_space_shortcut()
         self.shortcuts[0].activated.connect(self._shortcut_primary_action)
         self.shortcuts[1].activated.connect(lambda: self._issue("finish"))
         for index, shortcut in enumerate(self.shortcuts[2:]):
             shortcut.activated.connect(
                 lambda page=index: self._shortcut_show_screen(page)
             )
+
+    def _update_space_shortcut(self) -> None:
+        # Shortcut activation is too late to return Space to native controls.
+        # Update arbitration before the next key event, including focus loss.
+        self.shortcuts[0].setEnabled(not self._focused_widget_consumes_space())
 
     @staticmethod
     def _focused_widget_consumes_space() -> bool:

@@ -5,6 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QFrame,
     QHBoxLayout,
@@ -126,6 +127,7 @@ class TasksScreen(QFrame):
         self._render_totals(summaries)
         self.task_input.setEnabled(mutations_enabled)
         self.add_task_button.setEnabled(mutations_enabled)
+        focused_id, focused_row = self._focused_delete_id()
         self.task_table.setRowCount(len(tasks))
         for row, task in enumerate(tasks):
             self._render_task_row(
@@ -136,6 +138,7 @@ class TasksScreen(QFrame):
             )
         self.task_table.setVisible(bool(tasks))
         self.tasks_empty.setVisible(not tasks)
+        self._restore_delete_focus(focused_id, focused_row)
 
     @staticmethod
     def _signature(
@@ -217,18 +220,42 @@ class TasksScreen(QFrame):
         task_id = task_id if isinstance(task_id, str) else ""
         finished = summary.get("finished", 0) if isinstance(summary, dict) else 0
         time_ms = summary.get("timeMs", 0) if isinstance(summary, dict) else 0
-        self.task_table.setItem(row, 0, QTableWidgetItem(title))
-        count = QTableWidgetItem(str(finished))
-        count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.task_table.setItem(row, 1, count)
-        spent = QTableWidgetItem(self._format_task_time(time_ms))
-        spent.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.task_table.setItem(row, 2, spent)
+        self._set_text_cell(row, 0, title, None)
+        self._set_text_cell(
+            row, 1, str(finished), Qt.AlignmentFlag.AlignCenter
+        )
+        self._set_text_cell(
+            row, 2, self._format_task_time(time_ms), Qt.AlignmentFlag.AlignCenter
+        )
+        self._render_delete_cell(row, task_id, title, mutations_enabled)
+
+    def _set_text_cell(
+        self, row: int, column: int, text: str, alignment: Qt.AlignmentFlag | None
+    ) -> None:
+        existing = self.task_table.item(row, column)
+        if existing is None:
+            cell = QTableWidgetItem(text)
+            if alignment is not None:
+                cell.setTextAlignment(alignment)
+            self.task_table.setItem(row, column, cell)
+            return
+        existing.setText(text)
+
+    def _render_delete_cell(
+        self, row: int, task_id: str, title: str, mutations_enabled: bool
+    ) -> None:
+        accessible = self.strings.text("task.delete_accessible", task=title)
+        existing = self.task_table.cellWidget(row, 3)
+        if existing is not None and existing.property("taskId") == task_id:
+            existing.setAccessibleName(accessible)
+            existing.setEnabled(mutations_enabled)
+            return
+        if existing is not None:
+            existing.deleteLater()
         delete = QPushButton(self.strings.text("task.delete"))
         delete.setObjectName("dangerButton")
-        delete.setAccessibleName(
-            self.strings.text("task.delete_accessible", task=title)
-        )
+        delete.setProperty("taskId", task_id)
+        delete.setAccessibleName(accessible)
         delete.setEnabled(mutations_enabled)
         delete.clicked.connect(
             lambda checked=False, task_id=task_id: self.delete_task_requested.emit(
@@ -236,6 +263,41 @@ class TasksScreen(QFrame):
             )
         )
         self.task_table.setCellWidget(row, 3, delete)
+
+    def _focused_delete_id(self) -> tuple[str | None, int]:
+        focused = QApplication.focusWidget()
+        for row in range(self.task_table.rowCount()):
+            if self.task_table.cellWidget(row, 3) is focused and focused is not None:
+                value = focused.property("taskId")
+                return (value if isinstance(value, str) else None, row)
+        return (None, -1)
+
+    def _row_for_delete_id(self, task_id: str) -> int:
+        for row in range(self.task_table.rowCount()):
+            button = self.task_table.cellWidget(row, 3)
+            if button is not None and button.property("taskId") == task_id:
+                return row
+        return -1
+
+    def _restore_delete_focus(
+        self, focused_id: str | None, focused_row: int
+    ) -> None:
+        if focused_id is None and focused_row < 0:
+            return
+        if focused_id is not None:
+            row = self._row_for_delete_id(focused_id)
+            if row >= 0:
+                button = self.task_table.cellWidget(row, 3)
+                if button is not None and QApplication.focusWidget() is not button:
+                    button.setFocus()
+                return
+        if self.task_table.rowCount() == 0:
+            self.task_input.setFocus()
+            return
+        neighbor = min(max(0, focused_row), self.task_table.rowCount() - 1)
+        button = self.task_table.cellWidget(neighbor, 3)
+        if button is not None and QApplication.focusWidget() is not button:
+            button.setFocus()
 
     def _format_task_time(self, milliseconds: int) -> str:
         try:
