@@ -4,6 +4,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -12,13 +13,25 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from .localization import Strings
 
 PRIVACY_POLICY_URL = "https://pomodorough.egigoka.me/privacy"
+
+
+def _app_font_scale() -> float:
+    try:
+        app = QApplication.instance()
+        if app is not None and app.font().pointSizeF() > 0:
+            return float(app.font().pointSizeF()) / 9.0
+    except RuntimeError:
+        pass
+    return 1.0
 
 
 def _coerce_count(value: Any) -> int:
@@ -64,7 +77,15 @@ class NetworkScreen(QFrame):
         super().__init__()
         self.strings = strings
         self.setObjectName("ticket")
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(self._scroll, 1)
+        self._content = QWidget(self._scroll)
+        layout = QVBoxLayout(self._content)
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(10)
         layout.addLayout(self._build_header())
@@ -73,14 +94,40 @@ class NetworkScreen(QFrame):
         self._build_notices(layout)
         layout.addWidget(self._build_iroh_panel())
         self._build_footer(layout)
+        self._scroll.setWidget(self._content)
+        self._connect_focus_scroll()
+
+    def _connect_focus_scroll(self) -> None:
+        try:
+            app = QApplication.instance()
+        except RuntimeError:
+            return
+        if app is None:
+            return
+        try:
+            app.focusChanged.connect(self._ensure_focus_visible)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _ensure_focus_visible(self, _old: object, now: object) -> None:
+        if now is None or not isinstance(now, QWidget):
+            return
+        try:
+            if not self.isAncestorOf(now):
+                return
+            self._scroll.ensureWidgetVisible(now)
+        except RuntimeError:
+            pass
 
     def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
         heading = QVBoxLayout()
         title = QLabel(self.strings.text("network.title"))
         title.setObjectName("sectionTitle")
+        title.setWordWrap(True)
         subtitle = QLabel(self.strings.text("network.detail"))
         subtitle.setObjectName("taskSubtitle")
+        subtitle.setWordWrap(True)
         heading.addWidget(title)
         heading.addWidget(subtitle)
         header.addLayout(heading)
@@ -169,6 +216,7 @@ class NetworkScreen(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(8)
+        layout.setColumnStretch(0, 1)
         self._build_create_row(layout)
         self._build_join_row(layout)
         self._build_invite_row(layout)
@@ -252,6 +300,7 @@ class NetworkScreen(QFrame):
     def _build_footer(self, layout: QVBoxLayout) -> None:
         self.network_details = QLabel(self.strings.text("network.no_room"))
         self.network_details.setObjectName("device")
+        self.network_details.setWordWrap(True)
         self.network_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByKeyboard
             | Qt.TextInteractionFlag.TextSelectableByMouse
@@ -387,7 +436,11 @@ class NetworkScreen(QFrame):
 
     @staticmethod
     def stylesheet() -> str:
-        return """
+        scale = _app_font_scale()
+        sheet = """
         QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
         QLabel#privacyNotice { color: palette(text); background: palette(alternate-base); border-left: 4px solid palette(highlight); padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
         """
+        return sheet.replace(
+            "font-size: 9px", f"font-size: {6.75 * scale:.1f}pt"
+        )

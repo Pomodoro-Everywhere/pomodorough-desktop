@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Mapping
@@ -598,6 +599,63 @@ def capture_exception(error: BaseException | None = None) -> None:
         sentry_sdk.capture_exception(error)
     except Exception:  # noqa: BLE001 - reporting must stay non-fatal.
         _note_capture_fallback()
+
+
+CLOCK_FAILURE_REPORT_INTERVAL_SECONDS = 5.0
+_CLOCK_INCIDENT_SIGNATURE: str | None = None
+_CLOCK_NEXT_CAPTURE_AT = float("-inf")
+
+
+def _clock_failure_signature(error: BaseException) -> str:
+    """D48-07: category for the shared tick/render clock budget."""
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
+def should_capture_clock_failure(
+    error: BaseException,
+    *,
+    now_monotonic: float | None = None,
+) -> bool:
+    """D48-07: shared bounded budget across tick and render.
+
+    Same type with changing text stays one incident. Distinct type
+    starts a new incident. Check runs before SDK use so suppressed
+    repeats never consume quota. Validation stays silent.
+    """
+    if isinstance(error, ValueError):
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    signature = _clock_failure_signature(error)
+    global _CLOCK_INCIDENT_SIGNATURE, _CLOCK_NEXT_CAPTURE_AT
+    if signature != _CLOCK_INCIDENT_SIGNATURE:
+        _CLOCK_INCIDENT_SIGNATURE = signature
+        _CLOCK_NEXT_CAPTURE_AT = now + CLOCK_FAILURE_REPORT_INTERVAL_SECONDS
+        return True
+    if now >= _CLOCK_NEXT_CAPTURE_AT:
+        _CLOCK_NEXT_CAPTURE_AT = now + CLOCK_FAILURE_REPORT_INTERVAL_SECONDS
+        return True
+    return False
+
+
+def note_clock_recovery() -> None:
+    """D48-07: clear incident so recurrence after success reports."""
+    global _CLOCK_INCIDENT_SIGNATURE
+    _CLOCK_INCIDENT_SIGNATURE = None
+
+
+def reset_clock_incident_budget() -> None:
+    """Test seam: reset the D48-07 shared clock incident budget."""
+    global _CLOCK_INCIDENT_SIGNATURE, _CLOCK_NEXT_CAPTURE_AT
+    _CLOCK_INCIDENT_SIGNATURE = None
+    _CLOCK_NEXT_CAPTURE_AT = float("-inf")
+
+
+def capture_clock_failure(error: BaseException) -> bool:
+    """D48-07: gated capture; True when the incident budget allowed."""
+    if not should_capture_clock_failure(error):
+        return False
+    capture_exception(error)
+    return True
 
 
 def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:

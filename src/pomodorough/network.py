@@ -58,6 +58,7 @@ from .secure_store import (
     SecretStore,
     SecureStoreError,
     TokenCleanupPendingError,
+    should_capture_secure_store_error,
     token_store_lock,
 )
 from .sentry_monitoring import capture_exception
@@ -1083,6 +1084,23 @@ class _CollaboratorAttribute:
         setattr(target, self._path[-1], value)
 
 
+def _should_capture_restore_error(error: Exception) -> bool:
+    """D048-08: credential-restore boundary classification.
+
+    Infrastructure failures (permission/IO, infra-backed secure-store,
+    unexpected types) report once. Expected ApiError traffic (401,
+    offline, cancel) and malformed input stay silent; the UI notice
+    still fires for every failure.
+    """
+    if isinstance(error, ApiError):
+        return False
+    if isinstance(error, SecureStoreError):
+        return should_capture_secure_store_error(error)
+    if isinstance(error, OSError):
+        return True
+    return not isinstance(error, (ValueError, KeyError, TypeError))
+
+
 class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
@@ -1292,6 +1310,8 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
+            if _should_capture_restore_error(error):
+                capture_exception(error)
             self._state.access_token = None
             self._state.authenticated = False
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))

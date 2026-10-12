@@ -27,7 +27,11 @@ from .core import (
     empty_timer,
     task_from_title,
 )
-from .sentry_monitoring import capture_exception
+from .sentry_monitoring import (
+    capture_exception,
+    note_clock_recovery,
+    should_capture_clock_failure,
+)
 from .shared_core import SharedCoreError
 
 
@@ -195,11 +199,13 @@ class TimerInteractionController:
         try:
             now_ms = context.store.effective_timer_now_ms(timer)
         except (OSError, sqlite3.Error, SharedCoreError) as error:
-            # Tick clock guarded; infra reports, keep last-known clock.
-            capture_exception(error)
+            # D48-07: shared tick/render clock budget; keep last-known.
+            if should_capture_clock_failure(error):
+                capture_exception(error)
             return context, timer
         except ValueError:
             return context, timer
+        note_clock_recovery()
         if elapsed_ms(timer, now_ms) >= int(timer["plannedDurationMs"]):
             self._ports.apply_outcome(done(LoadState()))
             context = self._context()
@@ -405,7 +411,6 @@ class TimerInteractionController:
         if self._ports.mutation_blocked():
             return done(Render())
         context = self._context()
-        context.settings["selectedPhase"] = phase
         try:
             context.store.set_selected_phase(phase)
         except (OSError, sqlite3.Error, SharedCoreError) as error:
@@ -414,6 +419,7 @@ class TimerInteractionController:
             return done(Render(), EmitNotice(str(error)))
         except ValueError as error:
             return done(Render(), EmitNotice(str(error)))
+        context.settings["selectedPhase"] = phase
         return done(Render())
 
     def task_selection_changed(self, index: int) -> ControllerOutcome[None]:
@@ -453,10 +459,12 @@ class TimerInteractionController:
                 else self._ports.task_input_text()
             )
             task = task_from_title(title)
-            if not any(existing["id"] == task["id"] for existing in context.tasks):
-                context.store.queue_task_operation("upsert", task)
+            if any(existing["id"] == task["id"] for existing in context.tasks):
+                context.store.set_selected_task_id(task["id"])
+            else:
+                context.store.queue_task_operation_with_selection(
+                    "upsert", task, task["id"])
             context.settings["selectedTaskId"] = task["id"]
-            context.store.set_selected_task_id(task["id"])
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
@@ -474,10 +482,12 @@ class TimerInteractionController:
         if not task:
             return done()
         try:
-            context.store.queue_task_operation("delete", task)
             if context.settings.get("selectedTaskId") == task_id:
+                context.store.queue_task_operation_with_selection(
+                    "delete", task, None)
                 context.settings["selectedTaskId"] = None
-                context.store.set_selected_task_id(None)
+            else:
+                context.store.queue_task_operation("delete", task)
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)

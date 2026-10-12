@@ -564,6 +564,30 @@ class AccountResolutionController:
             ),
         )
 
+    def _signout_queue_count(
+        self, context: AccountResolutionContext
+    ) -> tuple[int | None, ControllerOutcome[None] | None]:
+        try:
+            state = context.store.load()
+            queued = sum(
+                len(state[key])
+                for key in (
+                    "pending",
+                    "pendingTasks",
+                    "pendingDurations",
+                    "pendingAutoStarts",
+                    "pendingSelectedTasks",
+                )
+            )
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            # D05: queue-count read guarded; infra reports once, no logout.
+            capture_exception(error)
+            return None, done(EmitNotice(str(error)))
+        except (ValueError, KeyError, TypeError) as error:
+            # validation stays silent
+            return None, done(EmitNotice(str(error)))
+        return queued, None
+
     def account_action(self) -> ControllerOutcome[None]:
         context = self._context()
         if context.cloud.authenticated:
@@ -585,17 +609,10 @@ class AccountResolutionController:
                 if action == "sign_out":
                     context.cloud.logout()
                 return done()
-            state = context.store.load()
-            queued_changes = sum(
-                len(state[key])
-                for key in (
-                    "pending",
-                    "pendingTasks",
-                    "pendingDurations",
-                    "pendingAutoStarts",
-                    "pendingSelectedTasks",
-                )
-            )
+            queued_changes, failure = self._signout_queue_count(context)
+            if failure is not None:
+                return failure
+            assert queued_changes is not None
             queue_label = context.strings.plural("queue.changes", queued_changes)
             answer = QMessageBox.question(
                 self._ports.dialog_parent(),

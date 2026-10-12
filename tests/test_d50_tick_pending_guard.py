@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from pomodorough.controller_outcomes import EmitNotice, Render
+from pomodorough.sentry_monitoring import reset_clock_incident_budget
 from pomodorough.shared_core import SharedCoreError
 from pomodorough.timer_interaction_controller import (
     TimerInteractionContext,
@@ -116,6 +117,7 @@ class D50TickPendingGuardTests(unittest.TestCase):
             sqlite3.Error("db boom"),
             SharedCoreError("core boom"),
         ):
+            reset_clock_incident_budget()
             harness = _harness(
                 user={"id": "user-1"}, authenticated=True, busy=False,
             )

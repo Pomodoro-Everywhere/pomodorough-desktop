@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QSystemTr
 
 from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.localization import Strings
+from pomodorough.sentry_monitoring import reset_clock_incident_budget
 from pomodorough.shared_core import SharedCoreError
 from pomodorough.storage import Store, utc_timestamp
 from pomodorough.terminal import LocalTimer
@@ -1498,6 +1499,7 @@ class MainWindowDurationTests(unittest.TestCase):
             SharedCoreError("core boom"),
         ):
             with self.subTest(error=type(error).__name__):
+                reset_clock_incident_budget()
                 with (
                     patch.object(
                         self.store,

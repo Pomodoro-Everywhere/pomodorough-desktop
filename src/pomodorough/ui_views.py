@@ -27,10 +27,26 @@ from .arrivals_screen import ArrivalsScreen
 from .core import format_remaining
 from .network_screen import PRIVACY_POLICY_URL as PRIVACY_POLICY_URL, NetworkScreen
 from .secure_store import SecureStoreError, should_capture_secure_store_error
-from .sentry_monitoring import capture_exception
+from .sentry_monitoring import (
+    capture_exception,
+    note_clock_recovery,
+    should_capture_clock_failure,
+)
 from .shared_core import SharedCoreError
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
+
+_BASE_APP_PT = 9.0
+
+
+def _app_font_scale() -> float:
+    try:
+        app = QApplication.instance()
+        if app is not None and app.font().pointSizeF() > 0:
+            return float(app.font().pointSizeF()) / _BASE_APP_PT
+    except RuntimeError:
+        pass
+    return 1.0
 
 
 class ScreenNavigation(QWidget):
@@ -435,11 +451,13 @@ class MainWindowViewMixin:
         try:
             now_ms = self.store.effective_timer_now_ms(source_timer)
         except (OSError, sqlite3.Error, SharedCoreError) as error:
-            # D50: render clock guarded; infra reports, keep last-known.
-            capture_exception(error)
+            # D48-07: shared tick/render clock budget; keep last-known.
+            if should_capture_clock_failure(error):
+                capture_exception(error)
             return self._fallback_timer_now_ms()
         except ValueError:
             return self._fallback_timer_now_ms()
+        note_clock_recovery()
         self._last_timer_now_ms = now_ms
         return now_ms
 
@@ -588,9 +606,13 @@ class MainWindowViewMixin:
 
     def _refresh_stylesheet(self) -> None:
         palette_key = QApplication.palette().cacheKey()
-        if palette_key == self._palette_key:
+        font_scale = _app_font_scale()
+        if palette_key == self._palette_key and font_scale == getattr(
+            self, "_font_scale", None
+        ):
             return
         self._palette_key = palette_key
+        self._font_scale = font_scale
         self.setStyleSheet(
             "\n".join(  # noqa: FLY002 - screen styles compose independently
                 (
@@ -605,7 +627,8 @@ class MainWindowViewMixin:
 
     @staticmethod
     def _stylesheet() -> str:
-        return """
+        scale = _app_font_scale()
+        sheet = """
         QWidget#root { background: palette(window); color: palette(window-text); font-family: "Noto Sans", "Segoe UI", sans-serif; font-size: 12px; }
         QLabel#brand { color: palette(window-text); font-family: "DejaVu Sans Condensed"; font-size: 24px; font-weight: 900; letter-spacing: 2px; }
         QLabel#tagline, QLabel#device { color: palette(window-text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 2px; }
@@ -630,3 +653,14 @@ class MainWindowViewMixin:
         QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid palette(highlight); }
         QStatusBar { background: palette(window); color: palette(window-text); }
         """
+        return (
+            sheet.replace("font-size: 12px", f"font-size: {9.0 * scale:.1f}pt")
+            .replace("font-size: 24px", f"font-size: {18.0 * scale:.1f}pt")
+            .replace("font-size: 14px", f"font-size: {10.5 * scale:.1f}pt")
+            .replace("font-size: 9px", f"font-size: {6.75 * scale:.1f}pt")
+            .replace("min-height: 29px", f"min-height: {round(29 * scale)}px")
+            .replace("36px", f"{round(36 * scale)}px")
+            .replace("72px", f"{round(72 * scale)}px")
+            .replace("150px", f"{round(150 * scale)}px")
+            .replace("64px", f"{round(64 * scale)}px")
+        )

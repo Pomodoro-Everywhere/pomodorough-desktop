@@ -462,7 +462,7 @@ class TimerD41Tests(unittest.TestCase):
     def test_add_task_splits(self) -> None:
         for error in INFRA_ERRORS:
             harness = TimerHarness()
-            harness.store.set_selected_task_id.side_effect = error
+            harness.store.queue_task_operation_with_selection.side_effect = error
             with patch(
                 "pomodorough.timer_interaction_controller.task_from_title",
                 return_value={"id": "task-1", "title": "Task"},
@@ -474,7 +474,7 @@ class TimerD41Tests(unittest.TestCase):
             capture.assert_called_once()
             self._assert_infra(outcome, error)
         harness = TimerHarness()
-        harness.store.set_selected_task_id.side_effect = ValueError("bad add")
+        harness.store.queue_task_operation_with_selection.side_effect = ValueError("bad add")
         with patch(
             "pomodorough.timer_interaction_controller.task_from_title",
             return_value={"id": "task-1", "title": "Task"},

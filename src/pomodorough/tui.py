@@ -4,6 +4,7 @@ import argparse
 import curses
 import sqlite3
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -24,6 +25,16 @@ FAILURE_REPORT_INTERVAL_SECONDS = 5.0
 def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings:
     candidate = strings or getattr(timer, "strings", None)
     return candidate if isinstance(candidate, Strings) else Strings()
+
+
+def _wrap_line(text: str, width: int) -> list[str]:
+    usable = max(1, width - 1)
+    if not text:
+        return []
+    wrapped = textwrap.wrap(
+        text, width=usable, break_long_words=True, break_on_hyphens=False
+    )
+    return wrapped or [text[:usable]]
 
 
 def build_lines(
@@ -143,16 +154,36 @@ def _draw(
     strings = _timer_strings(timer, strings)
     height, width = screen.getmaxyx()
     state = timer.state(auto_finish=True)
-    lines = build_lines(
-        state, timer.retained_history(5), width, message, strings=strings
-    )
+    retained = timer.retained_history(5)
     screen.erase()
     if height < 12 or width < 40:
         screen.addnstr(
             0, 0, strings.text("tui.too_small"), max(1, width - 1)
         )
     else:
-        for row, line in enumerate(lines[: height - 1]):
+        timer_lines = _timer_lines(state, width, strings)
+        primary = strings.text("tui.keys_primary")
+        secondary = strings.text("tui.keys_secondary")
+        tagline = strings.text("brand.tagline")
+        core = [ln for ln in timer_lines if ln not in ("", tagline, primary, secondary)]
+        core_wrapped: list[str] = []
+        for line in core:
+            core_wrapped.extend(_wrap_line(line, width))
+        message_wrapped = _wrap_line(message, width) if message else []
+        primary_wrapped = _wrap_line(primary, width)
+        secondary_wrapped = _wrap_line(secondary, width)
+        quit_tail = secondary_wrapped[-1:] if secondary_wrapped else []
+        pending_wrapped: list[str] = []
+        for line in _pending_lines(state, strings):
+            pending_wrapped.extend(_wrap_line(line, width))
+        history_wrapped = _wrap_line(strings.text("arrivals.title"), width)
+        for line in _history_lines(retained, width, strings):
+            history_wrapped.extend(_wrap_line(line, width))
+        tagline_wrapped = _wrap_line(tagline, width)
+        keys_rest = primary_wrapped + secondary_wrapped[:-1]
+        ordered = core_wrapped + message_wrapped + quit_tail
+        ordered += pending_wrapped + keys_rest + history_wrapped + tagline_wrapped
+        for row, line in enumerate(ordered[:height]):
             attribute = curses.A_BOLD if row in (0, 3, 4) else curses.A_NORMAL
             screen.addnstr(row, 0, line, max(1, width - 1), attribute)
     screen.refresh()
@@ -173,9 +204,11 @@ def _draw_failure(screen: Any, error: Exception, strings: Strings) -> None:
     try:
         height, width = screen.getmaxyx()
         screen.erase()
-        lines = (str(error) or type(error).__name__, strings.text("tui.keys_secondary"))
+        error_text = str(error) or type(error).__name__
+        ordered = _wrap_line(error_text, width)
+        ordered += _wrap_line(strings.text("tui.keys_secondary"), width)
         if width > 1:
-            for row, line in enumerate(lines[:height]):
+            for row, line in enumerate(ordered[:height]):
                 screen.addnstr(row, 0, line, width - 1)
         screen.refresh()
     except curses.error:

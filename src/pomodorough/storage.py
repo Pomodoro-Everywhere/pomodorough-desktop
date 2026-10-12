@@ -2567,6 +2567,40 @@ class Store:
             self._capture_iroh_after_mutation_locked()
         return operation
 
+    def queue_task_operation_with_selection(
+        self, operation_type: str, task: dict[str, str],
+        selected_task_id: str | None, now_ms: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if operation_type not in {"upsert", "delete"}:
+            raise ValueError("Unsupported task operation.")
+        normalized = self._normalized_task_identity(task)
+        if not isinstance(selected_task_id, (str, type(None))) or (
+            isinstance(selected_task_id, str) and not selected_task_id
+        ):
+            raise ValueError("Selected task identity must be non-empty or null.")
+        use_server_clock = now_ms is None
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        with self._immediate_transaction():
+            self._ensure_no_pending_resolution()
+            operation = self._create_task_operation(
+                operation_type, normalized, now_ms, use_server_clock)
+            settings = self._normalize_settings(self.get_meta("settings", {}))
+            self._project_task_operation(operation, settings)
+            self.connection.execute(
+                "INSERT INTO pending_task_operations(id, payload) VALUES (?, ?)",
+                (operation["id"], json.dumps(operation, separators=(",", ":"))),
+            )
+            self._mark_never_sent_locked("taskOperations", operation["id"])
+            self._remember_known_task(normalized)
+            self._set_meta("hlc", {"wallMs": operation["hlcWallMs"],
+                                   "counter": operation["hlcCounter"]})
+            selection = self._queue_selected_task_operation(
+                selected_task_id, settings, now_ms,
+                use_server_clock=use_server_clock)
+            self._queue_retarget_for_active_focus_locked(selected_task_id, now_ms)
+            self._capture_iroh_after_mutation_locked()
+        return operation, selection
+
     def _normalized_task_identity(self, task: dict[str, str]) -> dict[str, str]:
         core = (
             self._shared_core

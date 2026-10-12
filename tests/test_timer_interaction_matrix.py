@@ -176,10 +176,11 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
             harness.tasks = [{"id": "task-1", "title": "Task"}]
             harness.controller.add_task("Task")
             harness.store.queue_task_operation.assert_not_called()
+            harness.store.queue_task_operation_with_selection.assert_not_called()
             harness.tasks = []
             harness.controller.add_task("Task")
-            harness.store.queue_task_operation.assert_called_once()
-            harness.store.set_selected_task_id.side_effect = ValueError("task failed")
+            harness.store.queue_task_operation_with_selection.assert_called_once()
+            harness.store.queue_task_operation_with_selection.side_effect = ValueError("task failed")
             self.assertIsInstance(harness.controller.add_task("Task").effects[0], EmitNotice)
 
     def test_delete_task_covers_blocked_missing_selected_and_unselected(self) -> None:
@@ -191,10 +192,11 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.known_tasks["task-1"] = {"id": "task-1", "title": "Task"}
         harness.settings["selectedTaskId"] = "task-1"
         harness.controller.delete_task("task-1")
-        harness.store.set_selected_task_id.assert_called_once_with(None)
+        harness.store.queue_task_operation_with_selection.assert_called_once_with(
+            "delete", {"id": "task-1", "title": "Task"}, None)
         harness.settings["selectedTaskId"] = "task-2"
         harness.controller.delete_task("task-1")
-        self.assertEqual(harness.store.set_selected_task_id.call_count, 1)
+        self.assertEqual(harness.store.queue_task_operation_with_selection.call_count, 1)
         harness.store.queue_task_operation.side_effect = OSError("delete failed")
         self.assertIsInstance(harness.controller.delete_task("task-1").effects[0], EmitNotice)
 
