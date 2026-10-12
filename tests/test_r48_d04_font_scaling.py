@@ -83,15 +83,22 @@ def _window_overlaps(window: QWidget, screen) -> list[tuple[str, str]]:
 
 
 def _assert_focus_reaches(app: QApplication, screen) -> None:
+    scroll = getattr(screen, "_scroll", None)
     for name in KEY_CONTROLS:
         widget = getattr(screen, name, None)
         if widget is None or not widget.isEnabled() or not widget.isVisible():
             continue
         if widget.focusPolicy() == Qt.FocusPolicy.NoFocus:
             continue
+        if scroll is not None:
+            scroll.ensureWidgetVisible(widget)
+            _process(app)
         widget.setFocus()
         _process(app)
         assert widget.hasFocus(), name
+        if scroll is not None:
+            scroll.ensureWidgetVisible(widget)
+            _process(app)
         assert not widget.visibleRegion().isEmpty(), name
 
 
