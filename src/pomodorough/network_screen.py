@@ -177,6 +177,10 @@ class NetworkScreen(QFrame):
         row = QHBoxLayout()
         label = QLabel(self.strings.text("account.heading"))
         label.setObjectName("microLabel")
+        # D48: pseudo-locale strings at 1.5x exceed the 640px viewport;
+        # wrap the heading so the row keeps both buttons inside the scroll
+        # viewport (Qt will not horizontal-scroll them into view in RTL).
+        label.setWordWrap(True)
         self.privacy_policy_button = QPushButton(
             self.strings.text("account.privacy_policy")
         )
@@ -281,21 +285,29 @@ class NetworkScreen(QFrame):
         layout.addWidget(self.copy_invite_button, 2, 1)
 
     def _build_actions(self, layout: QGridLayout) -> None:
-        row = QHBoxLayout()
+        # D48: one line of four buttons forces a ~580px grid minimum, which
+        # overflows the 640px viewport at 1.5x pseudo-locale fonts and hides
+        # the account row's buttons in RTL (the scroller will not reveal
+        # them). Two lines keep every button fully visible via vertical
+        # scroll on every platform.
+        primary = QHBoxLayout()
         self.refresh_invite_button = QPushButton(
             self.strings.text("network.refresh_ticket")
         )
         self.refresh_invite_button.clicked.connect(self.refresh_invite_requested)
         self.sync_iroh_button = QPushButton(self.strings.text("network.sync_now"))
         self.sync_iroh_button.clicked.connect(self.sync_now_requested)
+        primary.addWidget(self.refresh_invite_button)
+        primary.addWidget(self.sync_iroh_button)
+        primary.addStretch()
+        layout.addLayout(primary, 3, 0, 1, 2)
+        danger = QHBoxLayout()
         self.leave_room_button = QPushButton(self.strings.text("network.leave_room"))
         self.leave_room_button.setObjectName("dangerButton")
         self.leave_room_button.clicked.connect(self.leave_room_requested)
-        row.addWidget(self.refresh_invite_button)
-        row.addWidget(self.sync_iroh_button)
-        row.addStretch()
-        row.addWidget(self.leave_room_button)
-        layout.addLayout(row, 3, 0, 1, 2)
+        danger.addStretch()
+        danger.addWidget(self.leave_room_button)
+        layout.addLayout(danger, 4, 0, 1, 2)
 
     def _build_footer(self, layout: QVBoxLayout) -> None:
         self.network_details = QLabel(self.strings.text("network.no_room"))
