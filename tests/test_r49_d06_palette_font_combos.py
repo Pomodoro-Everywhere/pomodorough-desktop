@@ -93,7 +93,7 @@ def test_font_then_palette_preserves_new_scale(app, tmp_path):
             _process(app, 6)
             try:
                 assert "font-size: 18.0pt" in _root_block(window.styleSheet())
-                assert window.primary_button.fontMetrics().lineSpacing() == 33
+                assert 30 <= window.primary_button.fontMetrics().lineSpacing() <= 36
             finally:
                 QApplication.setPalette(QApplication.style().standardPalette())
                 _process(app)
@@ -132,4 +132,5 @@ def test_synthetic_application_font_change_refreshes_sheet(app, tmp_path):
             )
             _process(app, 6)
             assert "font-size: 9.0pt" in _root_block(window.styleSheet())
-            assert window.primary_button.fontMetrics().lineSpacing() == 17
+            # Qt font metrics differ by platform (macOS 17, Ubuntu 16 for 9pt).
+            assert 15 <= window.primary_button.fontMetrics().lineSpacing() <= 19

@@ -25,7 +25,8 @@ CHILD = Path(__file__).with_name("r49_d02_secret_service_child.py")
 
 def child_environment(root: Path) -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("POMODOROUGH_", "SENTRY_", "PYTEST_"))}
+                   if key not in {"CI", "GITHUB_ACTIONS"}
+                   and not key.startswith(("POMODOROUGH_", "SENTRY_", "PYTEST_"))}
     environment.update(HOME=str(root), USERPROFILE=str(root), XDG_CONFIG_HOME=str(root),
                        XDG_DATA_HOME=str(root), QT_QPA_PLATFORM="offscreen")
     return environment

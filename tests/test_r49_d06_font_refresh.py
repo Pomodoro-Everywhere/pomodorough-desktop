@@ -83,7 +83,8 @@ def test_runtime_font_change_refreshes_sheet_and_geometry(app, tmp_path):
         with _main_window(app, tmp_path) as window:
             assert "font-size: 9.0pt" in _root_block(window.styleSheet())
             before_ls = window.primary_button.fontMetrics().lineSpacing()
-            assert before_ls == 17
+            # Qt font metrics differ by platform (macOS 17, Ubuntu 16 for 9pt). Keep relative intent.
+            assert 15 <= before_ls <= 19
             before_row = window.task_table.rowHeight(0)
             before_invite = window.invite_input.minimumHeight()
             scaled = QFont(QApplication.font())
@@ -92,7 +93,7 @@ def test_runtime_font_change_refreshes_sheet_and_geometry(app, tmp_path):
             _process(app, 8)
             # No private refresh call here; production changeEvent must act.
             assert "font-size: 18.0pt" in _root_block(window.styleSheet())
-            assert window.primary_button.fontMetrics().lineSpacing() == 33
+            assert 30 <= window.primary_button.fontMetrics().lineSpacing() <= 36
             assert window.primary_button.fontMetrics().lineSpacing() > before_ls
             assert window.task_table.rowHeight(0) > before_row
             assert window.invite_input.minimumHeight() > before_invite
