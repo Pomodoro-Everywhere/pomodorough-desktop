@@ -51,6 +51,7 @@ def assert_failure(receipt: dict, detail: str) -> None:
     assert receipt["events"][0]["exception"]["values"][-1]["type"] == "SecureStoreError"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux secret-tool/GNOME Keyring requires Unix")
 def test_fresh_missing_executable_reports_actionable_failure_once(tmp_path):
     environment = child_environment(tmp_path)
     environment["PATH"] = str(tmp_path / "empty-path")
@@ -60,6 +61,7 @@ def test_fresh_missing_executable_reports_actionable_failure_once(tmp_path):
     assert receipt["events"][0]["exception"]["values"][0]["type"] == "FileNotFoundError"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux secret-tool/GNOME Keyring requires Unix")
 @pytest.mark.parametrize("mode", ["signed-out", "legacy"])
 def test_missing_executable_retains_legacy_authority(tmp_path, mode):
     environment = child_environment(tmp_path)

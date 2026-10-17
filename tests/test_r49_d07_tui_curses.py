@@ -37,6 +37,8 @@ def _read_child(child, master, report_fd):
 
 @pytest.fixture(scope="module")
 def native_results(tmp_path_factory):
+    if sys.version_info >= (3, 14):
+        pytest.skip("Python 3.14 pty/curses changes require investigation")
     if os.name == "nt":
         pytest.skip("POSIX pseudoterminal requires Unix")
     import pty

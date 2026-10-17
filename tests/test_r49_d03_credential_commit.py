@@ -92,6 +92,7 @@ def _assert_deletion_matches(store: TokenStore, refresh: str) -> None:
         assert store._stored_credentials_match_identity(stored, identity)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX atomic replace semantics require Unix")
 def test_identity_replace_failure_keeps_secret_and_memory_new() -> None:
     with TemporaryDirectory() as directory:
         tmp = Path(directory)
@@ -128,6 +129,7 @@ def test_identity_replace_failure_keeps_secret_and_memory_new() -> None:
         _assert_deletion_matches(store, "new-refresh")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX atomic replace semantics require Unix")
 def test_identity_replace_failure_restart_recovers_without_retry() -> None:
     with TemporaryDirectory() as directory:
         tmp = Path(directory)

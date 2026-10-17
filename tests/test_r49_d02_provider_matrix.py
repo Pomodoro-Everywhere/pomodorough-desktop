@@ -26,6 +26,7 @@ def _failing_tool(tmp_path, message="org.freedesktop.secrets unavailable"):
     return executable
 
 
+@unittest.skipIf(os.name == "nt", "Linux Secret Service POSIX shebang requires Unix")
 class ProviderUnavailableMatrixTests(unittest.TestCase):
     def test_save_load_delete_share_actionable_provider_error(self) -> None:
         import tempfile

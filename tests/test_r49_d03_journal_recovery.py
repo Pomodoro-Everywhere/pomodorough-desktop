@@ -87,6 +87,7 @@ class JournalBoundaryTests(unittest.TestCase):
                 "new-refresh",
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX atomic replace semantics require Unix")
     def test_recovery_replay_failure_reports_during_recovery(self) -> None:
         with TemporaryDirectory() as name:
             tmp = Path(name)
