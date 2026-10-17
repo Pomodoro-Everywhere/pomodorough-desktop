@@ -1467,8 +1467,7 @@ class TestRunnerGateTests(unittest.TestCase):
             sys.modules.pop("pytest", None)
             sys.modules.pop("unittest", None)
             sys.modules["sentry_sdk"] = sdk
-            with patch.dict(os.environ):
-                os.environ.pop(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR, None)
+            with patch.dict(os.environ, {}, clear=True):
                 self.assertTrue(init_sentry(dsn=DSN, force=False))
         sdk.init.assert_called_once()
 

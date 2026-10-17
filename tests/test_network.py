@@ -1661,8 +1661,18 @@ class TokenStoreTests(unittest.TestCase):
                 ):
                     store.save(response)
 
-                self.assertEqual(len(replacements), 1)
-                mode, document, previous = replacements[0]
+                # R49-D03 journal adds one durable write before the fallback.
+                # First replacement is the credential-commit journal, second
+                # is the fallback itself which retains the original contract.
+                self.assertEqual(len(replacements), 2)
+                journal_mode, journal_document, journal_previous = replacements[0]
+                if os.name == "posix":
+                    self.assertEqual(journal_mode, 0o600)
+                self.assertEqual(journal_document["stored"], response)
+                self.assertEqual(
+                    journal_previous, "previous" if existing_mode is not None else None
+                )
+                mode, document, previous = replacements[1]
                 if os.name == "posix":
                     self.assertEqual(mode, 0o600)
                 self.assertEqual(document, response)
@@ -1888,7 +1898,11 @@ class TokenStoreTests(unittest.TestCase):
                 store.save(response)
 
             self.assertFalse(store.fallback_path.exists())
-            self.assertEqual(replacements, [expected])
+            # R49-D03 journal is the first durable replace; fallback is second.
+            self.assertEqual(len(replacements), 2)
+            self.assertEqual(replacements[1], expected)
+            self.assertEqual(replacements[0]["stored"], expected)
+            self.assertEqual(replacements[0]["version"], 1)
         run.assert_called_once_with(
             [
                 "secret-tool",

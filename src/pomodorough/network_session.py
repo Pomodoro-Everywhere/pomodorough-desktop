@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
 
+from .secure_store import TokenCommitPendingError
+
 
 class ApiError(RuntimeError):
     def __init__(
@@ -89,7 +91,15 @@ class AuthenticatedSession:
 
     def accept_tokens(self, response: dict[str, Any]) -> None:
         tokens = self._parse_tokens(response)
-        self.token_store.save(response)
+        try:
+            self.token_store.save(response)
+        except TokenCommitPendingError as error:
+            if error.during_recovery:
+                raise
+            self.state.access_token = tokens.access_token
+            self.state.refresh_token = tokens.refresh_token
+            self.state.access_expires_at = tokens.access_expires_at
+            raise
         self.state.access_token = tokens.access_token
         self.state.refresh_token = tokens.refresh_token
         self.state.access_expires_at = tokens.access_expires_at

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -30,6 +30,9 @@ class TasksScreen(QFrame):
         super().__init__()
         self.strings = strings
         self._render_signature: tuple[Any, ...] | None = None
+        self._row_resize_timer = QTimer(self)
+        self._row_resize_timer.setSingleShot(True)
+        self._row_resize_timer.timeout.connect(self._resize_task_rows)
         self.setObjectName("ticket")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 18)
@@ -89,6 +92,11 @@ class TasksScreen(QFrame):
         )
         self._configure_table_headers()
         self.task_table.verticalHeader().hide()
+        self.task_table.installEventFilter(self)
+        self.task_table.viewport().installEventFilter(self)
+        self.task_table.horizontalHeader().sectionResized.connect(
+            self._schedule_row_resize
+        )
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.task_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -97,6 +105,27 @@ class TasksScreen(QFrame):
         self.tasks_empty.setObjectName("emptyState")
         self.tasks_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.tasks_empty)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.StyleChange,
+            QEvent.Type.LayoutRequest,
+        ):
+            self._schedule_row_resize()
+        return super().eventFilter(watched, event)
+
+    def _schedule_row_resize(self) -> None:
+        # Wait for inherited styles and cell widgets to finish updating their hints.
+        self._row_resize_timer.start()
+
+    def _resize_task_rows(self) -> None:
+        self.task_table.resizeRowsToContents()
+        self.task_table.doItemsLayout()
+        focused_id, row = self._focused_delete_id()
+        if focused_id is None:
+            return
+        self.task_table.scrollToItem(self.task_table.item(row, 0))
 
     def _configure_table_headers(self) -> None:
         alignments = (
@@ -139,6 +168,7 @@ class TasksScreen(QFrame):
         self.task_table.setVisible(bool(tasks))
         self.tasks_empty.setVisible(not tasks)
         self._restore_delete_focus(focused_id, focused_row)
+        self._schedule_row_resize()
 
     @staticmethod
     def _signature(
@@ -257,6 +287,7 @@ class TasksScreen(QFrame):
         delete.setProperty("taskId", task_id)
         delete.setAccessibleName(accessible)
         delete.setEnabled(mutations_enabled)
+        delete.installEventFilter(self)
         delete.clicked.connect(
             lambda checked=False, task_id=task_id: self.delete_task_requested.emit(
                 task_id

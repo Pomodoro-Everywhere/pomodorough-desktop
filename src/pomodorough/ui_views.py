@@ -30,7 +30,9 @@ from .secure_store import SecureStoreError, should_capture_secure_store_error
 from .sentry_monitoring import (
     capture_exception,
     note_clock_recovery,
+    note_room_read_recovery,
     should_capture_clock_failure,
+    should_capture_room_read_failure,
 )
 from .shared_core import SharedCoreError
 from .tasks_screen import TasksScreen
@@ -534,18 +536,21 @@ class MainWindowViewMixin:
         try:
             room = self.store.iroh_room()
         except SecureStoreError as error:
-            # D73: infra-backed secure-store failures (OSError/subprocess
-            # cause) report; malformed-data stays silent like validation.
+            # R49-D08: infra-backed secure-store failures share the
+            # room-read budget; malformed-data stays silent like validation.
             if should_capture_secure_store_error(error):
-                capture_exception(error)
+                if should_capture_room_read_failure(error):
+                    capture_exception(error)
             return getattr(self, "_cached_iroh_room", None)
         except (OSError, sqlite3.Error) as error:
-            # D50: per-250ms read guarded; reuse cached room on infra failure.
-            capture_exception(error)
+            # R49-D08: per-render room-read budget; reuse cached room.
+            if should_capture_room_read_failure(error):
+                capture_exception(error)
             return getattr(self, "_cached_iroh_room", None)
         except (ValueError, KeyError):
             # validation stays silent; reuse cached room.
             return getattr(self, "_cached_iroh_room", None)
+        note_room_read_recovery()
         self._cached_iroh_room = room
         return room
 

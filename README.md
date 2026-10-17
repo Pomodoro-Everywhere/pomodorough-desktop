@@ -33,7 +33,7 @@ on screen, then reconciled with the Pomodorough service when signed in.
 - Durable SQLite command, task, and duration queues
 - Fully functional offline mode without an account
 - Google OAuth with PKCE and a temporary loopback callback
-- Secret Service or KWallet token storage on Linux with a user-profile file fallback
+- Secret Service token storage on Linux, including Secret Service-enabled KWallet
 - Server-Sent Event revision stream for low-latency cross-device updates
 - Deterministic hybrid logical clock merge and optimistic local replay
 - User-local Linux installation compatible with SteamOS's immutable root
@@ -42,7 +42,8 @@ on screen, then reconciled with the Pomodorough service when signed in.
 
 - Python 3.11 or newer
 - Windows 10 or newer, or a Linux desktop session, for the Qt application
-- Optional Linux `secret-tool` integration for Secret Service or KWallet storage
+- Linux account and Iroh features require `secret-tool` and a running, unlocked
+  Secret Service provider on the desktop session D-Bus
 - Optional [`uv`](https://docs.astral.sh/uv/) for faster installation
 
 PySide6 is installed as a Python dependency.
@@ -98,26 +99,55 @@ package manager. For example:
 
 ```sh
 # Debian or Ubuntu
-sudo apt install python3 python3-venv curl
+sudo apt install python3 python3-venv curl libsecret-tools gnome-keyring
 
 # Fedora
-sudo dnf install python3 curl
+sudo dnf install python3 curl libsecret gnome-keyring
 
 # Arch Linux
-sudo pacman -S python curl
+sudo pacman -S python curl libsecret gnome-keyring
 ```
 
 Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.48.0/pomodorough_linux-0.48.0.tar.gz
-tar -xzf pomodorough_linux-0.48.0.tar.gz
-cd pomodorough_linux-0.48.0
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.49.0/pomodorough_linux-0.49.0.tar.gz
+tar -xzf pomodorough_linux-0.49.0.tar.gz
+cd pomodorough_linux-0.49.0
 ./deploy/install.sh
 ```
 
 No system files are modified.
+
+### Linux secure storage
+
+The Python wheel, source installation, and user-local installer cannot install
+system packages. Install the prerequisites above before using Google sign-in or
+Iroh. GNOME Keyring supplies `org.freedesktop.secrets`; KWallet works only when
+its Secret Service interface is enabled. Start and unlock the provider through
+your desktop session. Run Pomodorough as that desktop user, not through `sudo`.
+
+Check availability without writing credentials:
+
+```sh
+python3 -c 'from pomodorough.secure_store import PlatformSecretStore; ready, reason = PlatformSecretStore().availability(); print(reason); raise SystemExit(0 if ready else 1)'
+```
+
+Use the Python executable from the installed virtual environment when needed,
+such as `~/.local/share/pomodorough/venv/bin/python`. A successful check proves
+service access, not permission to save into a locked keyring. If storage is
+unavailable or locked, the application reports the failure and the steps to
+retry. It does not switch new credentials to plaintext files. Timer, task, CLI,
+and TUI operations remain available offline.
+
+Existing mode-0600 `session.json` credentials remain readable, including when
+Secret Service is unavailable. A signed-out tombstone remains authoritative.
+Keep the file private and do not delete it to work around a provider error.
+The next successful credential save uses Secret Service and removes the legacy
+file. The legacy file backend remains available to callers that explicitly
+construct `TokenStore(device_id, secret_store=None)`; normal application wiring does not
+select it automatically.
 
 ### SteamOS
 
@@ -131,25 +161,37 @@ PATH="$HOME/.nix-profile/bin:$PATH" \
   ./deploy/install.sh
 ```
 
+For secure storage, also install `libsecret` in the Nix profile or use Flatpak
+below. Enable a Secret Service provider in SteamOS Desktop Mode and unlock its
+keyring. The user-local installer reports missing tooling without changing the
+immutable system root.
+
 ### NixOS
 
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.48.0
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.49.0
 ```
+
+The package wrapper includes `secret-tool` from `libsecret`. Enable a provider
+in the desktop session, for example `services.gnome.gnome-keyring.enable = true;`
+in the NixOS configuration, then log in again and unlock the keyring.
 
 ### Flatpak
 
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.48.0/Pomodorough-0.48.0-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.48.0-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.49.0/Pomodorough-0.49.0-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.49.0-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 
 The bundle is distributed only through GitHub Releases, not Flathub.
+It includes `secret-tool` and permission to contact `org.freedesktop.secrets`.
+The host desktop must still provide and unlock GNOME Keyring or a
+Secret Service-enabled KWallet. No keyring provider runs inside the sandbox.
 
 ### Homebrew
 
@@ -227,8 +269,10 @@ Override the OAuth configuration with either
 ```
 
 Any replacement client ID must be present in the server's
-`GOOGLE_NATIVE_CLIENT_IDS`. Refresh tokens are stored through Secret Service
-when `secret-tool` is available, with a mode-0600 JSON file fallback.
+`GOOGLE_NATIVE_CLIENT_IDS`. Linux refresh tokens use Secret Service with the
+[Linux secure storage prerequisites](#linux-secure-storage). Missing tooling
+or an unavailable provider blocks secure credential access with an actionable
+error; it never enables a new plaintext file fallback.
 
 ## Error-reporting telemetry
 

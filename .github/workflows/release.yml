@@ -237,7 +237,10 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             libegl1 \
             libgl1 \
-            libxkbcommon-x11-0
+            libxkbcommon-x11-0 \
+            dbus \
+            libsecret-tools \
+            gnome-keyring
 
       - name: Download Python package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -246,6 +249,8 @@ jobs:
           path: dist
 
       - name: Install and test wheel
+        env:
+          POMODOROUGH_SENTRY_DISABLE: "1"
         run: |
           python -m venv .release-wheel
           .release-wheel/bin/python -m pip install dist/*.whl pytest==9.1.1
@@ -253,10 +258,19 @@ jobs:
           QT_QPA_PLATFORM=offscreen \
             .release-wheel/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-wheel/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+          # shellcheck disable=SC2016 # The child shell expands its own provider environment.
+          dbus-run-session -- bash -euo pipefail -c '
+            eval "$(printf "\n" | gnome-keyring-daemon --components=secrets --unlock)"
+            .release-wheel/bin/python -m pomodorough.oauth_artifact_verifier --platform-store-self-test
+          '
           POMODOROUGH_SENTRY_DISABLE=1 QT_QPA_PLATFORM=offscreen .release-wheel/bin/python -m pytest tests -v
+          # shellcheck disable=SC2016 # The child shell expands its own provider environment.
           POMODOROUGH_SCREENSHOT="$PWD/.release-wheel-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
-            timeout 30s .release-wheel/bin/pomodorough \
+            dbus-run-session -- bash -euo pipefail -c '
+              eval "$(printf "\n" | gnome-keyring-daemon --components=secrets --unlock)"
+              exec timeout 30s .release-wheel/bin/pomodorough
+            ' \
             2>.release-wheel-smoke.stderr
           test -s .release-wheel-smoke.png
           if grep -q 'Traceback (most recent call last)' .release-wheel-smoke.stderr; then
@@ -284,7 +298,10 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             libegl1 \
             libgl1 \
-            libxkbcommon-x11-0
+            libxkbcommon-x11-0 \
+            dbus \
+            libsecret-tools \
+            gnome-keyring
 
       - name: Download Python package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -293,6 +310,8 @@ jobs:
           path: dist
 
       - name: Install and test source distribution
+        env:
+          POMODOROUGH_SENTRY_DISABLE: "1"
         run: |
           python -m venv .release-sdist
           .release-sdist/bin/python -m pip install dist/*.tar.gz pytest==9.1.1
@@ -300,10 +319,19 @@ jobs:
           QT_QPA_PLATFORM=offscreen \
             .release-sdist/bin/python -m pomodorough.oauth_artifact_verifier --self-test
           .release-sdist/bin/python -c 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+          # shellcheck disable=SC2016 # The child shell expands its own provider environment.
+          dbus-run-session -- bash -euo pipefail -c '
+            eval "$(printf "\n" | gnome-keyring-daemon --components=secrets --unlock)"
+            .release-sdist/bin/python -m pomodorough.oauth_artifact_verifier --platform-store-self-test
+          '
           POMODOROUGH_SENTRY_DISABLE=1 QT_QPA_PLATFORM=offscreen .release-sdist/bin/python -m pytest tests -v
+          # shellcheck disable=SC2016 # The child shell expands its own provider environment.
           POMODOROUGH_SCREENSHOT="$PWD/.release-sdist-smoke.png" \
             QT_QPA_PLATFORM=offscreen \
-            timeout 30s .release-sdist/bin/pomodorough \
+            dbus-run-session -- bash -euo pipefail -c '
+              eval "$(printf "\n" | gnome-keyring-daemon --components=secrets --unlock)"
+              exec timeout 30s .release-sdist/bin/pomodorough
+            ' \
             2>.release-sdist-smoke.stderr
           test -s .release-sdist-smoke.png
           if grep -q 'Traceback (most recent call last)' .release-sdist-smoke.stderr; then

@@ -76,10 +76,13 @@ def assert_full_suite_environment(workflow: str, test_step: str, install_step: s
     assert f"      - name: {test_step}\n" in job
     assert f"      - name: {install_step}\n" in job
     assert not workflow_environment(job, 4), "Unreviewed job environment"
-    assert not workflow_environment(workflow_step(job, install_step), 8), "Unreviewed install environment"
+    release_environment = {"POMODOROUGH_SENTRY_DISABLE": '"1"'}
+    assert workflow_environment(workflow_step(job, install_step), 8) == (
+        {} if python == "python" else release_environment
+    ), "Unreviewed install environment"
     expected = {"QT_QPA_PLATFORM": "offscreen", "UV_PYTHON": "${{ matrix.python-version }}"}
     assert workflow_environment(workflow_step(job, test_step), 8) == (
-        expected if python == "python" else {}
+        expected if python == "python" else release_environment
     ), "Unreviewed test environment"
     if python != "python":
         assert "    needs: package\n" in job, "Parallel distribution test must follow package build"
@@ -319,6 +322,20 @@ def test_release_runner_rejects_command_drift(
                                    test_step, install_step, python, artifact)
     with pytest.raises(AssertionError, match="Unsupported full-suite runner"):
         fixture_test_command(shlex.split(changed))
+
+
+@pytest.mark.parametrize("filename,test_step,install_step,python,artifact", FULL_RUNS[1:])
+@pytest.mark.parametrize("replacement", ["", '        env:\n          POMODOROUGH_SENTRY_DISABLE: "0"\n'])
+def test_release_runner_requires_complete_process_suppression(
+    filename, test_step, install_step, python, artifact, replacement,
+):
+    workflow = (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
+    step = workflow_step(workflow, test_step)
+    environment = '        env:\n          POMODOROUGH_SENTRY_DISABLE: "1"\n'
+    assert environment in step
+    changed = workflow.replace(step, step.replace(environment, replacement, 1), 1)
+    with pytest.raises(AssertionError, match="environment"):
+        assert_full_suite_contract(changed, test_step, install_step, python, artifact)
 
 
 @pytest.mark.parametrize("filename,test_step,install_step,python,artifact", FULL_RUNS)

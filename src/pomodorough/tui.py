@@ -4,10 +4,12 @@ import argparse
 import curses
 import sqlite3
 import sys
-import textwrap
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Sequence
+
+from wcwidth import SequenceTextWrapper, iter_graphemes, wcwidth, wcswidth
 
 from .core import BREAK_PHASES
 from .localization import Strings
@@ -27,14 +29,74 @@ def _timer_strings(timer: LocalTimer, strings: Strings | None = None) -> Strings
     return candidate if isinstance(candidate, Strings) else Strings()
 
 
+def _display_width(text: str) -> int:
+    # Unicode 18, narrow ambiguous characters. Budget for both modern grapheme
+    # rendering and curses' scalar writer, which can expand ZWJ/modifier sequences.
+    return sum(
+        max(wcswidth(cluster), sum(max(0, wcwidth(char)) for char in cluster))
+        for cluster in iter_graphemes(text)
+    )
+
+
+class _TerminalTextWrapper(SequenceTextWrapper):
+    def _width(self, text: str) -> int:
+        return _display_width(text)
+
+
+def _display_text(text: str) -> str:
+    # Sanitize only the display copy. ZWJ/ZWNJ and emoji tags belong to clusters.
+    return "".join(
+        " " if char in "\n\r\v\f" else
+        "?" if unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+        and char not in {"\u200c", "\u200d"} and not 0xE0020 <= ord(char) <= 0xE007F
+        else char
+        for char in text.expandtabs()
+    )
+
+
+def _split_cells(text: str, cells: int) -> tuple[str, str]:
+    used = 0
+    end = 0
+    for cluster in iter_graphemes(text):
+        used += _display_width(cluster)
+        if used > cells:
+            break
+        end += len(cluster)
+    return text[:end], text[end:]
+
+
 def _wrap_line(text: str, width: int) -> list[str]:
     usable = max(1, width - 1)
-    if not text:
-        return []
-    wrapped = textwrap.wrap(
-        text, width=usable, break_long_words=True, break_on_hyphens=False
+    display = "".join(
+        cluster if 0 < _display_width(cluster) <= usable else "?"
+        for cluster in iter_graphemes(_display_text(text))
     )
-    return wrapped or [text[:usable]]
+    return _TerminalTextWrapper(
+        width=usable, control_codes="strict", break_on_hyphens=False,
+    ).wrap(display)
+
+
+def _feedback_lines(message: str, height: int, width: int) -> list[str]:
+    rows = max(0, height)
+    lines = _wrap_line(message, width)
+    if len(lines) <= rows:
+        return lines
+    if not rows:
+        return []
+    lines = lines[:rows]
+    prefix, _ = _split_cells(lines[-1], max(0, width - 2))
+    lines[-1] = prefix.rstrip() + "…"
+    return lines
+
+
+def _reserved_lines(message: str, height: int, width: int, strings: Strings) -> list[str]:
+    if height < 2:
+        return _wrap_line(message, width)[:max(0, height)]
+    secondary = strings.text("tui.keys_secondary")
+    # The key is fixed; its label and trailing catalog decoration are localized.
+    quit_tail = _wrap_line("q " + secondary.rsplit("q ", 1)[1], width)[:height]
+    feedback_rows = height - len(quit_tail)
+    return _feedback_lines(message, feedback_rows, width) + quit_tail
 
 
 def build_lines(
@@ -161,32 +223,36 @@ def _draw(
             0, 0, strings.text("tui.too_small"), max(1, width - 1)
         )
     else:
-        timer_lines = _timer_lines(state, width, strings)
-        primary = strings.text("tui.keys_primary")
-        secondary = strings.text("tui.keys_secondary")
-        tagline = strings.text("brand.tagline")
-        core = [ln for ln in timer_lines if ln not in ("", tagline, primary, secondary)]
-        core_wrapped: list[str] = []
-        for line in core:
-            core_wrapped.extend(_wrap_line(line, width))
-        message_wrapped = _wrap_line(message, width) if message else []
-        primary_wrapped = _wrap_line(primary, width)
-        secondary_wrapped = _wrap_line(secondary, width)
-        quit_tail = secondary_wrapped[-1:] if secondary_wrapped else []
-        pending_wrapped: list[str] = []
-        for line in _pending_lines(state, strings):
-            pending_wrapped.extend(_wrap_line(line, width))
-        history_wrapped = _wrap_line(strings.text("arrivals.title"), width)
-        for line in _history_lines(retained, width, strings):
-            history_wrapped.extend(_wrap_line(line, width))
-        tagline_wrapped = _wrap_line(tagline, width)
-        keys_rest = primary_wrapped + secondary_wrapped[:-1]
-        ordered = core_wrapped + message_wrapped + quit_tail
-        ordered += pending_wrapped + keys_rest + history_wrapped + tagline_wrapped
-        for row, line in enumerate(ordered[:height]):
+        ordered = _screen_lines(state, retained, height, width, message, strings)
+        for row, line in enumerate(ordered):
             attribute = curses.A_BOLD if row in (0, 3, 4) else curses.A_NORMAL
-            screen.addnstr(row, 0, line, max(1, width - 1), attribute)
+            # Rows already fit display cells; curses limits characters, including combining marks.
+            screen.addnstr(row, 0, line, max(width - 1, len(line)), attribute)
     screen.refresh()
+
+
+def _screen_lines(
+    state: dict[str, Any], history: list[dict[str, Any]],
+    height: int, width: int, message: str, strings: Strings,
+) -> list[str]:
+    primary = strings.text("tui.keys_primary")
+    secondary = strings.text("tui.keys_secondary")
+    tagline = strings.text("brand.tagline")
+    core = [
+        line for line in _timer_lines(state, width, strings)
+        if line not in ("", tagline, primary, secondary)
+    ]
+    core_wrapped = [row for line in core for row in _wrap_line(line, width)]
+    # Keep one row per timer field, but a long task cannot consume feedback space.
+    reserved = _reserved_lines(message, max(0, height - len(core)), width, strings)
+    content_rows = height - len(reserved)
+    ordered = core_wrapped[:content_rows] + reserved
+    optional = _pending_lines(state, strings)
+    optional += [primary, secondary]
+    optional += [strings.text("arrivals.title")]
+    optional += _history_lines(history, width, strings) + [tagline]
+    optional_wrapped = [row for line in optional for row in _wrap_line(line, width)]
+    return ordered + optional_wrapped[:height - len(ordered)]
 
 
 def _report_loop_failure(error: Exception, next_capture_at: float) -> float:
@@ -205,11 +271,11 @@ def _draw_failure(screen: Any, error: Exception, strings: Strings) -> None:
         height, width = screen.getmaxyx()
         screen.erase()
         error_text = str(error) or type(error).__name__
-        ordered = _wrap_line(error_text, width)
+        ordered = _reserved_lines(error_text, height, width, strings)
         ordered += _wrap_line(strings.text("tui.keys_secondary"), width)
         if width > 1:
             for row, line in enumerate(ordered[:height]):
-                screen.addnstr(row, 0, line, width - 1)
+                screen.addnstr(row, 0, line, max(width - 1, len(line)))
         screen.refresh()
     except curses.error:
         # A resize/unavailable output may prevent even the fallback. Input

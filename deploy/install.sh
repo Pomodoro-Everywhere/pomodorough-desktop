@@ -11,6 +11,14 @@ ICON_HOME="$DATA_HOME/icons/hicolor/scalable/apps"
 PYTHON=${POMODOROUGH_PYTHON:-python3}
 INSTALL_TARGET=$ROOT
 
+if [ "$(uname -s)" = Linux ] && ! command -v secret-tool >/dev/null 2>&1; then
+  printf '%s\n' \
+    'Linux secure storage is unavailable: secret-tool was not found.' \
+    'Install libsecret-tools (Debian/Ubuntu) or libsecret (Fedora/Arch/Nix).' \
+    'Start and unlock GNOME Keyring or Secret Service-enabled KWallet in your desktop session.' \
+    'Offline timer use remains available. New credentials will not fall back to plaintext.' >&2
+fi
+
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:aarch64)
     GLIBC_VERSION=$(ldd --version 2>&1 | sed -n '1{s/.* \([0-9][0-9]*\.[0-9][0-9]*\)$/\1/p;q;}')
@@ -35,6 +43,12 @@ if command -v uv >/dev/null 2>&1; then
   uv pip install --python "$VENV/bin/python" --upgrade "$INSTALL_TARGET"
 else
   "$VENV/bin/python" -m pip install --upgrade "$INSTALL_TARGET"
+fi
+
+if [ "$(uname -s)" = Linux ]; then
+  "$VENV/bin/python" -c \
+    'from pomodorough.secure_store import PlatformSecretStore; ready, reason = PlatformSecretStore().availability(); print(reason); raise SystemExit(0 if ready else 1)' \
+    || printf '%s\n' 'Secure storage needs setup before sign-in or Iroh. See README.md: Linux secure storage.' >&2
 fi
 ln -sf "$VENV/bin/pomodorough" "$BIN_HOME/pomodorough"
 ln -sf "$VENV/bin/pomodorough-cli" "$BIN_HOME/pomodorough-cli"

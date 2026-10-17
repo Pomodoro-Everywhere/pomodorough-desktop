@@ -139,12 +139,48 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
 
     def changeEvent(self, event: Any) -> None:
         super().changeEvent(event)
-        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "clock"):
+        if not hasattr(self, "clock"):
+            return
+        event_type = event.type()
+        if event_type == QEvent.Type.PaletteChange:
             self._refresh_stylesheet()
             self._tray_progress_state = None
             self.clock.update()
             if hasattr(self, "tray"):
                 self._render()
+        elif event_type in (
+            QEvent.Type.FontChange,
+            QEvent.Type.ApplicationFontChange,
+        ):
+            self._refresh_font_dependent_content()
+
+    def _refresh_font_dependent_content(self) -> None:
+        previous_scale = getattr(self, "_font_scale", None)
+        self._refresh_stylesheet()
+        if getattr(self, "_font_scale", None) == previous_scale:
+            return
+        self.clock.update()
+        self.updateGeometry()
+        schedule = getattr(
+            getattr(self, "tasks_screen", None), "_schedule_row_resize", None
+        )
+        if callable(schedule):
+            schedule()
+        self._refresh_invite_minimums()
+
+    def _refresh_invite_minimums(self) -> None:
+        for name in ("invite_input", "invite_output"):
+            field = getattr(self, name, None)
+            if field is None:
+                continue
+            try:
+                frame = field.frameWidth() * 2
+                margin = int(field.document().documentMargin() * 2)
+                field.setMinimumHeight(
+                    field.fontMetrics().lineSpacing() * 3 + frame + margin
+                )
+            except RuntimeError:
+                continue
 
     def _build_tray(self) -> None:
         self.tray: QSystemTrayIcon | None = None

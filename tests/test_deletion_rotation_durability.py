@@ -205,10 +205,12 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
     with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
     assert file_sync.call_count == 2
-    assert directory_open.call_count == 2
+    # R49-D03 journal adds one directory sync; abort cleanup adds another.
+    # Journal (1), fallback (2, fails), journal abort cleanup (3).
+    assert directory_open.call_count == 3
     directory_open.assert_called_with(cloud.token_store.fallback_path.parent,
                                       os.O_RDONLY | filesystem.O_DIRECTORY)
-    assert directory_close.call_count == 2
+    assert directory_close.call_count == 3
     directory_close.assert_called_with(sentinel.directory_descriptor)
     assert failures == ["directory sync failed"]
     assert cloud._request.call_count == 1
@@ -238,7 +240,8 @@ def test_rotation_without_directory_sync_persists_before_delete_and_restart(clou
     filesystem.open = Mock(side_effect=AssertionError("Directory descriptors are unavailable"))
     with patch("pomodorough.network.os", filesystem):
         cloud.delete_account("DELETE")
-    assert filesystem.fsync.call_count == 2
+    # R49-D03 journal adds one file fsync (journal, fallback, identity).
+    assert filesystem.fsync.call_count == 3
     filesystem.open.assert_not_called()
     assert failures == ["unavailable"]
     assert cloud._request.call_args_list == [

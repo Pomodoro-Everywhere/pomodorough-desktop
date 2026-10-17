@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
@@ -65,6 +65,15 @@ def should_capture_secure_store_error(error: BaseException) -> bool:
 
 
 _WINDOWS_BLOB_LIMIT = 64 * 1024
+_LINUX_SERVICE_SETUP = (
+    "Start and unlock a Secret Service provider such as GNOME Keyring or "
+    "Secret Service-enabled KWallet, then retry from your desktop session."
+)
+_LINUX_TOOL_MISSING = (
+    "Linux secure storage is unavailable (secret-tool was not found). "
+    "Install libsecret-tools (Debian/Ubuntu) or libsecret (Fedora/Arch). "
+    + _LINUX_SERVICE_SETUP
+)
 
 
 def _read_capped_bytes(path: Path, limit: int) -> bytes:
@@ -78,6 +87,14 @@ def _read_capped_bytes(path: Path, limit: int) -> bytes:
 
 class TokenCleanupPendingError(SecureStoreError):
     pass
+
+
+class TokenCommitPendingError(SecureStoreError):
+    """Credential secret durable but identity commit incomplete; retry."""
+
+    def __init__(self, message: str = "", *, during_recovery: bool = False) -> None:
+        super().__init__(message or "Secure credential commit is pending; retry.")
+        self.during_recovery = during_recovery
 
 
 class SecretStore(Protocol):
@@ -136,49 +153,110 @@ def _file_lock(path: Path) -> Iterator[None]:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _journal_global_lock_path(store: SecretStore | None) -> Path | None:
+    """Cross-process file for journal serialization."""
+    if not isinstance(store, PlatformSecretStore):
+        return None
+    try:
+        sample = store._lock_path("__journal-global__")
+    except Exception:
+        return None
+    return sample.parent / "journal-global.lock"
+
+
 class SecretMutationJournal:
-    """Compensate external secret mutations when a surrounding transaction fails."""
+    """Serialize external mutations across commit/rollback + compensation.
+
+    Lock order is thread, journal-global file, SQLite, per-key file.
+    The outer journal holds thread and global across the inner SQLite
+    transaction and the compensation after rollback. Per-key locks are
+    held from first mutation until journal exit while global is held,
+    so multi-key room and peer updates cannot deadlock.
+    """
 
     def __init__(self, store: SecretStore) -> None:
         self._store = store
         self._snapshots: dict[str, bytes | None] = {}
+        self._mutated: dict[str, bytes | None] = {}
         self._order: list[str] = []
+        self._locks = ExitStack()
+        self._thread_held = False
 
     def __enter__(self) -> SecretMutationJournal:
+        _SECRET_MUTATION_LOCK.acquire()
+        self._thread_held = True
+        try:
+            path = _journal_global_lock_path(self._store)
+            if path is not None:
+                self._locks.enter_context(_file_lock(path))
+        except BaseException:
+            _SECRET_MUTATION_LOCK.release()
+            self._thread_held = False
+            raise
         return self
 
     def __exit__(self, error_type: object, _error: object, _traceback: object) -> bool:
-        if error_type is None:
+        try:
+            if error_type is None:
+                return False
+            failures: list[BaseException] = []
+            for key in reversed(self._order):
+                try:
+                    self._restore_key(key)
+                except BaseException as error:
+                    failures.append(error)
+            if failures:
+                raise SecureStoreError(
+                    "Secure storage rollback failed after a transaction error."
+                ) from failures[0]
             return False
-        failures: list[BaseException] = []
-        for key in reversed(self._order):
-            previous_secret = self._snapshots[key]
-            try:
-                if previous_secret is None:
-                    self._store.delete(key)
-                else:
-                    self._store.save(key, previous_secret)
-            except BaseException as error:
-                failures.append(error)
-        if failures:
-            raise SecureStoreError(
-                "Secure storage rollback failed after a transaction error."
-            ) from failures[0]
-        return False
+        finally:
+            self._release_locks()
 
     def save(self, key: str, secret: bytes) -> None:
         self._watch(key)
         self._store.save(key, secret)
+        self._mutated[key] = secret
 
     def delete(self, key: str) -> None:
         self._watch(key)
         self._store.delete(key)
+        self._mutated[key] = None
 
     def _watch(self, key: str) -> None:
         if key in self._snapshots:
             return
+        self._locks.enter_context(secret_store_lock(self._store, key))
         self._snapshots[key] = self._store.load(key)
         self._order.append(key)
+
+    def _restore_key(self, key: str) -> None:
+        previous_secret = self._snapshots[key]
+        if key not in self._mutated:
+            if previous_secret is None:
+                self._store.delete(key)
+            else:
+                self._store.save(key, previous_secret)
+            return
+        expected = self._mutated[key]
+        try:
+            current = self._store.load(key)
+        except BaseException:
+            current = expected
+        if current != expected:
+            return
+        if previous_secret is None:
+            self._store.delete(key)
+        else:
+            self._store.save(key, previous_secret)
+
+    def _release_locks(self) -> None:
+        try:
+            self._locks.close()
+        finally:
+            if self._thread_held:
+                _SECRET_MUTATION_LOCK.release()
+                self._thread_held = False
 
 
 _MACOS_ITEM_NOT_FOUND = -25300
@@ -325,11 +403,26 @@ class PlatformSecretStore:
             yield
 
     def availability(self) -> tuple[bool, str]:
+        available, reason = self._tool_availability()
+        if not available or os.name == "nt" or sys_platform() == "darwin":
+            return available, reason
+        # A missing item proves service access without writing or unlocking a vault.
+        try:
+            result = self._run(self._command("find", "availability:probe"))
+            if result.returncode != 0 and not self._lookup_not_found(result):
+                raise self._linux_service_error(result)
+        except SecureStoreError as error:
+            return False, str(error)
+        return True, "Linux Secret Service reachable; unlock the keyring before saving credentials."
+
+    def _tool_availability(self) -> tuple[bool, str]:
         if os.name == "nt":
             return True, "Windows Data Protection API ready"
         command = "security" if sys_platform() == "darwin" else "secret-tool"
         if shutil.which(command):
             return True, f"{command} secure storage ready"
+        if command == "secret-tool":
+            return False, _LINUX_TOOL_MISSING
         return False, f"{self.label} requires platform secure storage ({command} was not found)."
 
     def load(self, key: str) -> bytes | None:
@@ -352,10 +445,7 @@ class PlatformSecretStore:
         if result.returncode != 0:
             if self._lookup_not_found(result):
                 return None
-            raise SecureStoreError(
-                result.stderr.strip()
-                or "Platform secure storage rejected credential lookup."
-            )
+            raise self._linux_service_error(result)
         encoded = result.stdout.strip()
         if not encoded:
             return None
@@ -368,7 +458,7 @@ class PlatformSecretStore:
         self._validate_key(key)
         if not isinstance(secret, bytes) or not secret:
             raise SecureStoreError("Secure value must contain bytes.")
-        available, reason = self.availability()
+        available, reason = self._tool_availability()
         if not available:
             raise SecureStoreError(reason)
         if os.name == "nt":
@@ -380,10 +470,7 @@ class PlatformSecretStore:
         encoded = base64.b64encode(secret).decode("ascii")
         result = self._run(self._command("save", key), input_text=encoded)
         if result.returncode != 0:
-            raise SecureStoreError(
-                result.stderr.strip()
-                or f"Platform secure storage rejected {self.label} credentials."
-            )
+            raise self._linux_service_error(result)
 
     def delete(self, key: str) -> None:
         self._validate_key(key)
@@ -400,15 +487,21 @@ class PlatformSecretStore:
         if sys_platform() == "darwin":
             _macos_delete(self.service, key)
             return
-        available, reason = self.availability()
+        available, reason = self._tool_availability()
         if not available:
             raise SecureStoreError(reason)
         result = self._run(self._command("delete", key))
         if result.returncode != 0:
-            raise SecureStoreError(
-                result.stderr.strip()
-                or "Platform secure storage rejected credential deletion."
-            )
+            raise self._linux_service_error(result)
+
+    @staticmethod
+    def _linux_service_error(result: subprocess.CompletedProcess[str]) -> SecureStoreError:
+        detail = result.stderr.strip() or "Secret Service rejected the operation."
+        error = SecureStoreError(
+            f"Linux secure storage is unavailable: {detail} {_LINUX_SERVICE_SETUP}"
+        )
+        error.__cause__ = subprocess.CalledProcessError(result.returncode, result.args)
+        return error
 
     def _command(self, operation: str, key: str) -> list[str]:
         if sys_platform() == "darwin":
@@ -451,7 +544,15 @@ class PlatformSecretStore:
                 timeout=15,
                 check=False,
             )
+        except FileNotFoundError as error:
+            if command[0] != "secret-tool":
+                raise SecureStoreError(f"Platform secure storage failed: {error}") from error
+            raise SecureStoreError(_LINUX_TOOL_MISSING) from error
         except (OSError, subprocess.SubprocessError) as error:
+            if command[0] == "secret-tool":
+                raise SecureStoreError(
+                    f"Platform secure storage failed: {error} {_LINUX_SERVICE_SETUP}"
+                ) from error
             raise SecureStoreError(f"Platform secure storage failed: {error}") from error
 
     def _validate_key(self, key: str) -> None:

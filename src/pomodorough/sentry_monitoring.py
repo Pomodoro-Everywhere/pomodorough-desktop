@@ -587,9 +587,10 @@ def capture_exception(error: BaseException | None = None) -> None:
     Reporting failure stays off stderr but is counted (D29): see
     ``capture_fallback_count``. This runs on hot background paths where
     stderr spam would drown real errors, unlike init_sentry which prints
-    once at startup where a developer sees it. Under a test runner the
-    event is dropped before touching the SDK unless tests explicitly opt
-    in: init gates alone cannot stop a client initialized by other means.
+    once at startup where a developer sees it. The event is dropped
+    before touching the SDK for CI, smoke, and test
+    launches unless tests explicitly opt in. Init gates alone cannot stop
+    a client initialized by other means.
     """
     if _sentry_init_blocked(None):
         return
@@ -658,6 +659,63 @@ def capture_clock_failure(error: BaseException) -> bool:
     return True
 
 
+ROOM_READ_FAILURE_REPORT_INTERVAL_SECONDS = 5.0
+_ROOM_READ_INCIDENT_SIGNATURE: str | None = None
+_ROOM_READ_NEXT_CAPTURE_AT = float("-inf")
+
+
+def _room_read_failure_signature(error: BaseException) -> str:
+    """R49-D08: category for the room-read render budget."""
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
+def should_capture_room_read_failure(
+    error: BaseException,
+    *,
+    now_monotonic: float | None = None,
+) -> bool:
+    """R49-D08: bounded room-read budget across renders.
+
+    Same type with changing text stays one incident. Distinct type
+    starts a new incident. Check runs before SDK use so suppressed
+    repeats never consume quota. Validation stays silent.
+    """
+    if isinstance(error, (ValueError, KeyError)):
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    signature = _room_read_failure_signature(error)
+    global _ROOM_READ_INCIDENT_SIGNATURE, _ROOM_READ_NEXT_CAPTURE_AT
+    if signature != _ROOM_READ_INCIDENT_SIGNATURE:
+        _ROOM_READ_INCIDENT_SIGNATURE = signature
+        _ROOM_READ_NEXT_CAPTURE_AT = now + ROOM_READ_FAILURE_REPORT_INTERVAL_SECONDS
+        return True
+    if now >= _ROOM_READ_NEXT_CAPTURE_AT:
+        _ROOM_READ_NEXT_CAPTURE_AT = now + ROOM_READ_FAILURE_REPORT_INTERVAL_SECONDS
+        return True
+    return False
+
+
+def note_room_read_recovery() -> None:
+    """R49-D08: clear incident so recurrence after success reports."""
+    global _ROOM_READ_INCIDENT_SIGNATURE
+    _ROOM_READ_INCIDENT_SIGNATURE = None
+
+
+def reset_room_read_incident_budget() -> None:
+    """Test seam: reset the R49-D08 room-read incident budget."""
+    global _ROOM_READ_INCIDENT_SIGNATURE, _ROOM_READ_NEXT_CAPTURE_AT
+    _ROOM_READ_INCIDENT_SIGNATURE = None
+    _ROOM_READ_NEXT_CAPTURE_AT = float("-inf")
+
+
+def capture_room_read_failure(error: BaseException) -> bool:
+    """R49-D08: gated capture; True when the incident budget allowed."""
+    if not should_capture_room_read_failure(error):
+        return False
+    capture_exception(error)
+    return True
+
+
 def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
     """D29: report uncaught exceptions, then chain to the prior hook."""
     if exc_value is not None:
@@ -668,7 +726,16 @@ def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
     try:
         previous = _ORIGINAL_SYS_EXCEPTHOOK
         if previous is not None:
-            previous(exc_type, exc_value, exc_tb)
+            sdk = sys.modules.get("sentry_sdk")
+            if sdk is None:
+                previous(exc_type, exc_value, exc_tb)
+            else:
+                # Our capture owns this exception. An inherited SDK hook
+                # must still print diagnostics, but must not report again.
+                # A forked scope drops only events from this chained call.
+                with sdk.new_scope() as scope:
+                    scope.add_event_processor(lambda event, hint: None)
+                    previous(exc_type, exc_value, exc_tb)
     except Exception:  # noqa: BLE001 - chaining must stay non-fatal.
         pass
 
@@ -747,8 +814,24 @@ def _tests_opted_in(env: Mapping[str, str] | None) -> bool:
     return _is_truthy(os.environ.get(POMODOROUGH_SENTRY_ALLOW_IN_TESTS_ENV_VAR))
 
 
+def _nonproduction_launch(environment: Mapping[str, str]) -> bool:
+    flags = (
+        "CI", "GITHUB_ACTIONS", "POMODOROUGH_SHARED_CORE_SMOKE",
+        "POMODOROUGH_OAUTH_ARTIFACT_SELF_TEST", "POMODOROUGH_PLATFORM_STORE_SELF_TEST",
+    )
+    return any(_is_truthy(environment.get(key)) for key in flags) or bool(
+        environment.get("POMODOROUGH_SCREENSHOT") or environment.get("PYTEST_CURRENT_TEST")
+    )
+
+
 def _sentry_init_blocked(env: Mapping[str, str] | None) -> bool:
-    return _running_under_test_runner() and not _tests_opted_in(env)
+    # Standalone children do not import their parent's test runner. Keep
+    # process markers authoritative even when a caller supplies an env map.
+    sources = (os.environ, env if env is not None else {})
+    automated = _running_under_test_runner() or any(
+        _nonproduction_launch(source) for source in sources
+    )
+    return automated and not _tests_opted_in(env)
 
 
 def init_sentry(

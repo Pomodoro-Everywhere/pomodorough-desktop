@@ -176,7 +176,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
         with (
             patch.object(secure_store, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
             patch("pomodorough.secure_store.sys_platform", return_value="darwin"),
-            patch.object(self.store, "availability", return_value=(True, "ready")),
+            patch.object(self.store, "_tool_availability", return_value=(True, "ready")),
             patch("pomodorough.secure_store._macos_save") as save,
             patch("pomodorough.secure_store.subprocess.run") as run,
         ):
@@ -194,7 +194,7 @@ class PlatformSecretStoreTests(unittest.TestCase):
 
         with (
             linux_secret_store(self.root),
-            patch.object(self.store, "availability", side_effect=availability),
+            patch.object(self.store, "_tool_availability", side_effect=availability),
             patch.object(self.store, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
         ):
             self.store.save("pending-revocations", b"captured-session")

@@ -81,6 +81,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          POMODOROUGH_SENTRY_DISABLE: "1"
         run: |
           $executable = "dist/Pomodorough-$env:VERSION-windows-x86_64.exe"
           $env:POMODOROUGH_EXPECTED_OAUTH_CLIENT_ID = python -c "import json; print(json.load(open('src/pomodorough/resources/oauth-client.json'))['installed']['client_id'])"

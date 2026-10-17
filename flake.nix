@@ -35,7 +35,7 @@
         {
           default = pkgs.python3.pkgs.buildPythonApplication {
             pname = "pomodorough-linux";
-            version = "0.48.0";
+            version = "0.49.0";
             pyproject = true;
             src = pkgs.lib.fileset.toSource {
               root = ./.;
@@ -55,11 +55,14 @@
             dependencies = [
               pkgs.python3.pkgs.platformdirs
               pkgs.python3.pkgs.pyside6
+              pkgs.python3.pkgs.wcwidth
               wasmtime
             ];
             pythonRemoveDeps = [ "PySide6-Essentials" ];
             nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
             buildInputs = [ pkgs.qt6.qtwayland ];
+            # The provider belongs to the host desktop session, not this package.
+            makeWrapperArgs = [ "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.libsecret ]}" ];
 
             postInstall = ''
               install -Dm644 src/pomodorough/resources/icon.svg \
@@ -73,13 +76,16 @@
                 $out/share/metainfo/me.egigoka.Pomodorough.metainfo.xml
             '';
 
-            pythonImportsCheck = [ "pomodorough" "pomodorough.shared_core" ];
+            pythonImportsCheck = [ "pomodorough" "pomodorough.shared_core" "pomodorough.tui" ];
             doInstallCheck = true;
             installCheckPhase = ''
               runHook preInstallCheck
               PYTHONPATH="$out/${pkgs.python3.sitePackages}:$PYTHONPATH" \
                 ${pkgs.python3.interpreter} -c \
                 'from pomodorough.shared_core import SharedCore; assert SharedCore().dispatch("core.version", {})["schemaVersion"] == 1'
+              PYTHONPATH="$out/${pkgs.python3.sitePackages}:$PYTHONPATH" \
+                ${pkgs.python3.interpreter} -c \
+                'from pomodorough import tui'
               runHook postInstallCheck
             '';
 

@@ -58,6 +58,7 @@ from .secure_store import (
     SecretStore,
     SecureStoreError,
     TokenCleanupPendingError,
+    TokenCommitPendingError,
     should_capture_secure_store_error,
     token_store_lock,
 )
@@ -239,6 +240,11 @@ class _FallbackCommit:
     replaced: bool = False
 
 
+@dataclass
+class _CredentialCommitRemoval:
+    unlinked: bool = False
+
+
 class TokenStore:
     def __init__(
         self,
@@ -280,6 +286,7 @@ class TokenStore:
 
     def _load_stored(self) -> dict[str, Any] | None:
         with token_store_lock(self.secret_store, self.secret_key, self.fallback_path):
+            self._recover_credential_commit_locked()
             return self._read_stored()
 
     def _read_stored(self) -> dict[str, Any] | None:
@@ -371,6 +378,7 @@ class TokenStore:
         with _account_deletion_cleanup_lock(cleanup_path), token_store_lock(
             self.secret_store, self.secret_key, self.fallback_path
         ):
+            self._recover_credential_commit_locked()
             self._assert_account_deletion_unblocked_locked()
             self._assert_account_deletion_refresh_current_locked()
             self._save_locked(token_response)
@@ -401,24 +409,217 @@ class TokenStore:
             f".{self.fallback_path.name}.account-identity-{identity}"
         )
 
-    def _save_locked(self, token_response: dict[str, Any]) -> None:
+    def _credential_commit_path(self) -> Path:
+        identity = hashlib.sha256(self.secret_key.encode("utf-8")).hexdigest()[:16]
+        return self.fallback_path.with_name(
+            f".{self.fallback_path.name}.credential-commit-{identity}"
+        )
+
+    def _commit_stored_document(self, token_response: dict[str, Any]) -> dict[str, Any]:
         stored = {
             "refreshToken": token_response["refreshToken"],
             "refreshTokenExpiresAt": token_response["refreshTokenExpiresAt"],
         }
         if self.api_base is not None:
             stored["apiBase"] = self.api_base
+        return stored
+
+    def _commit_identity_document(self, token_response: dict[str, Any]) -> dict[str, Any] | None:
+        if self.api_base is None:
+            return None
+        access_token = token_response.get("accessToken")
+        refresh_token = token_response.get("refreshToken")
+        if not isinstance(access_token, str) or not access_token:
+            return {"credentialState": "cleared", "version": 1}
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return {"credentialState": "cleared", "version": 1}
+        identity = _DeletionCredentialIdentity.from_tokens(
+            self.api_base, access_token, refresh_token
+        )
+        return {
+            "accessTokenHash": identity.access_token_hash,
+            "apiBase": identity.api_base,
+            "refreshTokenHash": identity.refresh_token_hash,
+            "version": 1,
+        }
+
+    def _write_credential_commit_locked(
+        self,
+        stored: dict[str, Any],
+        identity_doc: dict[str, Any] | None,
+        *,
+        commit: _FallbackCommit | None = None,
+    ) -> None:
+        document = {"identity": identity_doc, "stored": stored, "version": 1}
+        self._write_private_file(
+            self._credential_commit_path(),
+            json.dumps(document, separators=(",", ":"), sort_keys=True),
+            commit=commit,
+        )
+
+    def _read_credential_commit_locked(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        path = self._credential_commit_path()
+        try:
+            document = json.loads(_read_capped_text(path, _FALLBACK_DOCUMENT_LIMIT))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeError) as error:
+            raise SecureStoreError("Credential commit journal is malformed.") from error
+        if not isinstance(document, dict) or document.get("version") != 1:
+            raise SecureStoreError("Credential commit journal is malformed.")
+        if "stored" not in document or "identity" not in document:
+            raise SecureStoreError("Credential commit journal is malformed.")
+        stored = document["stored"]
+        identity_doc = document["identity"]
+        if not isinstance(stored, dict) or (
+            identity_doc is not None and not isinstance(identity_doc, dict)
+        ):
+            raise SecureStoreError("Credential commit journal is malformed.")
+        return stored, identity_doc
+
+    def _clear_credential_commit_locked(
+        self, *, removal: _CredentialCommitRemoval | None = None
+    ) -> None:
+        path = self._credential_commit_path()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        if removal is not None:
+            removal.unlinked = True
+        _sync_replaced_file_directory(path, os)
+
+    def _remove_fallback_durable_locked(self) -> None:
+        try:
+            self.fallback_path.unlink()
+        except FileNotFoundError:
+            return
+        _sync_replaced_file_directory(self.fallback_path, os)
+
+    def _save_secret_durable_locked(self, encoded: str) -> bool:
+        if self.secret_store is not None:
+            self.secret_store.save(self.secret_key, encoded.encode("utf-8"))
+            return True
+        return self._save_legacy_secret_durable_locked(encoded)
+
+    def _save_legacy_secret_durable_locked(self, encoded: str) -> bool:
+        self._write_fallback(encoded)
+        if not shutil.which("secret-tool"):
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    "secret-tool", "store", "--label=Pomodorough",
+                    "service", "pomodorough", "device", self.device_id,
+                ],
+                input=encoded, text=True, timeout=15, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _commit_identity_document_locked(
+        self, identity_doc: dict[str, Any] | None
+    ) -> None:
+        if identity_doc is None:
+            return
+        self._write_private_file(
+            self._account_deletion_identity_path(),
+            json.dumps(identity_doc, separators=(",", ":"), sort_keys=True),
+        )
+
+    def _replay_credential_commit_locked(
+        self, stored: dict[str, Any], identity_doc: dict[str, Any] | None
+    ) -> None:
         encoded = json.dumps(stored, separators=(",", ":"))
         if self.secret_store is not None:
             self.secret_store.save(self.secret_key, encoded.encode("utf-8"))
-            try:
-                self.fallback_path.unlink()
-            except FileNotFoundError:
-                # No stale plaintext fallback exists; nothing to clean.
-                pass
+            self._remove_fallback_durable_locked()
         else:
-            self._save_legacy_token_locked(encoded)
-        self._save_account_deletion_identity_locked(token_response)
+            needs_removal = self._save_legacy_secret_durable_locked(encoded)
+            if needs_removal:
+                self._remove_fallback_durable_locked()
+        self._commit_identity_document_locked(identity_doc)
+        self._clear_credential_commit_locked()
+
+    def _recover_credential_commit_locked(self) -> bool:
+        commit = self._read_credential_commit_locked()
+        if commit is None:
+            return False
+        stored, identity_doc = commit
+        try:
+            self._replay_credential_commit_locked(stored, identity_doc)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise TokenCommitPendingError(
+                "Secure credential commit is pending; retry.",
+                during_recovery=True,
+            ) from error
+        return True
+
+    def _restore_credential_commit_journal_locked(
+        self, stored: dict[str, Any], identity_doc: dict[str, Any] | None
+    ) -> None:
+        journal = _FallbackCommit()
+        try:
+            self._write_credential_commit_locked(stored, identity_doc, commit=journal)
+        except (OSError, subprocess.SubprocessError) as error:
+            if journal.replaced:
+                raise TokenCommitPendingError() from error
+            # No replay journal exists, and abort durability remains unknown.
+            raise SecureStoreError(
+                "Credential commit abort durability is uncertain; "
+                "journal restoration failed; retry."
+            ) from error
+
+    def _abort_credential_commit_locked(
+        self, stored: dict[str, Any], identity_doc: dict[str, Any] | None
+    ) -> None:
+        removal = _CredentialCommitRemoval()
+        try:
+            self._clear_credential_commit_locked(removal=removal)
+        except (OSError, subprocess.SubprocessError) as abort_error:
+            if removal.unlinked:
+                # Failed directory sync does not establish a durable abort.
+                # Restore the replay journal before adopting new credentials.
+                self._restore_credential_commit_journal_locked(stored, identity_doc)
+            raise TokenCommitPendingError(
+                "Secure credential commit is pending; retry."
+            ) from abort_error
+
+    def _save_locked(self, token_response: dict[str, Any]) -> None:
+        self._recover_credential_commit_locked()
+        stored = self._commit_stored_document(token_response)
+        identity_doc = self._commit_identity_document(token_response)
+        encoded = json.dumps(stored, separators=(",", ":"))
+        journal = _FallbackCommit()
+        try:
+            self._write_credential_commit_locked(stored, identity_doc, commit=journal)
+        except TokenCommitPendingError:
+            raise
+        except (OSError, subprocess.SubprocessError, SecureStoreError) as error:
+            # Directory-sync-after-replace control: replace already installed
+            # the journal, so the new credentials stay replayable.
+            if journal.replaced:
+                raise TokenCommitPendingError(
+                    "Secure credential commit is pending; retry."
+                ) from error
+            raise
+        try:
+            needs_removal = self._save_secret_durable_locked(encoded)
+        except (OSError, subprocess.SubprocessError):
+            self._abort_credential_commit_locked(stored, identity_doc)
+            raise
+        try:
+            if needs_removal:
+                self._remove_fallback_durable_locked()
+            self._commit_identity_document_locked(identity_doc)
+            self._clear_credential_commit_locked()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise TokenCommitPendingError(
+                "Secure credential commit is pending; retry."
+            ) from error
 
     def _save_legacy_token_locked(self, encoded: str) -> None:
         self._write_fallback(encoded)
@@ -439,7 +640,7 @@ class TokenStore:
             # stay silent.
             return
         if result.returncode == 0:
-            self.fallback_path.unlink(missing_ok=True)
+            self._remove_fallback_durable_locked()
 
     def _save_account_deletion_identity_locked(
         self, token_response: dict[str, Any]
@@ -535,6 +736,7 @@ class TokenStore:
         return self._account_deletion_identity_locked()
 
     def account_deletion_confirmed_generation_locked(self) -> int | None:
+        self._recover_credential_commit_locked()
         identity, generation = self._load_account_deletion_record_locked()
         if generation is None:
             return None
@@ -618,6 +820,7 @@ class TokenStore:
     def _account_deletion_record_locked(
         self,
     ) -> tuple[_DeletionCredentialIdentity | None, int | None]:
+        self._recover_credential_commit_locked()
         stored = self._account_deletion_candidate_locked()
         identity, generation = self._load_account_deletion_record_locked()
         if stored is None:
@@ -726,6 +929,7 @@ class TokenStore:
         return document is not None and document.get("signedOut") is True
 
     def _clear_locked(self, commit: _FallbackCommit | None = None) -> None:
+        self._recover_credential_commit_locked()
         self._write_fallback('{"signedOut":true}', commit=commit)
         if self.secret_store is not None:
             self.secret_store.delete(self.secret_key)
