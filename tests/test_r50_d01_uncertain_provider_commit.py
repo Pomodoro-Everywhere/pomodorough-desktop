@@ -15,7 +15,6 @@ import os
 import subprocess
 import sys
 from datetime import UTC, datetime
-from unittest.mock import patch
 
 import pytest
 
@@ -261,19 +260,33 @@ def test_clean_pre_mutation_tool_rejection_still_aborts(tmp_path, monkeypatch):
 
 
 def test_plain_oserror_reject_still_aborts(tmp_path):
-    store = _make_store(tmp_path)
+    fault = {"active": False}
+    values: dict[str, bytes] = {}
+
+    class _PlainOSErrorStore:
+        def load(self, key):
+            return values.get(key)
+
+        def save(self, key, value):
+            if fault["active"]:
+                raise OSError("vault unreachable before mutation")
+            values[key] = value
+
+        def delete(self, key):
+            values.pop(key, None)
+
+    store = TokenStore(DEVICE, secret_store=_PlainOSErrorStore(),
+                       fallback_path=tmp_path / "session.json")
+    store.bind_api(API)
     session = _make_session(store)
     session.accept_tokens(_tokens("old"))
-
-    def failing_save(key, value):
-        raise OSError("vault unreachable before mutation")
-
-    with patch.object(store.secret_store, "save", side_effect=failing_save):
-        with pytest.raises(OSError, match="vault unreachable before mutation"):
-            session.accept_tokens(_tokens("new"))
+    fault["active"] = True
+    with pytest.raises(OSError, match="vault unreachable before mutation"):
+        session.accept_tokens(_tokens("new"))
     assert not store._credential_commit_path().exists()
     assert store.load() == _stored(_tokens("old"))
     assert session.state.refresh_token == "old-refresh"
+    fault["active"] = False
     session.accept_tokens(_tokens("new"))
     assert store.load() == _stored(_tokens("new"))
 
