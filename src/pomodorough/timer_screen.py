@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
@@ -114,6 +114,9 @@ class TimerScreen(QWidget):
         self._task_selector_signature: tuple[Any, ...] | None = None
         self.content_layout = QHBoxLayout(self)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self._settings_reflow_timer = QTimer(self)
+        self._settings_reflow_timer.setSingleShot(True)
+        self._settings_reflow_timer.timeout.connect(self._settings_reflow)
         self._build_left_panel()
         self._build_settings_panel(settings)
 
@@ -343,7 +346,14 @@ class TimerScreen(QWidget):
             self.settings_scroll.setMinimumWidth(225 if compact else 310)
             self.settings_scroll.setMaximumWidth(300 if compact else 370)
         self._settings_base_min = 225 if compact else 310
-        self._settings_reflow()
+        self._schedule_settings_reflow()
+
+    def _schedule_settings_reflow(self) -> None:
+        # R50-D03: changeEvent/resizeEvent run inside Qt event propagation,
+        # where synchronous layout mutation aborts on some Qt releases.
+        # Coalesce through the event loop like the task row resize timer.
+        if not self._settings_reflow_timer.isActive():
+            self._settings_reflow_timer.start()
 
     def _settings_reflow(self) -> None:
         layout = getattr(self, "phase_layout", None)
@@ -377,11 +387,11 @@ class TimerScreen(QWidget):
     def changeEvent(self, event: Any) -> None:
         super().changeEvent(event)
         if event.type() in (QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange, QEvent.Type.StyleChange, QEvent.Type.LayoutDirectionChange):
-            self._settings_reflow()
+            self._schedule_settings_reflow()
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
-        self._settings_reflow()
+        self._schedule_settings_reflow()
 
     def render(
         self,
