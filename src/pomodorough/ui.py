@@ -114,6 +114,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self._resolution_retry_scheduled = False
         self._resolution_corruption: str | None = None
         self._account_switch_user: dict[str, Any] | None = None
+        self._notice_dialog_active = False
 
     def _build_window(self) -> None:
         self.setWindowTitle(self.strings.text("window.title"))
@@ -261,7 +262,17 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         QDesktopServices.openUrl(QUrl(PRIVACY_POLICY_URL))
 
     def _show_notice(self, message: str) -> None:
-        QMessageBox.warning(self, "Pomodorough", message)
+        # R50-D02: the 250 ms tick keeps firing inside the modal nested
+        # loop, so a continuing read failure would stack dialogs.
+        # Keep at most one warning active; suppressed repeats are still
+        # bounded upstream by the pending-break notice incident.
+        if self._notice_dialog_active:
+            return
+        self._notice_dialog_active = True
+        try:
+            QMessageBox.warning(self, "Pomodorough", message)
+        finally:
+            self._notice_dialog_active = False
 
     def _is_window_foreground(self) -> bool:
         if self.isActiveWindow():

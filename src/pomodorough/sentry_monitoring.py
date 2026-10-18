@@ -716,6 +716,116 @@ def capture_room_read_failure(error: BaseException) -> bool:
     return True
 
 
+PENDING_BREAK_READ_FAILURE_REPORT_INTERVAL_SECONDS = 5.0
+_PENDING_BREAK_READ_INCIDENT_SIGNATURE: str | None = None
+_PENDING_BREAK_READ_NEXT_CAPTURE_AT = float("-inf")
+
+
+def _pending_break_read_failure_signature(error: BaseException) -> str:
+    """R50-D02: category for the pending-break read render budget."""
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
+def should_capture_pending_break_read_failure(
+    error: BaseException,
+    *,
+    now_monotonic: float | None = None,
+) -> bool:
+    """R50-D02: bounded pending-break read budget across ticks.
+
+    Same type with changing text stays one incident. Distinct type
+    starts a new incident. Check runs before SDK use so suppressed
+    repeats never consume quota. Validation stays silent. Independent
+    of the clock and room-read budgets.
+    """
+    if isinstance(error, ValueError):
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    signature = _pending_break_read_failure_signature(error)
+    global _PENDING_BREAK_READ_INCIDENT_SIGNATURE
+    global _PENDING_BREAK_READ_NEXT_CAPTURE_AT
+    if signature != _PENDING_BREAK_READ_INCIDENT_SIGNATURE:
+        _PENDING_BREAK_READ_INCIDENT_SIGNATURE = signature
+        _PENDING_BREAK_READ_NEXT_CAPTURE_AT = (
+            now + PENDING_BREAK_READ_FAILURE_REPORT_INTERVAL_SECONDS
+        )
+        return True
+    if now >= _PENDING_BREAK_READ_NEXT_CAPTURE_AT:
+        _PENDING_BREAK_READ_NEXT_CAPTURE_AT = (
+            now + PENDING_BREAK_READ_FAILURE_REPORT_INTERVAL_SECONDS
+        )
+        return True
+    return False
+
+
+def note_pending_break_read_recovery() -> None:
+    """R50-D02: clear incident so recurrence after success reports."""
+    global _PENDING_BREAK_READ_INCIDENT_SIGNATURE
+    _PENDING_BREAK_READ_INCIDENT_SIGNATURE = None
+
+
+def reset_pending_break_read_incident_budget() -> None:
+    """Test seam: reset the R50-D02 pending-break read incident budget."""
+    global _PENDING_BREAK_READ_INCIDENT_SIGNATURE
+    global _PENDING_BREAK_READ_NEXT_CAPTURE_AT
+    _PENDING_BREAK_READ_INCIDENT_SIGNATURE = None
+    _PENDING_BREAK_READ_NEXT_CAPTURE_AT = float("-inf")
+
+
+def capture_pending_break_read_failure(error: BaseException) -> bool:
+    """R50-D02: gated capture; True when the incident budget allowed."""
+    if not should_capture_pending_break_read_failure(error):
+        return False
+    capture_exception(error)
+    return True
+
+
+CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS = 5.0
+_CLOUD_CREDENTIAL_SIGNATURE: str | None = None
+_CLOUD_CREDENTIAL_NEXT_AT = float("-inf")
+
+
+def should_capture_cloud_credential(
+    operation: str, cause: str, *, now_monotonic: float | None = None
+) -> bool:
+    """R50-D04/L01: bounded cloud credential storage-infra budget."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    signature = f"{operation}:{cause}"
+    global _CLOUD_CREDENTIAL_SIGNATURE, _CLOUD_CREDENTIAL_NEXT_AT
+    if signature != _CLOUD_CREDENTIAL_SIGNATURE:
+        _CLOUD_CREDENTIAL_SIGNATURE = signature
+        _CLOUD_CREDENTIAL_NEXT_AT = now + CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS
+        return True
+    if now >= _CLOUD_CREDENTIAL_NEXT_AT:
+        _CLOUD_CREDENTIAL_NEXT_AT = now + CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS
+        return True
+    return False
+
+
+def note_cloud_credential_recovery() -> None:
+    """R50-D04/L01: clear incident so recurrence after success reports."""
+    global _CLOUD_CREDENTIAL_SIGNATURE
+    _CLOUD_CREDENTIAL_SIGNATURE = None
+
+
+def reset_cloud_credential_budget() -> None:
+    """Test seam: reset the R50-D04/L01 cloud credential budget."""
+    global _CLOUD_CREDENTIAL_SIGNATURE, _CLOUD_CREDENTIAL_NEXT_AT
+    _CLOUD_CREDENTIAL_SIGNATURE = None
+    _CLOUD_CREDENTIAL_NEXT_AT = float("-inf")
+
+
+def capture_cloud_credential(operation: str, cause: str) -> bool:
+    """R50-D04/L01: gated payload-free capture; True when budget allowed."""
+    if not should_capture_cloud_credential(operation, cause):
+        return False
+    try:
+        capture_exception(RuntimeError(f"cloud credential {operation} failed: {cause}"))
+    except Exception:  # noqa: BLE001 - reporting stays non-fatal.
+        _note_capture_fallback()
+    return True
+
+
 def _sentry_sys_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
     """D29: report uncaught exceptions, then chain to the prior hook."""
     if exc_value is not None:

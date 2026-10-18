@@ -30,7 +30,9 @@ from .core import (
 from .sentry_monitoring import (
     capture_exception,
     note_clock_recovery,
+    note_pending_break_read_recovery,
     should_capture_clock_failure,
+    should_capture_pending_break_read_failure,
 )
 from .shared_core import SharedCoreError
 
@@ -85,6 +87,9 @@ class TimerInteractionController:
         # load. Later reconciles are in-session refreshes and must never
         # pre-mark anything notified.
         self._startup_reconcile_pending = True
+        # R50-D02: bounds repeat pending-break notices for one incident.
+        # Captures use the independent sentry budget; success clears both.
+        self._pending_break_notice_incident: str | None = None
 
     def _context(self) -> TimerInteractionContext:
         return self._ports.context()
@@ -159,35 +164,73 @@ class TimerInteractionController:
             self.notified_timer_id = context.timer.get("id")
         return done()
 
+    @staticmethod
+    def _pending_break_notice_signature(error: BaseException) -> str:
+        return f"{type(error).__module__}.{type(error).__qualname__}"
+
+    def _pending_break_notice_due(self, error: BaseException) -> bool:
+        signature = self._pending_break_notice_signature(error)
+        if signature == self._pending_break_notice_incident:
+            return False
+        self._pending_break_notice_incident = signature
+        return True
+
+    def _clear_pending_break_incident(self) -> None:
+        note_pending_break_read_recovery()
+        self._pending_break_notice_incident = None
+
+    def _safe_has_pending_auto_break(
+        self, context: TimerInteractionContext
+    ) -> tuple[bool, EmitNotice | None]:
+        try:
+            pending = context.store.has_pending_auto_break()
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            if should_capture_pending_break_read_failure(error):
+                capture_exception(error)
+            if self._pending_break_notice_due(error):
+                return False, EmitNotice(str(error))
+            return False, None
+        except ValueError as error:
+            if self._pending_break_notice_due(error):
+                return False, EmitNotice(str(error))
+            return False, None
+        self._clear_pending_break_incident()
+        return bool(pending), None
+
     def tick(self) -> ControllerOutcome[None]:
         context = self._context()
         if context.closed:
             return done()
+        pending_notice: EmitNotice | None = None
         if (context.user is None or not context.cloud.authenticated) and not context.cloud.busy:
-            try:
-                pending_break = context.store.has_pending_auto_break()
-            except (OSError, sqlite3.Error, SharedCoreError) as error:
-                # D50: per-250ms read guarded; infra reports, notice-only.
-                capture_exception(error)
-                return done(EmitNotice(str(error)))
-            except ValueError as error:
-                return done(EmitNotice(str(error)))
+            pending_break, pending_notice = self._safe_has_pending_auto_break(
+                context
+            )
             if pending_break:
                 self._ports.maybe_auto_start_break(require_canonical=False)
                 context = self._context()
         timer = self._current_timer_value(context)
         context, timer = self._refresh_expired_timer(context, timer)
         if timer.get("status") not in {"running", "completed"}:
-            return done()
+            return done() if pending_notice is None else done(pending_notice)
         if context.history_resolution_active:
-            return done(Render())
+            if pending_notice is None:
+                return done(Render())
+            return done(Render(), pending_notice)
         deadline_completed = (
             timer.get("status") == "completed"
             and timer.get("lastIntent", {}).get("type") != "finish"
         )
         if deadline_completed:
-            return self._complete_expired_timer(context, timer)
-        return done(Render()) if timer.get("status") == "running" else done()
+            outcome = self._complete_expired_timer(context, timer)
+            if pending_notice is None:
+                return outcome
+            return done(*outcome.effects, pending_notice)
+        if timer.get("status") == "running":
+            if pending_notice is None:
+                return done(Render())
+            return done(Render(), pending_notice)
+        return done() if pending_notice is None else done(pending_notice)
 
     def _refresh_expired_timer(
         self,
@@ -539,15 +582,11 @@ class TimerInteractionController:
     def schedule_pending_auto_break(
         self, *, require_canonical: bool | None = None
     ) -> ControllerOutcome[None]:
-        try:
-            has_pending = self._context().store.has_pending_auto_break()
-        except (OSError, sqlite3.Error, SharedCoreError) as error:
-            # Sweep: scheduling read guarded like tick(); infra reports,
-            # notice-only so a broken DB cannot kill the outcome chain.
-            capture_exception(error)
-            return done(EmitNotice(str(error)))
-        except ValueError as error:
-            return done(EmitNotice(str(error)))
+        has_pending, pending_notice = self._safe_has_pending_auto_break(
+            self._context()
+        )
+        if pending_notice is not None:
+            return done(pending_notice)
         if has_pending:
             delay_ms = max(
                 0,

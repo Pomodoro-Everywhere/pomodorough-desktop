@@ -59,10 +59,16 @@ from .secure_store import (
     SecureStoreError,
     TokenCleanupPendingError,
     TokenCommitPendingError,
+    UncertainSecretStoreError,
+    is_infra_secure_store_error,
     should_capture_secure_store_error,
     token_store_lock,
 )
-from .sentry_monitoring import capture_exception
+from .sentry_monitoring import (
+    capture_cloud_credential,
+    capture_exception,
+    note_cloud_credential_recovery,
+)
 from .storage_revocation import PendingSessionRevocations, credential_api_base
 
 _RevisionEventParser = RevisionEventParser
@@ -516,7 +522,8 @@ class TokenStore:
                 ],
                 input=encoded, text=True, timeout=15, check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
+            _report_cloud_credential("save", error)
             return False
         return result.returncode == 0
 
@@ -608,6 +615,22 @@ class TokenStore:
             raise
         try:
             needs_removal = self._save_secret_durable_locked(encoded)
+        except TokenCommitPendingError:
+            raise
+        except SecureStoreError as error:
+            if isinstance(
+                error, UncertainSecretStoreError
+            ) or is_infra_secure_store_error(error):
+                # R50-D01: the journal above is durable and the provider
+                # ran or may have run, so the outcome is unknown. Retain
+                # the journal and report pending; recovery replays the new
+                # secret and identity idempotently. Only proven
+                # pre-mutation errors below may declare an abort.
+                raise TokenCommitPendingError(
+                    "Secure credential commit is pending; retry."
+                ) from error
+            self._abort_credential_commit_locked(stored, identity_doc)
+            raise
         except (OSError, subprocess.SubprocessError):
             self._abort_credential_commit_locked(stored, identity_doc)
             raise
@@ -1305,6 +1328,29 @@ def _should_capture_restore_error(error: Exception) -> bool:
     return not isinstance(error, (ValueError, KeyError, TypeError))
 
 
+def _cloud_credential_cause(error: Exception) -> str | None:
+    """R50-D04/L01: fixed cause for storage-infra; None stays quiet."""
+    if isinstance(error, (ApiError, TokenCommitPendingError)):
+        return None
+    if isinstance(error, SecureStoreError):
+        if not should_capture_secure_store_error(error):
+            return None
+        return "secure-store-infra"
+    if isinstance(error, (OSError, subprocess.SubprocessError)):
+        return "filesystem"
+    if isinstance(error, (ValueError, KeyError, TypeError)):
+        return None
+    return "unexpected"
+
+
+def _report_cloud_credential(operation: str, error: Exception) -> bool:
+    """R50-D04/L01: bounded payload-free capture; failure signal unchanged."""
+    cause = _cloud_credential_cause(error)
+    if cause is None:
+        return False
+    return capture_cloud_credential(operation, cause)
+
+
 class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
@@ -1529,6 +1575,7 @@ class CloudService(QObject):
         try:
             self._accounts.require_authentication_ready()
         except SecureStoreError as error:
+            _report_cloud_credential("login", error)
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
             self.failure.emit(str(error))
             return
@@ -1536,11 +1583,13 @@ class CloudService(QObject):
 
         def authorized(user: dict[str, Any]) -> None:
             self._state.authenticated = True
+            note_cloud_credential_recovery()
             self.signed_in.emit(user)
             self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
             self.start_revision_stream()
 
         def failed(error: Exception) -> None:
+            _report_cloud_credential("login", error)
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
             self.failure.emit(str(error))
 
@@ -1660,6 +1709,7 @@ class CloudService(QObject):
             return self._authorized_request("POST", "/api/v1/sync", payload)
 
         def synchronized(response: dict[str, Any]) -> None:
+            note_cloud_credential_recovery()
             self.sync_ready.emit(response)
             self.status_changed.emit(self.strings.text("cloud.status.synced"))
             self.start_revision_stream()
@@ -1668,6 +1718,7 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
+            _report_cloud_credential("sync", error)
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))
             self.failure.emit(str(error))
 
@@ -1682,6 +1733,7 @@ class CloudService(QObject):
             return self._authorized_request("GET", "/api/v1/bootstrap")
 
         def ready(response: dict[str, Any]) -> None:
+            note_cloud_credential_recovery()
             self.bootstrap_ready.emit(response)
             self.status_changed.emit(self.strings.text("cloud.status.history_decision"))
 
@@ -1689,6 +1741,7 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
+            _report_cloud_credential("preview_bootstrap", error)
             self.status_changed.emit(self.strings.text("cloud.status.history_preserved"))
             self.failure.emit(str(error))
 
@@ -1705,6 +1758,7 @@ class CloudService(QObject):
             )
 
         def resolved(response: dict[str, Any]) -> None:
+            note_cloud_credential_recovery()
             self.bootstrap_resolved.emit(response)
             self.status_changed.emit(self.strings.text("cloud.status.synced"))
             self.start_revision_stream()
@@ -1717,6 +1771,7 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
+            _report_cloud_credential("resolve_bootstrap", error)
             self.status_changed.emit(self.strings.text("cloud.status.history_preserved"))
             self.failure.emit(str(error))
 
@@ -1733,6 +1788,7 @@ class CloudService(QObject):
         try:
             self._accounts.require_authentication_ready()
         except SecureStoreError as error:
+            _report_cloud_credential("revision_stream", error)
             self.failure.emit(str(error))
             return
         self._revisions.start(

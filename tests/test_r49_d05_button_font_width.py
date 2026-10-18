@@ -1,4 +1,4 @@
-"""R49-D05 residual: button-only font growth stays vertical, width documented."""
+"""R49-D05 residual fixed in R50-D05: button-only font growth widens column."""
 
 from __future__ import annotations
 
@@ -81,10 +81,10 @@ def test_button_only_font_growth_stays_vertically_contained(app, rtl):
         # Adjacent rows do not overlap even when the action column is narrow.
         neighbor = table.cellWidget(1, 3)
         assert not button.geometry().intersects(neighbor.geometry())
-        # Documented limitation: the action column keeps its old width while
-        # the button hint grows, so the hint can exceed the column.
-        assert table.columnWidth(3) == before_width
-        assert button.minimumSizeHint().width() > table.columnWidth(3)
+        # Fixed in R50-D05: the action column follows the button hint.
+        assert table.columnWidth(3) > before_width
+        assert table.columnWidth(3) >= button.minimumSizeHint().width()
+        assert button.width() >= button.minimumSizeHint().width() - 1
         # Hit-testing still delivers row zero at the button center.
         viewport = table.viewport()
         position = button.mapTo(viewport, button.rect().center())

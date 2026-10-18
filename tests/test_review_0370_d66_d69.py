@@ -121,7 +121,9 @@ class D66ControllerBoundaryTests(unittest.TestCase):
         cloud.authenticated = False
         cloud.busy = False
         context = TimerInteractionContext(
-            store, cloud, False, None, {}, None, [], {}, 0, "offline", False
+            store, cloud, False, None,
+            {"durationsMs": {"focus": 1_500_000}},
+            None, [], {}, 0, "offline", False
         )
         ports = Mock()
         ports.context.return_value = context

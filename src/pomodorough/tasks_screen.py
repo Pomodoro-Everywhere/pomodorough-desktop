@@ -30,6 +30,7 @@ class TasksScreen(QFrame):
         super().__init__()
         self.strings = strings
         self._render_signature: tuple[Any, ...] | None = None
+        self._in_layout_refresh = False
         self._row_resize_timer = QTimer(self)
         self._row_resize_timer.setSingleShot(True)
         self._row_resize_timer.timeout.connect(self._resize_task_rows)
@@ -117,11 +118,30 @@ class TasksScreen(QFrame):
 
     def _schedule_row_resize(self) -> None:
         # Wait for inherited styles and cell widgets to finish updating their hints.
+        if self._in_layout_refresh:
+            return
         self._row_resize_timer.start()
 
     def _resize_task_rows(self) -> None:
-        self.task_table.resizeRowsToContents()
-        self.task_table.doItemsLayout()
+        if self._in_layout_refresh:
+            return
+        self._in_layout_refresh = True
+        try:
+            table = self.task_table
+            h_value = table.horizontalScrollBar().value()
+            v_value = table.verticalScrollBar().value()
+            header = table.horizontalHeader()
+            was_blocked = header.blockSignals(True)
+            try:
+                table.resizeRowsToContents()
+                table.resizeColumnToContents(3)
+                table.doItemsLayout()
+            finally:
+                header.blockSignals(was_blocked)
+            table.horizontalScrollBar().setValue(h_value)
+            table.verticalScrollBar().setValue(v_value)
+        finally:
+            self._in_layout_refresh = False
         focused_id, row = self._focused_delete_id()
         if focused_id is None:
             return

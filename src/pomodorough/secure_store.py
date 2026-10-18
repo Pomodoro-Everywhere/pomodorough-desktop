@@ -97,6 +97,15 @@ class TokenCommitPendingError(SecureStoreError):
         self.during_recovery = during_recovery
 
 
+class UncertainSecretStoreError(SecureStoreError):
+    """Provider ran or may have run; mutation outcome is unknown.
+
+    Callers must retain recovery state and retry instead of declaring
+    an abort. Raised only after the availability check, so validation
+    and tool-missing rejections stay plain SecureStoreError.
+    """
+
+
 class SecretStore(Protocol):
     def load(self, key: str) -> bytes | None: ...
 
@@ -461,6 +470,20 @@ class PlatformSecretStore:
         available, reason = self._tool_availability()
         if not available:
             raise SecureStoreError(reason)
+        try:
+            self._save_after_availability(key, secret)
+        except UncertainSecretStoreError:
+            raise
+        except SecureStoreError as error:
+            # R50-D01: past availability the provider runs or may run,
+            # so no SecureStoreError proves non-mutation. Chain the root
+            # provider cause directly so cause-chain assertions keep
+            # seeing the invocation result, and let the commit boundary
+            # quarantine on the type.
+            root = error.__cause__ if error.__cause__ is not None else error
+            raise UncertainSecretStoreError(str(error)) from root
+
+    def _save_after_availability(self, key: str, secret: bytes) -> None:
         if os.name == "nt":
             self._write_private(self._windows_path(key), self._windows_protect(secret))
             return
@@ -635,6 +658,7 @@ __all__ = [
     "PlatformSecretStore",
     "SecretMutationJournal",
     "SecureStoreError",
+    "UncertainSecretStoreError",
     "is_infra_secure_store_error",
     "should_capture_secure_store_error",
 ]

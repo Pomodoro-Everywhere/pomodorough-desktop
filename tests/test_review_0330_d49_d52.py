@@ -195,8 +195,9 @@ class D50BareReadTests(unittest.TestCase):
         cloud = SimpleNamespace(authenticated=False, busy=False)
         ports = TimerInteractionPorts(
             context=lambda: TimerInteractionContext(
-                store, cloud, False, None, {}, None, [], {}, 0,
-                "offline", False,
+                store, cloud, False, None,
+                {"durationsMs": {"focus": 1_500_000}},
+                None, [], {}, 0, "offline", False,
             ),
             apply_outcome=Mock(), mutation_blocked=Mock(return_value=False),
             issue_command=Mock(), maybe_auto_start_break=Mock(),

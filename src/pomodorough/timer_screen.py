@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
@@ -241,8 +241,8 @@ class TimerScreen(QWidget):
         self.phase_group = QButtonGroup(self)
         self.phase_group.setExclusive(True)
         self.phase_buttons: dict[str, QPushButton] = {}
-        layout = QHBoxLayout()
-        layout.setSpacing(5)
+        self.phase_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.phase_layout.setSpacing(5)
         for phase in PHASES:
             label = self.strings.text(f"phase.{phase}")
             button = QPushButton(label.upper())
@@ -254,8 +254,8 @@ class TimerScreen(QWidget):
             )
             self.phase_group.addButton(button)
             self.phase_buttons[phase] = button
-            layout.addWidget(button)
-        self.right_layout.addLayout(layout)
+            self.phase_layout.addWidget(button)
+        self.right_layout.addLayout(self.phase_layout)
 
     def _build_duration_controls(self, settings: dict[str, Any]) -> None:
         grid = QGridLayout()
@@ -342,6 +342,46 @@ class TimerScreen(QWidget):
         if hasattr(self, "settings_scroll"):
             self.settings_scroll.setMinimumWidth(225 if compact else 310)
             self.settings_scroll.setMaximumWidth(300 if compact else 370)
+        self._settings_base_min = 225 if compact else 310
+        self._settings_reflow()
+
+    def _settings_reflow(self) -> None:
+        layout = getattr(self, "phase_layout", None)
+        scroll = getattr(self, "settings_scroll", None)
+        panel = getattr(self, "right_panel", None)
+        if layout is None or scroll is None or panel is None:
+            return
+        if not getattr(self, "phase_buttons", None):
+            return
+        hints = [b.minimumSizeHint().width() for b in self.phase_buttons.values()]
+        if not hints:
+            return
+        margins = self.right_layout.contentsMargins()
+        chrome = margins.left() + margins.right() + panel.contentsMargins().left() + panel.contentsMargins().right()
+        need_row = sum(hints) + layout.spacing() * (len(hints) - 1) + chrome
+        need_stack = max(hints) + chrome
+        avail = panel.width() or (scroll.viewport().width() if scroll.isVisible() else 0) or panel.maximumWidth()
+        stack = avail < need_row
+        want = QBoxLayout.Direction.TopToBottom if stack else QBoxLayout.Direction.LeftToRight
+        if layout.direction() != want:
+            layout.setDirection(want)
+        base = getattr(self, "_settings_base_min", panel.minimumWidth())
+        need_min = max(base, need_stack) if stack else base
+        for widget in (panel, scroll):
+            if widget.minimumWidth() != need_min:
+                widget.setMinimumWidth(need_min)
+        if panel.maximumWidth() < need_min:
+            panel.setMaximumWidth(need_min)
+            scroll.setMaximumWidth(need_min)
+
+    def changeEvent(self, event: Any) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange, QEvent.Type.StyleChange, QEvent.Type.LayoutDirectionChange):
+            self._settings_reflow()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._settings_reflow()
 
     def render(
         self,
