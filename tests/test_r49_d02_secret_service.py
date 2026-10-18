@@ -185,8 +185,9 @@ def test_real_provider_failure_rejects_new_write_and_retains_legacy_file(tmp_pat
         result = subprocess.run([*prefix, sys.executable, "-c", script], cwd=tmp_path,
                                 env=environment, capture_output=True, text=True, timeout=30)
         assert result.returncode == 1
-        assert "SecureStoreError" in result.stderr and "Start and unlock" in result.stderr
+        assert "TokenCommitPendingError" in result.stderr and "pending" in result.stderr.lower()
         assert (path.read_bytes() if path.exists() else None) == retained
+        assert list(tmp_path.glob(".session.json.credential-commit-*")) != []
 
 
 def test_provider_timeout_is_actionable_and_stays_infrastructure_error(tmp_path):
