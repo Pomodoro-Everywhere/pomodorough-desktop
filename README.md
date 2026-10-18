@@ -112,9 +112,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.49.0/pomodorough_linux-0.49.0.tar.gz
-tar -xzf pomodorough_linux-0.49.0.tar.gz
-cd pomodorough_linux-0.49.0
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.50.0/pomodorough_linux-0.50.0.tar.gz
+tar -xzf pomodorough_linux-0.50.0.tar.gz
+cd pomodorough_linux-0.50.0
 ./deploy/install.sh
 ```
 
@@ -171,7 +171,7 @@ immutable system root.
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.49.0
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.50.0
 ```
 
 The package wrapper includes `secret-tool` from `libsecret`. Enable a provider
@@ -183,8 +183,8 @@ in the NixOS configuration, then log in again and unlock the keyring.
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.49.0/Pomodorough-0.49.0-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.49.0-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.50.0/Pomodorough-0.50.0-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.50.0-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 

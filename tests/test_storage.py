@@ -4915,7 +4915,7 @@ class StorageTests(unittest.TestCase):
         canonical_local = dict(local_history[0])
         canonical_local.pop("pending", None)
         completed_at = str(canonical_local["completedAt"])
-        # Core 0.49.0 counts causally through source in timestamp order.
+        # Core 0.50.0 counts causally through source in timestamp order.
         # Prior remotes keep source fourth so four focuses still yield long_break.
         remote_history = self._prior_focus_history("remote", completed_at)
         response = self._canonical_response(
