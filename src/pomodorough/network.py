@@ -1311,27 +1311,38 @@ class _CollaboratorAttribute:
         setattr(target, self._path[-1], value)
 
 
-def _should_capture_restore_error(error: Exception) -> bool:
-    """D048-08: credential-restore boundary classification.
-
-    Infrastructure failures (permission/IO, infra-backed secure-store,
-    unexpected types) report once. Expected ApiError traffic (401,
-    offline, cancel) and malformed input stay silent; the UI notice
-    still fires for every failure.
-    """
-    if isinstance(error, ApiError):
-        return False
-    if isinstance(error, SecureStoreError):
-        return should_capture_secure_store_error(error)
-    if isinstance(error, OSError):
-        return True
-    return not isinstance(error, (ValueError, KeyError, TypeError))
+def _pending_infra_target(error: TokenCommitPendingError) -> BaseException | None:
+    """R51-D04: first non-pending cause; None for plain pending."""
+    seen: set[int] = set()
+    current: BaseException = error
+    for _ in range(8):
+        if id(current) in seen:
+            return None
+        seen.add(id(current))
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            current = cause
+        elif isinstance(context, BaseException):
+            current = context
+        else:
+            return None
+        if not isinstance(current, TokenCommitPendingError):
+            return current
+    return None
 
 
 def _cloud_credential_cause(error: Exception) -> str | None:
-    """R50-D04/L01: fixed cause for storage-infra; None stays quiet."""
-    if isinstance(error, (ApiError, TokenCommitPendingError)):
+    """R51-D04: classify pending infra cause; plain pending stays quiet."""
+    if isinstance(error, ApiError):
         return None
+    if isinstance(error, TokenCommitPendingError):
+        target = _pending_infra_target(error)
+        if target is None:
+            return None
+        if isinstance(target, ApiError):
+            return None
+        error = target
     if isinstance(error, SecureStoreError):
         if not should_capture_secure_store_error(error):
             return None
@@ -1549,6 +1560,7 @@ class CloudService(QObject):
 
         def restored(user: dict[str, Any] | None) -> None:
             if user:
+                note_cloud_credential_recovery()
                 self._state.authenticated = True
                 self.signed_in.emit(user)
                 self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
@@ -1560,8 +1572,7 @@ class CloudService(QObject):
             if isinstance(error, ApiError) and error.status == 401:
                 self._expire_session()
                 return
-            if _should_capture_restore_error(error):
-                capture_exception(error)
+            _report_cloud_credential("restore", error)
             self._state.access_token = None
             self._state.authenticated = False
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))

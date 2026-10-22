@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 from pomodorough.network import ApiError, CloudService, TokenStore
 from pomodorough.secure_store import SecureStoreError
+from pomodorough.sentry_monitoring import reset_cloud_credential_budget
 
 
 class _MemorySecretStore:
@@ -44,6 +45,15 @@ def _run_immediately(function, on_result, on_error=None) -> None:
 @pytest.fixture(scope="module")
 def app() -> Iterator[QApplication]:
     yield QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _budget() -> Iterator[None]:
+    reset_cloud_credential_budget()
+    try:
+        yield
+    finally:
+        reset_cloud_credential_budget()
 
 
 @pytest.fixture()
@@ -90,7 +100,7 @@ def test_real_worker_permission_error_reports_once(app, cloud) -> None:
     denied = PermissionError(13, "Permission denied")
     with (
         patch.object(cloud.token_store, "load", side_effect=denied),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
         deadline = time.monotonic() + 10
@@ -102,7 +112,8 @@ def test_real_worker_permission_error_reports_once(app, cloud) -> None:
     assert not cloud.authenticated
     assert cloud._state.access_token is None
     capture.assert_called_once()
-    assert isinstance(capture.call_args.args[0], PermissionError)
+    assert isinstance(capture.call_args.args[0], RuntimeError)
+    assert str(capture.call_args.args[0]) == "cloud credential restore failed: filesystem"
 
 
 def test_permission_error_reports_once_with_offline_notice(cloud) -> None:
@@ -111,14 +122,15 @@ def test_permission_error_reports_once_with_offline_notice(cloud) -> None:
     with (
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", side_effect=denied),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert statuses == ["CONNECTING", "OFFLINE • RETRYING"]
     assert failures == [str(denied)]
     assert not cloud.authenticated
     capture.assert_called_once()
-    assert isinstance(capture.call_args.args[0], PermissionError)
+    assert isinstance(capture.call_args.args[0], RuntimeError)
+    assert str(capture.call_args.args[0]) == "cloud credential restore failed: filesystem"
 
 
 def test_infra_backed_secure_store_error_reports_once(cloud) -> None:
@@ -127,12 +139,13 @@ def test_infra_backed_secure_store_error_reports_once(cloud) -> None:
     with (
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", side_effect=error),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert failures == [str(error)]
     capture.assert_called_once()
-    assert capture.call_args.args[0] is error
+    assert isinstance(capture.call_args.args[0], RuntimeError)
+    assert str(capture.call_args.args[0]) == "cloud credential restore failed: secure-store-infra"
 
 
 def test_malformed_secure_store_error_stays_silent(cloud) -> None:
@@ -141,7 +154,7 @@ def test_malformed_secure_store_error_stays_silent(cloud) -> None:
     with (
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", side_effect=error),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert failures == [str(error)]
@@ -155,7 +168,7 @@ def test_offline_api_error_stays_silent(cloud) -> None:
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
         patch.object(cloud, "_ensure_access", side_effect=error),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert statuses[-1] == "OFFLINE • RETRYING"
@@ -170,7 +183,7 @@ def test_401_expires_session_silently(cloud) -> None:
         patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
         patch.object(cloud, "_ensure_access", side_effect=ApiError("expired", 401)),
         patch.object(cloud.token_store, "clear") as clear,
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert expired == [True]
@@ -187,7 +200,7 @@ def test_cancel_stays_silent(cloud) -> None:
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
         patch.object(cloud, "_ensure_access", side_effect=error),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert failures == [str(error)]
@@ -202,7 +215,7 @@ def test_malformed_profile_response_stays_silent(cloud) -> None:
         patch.object(cloud.token_store, "load", return_value={"refreshToken": "stored"}),
         patch.object(cloud, "_ensure_access", return_value="access"),
         patch.object(cloud, "_request", return_value={"unexpected": 1}),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert len(failures) == 1
@@ -215,9 +228,10 @@ def test_unexpected_error_reports_once(cloud) -> None:
     with (
         patch.object(cloud, "_start", side_effect=_run_immediately),
         patch.object(cloud.token_store, "load", side_effect=RuntimeError("boom")),
-        patch("pomodorough.network.capture_exception") as capture,
+        patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
     assert failures == ["boom"]
     capture.assert_called_once()
     assert isinstance(capture.call_args.args[0], RuntimeError)
+    assert str(capture.call_args.args[0]) == "cloud credential restore failed: unexpected"

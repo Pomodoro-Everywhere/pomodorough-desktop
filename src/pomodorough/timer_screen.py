@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
@@ -231,14 +231,18 @@ class TimerScreen(QWidget):
     def _build_pattern_heading(self) -> None:
         label = QLabel(self.strings.text("pattern.title"))
         label.setObjectName("sectionTitle")
+        label.setWordWrap(True)
         self.right_layout.addWidget(label)
         detail = QLabel(self.strings.text("pattern.detail"))
         detail.setObjectName("taskSubtitle")
+        detail.setWordWrap(True)
         self.right_layout.addWidget(detail)
         self.pattern_scope = QLabel("")
         self.pattern_scope.setObjectName("taskSubtitle")
+        self.pattern_scope.setWordWrap(True)
         self.pattern_scope.setAccessibleName(self.strings.text("pattern.next_scope"))
         self.right_layout.addWidget(self.pattern_scope)
+        self._settings_heading_labels = (label, detail, self.pattern_scope)
 
     def _build_phase_buttons(self) -> None:
         self.phase_group = QButtonGroup(self)
@@ -257,6 +261,7 @@ class TimerScreen(QWidget):
             )
             self.phase_group.addButton(button)
             self.phase_buttons[phase] = button
+            button.installEventFilter(self)
             self.phase_layout.addWidget(button)
         self.right_layout.addLayout(self.phase_layout)
 
@@ -267,6 +272,7 @@ class TimerScreen(QWidget):
         for row, phase in enumerate(PHASES):
             label_text = self.strings.text(f"phase.{phase}")
             label = QLabel(label_text)
+            label.setWordWrap(True)
             spin = QSpinBox()
             spin.setAccessibleName(
                 self.strings.text("pattern.duration_accessible", phase=label_text)
@@ -280,6 +286,7 @@ class TimerScreen(QWidget):
             grid.addWidget(label, row, 0)
             grid.addWidget(spin, row, 1)
             self.duration_spins[phase] = spin
+        self._duration_grid = grid
         self.right_layout.addLayout(grid)
 
     def _build_auto_break_controls(self, settings: dict[str, Any]) -> None:
@@ -346,6 +353,8 @@ class TimerScreen(QWidget):
             self.settings_scroll.setMinimumWidth(225 if compact else 310)
             self.settings_scroll.setMaximumWidth(300 if compact else 370)
         self._settings_base_min = 225 if compact else 310
+        self._settings_base_max = 300 if compact else 370
+        self._settings_imposed_min = self._settings_base_min
         self._schedule_settings_reflow()
 
     def _schedule_settings_reflow(self) -> None:
@@ -354,6 +363,17 @@ class TimerScreen(QWidget):
         # Coalesce through the event loop like the task row resize timer.
         if not self._settings_reflow_timer.isActive():
             self._settings_reflow_timer.start()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.StyleChange,
+            QEvent.Type.LayoutRequest,
+        ):
+            buttons = getattr(self, "phase_buttons", None) or {}
+            if watched in buttons.values():
+                self._schedule_settings_reflow()
+        return super().eventFilter(watched, event)
 
     def _settings_reflow(self) -> None:
         layout = getattr(self, "phase_layout", None)
@@ -370,19 +390,53 @@ class TimerScreen(QWidget):
         chrome = margins.left() + margins.right() + panel.contentsMargins().left() + panel.contentsMargins().right()
         need_row = sum(hints) + layout.spacing() * (len(hints) - 1) + chrome
         need_stack = max(hints) + chrome
-        avail = panel.width() or (scroll.viewport().width() if scroll.isVisible() else 0) or panel.maximumWidth()
-        stack = avail < need_row
+        need_content = self._settings_content_need() + chrome
+        base = getattr(self, "_settings_base_min", panel.minimumWidth())
+        stack = self._reflow_avail(panel, scroll, base) < need_row
         want = QBoxLayout.Direction.TopToBottom if stack else QBoxLayout.Direction.LeftToRight
         if layout.direction() != want:
             layout.setDirection(want)
-        base = getattr(self, "_settings_base_min", panel.minimumWidth())
-        need_min = max(base, need_stack) if stack else base
+        phase_need = max(base, need_stack) if stack else base
+        self._apply_reflow_widths(panel, scroll, max(phase_need, need_content))
+
+    def _settings_content_need(self) -> int:
+        # R51-D03: phase buttons alone do not size headings, detail, or
+        # duration rows. Wrapped labels report a small minimum width;
+        # the grid minimum keeps spins and long words measurable so the
+        # scroll content retains its intrinsic minimum instead of
+        # clipping inside labels. No fixed width is added here.
+        needs = []
+        for label in getattr(self, "_settings_heading_labels", ()):
+            needs.append(label.minimumSizeHint().width())
+        grid = getattr(self, "_duration_grid", None)
+        if grid is not None:
+            needs.append(grid.minimumSize().width())
+        return max(needs) if needs else 0
+
+    def _reflow_avail(self, panel: QFrame, scroll: QScrollArea, base: int) -> int:
+        avail = panel.width() or (scroll.viewport().width() if scroll.isVisible() else 0) or panel.maximumWidth()
+        imposed = getattr(self, "_settings_imposed_min", base)
+        if imposed > base and avail <= imposed + 2:
+            # Width still carries our own grown minimum from a child-only
+            # style change. Judge the row against the base width so shrink
+            # restores the stack instead of squeezing a stale row.
+            return base
+        return avail
+
+    def _apply_reflow_widths(self, panel: QFrame, scroll: QScrollArea, need_min: int) -> None:
         for widget in (panel, scroll):
             if widget.minimumWidth() != need_min:
                 widget.setMinimumWidth(need_min)
+        self._settings_imposed_min = need_min
+        base_max = getattr(self, "_settings_base_max", panel.maximumWidth())
         if panel.maximumWidth() < need_min:
             panel.setMaximumWidth(need_min)
             scroll.setMaximumWidth(need_min)
+        elif need_min <= base_max:
+            if panel.maximumWidth() > base_max:
+                panel.setMaximumWidth(base_max)
+            if scroll.maximumWidth() > base_max:
+                scroll.setMaximumWidth(base_max)
 
     def changeEvent(self, event: Any) -> None:
         super().changeEvent(event)

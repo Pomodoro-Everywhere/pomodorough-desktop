@@ -3456,6 +3456,7 @@ class Store:
                 "deliveryProof",
                 {domain: [] for domain in DELIVERY_QUEUE_DOMAINS})
             self._set_meta("canonicalHead", None)
+            self._set_meta("canonicalDurationsMs", None)
             self._set_meta("commandPhysicalTimes", {})
             self._set_meta("centralizedTimerOwnership", None)
             self._set_meta("pendingSync", None)

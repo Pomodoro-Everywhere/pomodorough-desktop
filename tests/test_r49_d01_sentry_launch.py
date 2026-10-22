@@ -87,13 +87,33 @@ def test_explicit_test_opt_in_preserves_reporting(tmp_path, markers, runner):
 def assert_reporting(receipt):
     assert receipt["initialized"] is True
     events = receipt["events"]
-    assert len(events) == 4
+    assert len(events) == 5
     assert all(event["environment"] == "production" for event in events)
     assert all(event["release"] == __version__ for event in events)
-    assert [event["exception"]["values"][-1]["type"] for event in events[:2]] == [
-        "PermissionError", "RuntimeError",
+    exceptions = [event for event in events if "exception" in event]
+    messages = [event for event in events if "message" in event]
+    assert len(exceptions) == 3
+    assert len(messages) == 2
+    assert all(
+        event["exception"]["values"][-1]["type"] == "RuntimeError"
+        for event in exceptions
+    )
+    # R51-L01 fixed taxonomy: restore/filesystem (was raw PermissionError).
+    cloud = [
+        event for event in exceptions
+        if (event.get("tags") or {}).get("cloud_credential.operation") == "restore"
     ]
-    assert [event["message"] for event in events[2:]] == [
+    assert len(cloud) == 1
+    assert cloud[0]["tags"]["cloud_credential.cause"] == "filesystem"
+    # R51-L02 diagnostic: revocation restore/queue-read from the all-denied
+    # secret store in the child. Restore order races, so match unordered.
+    revocation = [
+        event for event in exceptions
+        if (event.get("tags") or {}).get("revocation_storage.operation") == "restore"
+    ]
+    assert len(revocation) == 1
+    assert revocation[0]["tags"]["revocation_storage.cause"] == "queue-read"
+    assert [event["message"] for event in messages] == [
         "R49-D01 synthetic Qt critical hook", "R49-D01 synthetic Qt fatal hook",
     ]
 

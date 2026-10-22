@@ -208,6 +208,7 @@ class ReplicatedStateProjection:
                 "selectedTaskOperations": [],
             },
             canonicalHead=None,
+            canonicalDurationsMs=deepcopy(genesis["durationsMs"]),
         )
         for table in workspace["tables"]:
             workspace["tables"][table] = []
@@ -266,6 +267,7 @@ class ReplicatedStateProjection:
             commandPhysicalTimes=self._pending_command_physical_times(workspace),
             pendingSync=None,
             pendingResolution=None,
+            canonicalDurationsMs=deepcopy(projection["durationsMs"]),
         )
         # Capture retires published rows before projection. Remaining operation
         # rows belong to the workspace, including capability-held retargets;

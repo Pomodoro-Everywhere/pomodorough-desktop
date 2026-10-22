@@ -48,7 +48,9 @@ def assert_failure(receipt: dict, detail: str) -> None:
     assert receipt["statuses"] == ["CONNECTING", "OFFLINE • RETRYING"]
     assert receipt["users"] == [] and not receipt["fallback_exists"]
     assert len(receipt["events"]) == 1
-    assert receipt["events"][0]["exception"]["values"][-1]["type"] == "SecureStoreError"
+    assert receipt["events"][0]["exception"]["values"][-1]["type"] == "RuntimeError"
+    assert receipt["events"][0].get("tags", {}).get("cloud_credential.operation") == "restore"
+    assert receipt["events"][0].get("tags", {}).get("cloud_credential.cause") == "secure-store-infra"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Linux secret-tool/GNOME Keyring requires Unix")
@@ -58,7 +60,8 @@ def test_fresh_missing_executable_reports_actionable_failure_once(tmp_path):
     receipt = run_child(tmp_path, "missing", environment=environment)
     assert_failure(receipt, "secret-tool was not found")
     assert "libsecret-tools" in receipt["reason"]
-    assert receipt["events"][0]["exception"]["values"][0]["type"] == "FileNotFoundError"
+    assert len(receipt["events"][0]["exception"]["values"]) == 1
+    assert receipt["events"][0]["exception"]["values"][0]["type"] == "RuntimeError"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Linux secret-tool/GNOME Keyring requires Unix")
@@ -144,7 +147,8 @@ def test_real_provider_unavailable_controls(tmp_path, mode):
     receipt = run_child(tmp_path, mode, prefix=isolated_bus(tmp_path))
     if mode == "provider":
         assert_failure(receipt, "org.freedesktop.secrets")
-        assert receipt["events"][0]["exception"]["values"][0]["type"] == "CalledProcessError"
+        assert len(receipt["events"][0]["exception"]["values"]) == 1
+        assert receipt["events"][0]["exception"]["values"][0]["type"] == "RuntimeError"
     else:
         assert receipt["retained"] and receipt["fallback_exists"]
         assert len(receipt["events"]) == (0 if mode == "signed-out" else 1)

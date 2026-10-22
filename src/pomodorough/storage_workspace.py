@@ -21,6 +21,7 @@ _METADATA_KEYS = (
     "pendingResolution",
     "deliveryProof",
     "canonicalHead",
+    "canonicalDurationsMs",
 )
 
 _TABLE_COLUMNS = {
@@ -115,9 +116,14 @@ class WorkspacePersistence:
             )
 
     def restore_metadata(self, metadata: dict[str, Any]) -> None:
-        # Older saved workspaces have no delivery proof or canonical head;
-        # never inherit another workspace's delivery claims.
-        defaults = {"deliveryProof": None, "canonicalHead": None}
+        # Older saved workspaces have no delivery proof, canonical head,
+        # or canonical duration base; never inherit another workspace's
+        # delivery claims or centralized duration base.
+        defaults = {
+            "deliveryProof": None,
+            "canonicalHead": None,
+            "canonicalDurationsMs": None,
+        }
         for key, value in {**defaults, **metadata}.items():
             if key in _METADATA_KEYS:
                 self._write_meta(key, value)
@@ -158,6 +164,10 @@ class WorkspacePersistence:
             phase: int(definition["default_minutes"]) * 60_000
             for phase, definition in PHASES.items()
         }
+        # Account reset drops the workspace-owned canonical duration base
+        # alongside optimistic settings; the next projection falls back
+        # to defaults until a fresh authoritative install arrives.
+        metadata["canonicalDurationsMs"] = None
         settings["selectedTaskId"] = None
         settings["autoStartBreaks"] = False
         metadata["settings"] = settings

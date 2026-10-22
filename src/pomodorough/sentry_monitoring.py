@@ -530,15 +530,20 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
     Fail-closed: never raises and never returns a partially scrubbed or
     original event on internal error. Returning None drops the event in
     Sentry's before_send contract, which is safer than leaking PII.
+    R51-L03: validated cloud-credential taxonomy is re-attached after
+    scrubbing so finite operation/cause survives `[Filtered]` values.
     """
     del hint
     try:
         if not isinstance(event, dict):
             return event
+        operation, cause = _extract_cloud_taxonomy(event)
         cleaned = _scrub_value(event)
         # Privacy: drop hostname even if the SDK re-adds it; init also
         # sets server_name="" (separate hunk, same privacy fix).
         cleaned.pop("server_name", None)
+        if operation is not None and cause is not None:
+            _attach_cloud_taxonomy(cleaned, operation, cause)
         return cleaned
     except Exception:  # noqa: BLE001 - scrubber must stay non-fatal.
         return None
@@ -781,46 +786,238 @@ def capture_pending_break_read_failure(error: BaseException) -> bool:
 
 
 CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS = 5.0
-_CLOUD_CREDENTIAL_SIGNATURE: str | None = None
-_CLOUD_CREDENTIAL_NEXT_AT = float("-inf")
+CLOUD_CREDENTIAL_SHARED_BUDGET = 4
+_CLOUD_CREDENTIAL_OPERATIONS = frozenset(
+    {
+        "save",
+        "login",
+        "sync",
+        "preview_bootstrap",
+        "resolve_bootstrap",
+        "revision_stream",
+        "restore",
+    }
+)
+_CLOUD_CREDENTIAL_CAUSES = frozenset(
+    {"filesystem", "secure-store-infra", "unexpected"}
+)
+_CLOUD_CREDENTIAL_NEXT_AT: dict[str, float] = {}
+_CLOUD_CREDENTIAL_SHARED_COUNT = 0
+_CLOUD_CREDENTIAL_TAG_OPERATION = "cloud_credential.operation"
+_CLOUD_CREDENTIAL_TAG_CAUSE = "cloud_credential.cause"
+_CLOUD_CREDENTIAL_CONTEXT_KEY = "cloud_credential"
+_CLOUD_CREDENTIAL_MESSAGE_RE = re.compile(r"^cloud credential (\S+) failed: (\S+)$")
+
+
+def _validated_cloud_taxonomy(operation: Any, cause: Any) -> tuple[str | None, str | None]:
+    """R51-L03: finite taxonomy only; anything else stays silent."""
+    if isinstance(operation, str) and isinstance(cause, str):
+        if operation in _CLOUD_CREDENTIAL_OPERATIONS and cause in _CLOUD_CREDENTIAL_CAUSES:
+            return operation, cause
+    return None, None
+
+
+def _extract_cloud_taxonomy(event: dict[str, Any]) -> tuple[str | None, str | None]:
+    """R51-L03: read taxonomy from tags, context, or fixed message."""
+    try:
+        tags = event.get("tags")
+        if isinstance(tags, dict):
+            operation, cause = _validated_cloud_taxonomy(
+                tags.get(_CLOUD_CREDENTIAL_TAG_OPERATION),
+                tags.get(_CLOUD_CREDENTIAL_TAG_CAUSE),
+            )
+            if operation is not None and cause is not None:
+                return operation, cause
+        contexts = event.get("contexts")
+        if isinstance(contexts, dict):
+            inner = contexts.get(_CLOUD_CREDENTIAL_CONTEXT_KEY)
+            if isinstance(inner, dict):
+                operation, cause = _validated_cloud_taxonomy(
+                    inner.get("operation"), inner.get("cause")
+                )
+                if operation is not None and cause is not None:
+                    return operation, cause
+        exception = event.get("exception")
+        values = exception.get("values") if isinstance(exception, dict) else None
+        for item in values if isinstance(values, list) else []:
+            value = item.get("value") if isinstance(item, dict) else None
+            if not isinstance(value, str):
+                continue
+            match = _CLOUD_CREDENTIAL_MESSAGE_RE.match(value.strip())
+            if match:
+                operation, cause = _validated_cloud_taxonomy(*match.groups())
+                if operation is not None and cause is not None:
+                    return operation, cause
+    except Exception:  # noqa: BLE001 - extraction stays non-fatal.
+        return None, None
+    return None, None
+
+
+def _attach_cloud_taxonomy(cleaned: dict[str, Any], operation: str, cause: str) -> None:
+    """R51-L03: write validated taxonomy into tags and context."""
+    try:
+        tags = cleaned.get("tags")
+        if not isinstance(tags, dict):
+            tags = {}
+            cleaned["tags"] = tags
+        tags[_CLOUD_CREDENTIAL_TAG_OPERATION] = operation
+        tags[_CLOUD_CREDENTIAL_TAG_CAUSE] = cause
+        contexts = cleaned.get("contexts")
+        if not isinstance(contexts, dict):
+            contexts = {}
+            cleaned["contexts"] = contexts
+        contexts[_CLOUD_CREDENTIAL_CONTEXT_KEY] = {"operation": operation, "cause": cause}
+    except Exception:  # noqa: BLE001 - attach stays non-fatal.
+        pass
+
+
+def _cloud_credential_key_valid(operation: str, cause: str) -> bool:
+    """R51-L01: fixed taxonomy only; unknown keys stay silent."""
+    return operation in _CLOUD_CREDENTIAL_OPERATIONS and cause in _CLOUD_CREDENTIAL_CAUSES
 
 
 def should_capture_cloud_credential(
     operation: str, cause: str, *, now_monotonic: float | None = None
 ) -> bool:
-    """R50-D04/L01: bounded cloud credential storage-infra budget."""
+    """R51-L01: per-key throttle plus shared epoch cap.
+
+    Each operation:cause key recurs no faster than the report
+    interval. Alternating keys cannot rearm each other because
+    every key keeps its own timestamp. The shared count bounds
+    a many-key burst within one recovery epoch.
+    """
+    if not _cloud_credential_key_valid(operation, cause):
+        return False
     now = time.monotonic() if now_monotonic is None else now_monotonic
     signature = f"{operation}:{cause}"
-    global _CLOUD_CREDENTIAL_SIGNATURE, _CLOUD_CREDENTIAL_NEXT_AT
-    if signature != _CLOUD_CREDENTIAL_SIGNATURE:
-        _CLOUD_CREDENTIAL_SIGNATURE = signature
-        _CLOUD_CREDENTIAL_NEXT_AT = now + CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS
-        return True
-    if now >= _CLOUD_CREDENTIAL_NEXT_AT:
-        _CLOUD_CREDENTIAL_NEXT_AT = now + CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS
-        return True
-    return False
+    global _CLOUD_CREDENTIAL_SHARED_COUNT
+    if now < _CLOUD_CREDENTIAL_NEXT_AT.get(signature, float("-inf")):
+        return False
+    if _CLOUD_CREDENTIAL_SHARED_COUNT >= CLOUD_CREDENTIAL_SHARED_BUDGET:
+        return False
+    _CLOUD_CREDENTIAL_NEXT_AT[signature] = (
+        now + CLOUD_CREDENTIAL_REPORT_INTERVAL_SECONDS
+    )
+    _CLOUD_CREDENTIAL_SHARED_COUNT += 1
+    return True
 
 
 def note_cloud_credential_recovery() -> None:
-    """R50-D04/L01: clear incident so recurrence after success reports."""
-    global _CLOUD_CREDENTIAL_SIGNATURE
-    _CLOUD_CREDENTIAL_SIGNATURE = None
+    """R51-L01: clear per-key and shared budget after success."""
+    global _CLOUD_CREDENTIAL_SHARED_COUNT
+    _CLOUD_CREDENTIAL_NEXT_AT.clear()
+    _CLOUD_CREDENTIAL_SHARED_COUNT = 0
 
 
 def reset_cloud_credential_budget() -> None:
-    """Test seam: reset the R50-D04/L01 cloud credential budget."""
-    global _CLOUD_CREDENTIAL_SIGNATURE, _CLOUD_CREDENTIAL_NEXT_AT
-    _CLOUD_CREDENTIAL_SIGNATURE = None
-    _CLOUD_CREDENTIAL_NEXT_AT = float("-inf")
+    """Test seam: reset the R51-L01 cloud credential budget."""
+    global _CLOUD_CREDENTIAL_SHARED_COUNT
+    _CLOUD_CREDENTIAL_NEXT_AT.clear()
+    _CLOUD_CREDENTIAL_SHARED_COUNT = 0
 
 
 def capture_cloud_credential(operation: str, cause: str) -> bool:
-    """R50-D04/L01: gated payload-free capture; True when budget allowed."""
+    """R51-L01: gated payload-free capture; True when budget allowed.
+
+    R51-L03: taxonomy also rides in tags/context so scrubbing the
+    fixed `value` message cannot erase it; scrubber re-attaches it.
+    """
     if not should_capture_cloud_credential(operation, cause):
         return False
     try:
-        capture_exception(RuntimeError(f"cloud credential {operation} failed: {cause}"))
+        import sentry_sdk
+
+        error = RuntimeError(f"cloud credential {operation} failed: {cause}")
+        try:
+            with sentry_sdk.new_scope() as scope:
+                scope.set_tag(_CLOUD_CREDENTIAL_TAG_OPERATION, operation)
+                scope.set_tag(_CLOUD_CREDENTIAL_TAG_CAUSE, cause)
+                scope.set_context(
+                    _CLOUD_CREDENTIAL_CONTEXT_KEY,
+                    {"operation": operation, "cause": cause},
+                )
+                capture_exception(error)
+        except Exception:  # noqa: BLE001 - scope isolation stays best-effort.
+            capture_exception(error)
+    except Exception:  # noqa: BLE001 - reporting stays non-fatal.
+        _note_capture_fallback()
+    return True
+
+
+REVOCATION_STORAGE_REPORT_INTERVAL_SECONDS = 5.0
+REVOCATION_STORAGE_SHARED_BUDGET = 4
+_REVOCATION_STORAGE_OPERATIONS = frozenset({"restore", "replay"})
+_REVOCATION_STORAGE_CAUSES = frozenset(
+    {"queue-read", "queue-update", "acknowledge"}
+)
+_REVOCATION_STORAGE_NEXT_AT: dict[str, float] = {}
+_REVOCATION_STORAGE_SHARED_COUNT = 0
+_REVOCATION_STORAGE_TAG_OPERATION = "revocation_storage.operation"
+_REVOCATION_STORAGE_TAG_CAUSE = "revocation_storage.cause"
+_REVOCATION_STORAGE_CONTEXT_KEY = "revocation_storage"
+
+
+def _revocation_storage_key_valid(operation: str, cause: str) -> bool:
+    """R51-L02: fixed taxonomy only; unknown keys stay silent."""
+    return (
+        operation in _REVOCATION_STORAGE_OPERATIONS
+        and cause in _REVOCATION_STORAGE_CAUSES
+    )
+
+
+def should_capture_revocation_storage(
+    operation: str, cause: str, *, now_monotonic: float | None = None
+) -> bool:
+    """R51-L02: per-key throttle plus shared epoch cap."""
+    if not _revocation_storage_key_valid(operation, cause):
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    signature = f"{operation}:{cause}"
+    global _REVOCATION_STORAGE_SHARED_COUNT
+    if now < _REVOCATION_STORAGE_NEXT_AT.get(signature, float("-inf")):
+        return False
+    if _REVOCATION_STORAGE_SHARED_COUNT >= REVOCATION_STORAGE_SHARED_BUDGET:
+        return False
+    _REVOCATION_STORAGE_NEXT_AT[signature] = (
+        now + REVOCATION_STORAGE_REPORT_INTERVAL_SECONDS
+    )
+    _REVOCATION_STORAGE_SHARED_COUNT += 1
+    return True
+
+
+def note_revocation_storage_recovery() -> None:
+    """R51-L02: clear per-key and shared budget after success."""
+    global _REVOCATION_STORAGE_SHARED_COUNT
+    _REVOCATION_STORAGE_NEXT_AT.clear()
+    _REVOCATION_STORAGE_SHARED_COUNT = 0
+
+
+def reset_revocation_storage_budget() -> None:
+    """Test seam: reset the R51-L02 revocation storage budget."""
+    global _REVOCATION_STORAGE_SHARED_COUNT
+    _REVOCATION_STORAGE_NEXT_AT.clear()
+    _REVOCATION_STORAGE_SHARED_COUNT = 0
+
+
+def capture_revocation_storage(operation: str, cause: str) -> bool:
+    """R51-L02: gated payload-free capture; True when budget allowed."""
+    if not should_capture_revocation_storage(operation, cause):
+        return False
+    try:
+        import sentry_sdk
+
+        error = RuntimeError(f"revocation {operation} failed: {cause}")
+        try:
+            with sentry_sdk.new_scope() as scope:
+                scope.set_tag(_REVOCATION_STORAGE_TAG_OPERATION, operation)
+                scope.set_tag(_REVOCATION_STORAGE_TAG_CAUSE, cause)
+                scope.set_context(
+                    _REVOCATION_STORAGE_CONTEXT_KEY,
+                    {"operation": operation, "cause": cause},
+                )
+                capture_exception(error)
+        except Exception:  # noqa: BLE001 - scope isolation stays best-effort.
+            capture_exception(error)
     except Exception:  # noqa: BLE001 - reporting stays non-fatal.
         _note_capture_fallback()
     return True

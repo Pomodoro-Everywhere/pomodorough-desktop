@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .network_session import ApiError, Request, SessionState, Text, TokenStorePort
-from .secure_store import SecureStoreError, TokenCleanupPendingError, token_store_lock
+from .secure_store import (
+    SecureStoreError,
+    TokenCleanupPendingError,
+    TokenCommitPendingError,
+    should_capture_secure_store_error,
+    token_store_lock,
+)
 from .storage_revocation import PendingSessionRevocations, credential_api_base
 
 _CLEARED_DELETION_CLEANUP = {"version": 1, "cleanupState": "cleared"}
@@ -311,6 +317,56 @@ class RevocationState:
     acknowledged: bool = False
     api_base: str | None = field(default=None, kw_only=True)
     _durable_credentials: dict[str, Any] | None = field(default=None, init=False, repr=False)
+
+
+def _revocation_pending_target(error: TokenCommitPendingError) -> BaseException | None:
+    """R51-L02: first non-pending cause; None for plain pending."""
+    seen: set[int] = set()
+    current: BaseException = error
+    for _ in range(8):
+        if id(current) in seen:
+            return None
+        seen.add(id(current))
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            current = cause
+        elif isinstance(context, BaseException):
+            current = context
+        else:
+            return None
+        if not isinstance(current, TokenCommitPendingError):
+            return current
+    return None
+
+
+def _revocation_storage_cause(error: BaseException, cause: str) -> str | None:
+    """R51-L02: infra storage maps to fixed phase; expected stays quiet."""
+    if isinstance(error, TokenCommitPendingError):
+        target = _revocation_pending_target(error)
+        if target is None:
+            return None
+        return _revocation_storage_cause(target, cause)
+    if isinstance(error, ApiError):
+        return None
+    if isinstance(error, SecureStoreError):
+        if not should_capture_secure_store_error(error):
+            return None
+        return cause
+    if isinstance(error, (OSError, subprocess.SubprocessError)):
+        return cause
+    if isinstance(error, (ValueError, KeyError, TypeError)):
+        return None
+    return None
+
+
+def _report_revocation_storage(operation: str, cause: str, error: BaseException) -> bool:
+    """R51-L02: bounded payload-free report; queue claim preserved."""
+    if _revocation_storage_cause(error, cause) is None:
+        return False
+    from .sentry_monitoring import capture_revocation_storage
+
+    return capture_revocation_storage(operation, cause)
 
 
 class AccountLifecycle:
@@ -1056,16 +1112,30 @@ class AccountLifecycle:
             self.enqueue_revocation(revocation)
         api_base = self._revocation_api(revocation)
         with self.revocations.claim(api_base, revocation.identifier):
-            current = self.revocations.load(api_base).get(revocation.identifier)
+            try:
+                current = self.revocations.load(api_base).get(revocation.identifier)
+            except Exception as error:
+                _report_revocation_storage("replay", "queue-read", error)
+                raise
             if current is None:
                 revocation.acknowledged = True
+                from .sentry_monitoring import note_revocation_storage_recovery
+
+                note_revocation_storage_recovery()
                 return
             self._revalidate_revocation(revocation, current)
             if not revocation.acknowledged:
                 self._revoke_session(revocation)
                 revocation.acknowledged = True
                 self._save_revocation(revocation)
-            self.revocations.acknowledge(api_base, revocation.identifier)
+            try:
+                self.revocations.acknowledge(api_base, revocation.identifier)
+            except Exception as error:
+                _report_revocation_storage("replay", "acknowledge", error)
+                raise
+        from .sentry_monitoring import note_revocation_storage_recovery
+
+        note_revocation_storage_recovery()
 
     def _revalidate_revocation(
         self, revocation: RevocationState, current: dict[str, Any]
@@ -1080,6 +1150,14 @@ class AccountLifecycle:
         revocation._durable_credentials = current
 
     def pending_revocations(self) -> list[RevocationState]:
+        try:
+            groups = self.revocations.load_all(self.api_base).items()
+        except Exception as error:
+            _report_revocation_storage("restore", "queue-read", error)
+            raise
+        from .sentry_monitoring import note_revocation_storage_recovery
+
+        note_revocation_storage_recovery()
         return [
             RevocationState(
                 credentials["accessToken"], credentials["refreshToken"],
@@ -1087,15 +1165,19 @@ class AccountLifecycle:
                 credentials["acknowledged"],
                 api_base=api_base,
             )
-            for api_base, pending in self.revocations.load_all(self.api_base).items()
+            for api_base, pending in groups
             for identifier, credentials in pending.items()
         ]
 
     def _save_revocation(self, revocation: RevocationState) -> None:
         credentials = self._revocation_credentials(revocation)
-        self.revocations.update(
-            self._revocation_api(revocation), revocation.identifier, credentials,
-        )
+        try:
+            self.revocations.update(
+                self._revocation_api(revocation), revocation.identifier, credentials,
+            )
+        except Exception as error:
+            _report_revocation_storage("replay", "queue-update", error)
+            raise
         revocation._durable_credentials = credentials
 
     @staticmethod
