@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -351,11 +352,12 @@ class TimerScreen(QWidget):
         need_row, need_stack, need_content = self._measured_settings_needs()
         base_min = max(need_stack, need_content)
         base_max = max(base_min, need_row)
+        extra = self._settings_scroll_extra()
         self.right_panel.setMinimumWidth(base_min)
         self.right_panel.setMaximumWidth(base_max)
         if hasattr(self, "settings_scroll"):
-            self.settings_scroll.setMinimumWidth(base_min)
-            self.settings_scroll.setMaximumWidth(base_max)
+            self.settings_scroll.setMinimumWidth(base_min + extra)
+            self.settings_scroll.setMaximumWidth(base_max + extra)
         self._settings_base_min = base_min
         self._settings_base_max = base_max
         self._settings_imposed_min = base_min
@@ -475,20 +477,40 @@ class TimerScreen(QWidget):
             return base
         return avail
 
+    def _settings_scroll_extra(self) -> int:
+        # The panel lives inside a scroll area whose vertical scrollbar
+        # and frame consume viewport width. The scroll wrapper minimum
+        # carries that measured chrome so the viewport still fits the
+        # panel minimum instead of opening a horizontal scrollbar.
+        frame = 0
+        scroll = getattr(self, "settings_scroll", None)
+        if scroll is not None:
+            try:
+                frame = scroll.frameWidth()
+            except RuntimeError:
+                frame = 0
+        try:
+            extent = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        except RuntimeError:
+            extent = 0
+        return frame * 2 + max(0, extent)
+
     def _apply_reflow_widths(self, panel: QFrame, scroll: QScrollArea, need_min: int) -> None:
-        for widget in (panel, scroll):
-            if widget.minimumWidth() != need_min:
-                widget.setMinimumWidth(need_min)
+        extra = self._settings_scroll_extra()
+        if panel.minimumWidth() != need_min:
+            panel.setMinimumWidth(need_min)
+        if scroll.minimumWidth() != need_min + extra:
+            scroll.setMinimumWidth(need_min + extra)
         self._settings_imposed_min = need_min
         base_max = getattr(self, "_settings_base_max", panel.maximumWidth())
         if panel.maximumWidth() < need_min:
             panel.setMaximumWidth(need_min)
-            scroll.setMaximumWidth(need_min)
+            scroll.setMaximumWidth(need_min + extra)
         elif need_min <= base_max:
             if panel.maximumWidth() > base_max:
                 panel.setMaximumWidth(base_max)
-            if scroll.maximumWidth() > base_max:
-                scroll.setMaximumWidth(base_max)
+            if scroll.maximumWidth() > base_max + extra:
+                scroll.setMaximumWidth(base_max + extra)
 
     def changeEvent(self, event: Any) -> None:
         super().changeEvent(event)

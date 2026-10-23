@@ -156,15 +156,30 @@ def _expected_settings_min(screen) -> int:
     return max(need_stack, need_content)
 
 
+def _expected_scroll_extra(screen) -> int:
+    try:
+        frame = screen.settings_scroll.frameWidth()
+    except RuntimeError:
+        frame = 0
+    try:
+        from PySide6.QtWidgets import QStyle
+
+        extent = screen.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+    except RuntimeError:
+        extent = 0
+    return frame * 2 + max(0, extent)
+
+
 @pytest.mark.parametrize("locale", ["en", "ar-XB"])
 def test_no_spurious_horizontal_scroll_at_base_font(app, tmp_path, locale):
     with _scaled_font(app, 9.0):
         with _main_window(app, tmp_path, locale, 640, 360) as window:
             screen = window.timer_screen
             expected = _expected_settings_min(screen)
+            extra = _expected_scroll_extra(screen)
             assert screen._settings_base_min == expected
             assert screen.right_panel.minimumWidth() == expected
-            assert screen.settings_scroll.minimumWidth() == expected
+            assert screen.settings_scroll.minimumWidth() == expected + extra
             assert screen.right_panel.minimumWidth() == screen._settings_base_min
             bar = screen.settings_scroll.horizontalScrollBar()
             # Offscreen can expand to host width; font metrics vary by
