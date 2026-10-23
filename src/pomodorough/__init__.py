@@ -1,3 +1,3 @@
 """Pomodorough desktop client."""
 
-__version__ = "0.51.2"
+__version__ = "0.51.3"
