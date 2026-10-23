@@ -449,11 +449,20 @@ class TimerScreen(QWidget):
         # duration rows. Wrapped labels report a small minimum width.
         # Duration need is measured per row as label hint plus spin
         # hint so Windows font metrics cannot overflow a fixed width.
+        # Single-line controls such as the auto-breaks checkbox report
+        # their full text width; every direct settings child is measured
+        # so longer fonts never hide behind a horizontal scrollbar.
         # No fixed width is added here.
         needs = []
         for label in getattr(self, "_settings_heading_labels", ()):
             needs.append(label.minimumSizeHint().width())
         needs.append(self._duration_row_need())
+        layout = getattr(self, "right_layout", None)
+        if layout is not None:
+            for index in range(layout.count()):
+                widget = layout.itemAt(index).widget()
+                if widget is not None:
+                    needs.append(widget.minimumSizeHint().width())
         return max(needs) if needs else 0
 
     def _reflow_avail(self, panel: QFrame, scroll: QScrollArea, base: int) -> int:

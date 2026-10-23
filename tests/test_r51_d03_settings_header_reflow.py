@@ -145,10 +145,14 @@ def _expected_settings_min(screen) -> int:
         spin = grid.itemAtPosition(row, 1).widget()
         row_need = max(row_need, label.minimumSizeHint().width() + spin.minimumSizeHint().width())
     duration_need = row_need + grid_spacing if row_need else 0
-    heading_need = max(
-        [label.minimumSizeHint().width() for label in screen._settings_heading_labels] + [duration_need]
-    )
-    need_content = heading_need + chrome
+    child_need = duration_need
+    for label in screen._settings_heading_labels:
+        child_need = max(child_need, label.minimumSizeHint().width())
+    for index in range(screen.right_layout.count()):
+        widget = screen.right_layout.itemAt(index).widget()
+        if widget is not None:
+            child_need = max(child_need, widget.minimumSizeHint().width())
+    need_content = child_need + chrome
     return max(need_stack, need_content)
 
 
