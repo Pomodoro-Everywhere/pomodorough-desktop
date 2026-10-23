@@ -126,11 +126,41 @@ def test_headings_and_durations_intact(app, tmp_path, locale, point_size, size):
             assert not window.timer_screen._settings_reflow_timer.isActive()
 
 
+def _expected_settings_min(screen) -> int:
+    hints = [b.minimumSizeHint().width() for b in screen.phase_buttons.values()]
+    margins = screen.right_layout.contentsMargins()
+    chrome = margins.left() + margins.right()
+    chrome += screen.right_panel.contentsMargins().left()
+    chrome += screen.right_panel.contentsMargins().right()
+    need_stack = (max(hints) if hints else 0) + chrome
+    grid = screen._duration_grid
+    grid_spacing = grid.horizontalSpacing()
+    if grid_spacing < 0:
+        grid_spacing = grid.verticalSpacing()
+    if grid_spacing < 0:
+        grid_spacing = 0
+    row_need = 0
+    for row in range(grid.rowCount()):
+        label = grid.itemAtPosition(row, 0).widget()
+        spin = grid.itemAtPosition(row, 1).widget()
+        row_need = max(row_need, label.minimumSizeHint().width() + spin.minimumSizeHint().width())
+    duration_need = row_need + grid_spacing if row_need else 0
+    heading_need = max(
+        [label.minimumSizeHint().width() for label in screen._settings_heading_labels] + [duration_need]
+    )
+    need_content = heading_need + chrome
+    return max(need_stack, need_content)
+
+
 @pytest.mark.parametrize("locale", ["en", "ar-XB"])
 def test_no_spurious_horizontal_scroll_at_base_font(app, tmp_path, locale):
     with _scaled_font(app, 9.0):
         with _main_window(app, tmp_path, locale, 640, 360) as window:
             screen = window.timer_screen
+            expected = _expected_settings_min(screen)
+            assert screen._settings_base_min == expected
+            assert screen.right_panel.minimumWidth() == expected
+            assert screen.settings_scroll.minimumWidth() == expected
             assert screen.right_panel.minimumWidth() == screen._settings_base_min
             bar = screen.settings_scroll.horizontalScrollBar()
             # Offscreen can expand to host width; font metrics vary by

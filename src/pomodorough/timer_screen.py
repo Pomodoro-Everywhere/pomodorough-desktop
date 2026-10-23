@@ -222,8 +222,8 @@ class TimerScreen(QWidget):
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setWidget(self.right_panel)
-        self.settings_scroll.setMinimumWidth(225)
-        self.settings_scroll.setMaximumWidth(370)
+        self.settings_scroll.setMinimumWidth(0)
+        self.settings_scroll.setMaximumWidth(16777215)
         self.content_layout.addWidget(self.settings_scroll, 2)
         self.settings_scroll.hide()
         self.right_panel.hide()
@@ -268,6 +268,7 @@ class TimerScreen(QWidget):
     def _build_duration_controls(self, settings: dict[str, Any]) -> None:
         grid = QGridLayout()
         grid.setVerticalSpacing(7)
+        grid.setHorizontalSpacing(7)
         self.duration_spins: dict[str, QSpinBox] = {}
         for row, phase in enumerate(PHASES):
             label_text = self.strings.text(f"phase.{phase}")
@@ -347,14 +348,17 @@ class TimerScreen(QWidget):
         margin = 12 if compact else 18
         self.right_layout.setContentsMargins(margin, margin, margin, margin)
         self.right_layout.setSpacing(7 if compact else 12)
-        self.right_panel.setMinimumWidth(225 if compact else 310)
-        self.right_panel.setMaximumWidth(300 if compact else 370)
+        need_row, need_stack, need_content = self._measured_settings_needs()
+        base_min = max(need_stack, need_content)
+        base_max = max(base_min, need_row)
+        self.right_panel.setMinimumWidth(base_min)
+        self.right_panel.setMaximumWidth(base_max)
         if hasattr(self, "settings_scroll"):
-            self.settings_scroll.setMinimumWidth(225 if compact else 310)
-            self.settings_scroll.setMaximumWidth(300 if compact else 370)
-        self._settings_base_min = 225 if compact else 310
-        self._settings_base_max = 300 if compact else 370
-        self._settings_imposed_min = self._settings_base_min
+            self.settings_scroll.setMinimumWidth(base_min)
+            self.settings_scroll.setMaximumWidth(base_max)
+        self._settings_base_min = base_min
+        self._settings_base_max = base_max
+        self._settings_imposed_min = base_min
         self._schedule_settings_reflow()
 
     def _schedule_settings_reflow(self) -> None:
@@ -375,6 +379,51 @@ class TimerScreen(QWidget):
                 self._schedule_settings_reflow()
         return super().eventFilter(watched, event)
 
+    def _settings_chrome(self) -> int:
+        panel = getattr(self, "right_panel", None)
+        margins = self.right_layout.contentsMargins()
+        chrome = margins.left() + margins.right()
+        if panel is not None:
+            outer = panel.contentsMargins()
+            chrome += outer.left() + outer.right()
+        return chrome
+
+    def _duration_row_need(self) -> int:
+        grid = getattr(self, "_duration_grid", None)
+        if grid is None:
+            return 0
+        spacing = grid.horizontalSpacing()
+        if spacing < 0:
+            spacing = grid.verticalSpacing()
+        if spacing < 0:
+            spacing = 0
+        need = 0
+        for row in range(grid.rowCount()):
+            label = grid.itemAtPosition(row, 0).widget()
+            spin = grid.itemAtPosition(row, 1).widget()
+            if label is None or spin is None:
+                continue
+            row_need = label.minimumSizeHint().width()
+            row_need += spin.minimumSizeHint().width()
+            need = max(need, row_need)
+        return need + spacing if need else 0
+
+    def _measured_settings_needs(self) -> tuple[int, int, int]:
+        hints = [b.minimumSizeHint().width() for b in self.phase_buttons.values()]
+        chrome = self._settings_chrome()
+        layout = getattr(self, "phase_layout", None)
+        spacing = layout.spacing() if layout is not None else 0
+        need_row = sum(hints) + spacing * max(0, len(hints) - 1) + chrome
+        need_stack = (max(hints) if hints else 0) + chrome
+        need_content = self._settings_content_need() + chrome
+        return need_row, need_stack, need_content
+
+    def _sync_spin_minima(self) -> None:
+        for spin in getattr(self, "duration_spins", {}).values():
+            hint = spin.minimumSizeHint().width()
+            if spin.minimumWidth() != hint:
+                spin.setMinimumWidth(hint)
+
     def _settings_reflow(self) -> None:
         layout = getattr(self, "phase_layout", None)
         scroll = getattr(self, "settings_scroll", None)
@@ -383,14 +432,10 @@ class TimerScreen(QWidget):
             return
         if not getattr(self, "phase_buttons", None):
             return
-        hints = [b.minimumSizeHint().width() for b in self.phase_buttons.values()]
-        if not hints:
+        self._sync_spin_minima()
+        need_row, need_stack, need_content = self._measured_settings_needs()
+        if not self.phase_buttons:
             return
-        margins = self.right_layout.contentsMargins()
-        chrome = margins.left() + margins.right() + panel.contentsMargins().left() + panel.contentsMargins().right()
-        need_row = sum(hints) + layout.spacing() * (len(hints) - 1) + chrome
-        need_stack = max(hints) + chrome
-        need_content = self._settings_content_need() + chrome
         base = getattr(self, "_settings_base_min", panel.minimumWidth())
         stack = self._reflow_avail(panel, scroll, base) < need_row
         want = QBoxLayout.Direction.TopToBottom if stack else QBoxLayout.Direction.LeftToRight
@@ -401,16 +446,14 @@ class TimerScreen(QWidget):
 
     def _settings_content_need(self) -> int:
         # R51-D03: phase buttons alone do not size headings, detail, or
-        # duration rows. Wrapped labels report a small minimum width;
-        # the grid minimum keeps spins and long words measurable so the
-        # scroll content retains its intrinsic minimum instead of
-        # clipping inside labels. No fixed width is added here.
+        # duration rows. Wrapped labels report a small minimum width.
+        # Duration need is measured per row as label hint plus spin
+        # hint so Windows font metrics cannot overflow a fixed width.
+        # No fixed width is added here.
         needs = []
         for label in getattr(self, "_settings_heading_labels", ()):
             needs.append(label.minimumSizeHint().width())
-        grid = getattr(self, "_duration_grid", None)
-        if grid is not None:
-            needs.append(grid.minimumSize().width())
+        needs.append(self._duration_row_need())
         return max(needs) if needs else 0
 
     def _reflow_avail(self, panel: QFrame, scroll: QScrollArea, base: int) -> int:
@@ -706,6 +749,6 @@ class TimerScreen(QWidget):
         return """
         QPushButton[phase="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
         QFrame#taskSelector { background: palette(base); border: 2px solid palette(mid); }
-        QSpinBox { min-width: 68px; font-family: "DejaVu Sans Mono"; }
+        QSpinBox { font-family: "DejaVu Sans Mono"; }
         QCheckBox { spacing: 8px; }
         """
