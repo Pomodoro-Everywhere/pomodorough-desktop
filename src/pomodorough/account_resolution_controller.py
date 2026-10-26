@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox, QWidget
@@ -23,6 +23,7 @@ from .controller_outcomes import (
     returning,
 )
 from .sentry_monitoring import capture_exception
+from .secure_store import SecureStoreError
 from .shared_core import SharedCoreError
 
 
@@ -74,6 +75,7 @@ class AccountResolutionController:
         self.resolution_retry_scheduled = False
         self.resolution_corruption: str | None = None
         self.account_switch_user: dict[str, Any] | None = None
+        self._sign_out_phase: Literal["reset", "credentials"] | None = None
 
     def _context(self) -> AccountResolutionContext:
         return self._ports.context()
@@ -117,7 +119,7 @@ class AccountResolutionController:
         return done()
 
     def resume_history_resolution(self) -> ControllerOutcome[None]:
-        if not self.history_resolution_active:
+        if self._sign_out_phase is not None or not self.history_resolution_active:
             return done()
         self.resolution_retry_paused = False
         if self.resolution_phase == "choice" and self.resolution_preview is not None:
@@ -129,6 +131,7 @@ class AccountResolutionController:
         context = self._context()
         if (
             not self.history_resolution_active
+            or self._sign_out_phase is not None
             or self.resolution_retry_paused
             or not context.cloud.authenticated
             or self.resolution_user is None
@@ -162,6 +165,8 @@ class AccountResolutionController:
         return done()
 
     def bootstrap_ready(self, response: dict[str, Any]) -> ControllerOutcome[None]:
+        if self._sign_out_phase is not None:
+            return done()
         if not self.history_resolution_active or self.resolution_user is None:
             return done()
         context = self._context()
@@ -267,6 +272,8 @@ class AccountResolutionController:
         return returning(answer == QMessageBox.StandardButton.Yes)
 
     def apply_resolution(self, response: dict[str, Any]) -> ControllerOutcome[None]:
+        if self._sign_out_phase is not None:
+            return done()
         if not self.history_resolution_active or self.resolution_user is None:
             return done()
         context = self._context()
@@ -369,6 +376,8 @@ class AccountResolutionController:
         return done()
 
     def signed_in(self, user: dict[str, Any]) -> ControllerOutcome[None]:
+        if self._sign_out_phase is not None:
+            return done()
         context = self._context()
         try:
             pending = context.store.pending_resolution()
@@ -397,7 +406,7 @@ class AccountResolutionController:
         return done()
 
     def _begin_history_resolution_value(
-        self, user: dict[str, Any], phase: str | None, *, paused: bool
+        self, user: dict[str, Any] | None, phase: str | None, *, paused: bool
     ) -> None:
         self.history_resolution_active = True
         self.resolution_user = user
@@ -455,10 +464,44 @@ class AccountResolutionController:
         self._clear_history_resolution_value()
         return done(LoadState(), Render(), SetAccountState(False), Synchronize())
 
+    def prepare_sign_out(self) -> bool:
+        context = self._context()
+        if self._sign_out_phase is None:
+            self._sign_out_phase = "reset"
+        self._begin_history_resolution_value(
+            self.resolution_user or context.user, None, paused=True
+        )
+        self._ports.clear_sync_request()
+        self._ports.apply_outcome(done(Render(), SetAccountState(False)))
+        if self._sign_out_phase == "credentials":
+            return True
+        try:
+            if self.account_switch_user is None:
+                context.store.reset_account_data()
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            capture_exception(error)
+            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            return False
+        except (ValueError, KeyError, TypeError) as error:
+            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            return False
+        self._sign_out_phase = "credentials"
+        self._ports.apply_outcome(done(LoadState(), Render()))
+        return True
+
+    def _request_sign_out(self) -> ControllerOutcome[None]:
+        try:
+            self._context().cloud.logout()
+        except SecureStoreError as error:
+            # CloudService already classified and published credential failures.
+            return done(EmitNotice(str(error)))
+        return done()
+
     def signed_out(self) -> ControllerOutcome[None]:
         context = self._context()
-        if self.account_switch_user is None:
+        if self._sign_out_phase != "credentials" and self.account_switch_user is None:
             context.store.reset_account_data()
+        self._sign_out_phase = None
         self.account_switch_user = None
         self._clear_history_resolution_value()
         self._ports.clear_sync_request()
@@ -470,6 +513,8 @@ class AccountResolutionController:
         )
 
     def session_expired(self) -> ControllerOutcome[None]:
+        if self._sign_out_phase is not None:
+            return done(SetAccountState(False), Render())
         self.account_switch_user = None
         self._clear_history_resolution_value()
         self._ports.clear_sync_request()
@@ -590,6 +635,8 @@ class AccountResolutionController:
 
     def account_action(self) -> ControllerOutcome[None]:
         context = self._context()
+        if self._sign_out_phase is not None:
+            return self._request_sign_out()
         if context.cloud.authenticated:
             if self.account_switch_user is not None:
                 action = self._ports.choose_account_switch_action()
@@ -600,14 +647,14 @@ class AccountResolutionController:
                     self._ports.apply_outcome(done(LoadState()))
                     self._ports.signed_in(user)
                 elif action == "sign_out":
-                    context.cloud.logout()
+                    return self._request_sign_out()
                 return done()
             if self.history_resolution_active:
                 action = self._ports.choose_resolution_account_action()
                 if action == "continue":
                     return self.resume_history_resolution()
                 if action == "sign_out":
-                    context.cloud.logout()
+                    return self._request_sign_out()
                 return done()
             queued_changes, failure = self._signout_queue_count(context)
             if failure is not None:
@@ -622,7 +669,7 @@ class AccountResolutionController:
                 QMessageBox.StandardButton.Cancel,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                context.cloud.logout()
+                return self._request_sign_out()
         else:
             context.cloud.login()
         return done()

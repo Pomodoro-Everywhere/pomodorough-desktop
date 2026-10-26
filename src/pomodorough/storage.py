@@ -1518,7 +1518,11 @@ class Store:
                 self.connection.rollback()
             raise
         if owns_transaction:
-            self.connection.commit()
+            try:
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
         return state
 
     def _pending_operation_payloads(self, table: str) -> list[dict[str, Any]]:
@@ -3269,7 +3273,11 @@ class Store:
                 self.connection.rollback()
             raise
         if owns_transaction:
-            self.connection.commit()
+            try:
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
         return state, timer_ids
 
     def process_auto_break(

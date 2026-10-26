@@ -137,6 +137,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "arrivals_page"):
             self._apply_responsive_layout()
+            self._schedule_nav_reflow()
 
     def changeEvent(self, event: Any) -> None:
         super().changeEvent(event)
@@ -154,6 +155,8 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
             QEvent.Type.ApplicationFontChange,
         ):
             self._refresh_font_dependent_content()
+        elif event_type == QEvent.Type.LayoutDirectionChange:
+            self._schedule_nav_reflow()
 
     def _refresh_font_dependent_content(self) -> None:
         previous_scale = getattr(self, "_font_scale", None)
@@ -162,6 +165,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
             return
         self.clock.update()
         self.updateGeometry()
+        self._schedule_nav_reflow()
         schedule = getattr(
             getattr(self, "tasks_screen", None), "_schedule_row_resize", None
         )

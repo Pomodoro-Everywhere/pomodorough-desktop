@@ -82,6 +82,10 @@ RETIRED_IMPLICIT_GOOGLE_CLIENT_IDS = frozenset(
 )
 _DEFAULT_SECRET_STORE = object()
 _HTTP_RESPONSE_BODY_LIMIT = 1024 * 1024
+
+# R52-D03: offline startup restore retries with the same bound as the
+# revocation and sign-out cleanup chains (1s doubling to 30s, ~1 minute).
+_RESTORE_RETRY_ATTEMPTS = 6
 _OAUTH_CREDENTIALS_LIMIT = 64 * 1024
 _FALLBACK_DOCUMENT_LIMIT = 64 * 1024
 
@@ -1446,6 +1450,9 @@ class CloudService(QObject):
         )
         self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
         self._token_urlsafe = token_urlsafe
+        self._prepare_sign_out: Callable[[], bool] | None = None
+        self._restore_attempt = 0
+        self._restore_epoch = 0
         self._configure_sign_out_cleanup()
 
     # Compatibility methods remain patchable, but resolve the current collaborator
@@ -1508,6 +1515,8 @@ class CloudService(QObject):
         on_result: Callable[[Any], None],
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
+        if self._state.sign_out_pending:
+            return
         self._state.busy = True
         worker = Worker(function)
         generation = self._state.account_generation
@@ -1547,6 +1556,11 @@ class CloudService(QObject):
             self.sync(payload)
 
     def restore(self) -> None:
+        self._restore_epoch += 1
+        self._restore_attempt = 0
+        self._restore_session(is_retry=False)
+
+    def _restore_session(self, *, is_retry: bool) -> None:
         self.status_changed.emit(self.strings.text("cloud.status.connecting"))
 
         def restore_session() -> dict[str, Any] | None:
@@ -1559,6 +1573,7 @@ class CloudService(QObject):
             )["user"]
 
         def restored(user: dict[str, Any] | None) -> None:
+            self._restore_attempt = 0
             if user:
                 note_cloud_credential_recovery()
                 self._state.authenticated = True
@@ -1570,15 +1585,47 @@ class CloudService(QObject):
 
         def failed(error: Exception) -> None:
             if isinstance(error, ApiError) and error.status == 401:
+                self._restore_attempt = 0
                 self._expire_session()
                 return
             _report_cloud_credential("restore", error)
             self._state.access_token = None
             self._state.authenticated = False
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))
-            self.failure.emit(str(error))
+            if not is_retry:
+                self.failure.emit(str(error))
+            self._schedule_restore_retry()
 
         self._start(restore_session, restored, failed)
+
+    def _schedule_restore_retry(self) -> None:
+        if self._state.shutting_down or self._state.sign_out_pending:
+            return
+        if self._restore_attempt >= _RESTORE_RETRY_ATTEMPTS:
+            return
+        self._restore_attempt += 1
+        generation = self._state.account_generation
+        api_base = self.api_base
+        epoch = self._restore_epoch
+        delay_ms = min(30_000, 1_000 * 2 ** (self._restore_attempt - 1))
+        QTimer.singleShot(
+            delay_ms,
+            lambda: self._retry_restore(generation, api_base, epoch),
+        )
+
+    def _retry_restore(self, generation: int, api_base: str, epoch: int) -> None:
+        if (
+            self._state.shutting_down
+            or self._state.sign_out_pending
+            or self._state.deleting_account
+            or self._state.authenticated
+            or self._state.busy
+            or epoch != self._restore_epoch
+            or generation != self._state.account_generation
+            or api_base != self.api_base
+        ):
+            return
+        self._restore_session(is_retry=True)
 
     def login(self) -> None:
         if self._state.busy:
@@ -1791,6 +1838,7 @@ class CloudService(QObject):
     def start_revision_stream(self) -> None:
         if (
             self._state.shutting_down
+            or self._state.sign_out_pending
             or not self._state.authenticated
             or not self._state.access_token
             or self._revisions.state.reply is not None
@@ -1852,7 +1900,21 @@ class CloudService(QObject):
         self._sign_out_cleanup_timer.stop()
         self.stop_revision_stream()
 
+    def set_sign_out_preparation(self, prepare: Callable[[], bool]) -> None:
+        self._prepare_sign_out = prepare
+
     def logout(self) -> None:
+        # The workspace must commit its scrub before credentials become unavailable.
+        if self._prepare_sign_out is not None:
+            # Fence in-flight refresh/401 replies before the reset can fail or show a notice.
+            with self._state.lock:
+                self._state.sign_out_pending = True
+                self._state.account_generation += 1
+                self._state.busy = False
+                self._state.sync_queued = None
+            self.stop_revision_stream()
+            if not self._prepare_sign_out():
+                return
         try:
             credentials = self._accounts.sign_out()
         except SignOutCleanupError as error:
@@ -1870,6 +1932,7 @@ class CloudService(QObject):
 
     def _publish_sign_out(self, credentials: LogoutCredentials) -> None:
         self.stop_revision_stream()
+        self._state.sign_out_pending = False
         self.signed_out.emit()
         self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
         if credentials.access_token or credentials.refresh_token:
@@ -1902,6 +1965,8 @@ class CloudService(QObject):
             )
 
     def delete_account(self, confirmation: str) -> None:
+        if self._state.sign_out_pending:
+            return
         credentials = self._begin_account_deletion(confirmation)
         if credentials is None:
             return

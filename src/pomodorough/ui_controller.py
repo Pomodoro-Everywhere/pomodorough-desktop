@@ -29,6 +29,7 @@ from .controller_outcomes import (
     Synchronize,
 )
 from .core import TERMINAL_STATUSES
+from .network import CloudService
 from .replication_controller import (
     ReplicationContext,
     ReplicationController,
@@ -512,6 +513,8 @@ class ApplicationController:
             self.timer_screen.refresh_auto_breaks(self.settings)
 
     def _connect_cloud(self) -> None:
+        if isinstance(self.cloud, CloudService):
+            self.cloud.set_sign_out_preparation(self.account_resolution.prepare_sign_out)
         self.cloud.signed_in.connect(self._signed_in)
         self.cloud.signed_out.connect(self._signed_out)
         self.cloud.session_expired.connect(self._session_expired)

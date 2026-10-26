@@ -50,6 +50,7 @@ class SessionState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     account_generation: int = 0
     shutting_down: bool = False
+    sign_out_pending: bool = False
     access_token: str | None = None
     refresh_token: str | None = None
     access_expires_at: datetime = field(
@@ -169,7 +170,11 @@ class AuthenticatedSession:
             self.assert_current_locked(generation)
 
     def assert_current_locked(self, generation: int) -> None:
-        if self.state.shutting_down or generation != self.state.account_generation:
+        if (
+            self.state.shutting_down
+            or self.state.sign_out_pending
+            or generation != self.state.account_generation
+        ):
             raise ApiError(self.text("network.error.sign_in_cancelled"))
 
     def ensure_access(self, generation: int | None = None) -> str:

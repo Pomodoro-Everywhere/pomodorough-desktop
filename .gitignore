@@ -50,3 +50,8 @@ screenshots/*.png
 # D34: operator download-staging dirs (e.g. desk021dl/) are fetch residue, never source.
 desk*dl/
 /scratch/
+graphify-out/
+*.key
+*.pem
+*.p8
+*.p12

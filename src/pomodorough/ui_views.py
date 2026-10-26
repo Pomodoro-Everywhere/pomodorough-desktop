@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,12 +13,16 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -54,13 +59,23 @@ def _app_font_scale() -> float:
 class ScreenNavigation(QWidget):
     screen_requested = Signal(int)
 
+    # R52-D05: measured reflow cells. Buttons keep identity, group,
+    # and signals; only grid cells change, so focus and routing
+    # survive. QGridLayout mirrors columns under RTL by itself.
+    _NAV_CELLS = {
+        "row": ((0, 0), (0, 1), (0, 2), (0, 3)),
+        "grid": ((0, 0), (0, 1), (1, 0), (1, 1)),
+        "column": ((0, 0), (1, 0), (2, 0), (3, 0)),
+    }
+
     def __init__(self, strings: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
         self.buttons: list[QPushButton] = []
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self._nav_layout = QGridLayout(self)
+        self._nav_layout.setContentsMargins(0, 0, 0, 0)
+        self._nav_mode = "row"
         destinations = (
             ("timer", strings.text("nav.timer")),
             ("tasks", strings.text("nav.tasks")),
@@ -74,8 +89,46 @@ class ScreenNavigation(QWidget):
             )
             self.group.addButton(button)
             self.buttons.append(button)
-            layout.addWidget(button)
+        self._place_nav_buttons()
         self.buttons[0].setChecked(True)
+
+    def _place_nav_buttons(self) -> None:
+        for button, cell in zip(self.buttons, self._NAV_CELLS[self._nav_mode]):
+            self._nav_layout.addWidget(button, *cell)
+
+    def set_nav_mode(self, mode: str) -> None:
+        if mode == self._nav_mode:
+            return
+        self._nav_mode = mode
+        self._place_nav_buttons()
+        self.updateGeometry()
+
+    def measured_nav_needs(self) -> tuple[int, int, int]:
+        hints = [button.minimumSizeHint().width() for button in self.buttons]
+        margins = self._nav_layout.contentsMargins()
+        chrome = margins.left() + margins.right()
+        gap = self._nav_gap(horizontal=True)
+        need_row = sum(hints) + gap * (len(hints) - 1) + chrome
+        need_grid = max(hints[0], hints[2]) + max(hints[1], hints[3]) + gap + chrome
+        return need_row, need_grid, max(hints) + chrome
+
+    def _nav_gap(self, *, horizontal: bool) -> int:
+        raw = (
+            self._nav_layout.horizontalSpacing()
+            if horizontal
+            else self._nav_layout.verticalSpacing()
+        )
+        if raw >= 0:
+            return raw
+        try:
+            metric = (
+                QStyle.PixelMetric.PM_LayoutHorizontalSpacing
+                if horizontal
+                else QStyle.PixelMetric.PM_LayoutVerticalSpacing
+            )
+            return max(0, self.style().pixelMetric(metric))
+        except RuntimeError:
+            return 0
 
     @staticmethod
     def _button(strings: Any, destination: str, label: str) -> QPushButton:
@@ -108,10 +161,32 @@ class MainWindowViewMixin:
 
     def _build_header(self) -> None:
         header = QHBoxLayout()
+        self._header_layout = header
         self.navigation = ScreenNavigation(self.strings, self)
         self.screen_group = self.navigation.group
         self.screen_buttons = self.navigation.buttons
-        header.addWidget(self.navigation)
+        # R52-D05: the nav group scrolls instead of overlapping when the
+        # measured stack still exceeds the header (short window, huge
+        # font). No frame, bars only on overflow; fitting modes are
+        # visually unchanged.
+        self._nav_scroll = QScrollArea()
+        self._nav_scroll.setObjectName("navScroll")
+        self._nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._nav_scroll.setWidgetResizable(True)
+        # R52-D05: QScrollArea reports a fixed 88x88 minimum of its own.
+        # Height follows the header (same as the bare nav widget before);
+        # the viewport scrolls when the measured stack needs more.
+        self._nav_scroll.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored
+        )
+        self._nav_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._nav_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._nav_scroll.setWidget(self.navigation)
+        header.addWidget(self._nav_scroll)
         header.addStretch()
         self._build_header_actions(header)
         self.outer_layout.addLayout(header)
@@ -416,6 +491,99 @@ class MainWindowViewMixin:
             compact=compact,
         )
 
+    def _schedule_nav_reflow(self) -> None:
+        # R52-D05: resize/change events run inside Qt event propagation,
+        # where synchronous layout mutation aborts on some Qt releases.
+        # Coalesce through the event loop like the settings reflow timer.
+        timer = getattr(self, "_nav_reflow_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._reflow_navigation)
+            self._nav_reflow_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _reflow_navigation(self) -> None:
+        navigation = getattr(self, "navigation", None)
+        if navigation is None:
+            return
+        need_row, need_grid, _need_column = navigation.measured_nav_needs()
+        avail = self._header_nav_avail()
+        if avail <= 0:
+            return
+        if avail >= need_row:
+            navigation.set_nav_mode("row")
+        elif avail >= need_grid:
+            navigation.set_nav_mode("grid")
+        else:
+            navigation.set_nav_mode("column")
+        self._sync_nav_scrollbars(navigation)
+
+    def _sync_nav_scrollbars(self, navigation: ScreenNavigation) -> None:
+        # R52-D05: the row fit is exact, so bars stay off and the base
+        # header keeps its height. Stacked modes scroll on demand for
+        # short windows or extreme fonts.
+        mode = navigation._nav_mode
+        scroll = getattr(self, "_nav_scroll", None)
+        if scroll is None:
+            return
+        stacked = mode != "row"
+        horizontal = (
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if stacked
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        vertical = (
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if stacked
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        if scroll.horizontalScrollBarPolicy() != horizontal:
+            scroll.setHorizontalScrollBarPolicy(horizontal)
+        if scroll.verticalScrollBarPolicy() != vertical:
+            scroll.setVerticalScrollBarPolicy(vertical)
+        size_policy = scroll.sizePolicy()
+        vertical_policy = (
+            QSizePolicy.Policy.Preferred
+            if stacked
+            else QSizePolicy.Policy.Ignored
+        )
+        if size_policy.verticalPolicy() != vertical_policy:
+            size_policy.setVerticalPolicy(vertical_policy)
+            scroll.setSizePolicy(size_policy)
+
+    def _header_nav_avail(self) -> int:
+        central = self.centralWidget()
+        if central is None or central.width() <= 0:
+            return 0
+        margins = self.outer_layout.contentsMargins()
+        avail = central.width() - margins.left() - margins.right()
+        # Header holds nav scroll, stretch, settings, account: 3 gaps.
+        avail -= 3 * self._header_gap()
+        avail -= self._action_need(getattr(self, "settings_button", None))
+        avail -= self._action_need(getattr(self, "account_button", None))
+        return avail
+
+    @staticmethod
+    def _action_need(action: QWidget | None) -> int:
+        if action is None or not action.isVisible():
+            return 0
+        try:
+            return max(action.width(), action.minimumSizeHint().width())
+        except RuntimeError:
+            return 0
+
+    def _header_gap(self) -> int:
+        raw = self._header_layout.spacing()
+        if raw >= 0:
+            return raw
+        try:
+            metric = QStyle.PixelMetric.PM_LayoutHorizontalSpacing
+            return max(0, self.style().pixelMetric(metric))
+        except RuntimeError:
+            return 0
+
     def _render(self) -> None:
         state = self._render_timer_state()
         self.timer_screen.render_clock(state, self.history)
@@ -658,14 +826,16 @@ class MainWindowViewMixin:
         QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid palette(highlight); }
         QStatusBar { background: palette(window); color: palette(window-text); }
         """
-        return (
+        sheet = (
             sheet.replace("font-size: 12px", f"font-size: {9.0 * scale:.1f}pt")
             .replace("font-size: 24px", f"font-size: {18.0 * scale:.1f}pt")
             .replace("font-size: 14px", f"font-size: {10.5 * scale:.1f}pt")
             .replace("font-size: 9px", f"font-size: {6.75 * scale:.1f}pt")
-            .replace("min-height: 29px", f"min-height: {round(29 * scale)}px")
-            .replace("36px", f"{round(36 * scale)}px")
-            .replace("72px", f"{round(72 * scale)}px")
-            .replace("150px", f"{round(150 * scale)}px")
-            .replace("64px", f"{round(64 * scale)}px")
+        )
+        # R52-D04: scale each pixel dimension once. Chained str.replace
+        # calls re-scaled values just created (36px->72px, then 72px->144px).
+        return re.sub(
+            r"\b(29|36|64|72|150)px\b",
+            lambda match: f"{round(int(match.group(1)) * scale)}px",
+            sheet,
         )

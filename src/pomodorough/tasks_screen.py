@@ -42,19 +42,19 @@ class TasksScreen(QFrame):
         layout.addLayout(self._build_form())
         self._build_table(layout)
 
-    def _build_header(self) -> QHBoxLayout:
-        header = QHBoxLayout()
-        heading = QVBoxLayout()
-        title = QLabel(self.strings.text("task.board"))
-        title.setObjectName("sectionTitle")
-        subtitle = QLabel(self.strings.text("task.board_detail"))
-        subtitle.setObjectName("taskSubtitle")
-        heading.addWidget(title)
-        heading.addWidget(subtitle)
-        header.addLayout(heading)
-        header.addStretch()
+    def _build_header(self) -> QVBoxLayout:
+        header = QVBoxLayout()
+        self.task_title = QLabel(self.strings.text("task.board"))
+        self.task_title.setObjectName("sectionTitle")
+        self.task_title.setWordWrap(True)
+        header.addWidget(self.task_title)
+        self.task_subtitle = QLabel(self.strings.text("task.board_detail"))
+        self.task_subtitle.setObjectName("taskSubtitle")
+        self.task_subtitle.setWordWrap(True)
+        header.addWidget(self.task_subtitle)
         self.task_totals = QLabel(self._empty_totals())
         self.task_totals.setObjectName("countBadge")
+        self.task_totals.setWordWrap(True)
         header.addWidget(self.task_totals)
         return header
 
@@ -140,12 +140,25 @@ class TasksScreen(QFrame):
                 header.blockSignals(was_blocked)
             table.horizontalScrollBar().setValue(h_value)
             table.verticalScrollBar().setValue(v_value)
+            self._reflow_header_text()
         finally:
             self._in_layout_refresh = False
         focused_id, row = self._focused_delete_id()
         if focused_id is None:
             return
         self.task_table.scrollToItem(self.task_table.item(row, 0))
+
+    def _reflow_header_text(self) -> None:
+        # Wrapped labels report a single-line minimum height, so the page
+        # column would squeeze them vertically. Claim the wrapped height.
+        # Clear first: heightForWidth honors the current minimum height,
+        # which would freeze a stale enlarged value after font shrink.
+        for label in (self.task_title, self.task_subtitle, self.task_totals):
+            width = label.width()
+            if width <= 0 or not label.isVisible():
+                continue
+            label.setMinimumHeight(0)
+            label.setMinimumHeight(label.heightForWidth(width))
 
     def _configure_table_headers(self) -> None:
         alignments = (
