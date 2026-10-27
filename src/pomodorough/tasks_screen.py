@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
@@ -135,61 +136,92 @@ class TasksScreen(QFrame):
             )
         self._row_resize_timer.start()
 
+    @staticmethod
+    def _restore_task_scroll(
+        table: QTableWidget,
+        scheduled: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        current = (
+            table.verticalScrollBar().value(),
+            table.horizontalScrollBar().value(),
+        )
+        fresh_v = scheduled is None or scheduled[0] == current[0]
+        fresh_h = scheduled is None or scheduled[1] == current[1]
+        anchor = table.rowAt(0)
+        header = table.horizontalHeader()
+        was_blocked = header.blockSignals(True)
+        try:
+            table.resizeRowsToContents()
+            table.resizeColumnToContents(3)
+            table.doItemsLayout()
+        finally:
+            header.blockSignals(was_blocked)
+        if fresh_h:
+            table.horizontalScrollBar().setValue(current[1])
+        if not fresh_v:
+            # A newer scroll superseded this pass; leave it alone.
+            return None
+        table.verticalScrollBar().setValue(current[0])
+        if table.rowAt(0) != anchor and 0 <= anchor < table.rowCount():
+            # Per-pixel values land on a different row after row heights
+            # change; keep the top row instead.
+            table.scrollToItem(
+                table.item(anchor, 0),
+                QAbstractItemView.ScrollHint.PositionAtTop,
+            )
+        return (
+            table.verticalScrollBar().value(),
+            table.horizontalScrollBar().value(),
+        )
+
     def _resize_task_rows(self) -> None:
         if self._in_layout_refresh:
             return
         self._in_layout_refresh = True
+        scroll_at_post: tuple[int, int] | None = None
         try:
             table = self.task_table
             scheduled = self._scheduled_scroll
             self._scheduled_scroll = None
-            current = (
-                table.verticalScrollBar().value(),
-                table.horizontalScrollBar().value(),
-            )
-            fresh_v = scheduled is None or scheduled[0] == current[0]
-            fresh_h = scheduled is None or scheduled[1] == current[1]
-            anchor = table.rowAt(0)
-            header = table.horizontalHeader()
-            was_blocked = header.blockSignals(True)
-            try:
-                table.resizeRowsToContents()
-                table.resizeColumnToContents(3)
-                table.doItemsLayout()
-                self._reserve_task_row()
-            finally:
-                header.blockSignals(was_blocked)
-            if fresh_h:
-                table.horizontalScrollBar().setValue(current[1])
-            if fresh_v:
-                table.verticalScrollBar().setValue(current[0])
-                if table.rowAt(0) != anchor and 0 <= anchor < table.rowCount():
-                    # Per-pixel values land on a different row after row
-                    # heights change; keep the top row instead.
-                    table.scrollToItem(
-                        table.item(anchor, 0),
-                        QAbstractItemView.ScrollHint.PositionAtTop,
-                    )
-            # else: a newer scroll superseded this pass; leave it alone.
+            scroll_at_post = self._restore_task_scroll(table, scheduled)
+            self._reserve_task_row()
             self._reflow_header_text()
         finally:
             self._in_layout_refresh = False
-        if fresh_v:
-            QTimer.singleShot(0, self._reveal_focused_delete)
+        # A newer scroll owns the table position when stale, but the page
+        # can still hide the button (header growth moves the table), so a
+        # reveal always runs: it only recenters a settled table.
+        QTimer.singleShot(
+            0,
+            partial(
+                self._reveal_focused_delete, table_scroll=scroll_at_post
+            ),
+        )
 
-    def _reveal_focused_delete(self) -> None:
+    def _reveal_focused_delete(
+        self, table_scroll: tuple[int, int] | None = None
+    ) -> None:
         focused_id, row = self._focused_delete_id()
         if focused_id is None:
             return
         button = self.task_table.cellWidget(row, 3)
         if button is None:
             return
-        viewport = self.task_table.viewport()
-        if not viewport.rect().contains(
-            button.mapTo(viewport, button.rect().center())
+        table = self.task_table
+        viewport = table.viewport()
+        if (
+            table_scroll is not None
+            and table_scroll
+            == (
+                table.verticalScrollBar().value(),
+                table.horizontalScrollBar().value(),
+            )
+            and not viewport.rect().contains(
+                button.mapTo(viewport, button.rect().center())
+            )
         ):
-            self.task_table.scrollTo(
-                self.task_table.model().index(row, 3),
+            table.scrollTo(
+                table.model().index(row, 3),
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
         page = self.parentWidget()
