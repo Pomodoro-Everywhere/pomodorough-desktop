@@ -35,6 +35,7 @@ class TasksScreen(QFrame):
         self._row_resize_timer = QTimer(self)
         self._row_resize_timer.setSingleShot(True)
         self._row_resize_timer.timeout.connect(self._resize_task_rows)
+        self._scheduled_scroll: tuple[int, int] | None = None
         self.setObjectName("ticket")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 18)
@@ -126,6 +127,12 @@ class TasksScreen(QFrame):
         # Wait for inherited styles and cell widgets to finish updating their hints.
         if self._in_layout_refresh:
             return
+        if not self._row_resize_timer.isActive():
+            table = self.task_table
+            self._scheduled_scroll = (
+                table.verticalScrollBar().value(),
+                table.horizontalScrollBar().value(),
+            )
         self._row_resize_timer.start()
 
     def _resize_task_rows(self) -> None:
@@ -134,8 +141,15 @@ class TasksScreen(QFrame):
         self._in_layout_refresh = True
         try:
             table = self.task_table
-            h_value = table.horizontalScrollBar().value()
-            v_value = table.verticalScrollBar().value()
+            scheduled = self._scheduled_scroll
+            self._scheduled_scroll = None
+            current = (
+                table.verticalScrollBar().value(),
+                table.horizontalScrollBar().value(),
+            )
+            fresh_v = scheduled is None or scheduled[0] == current[0]
+            fresh_h = scheduled is None or scheduled[1] == current[1]
+            anchor = table.rowAt(0)
             header = table.horizontalHeader()
             was_blocked = header.blockSignals(True)
             try:
@@ -145,26 +159,42 @@ class TasksScreen(QFrame):
                 self._reserve_task_row()
             finally:
                 header.blockSignals(was_blocked)
-            table.horizontalScrollBar().setValue(h_value)
-            table.verticalScrollBar().setValue(v_value)
+            if fresh_h:
+                table.horizontalScrollBar().setValue(current[1])
+            if fresh_v:
+                table.verticalScrollBar().setValue(current[0])
+                if table.rowAt(0) != anchor and 0 <= anchor < table.rowCount():
+                    # Per-pixel values land on a different row after row
+                    # heights change; keep the top row instead.
+                    table.scrollToItem(
+                        table.item(anchor, 0),
+                        QAbstractItemView.ScrollHint.PositionAtTop,
+                    )
+            # else: a newer scroll superseded this pass; leave it alone.
             self._reflow_header_text()
         finally:
             self._in_layout_refresh = False
-        QTimer.singleShot(0, self._reveal_focused_delete)
+        if fresh_v:
+            QTimer.singleShot(0, self._reveal_focused_delete)
 
     def _reveal_focused_delete(self) -> None:
         focused_id, row = self._focused_delete_id()
         if focused_id is None:
             return
-        self.task_table.scrollTo(
-            self.task_table.model().index(row, 3),
-            QAbstractItemView.ScrollHint.PositionAtCenter,
-        )
+        button = self.task_table.cellWidget(row, 3)
+        if button is None:
+            return
+        viewport = self.task_table.viewport()
+        if not viewport.rect().contains(
+            button.mapTo(viewport, button.rect().center())
+        ):
+            self.task_table.scrollTo(
+                self.task_table.model().index(row, 3),
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
         page = self.parentWidget()
         if page is not None and isinstance(page.parentWidget(), QScrollArea):
-            page.parentWidget().ensureWidgetVisible(
-                self.task_table.cellWidget(row, 3), 0, 0
-            )
+            page.parentWidget().ensureWidgetVisible(button, 0, 0)
 
     def _reserve_task_row(self) -> None:
         # Keep one complete row reachable; the page scrolls instead of crushing it.

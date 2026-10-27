@@ -54,6 +54,10 @@ def window():
     app.processEvents()
     yield view
     view.close()
+    # Flush deferred row-resize reveals while the C++ widgets still live;
+    # firing them after shiboken delete() raises "already deleted".
+    app.processEvents()
+    app.processEvents()
     delete(view)
     app.processEvents()
 

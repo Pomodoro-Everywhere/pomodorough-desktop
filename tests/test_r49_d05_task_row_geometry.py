@@ -54,6 +54,9 @@ def _board(app: QApplication, scale: float, rtl: bool = False, *, styled=True):
     try:
         yield root, view
     finally:
+        # Flush deferred row-resize reveals before tearing down the C++
+        # widgets; firing them after deleteLater() raises "already deleted".
+        _settle()
         root.close()
         root.deleteLater()
         _settle()
