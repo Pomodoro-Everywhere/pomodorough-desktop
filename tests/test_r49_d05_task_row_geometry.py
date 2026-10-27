@@ -67,6 +67,11 @@ def _board(app: QApplication, scale: float, rtl: bool = False, *, styled=True):
 def _reveal(view: TasksScreen, row: int):
     table = view.task_table
     table.scrollToItem(table.item(row, 0), QAbstractItemView.PositionAtCenter)
+    # Centering the title column can push the delete column out of view
+    # (RTL with wide metrics); the target cell itself must be visible.
+    table.scrollTo(
+        table.model().index(row, 3), QAbstractItemView.ScrollHint.EnsureVisible
+    )
     _settle()
     return table.cellWidget(row, 3)
 
