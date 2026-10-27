@@ -36,7 +36,7 @@ class TasksScreen(QFrame):
         self._row_resize_timer = QTimer(self)
         self._row_resize_timer.setSingleShot(True)
         self._row_resize_timer.timeout.connect(self._resize_task_rows)
-        self._scheduled_scroll: tuple[int, int] | None = None
+        self._scheduled_scroll: tuple[int, int, int, int] | None = None
         self.setObjectName("ticket")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 18)
@@ -130,23 +130,35 @@ class TasksScreen(QFrame):
             return
         if not self._row_resize_timer.isActive():
             table = self.task_table
+            bar_v = table.verticalScrollBar()
+            bar_h = table.horizontalScrollBar()
             self._scheduled_scroll = (
-                table.verticalScrollBar().value(),
-                table.horizontalScrollBar().value(),
+                bar_v.value(),
+                bar_h.value(),
+                bar_v.maximum(),
+                bar_h.maximum(),
             )
         self._row_resize_timer.start()
 
     @staticmethod
     def _restore_task_scroll(
         table: QTableWidget,
-        scheduled: tuple[int, int] | None,
+        scheduled: tuple[int, int, int, int] | None,
     ) -> tuple[int, int] | None:
-        current = (
-            table.verticalScrollBar().value(),
-            table.horizontalScrollBar().value(),
-        )
-        fresh_v = scheduled is None or scheduled[0] == current[0]
-        fresh_h = scheduled is None or scheduled[1] == current[1]
+        bar_v = table.verticalScrollBar()
+        bar_h = table.horizontalScrollBar()
+        current = (bar_v.value(), bar_h.value())
+        if scheduled is None:
+            fresh_v = True
+            fresh_h = True
+        elif (scheduled[2], scheduled[3]) != (bar_v.maximum(), bar_h.maximum()):
+            # Range collapse clamps values without any real scroll; fall
+            # back to restoring instead of stranding the content.
+            fresh_v = True
+            fresh_h = True
+        else:
+            fresh_v = scheduled[0] == current[0]
+            fresh_h = scheduled[1] == current[1]
         anchor = table.rowAt(0)
         header = table.horizontalHeader()
         was_blocked = header.blockSignals(True)
