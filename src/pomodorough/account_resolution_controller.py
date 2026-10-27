@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -76,6 +77,10 @@ class AccountResolutionController:
         self.resolution_corruption: str | None = None
         self.account_switch_user: dict[str, Any] | None = None
         self._sign_out_phase: Literal["reset", "credentials"] | None = None
+        self.deletion_pending = False
+        self._deletion_retry_scheduled = False
+        self._deletion_diagnostic: str | None = None
+        self._deletion_denied = False
 
     def _context(self) -> AccountResolutionContext:
         return self._ports.context()
@@ -83,6 +88,11 @@ class AccountResolutionController:
     def activate_persisted_resolution(self) -> ControllerOutcome[bool]:
         context = self._context()
         try:
+            marker = context.store.get_meta("accountDeletionCleanup", None)
+            if isinstance(marker, dict):
+                self._fence_deletion()
+                self._schedule_deletion_retry()
+                return returning(True, LoadState())
             pending = context.store.pending_resolution()
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
@@ -376,7 +386,7 @@ class AccountResolutionController:
         return done()
 
     def signed_in(self, user: dict[str, Any]) -> ControllerOutcome[None]:
-        if self._sign_out_phase is not None:
+        if self.deletion_pending or self._sign_out_phase is not None:
             return done()
         context = self._context()
         try:
@@ -513,6 +523,8 @@ class AccountResolutionController:
         )
 
     def session_expired(self) -> ControllerOutcome[None]:
+        if self.deletion_pending:
+            return done(SetAccountState(False), Render())
         if self._sign_out_phase is not None:
             return done(SetAccountState(False), Render())
         self.account_switch_user = None
@@ -589,7 +601,10 @@ class AccountResolutionController:
         return done(RenderNetwork())
 
     def account_deleted(self) -> ControllerOutcome[None]:
-        outcome = self.signed_out()
+        if not self.deletion_pending:
+            self._deletion_denied = False
+            self._fence_deletion()
+        outcome = self.retry_deletion_cleanup()
         return ControllerOutcome(
             None,
             outcome.effects
@@ -601,6 +616,9 @@ class AccountResolutionController:
         )
 
     def account_deletion_failed(self, error: str) -> ControllerOutcome[None]:
+        if self.deletion_pending:
+            self._deletion_denied = self._context().cloud.authenticated
+            self._ports.apply_outcome(self.retry_deletion_cleanup())
         return done(
             Render(),
             ShowStatus(
@@ -608,6 +626,71 @@ class AccountResolutionController:
                 15_000,
             ),
         )
+
+    def _deletion_phase(self, phase: str) -> None:
+        if self._deletion_diagnostic != phase:
+            logging.getLogger(__name__).warning(
+                "Account deletion cleanup phase: %s", phase
+            )
+            self._deletion_diagnostic = phase
+
+    def _fence_deletion(self) -> None:
+        self.deletion_pending = True
+        self._begin_history_resolution_value(self._context().user, None, paused=True)
+        self._ports.clear_sync_request()
+
+    def prepare_deletion(self) -> bool:
+        if self.deletion_pending:
+            return False
+        try:
+            self._context().store.set_meta("accountDeletionCleanup", {"version": 1})
+        except (OSError, sqlite3.Error, SharedCoreError) as error:
+            self._deletion_phase("prepare_failed")
+            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            return False
+        self._fence_deletion()
+        self._deletion_phase("prepared")
+        self._ports.apply_outcome(done(LoadState(), Render(), SetAccountState(False)))
+        return True
+
+    def _schedule_deletion_retry(self) -> None:
+        if self._deletion_retry_scheduled:
+            return
+        self._deletion_retry_scheduled = True
+        QTimer.singleShot(1000, self._retry_deletion_callback)
+
+    def _retry_deletion_callback(self) -> None:
+        self._deletion_retry_scheduled = False
+        if getattr(self._context().cloud, "_shutting_down", False):
+            return
+        self._ports.apply_outcome(self.retry_deletion_cleanup())
+
+    def retry_deletion_cleanup(self) -> ControllerOutcome[None]:
+        if not self.deletion_pending:
+            return done()
+        context = self._context()
+        if context.cloud.deleting_account:
+            return done()
+        try:
+            if not self._deletion_denied:
+                recover = getattr(context.cloud, "recover_deletion_credentials", None)
+                if recover is None:
+                    self._deletion_denied = bool(context.cloud.authenticated)
+                else:
+                    self._deletion_denied = recover()
+            if self._deletion_denied:
+                context.store.set_meta("accountDeletionCleanup", None)
+            else:
+                context.store.complete_account_deletion()
+        except (OSError, sqlite3.Error, SharedCoreError, SecureStoreError, ValueError) as error:
+            self._deletion_phase("scrub_pending")
+            self._schedule_deletion_retry()
+            return done(LoadState(), Render(), EmitNotice(str(error)))
+        self.deletion_pending = False
+        self._clear_history_resolution_value()
+        self._deletion_phase("denied" if self._deletion_denied else "complete")
+        self._deletion_denied = False
+        return done(LoadState(), Render(), SetAccountState(False))
 
     def _signout_queue_count(
         self, context: AccountResolutionContext
@@ -635,6 +718,8 @@ class AccountResolutionController:
 
     def account_action(self) -> ControllerOutcome[None]:
         context = self._context()
+        if self.deletion_pending:
+            return self.retry_deletion_cleanup()
         if self._sign_out_phase is not None:
             return self._request_sign_out()
         if context.cloud.authenticated:

@@ -228,6 +228,10 @@ class MainWindowViewMixin:
         self.page_stack = QStackedWidget()
         self.timer_screen = TimerScreen(self.strings, self.settings)
         self.tasks_screen = TasksScreen(self.strings)
+        self.tasks_page = QScrollArea()
+        self.tasks_page.setFrameShape(QFrame.Shape.NoFrame)
+        self.tasks_page.setWidgetResizable(True)
+        self.tasks_page.setWidget(self.tasks_screen)
         self.arrivals_screen = ArrivalsScreen(self.strings, self.store.device_id)
         self.network_screen = NetworkScreen(self.strings, self.replication_mode)
         for screen in self._screens():
@@ -241,7 +245,7 @@ class MainWindowViewMixin:
     def _screens(self) -> tuple[QWidget, ...]:
         return (
             self.timer_screen,
-            self.tasks_screen,
+            self.tasks_page,
             self.arrivals_screen,
             self.network_screen,
         )
@@ -274,7 +278,6 @@ class MainWindowViewMixin:
             setattr(self, name, getattr(self.timer_screen, name))
 
     def _expose_tasks_seams(self) -> None:
-        self.tasks_page = self.tasks_screen
         for name in (
             "task_totals",
             "task_input",

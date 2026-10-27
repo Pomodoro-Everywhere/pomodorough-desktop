@@ -23,6 +23,8 @@ google-oauth.json
 .DS_Store
 .cache_ggshield
 .ruff_cache/
+.complexipy_cache/
+/.release-gates/
 # D26: never commit local secrets, logs, or editor state.
 .env
 .env.*

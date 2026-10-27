@@ -1619,11 +1619,16 @@ class CloudService(QObject):
             or self._state.sign_out_pending
             or self._state.deleting_account
             or self._state.authenticated
-            or self._state.busy
             or epoch != self._restore_epoch
             or generation != self._state.account_generation
             or api_base != self.api_base
         ):
+            return
+        if self._state.busy:
+            # Keep this retry's identity and budget while another worker owns the service.
+            QTimer.singleShot(
+                1_000, lambda: self._retry_restore(generation, api_base, epoch)
+            )
             return
         self._restore_session(is_retry=True)
 
@@ -1903,6 +1908,13 @@ class CloudService(QObject):
     def set_sign_out_preparation(self, prepare: Callable[[], bool]) -> None:
         self._prepare_sign_out = prepare
 
+    def set_deletion_preparation(self, prepare: Callable[[], bool]) -> None:
+        self._prepare_deletion = prepare
+
+    def recover_deletion_credentials(self) -> bool:
+        self._accounts.require_authentication_ready()
+        return self.token_store.load() is not None
+
     def logout(self) -> None:
         # The workspace must commit its scrub before credentials become unavailable.
         if self._prepare_sign_out is not None:
@@ -1966,6 +1978,11 @@ class CloudService(QObject):
 
     def delete_account(self, confirmation: str) -> None:
         if self._state.sign_out_pending:
+            return
+        if confirmation != "DELETE" or not self.authenticated or self.deleting_account:
+            return
+        prepare = getattr(self, "_prepare_deletion", None)
+        if prepare is not None and not prepare():
             return
         credentials = self._begin_account_deletion(confirmation)
         if credentials is None:

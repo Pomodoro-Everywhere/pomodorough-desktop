@@ -417,6 +417,8 @@ class ApplicationController:
 
     def _load_state(self) -> None:
         previous_timer = getattr(self, "timer", None)
+        if self.account_resolution.deletion_pending:
+            self.tasks, self.history, self.known_tasks, self.timer = [], [], {}, None
         try:
             state, provisional_ids, projection = self._project_current_state(
                 previous_timer
@@ -504,6 +506,11 @@ class ApplicationController:
 
     def _install_projected_tasks(self, projection: ProjectionApplyV2) -> None:
         self.tasks = projection.tasks
+        if self.account_resolution.deletion_pending:
+            self.tasks = []
+            self.history = []
+            self.known_tasks = {}
+            self.timer = None
         for task in self.tasks:
             self.known_tasks[task["id"]] = task
 
@@ -515,6 +522,7 @@ class ApplicationController:
     def _connect_cloud(self) -> None:
         if isinstance(self.cloud, CloudService):
             self.cloud.set_sign_out_preparation(self.account_resolution.prepare_sign_out)
+            self.cloud.set_deletion_preparation(self.account_resolution.prepare_deletion)
         self.cloud.signed_in.connect(self._signed_in)
         self.cloud.signed_out.connect(self._signed_out)
         self.cloud.session_expired.connect(self._session_expired)

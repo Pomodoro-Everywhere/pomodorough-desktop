@@ -3455,39 +3455,47 @@ class Store:
 
     def reset_account_data(self) -> None:
         with self._immediate_transaction():
-            room_id = self.active_iroh_room_id
-            if self.replication_mode == "iroh" and room_id is not None:
-                self._reset_iroh_account_data(room_id)
-                return
-            self._clear_account_queues()
-            self._set_meta(
-                "deliveryProof",
-                {domain: [] for domain in DELIVERY_QUEUE_DOMAINS})
-            self._set_meta("canonicalHead", None)
-            self._set_meta("canonicalDurationsMs", None)
-            self._set_meta("commandPhysicalTimes", {})
-            self._set_meta("centralizedTimerOwnership", None)
-            self._set_meta("pendingSync", None)
-            self._set_meta("pendingResolution", None)
-            settings = self._normalize_settings(self.get_meta("settings", {}))
-            settings["durations"] = {
-                phase: int(definition["default_minutes"])
-                for phase, definition in PHASES.items()
-            }
-            settings["durationsMs"] = {
-                phase: int(definition["default_minutes"]) * 60_000
-                for phase, definition in PHASES.items()
-            }
-            settings["selectedTaskId"] = None
-            settings["autoStartBreaks"] = False
-            self._set_meta("autoStartLegacyDefaultUnknown", False)
-            self._set_meta("settings", settings)
-            self._set_meta(
-                "snapshot",
-                {"revision": 0, "canonicalTimer": None, "history": [], "tasks": [],
-                 "knownTasks": [], "autoStartBreaks": False,
-                 "selectedTaskId": None, "user": None},
-            )
+            self._reset_account_data_locked()
+
+    def complete_account_deletion(self) -> None:
+        with self._immediate_transaction():
+            self._reset_account_data_locked()
+            self._set_meta("accountDeletionCleanup", None)
+
+    def _reset_account_data_locked(self) -> None:
+        room_id = self.active_iroh_room_id
+        if self.replication_mode == "iroh" and room_id is not None:
+            self._reset_iroh_account_data(room_id)
+            return
+        self._clear_account_queues()
+        self._set_meta(
+            "deliveryProof",
+            {domain: [] for domain in DELIVERY_QUEUE_DOMAINS})
+        self._set_meta("canonicalHead", None)
+        self._set_meta("canonicalDurationsMs", None)
+        self._set_meta("commandPhysicalTimes", {})
+        self._set_meta("centralizedTimerOwnership", None)
+        self._set_meta("pendingSync", None)
+        self._set_meta("pendingResolution", None)
+        settings = self._normalize_settings(self.get_meta("settings", {}))
+        settings["durations"] = {
+            phase: int(definition["default_minutes"])
+            for phase, definition in PHASES.items()
+        }
+        settings["durationsMs"] = {
+            phase: int(definition["default_minutes"]) * 60_000
+            for phase, definition in PHASES.items()
+        }
+        settings["selectedTaskId"] = None
+        settings["autoStartBreaks"] = False
+        self._set_meta("autoStartLegacyDefaultUnknown", False)
+        self._set_meta("settings", settings)
+        self._set_meta(
+            "snapshot",
+            {"revision": 0, "canonicalTimer": None, "history": [], "tasks": [],
+             "knownTasks": [], "autoStartBreaks": False,
+             "selectedTaskId": None, "user": None},
+        )
 
     def _reset_iroh_account_data(self, room_id: str) -> None:
         self._capture_local_iroh_records_locked(room_id)

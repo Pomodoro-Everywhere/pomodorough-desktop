@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -101,6 +102,9 @@ class TasksScreen(QFrame):
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.task_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.task_table.setTabKeyNavigation(False)
+        self.task_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.task_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         layout.addWidget(self.task_table, 1)
         self.tasks_empty = QLabel(self.strings.text("task.empty"))
         self.tasks_empty.setObjectName("emptyState")
@@ -112,6 +116,8 @@ class TasksScreen(QFrame):
             QEvent.Type.FontChange,
             QEvent.Type.StyleChange,
             QEvent.Type.LayoutRequest,
+            QEvent.Type.FocusIn,
+            QEvent.Type.Resize,
         ):
             self._schedule_row_resize()
         return super().eventFilter(watched, event)
@@ -136,6 +142,7 @@ class TasksScreen(QFrame):
                 table.resizeRowsToContents()
                 table.resizeColumnToContents(3)
                 table.doItemsLayout()
+                self._reserve_task_row()
             finally:
                 header.blockSignals(was_blocked)
             table.horizontalScrollBar().setValue(h_value)
@@ -143,10 +150,35 @@ class TasksScreen(QFrame):
             self._reflow_header_text()
         finally:
             self._in_layout_refresh = False
+        QTimer.singleShot(0, self._reveal_focused_delete)
+
+    def _reveal_focused_delete(self) -> None:
         focused_id, row = self._focused_delete_id()
         if focused_id is None:
             return
-        self.task_table.scrollToItem(self.task_table.item(row, 0))
+        self.task_table.scrollTo(
+            self.task_table.model().index(row, 3),
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+        page = self.parentWidget()
+        if page is not None and isinstance(page.parentWidget(), QScrollArea):
+            page.parentWidget().ensureWidgetVisible(
+                self.task_table.cellWidget(row, 3), 0, 0
+            )
+
+    def _reserve_task_row(self) -> None:
+        # Keep one complete row reachable; the page scrolls instead of crushing it.
+        table = self.task_table
+        row_height = max(
+            (table.rowHeight(row) for row in range(table.rowCount())),
+            default=table.verticalHeader().defaultSectionSize(),
+        )
+        table.setMinimumHeight(
+            table.horizontalHeader().height()
+            + row_height
+            + table.horizontalScrollBar().sizeHint().height()
+            + table.frameWidth() * 2
+        )
 
     def _reflow_header_text(self) -> None:
         # Wrapped labels report a single-line minimum height, so the page
