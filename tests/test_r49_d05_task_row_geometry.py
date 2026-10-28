@@ -78,6 +78,12 @@ def _reveal(view: TasksScreen, row: int):
 
 def _assert_hit(view: TasksScreen, row: int, point: QPoint) -> None:
     table = view.task_table
+    # Same wide-metric RTL caveat as _reveal: the target cell must be
+    # in view before mapping; no-op when already visible.
+    table.scrollTo(
+        table.model().index(row, 3), QAbstractItemView.ScrollHint.EnsureVisible
+    )
+    _settle()
     button = table.cellWidget(row, 3)
     viewport = table.viewport()
     position = button.mapTo(viewport, point)
