@@ -321,7 +321,11 @@ def startup_process(root, phase):
         if phase == "recovered":
             (root / "reject-delete").unlink(missing_ok=True)
         cloud.restore()
-        deadline = time.monotonic() + (2.6 if phase == "unavailable" else 0.6)
+        # Loaded Windows runners stall the QThreadPool retry cadence, so
+        # the unavailable phase (initial attempt plus retry) gets a roomy
+        # bound; the assertions below still require both attempts. Must
+        # stay under run_startup's communicate(timeout=15).
+        deadline = time.monotonic() + (10.0 if phase == "unavailable" else 0.6)
         while time.monotonic() < deadline:
             app.processEvents()
             time.sleep(0.005)

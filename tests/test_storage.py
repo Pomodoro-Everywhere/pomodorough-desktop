@@ -5420,7 +5420,11 @@ class StorageTests(unittest.TestCase):
         class PausingStore(Store):
             def provisional_auto_break_timer_ids(self) -> set[str]:
                 loaded_state.set()
-                if not continue_read.wait(2):
+                # Slow CI runners can stall thread startup past a tight
+                # bound; the race under test (writer deletes while the
+                # reader holds the snapshot) is unchanged by waiting
+                # longer for the rendezvous.
+                if not continue_read.wait(15):
                     raise TimeoutError("writer did not release snapshot read")
                 return super().provisional_auto_break_timer_ids()
 
@@ -5433,11 +5437,11 @@ class StorageTests(unittest.TestCase):
 
         thread = Thread(target=read_projection)
         thread.start()
-        self.assertTrue(loaded_state.wait(2))
+        self.assertTrue(loaded_state.wait(15))
         self.store.connection.execute("DELETE FROM pending_auto_break_starts")
         self.store.connection.commit()
         continue_read.set()
-        thread.join(5)
+        thread.join(15)
         self.assertFalse(thread.is_alive())
 
         state, timer_ids = results.get_nowait()
