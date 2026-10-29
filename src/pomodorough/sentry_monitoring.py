@@ -123,7 +123,55 @@ _KEY_SUFFIX_ALLOWLIST = frozenset(
     }
 )
 _BARE_SECRET_KEYS = frozenset({"key", "value"})
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_SIGNATURE_KEY_SUFFIXES = ("signature", "signatures")
+# R54-L02: every URL pattern below scans each character a bounded number of
+# times. Quantifiers are possessive or bounded, and a pattern whose secret part
+# is absent still consumes its head, so a failed start never rescans the text.
+#
+# Userinfo before the last `@` of an authority is a credential in any encoding.
+# The authority runs to the next `/`, `?`, or `#`; WHATWG keeps spaces there and
+# drops tabs and newlines. JSON escapes the slashes as `:\/\/`. Connection
+# string parsers such as SQLAlchemy also accept a raw `/` in a password
+# (`user:ab/cd@host`); that run stops before the next scheme separator.
+_URL_USERINFO_RE = re.compile(
+    r"(:(?:\\*/){2})"
+    r"(?:[^/?#]*@|[^:/?#\s@]*+:(?:[^:@\s]|:(?!\\*/))*+@)"
+)
+# Only a literal `&` separates parameters for every query parser. Quotes,
+# whitespace, controls, `;`, `?`, and `#` can belong to a malformed value or
+# key, so an ambiguous URL part stays filtered through the next `&`.
+# Encoding in a scheme or head can hide every separator, so only the literal
+# head before the first `%` survives. An encoded scheme separator (`https%3A`,
+# `https:%2F`) keeps only the scheme. Group 2 is empty for a head without `%`.
+_ENCODED_URL_HEAD_RE = re.compile(
+    r"(?i)(?<![a-z0-9+.-])"
+    r"([a-z0-9+.-]++(?:://[^?&#; %]*+|:/*+(?=%)|(?=%(?:25)*+3a)))(%[^&]*+)?"
+)
+_URL_SEGMENT_SPLIT_RE = re.compile(r"(?=&)")
+# Encoded separators at any nesting depth, escapes that decode into a new
+# escape (`%%33%46` and `%3%46` decode twice to `?`), IIS `%u` escapes,
+# escapes split by a tab or newline that WHATWG strips (`%3\tF`, also after
+# JSON or repr escaped the control), and JSON or C escapes of a separator or
+# `%` (`\u0026`, `\x3f`).
+_URL_PREFIX_RE = re.compile(
+    r"(?i)[?&#;]"
+    r"|%(?:25)*+(?:3f|23|26|3b|[0-9a-f]?%|u"
+    r"|[0-9a-f]{0,2}(?:[\t\n\r]|\\++(?:[tnr]|u000[9ad]|x0[9ad])))"
+    r"|(?<!\\)\\++(?:u00|x)(?:26|3f|23|3b|25)"
+)
+_LITERAL_URL_SEPARATORS = frozenset("?&#;")
+# Always matches; every group may be empty.
+_URL_PARAMETER_RE = re.compile(r"([A-Za-z0-9_.~-]*)(=?)([A-Za-z0-9_.~-]*)")
+_CANONICAL_QUERY_KEY_RE = re.compile(r"[A-Za-z0-9_.~-]+")
+# Sentry's stdlib integration records the raw query and fragment without `?`
+# or `#` in breadcrumb data; the request interface sends `query_string` as
+# text, a mapping, or a list of pairs.
+_URL_PART_SEPARATORS = {"http.query": "?", "http.fragment": "#", "query_string": "?"}
+# Group 1 is empty for a local-part run that no domain follows. The local
+# part takes RFC 5322 atext except URL delimiters (`/`, `?`, `#`, `&`, `=`).
+_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+!$'*^`{|}~-]++(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?"
+)
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/=]+")
@@ -424,6 +472,13 @@ def _is_key_suffix(lowered: str) -> bool:
     return True
 
 
+def _is_signature_key(lowered: str) -> bool:
+    # R54-L02: signed URLs carry their credential in `sig` (Azure SAS),
+    # `Signature` (GCS, CloudFront), or `X-Amz-Signature` (S3 SigV4). Match
+    # `sig` exactly so `signal` and `design` stay readable.
+    return lowered == "sig" or lowered.endswith(_SIGNATURE_KEY_SUFFIXES)
+
+
 def _sensitive_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
@@ -434,6 +489,8 @@ def _sensitive_key(key: Any) -> bool:
         return True
     if _is_key_suffix(lowered):
         return True
+    if _is_signature_key(lowered):
+        return True
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
 
@@ -443,8 +500,63 @@ def _json_secret_replacement(match: re.Match[str]) -> str:
     return (match.group(1) or match.group(2)) + _FILTERED
 
 
+def _email_replacement(match: re.Match[str]) -> str:
+    return _FILTERED if match.group(1) else match.group(0)
+
+
+def _encoded_url_head_replacement(match: re.Match[str]) -> str:
+    if match.group(2) is None:
+        return match.group(0)
+    return match.group(1) + _FILTERED
+
+
+def _url_component_ambiguous(
+    segment: str, parameter: re.Match[str], last_equals: int
+) -> bool:
+    tail_start = parameter.end()
+    if tail_start == len(segment):
+        return False
+    # Reject all encoding, including malformed and arbitrarily nested escapes.
+    # Encoded values can themselves hide another URL or parameter separator.
+    if segment[tail_start] == "%":
+        return True
+    # A complete non-sensitive key owns its continuation. Before `=`, a space,
+    # quote, control, `+`, `;`, `?`, or `#` can extend a key that a parser
+    # strips or rejoins (`to\tken=`, `xtoken;y=`).
+    return not parameter.group(2) and last_equals >= tail_start
+
+
+def _scrub_url_segment(segment: str) -> str:
+    # Filtering runs to the segment end instead of a quote or whitespace.
+    last_equals = segment.rfind("=")
+    scrubbed: list[str] = []
+    position = 0
+    while (prefix := _URL_PREFIX_RE.search(segment, position)) is not None:
+        parameter = _URL_PARAMETER_RE.match(segment, prefix.end())
+        key, separator, _ = parameter.groups()
+        scrubbed.append(segment[position:prefix.end()])
+        encoded = prefix.group(0) not in _LITERAL_URL_SEPARATORS
+        if encoded or _url_component_ambiguous(segment, parameter, last_equals):
+            return "".join(scrubbed) + _FILTERED
+        if separator and _sensitive_key(key):
+            return "".join(scrubbed) + key + "=" + _FILTERED
+        scrubbed.append(parameter.group(0))
+        position = parameter.end()
+    return "".join(scrubbed) + segment[position:]
+
+
+def _scrub_urls(text: str) -> str:
+    redacted = _ENCODED_URL_HEAD_RE.sub(_encoded_url_head_replacement, text)
+    segments = _URL_SEGMENT_SPLIT_RE.split(redacted)
+    return "".join(_scrub_url_segment(segment) for segment in segments)
+
+
 def _scrub_string(text: str) -> str:
-    redacted = _EMAIL_RE.sub(_FILTERED, text)
+    # R54-L02: userinfo and emails go first. URL rules filter from an escape
+    # onward and would keep a literal secret before `%` (`alice:pw%21@host`).
+    redacted = _URL_USERINFO_RE.sub(r"\1" + _FILTERED + "@", text)
+    redacted = _EMAIL_RE.sub(_email_replacement, redacted)
+    redacted = _scrub_urls(redacted)
     redacted = _POSIX_HOME_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _WINDOWS_HOME_RE.sub(r"\1" + _FILTERED, redacted)
     redacted = _BEARER_RE.sub(r"\1" + _FILTERED, redacted)
@@ -490,19 +602,63 @@ def _scrub_unknown(value: Any) -> Any:
         return _FILTERED
 
 
+def _scrub_query_parameter_value(key: Any, value: Any, depth: int) -> Any:
+    # R54-L02: only a canonical key names its value. Any other key can decode
+    # to a secret name (`%74oken`, `to ken`), so its value stays filtered.
+    canonical = isinstance(key, str) and _CANONICAL_QUERY_KEY_RE.fullmatch(key)
+    if not canonical or _sensitive_key(key):
+        return _FILTERED
+    return _scrub_value(value, depth + 1)
+
+
+def _scrub_query_entry(entry: Any, depth: int) -> Any:
+    # Sentry sends query lists as `[key, value]` pairs. Any other entry can be
+    # one half of a flattened pair (`["token", secret]`), so it stays opaque.
+    if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+        return _FILTERED
+    key, value = entry
+    scrubbed_value = _scrub_query_parameter_value(key, value, depth)
+    pair = [_scrub_value(key, depth + 1), scrubbed_value]
+    return pair if isinstance(entry, list) else tuple(pair)
+
+
+def _scrub_url_part(value: Any, separator: str, depth: int) -> Any:
+    """R54-L02: scrub a query or fragment recorded without its separator."""
+    if depth > _SCRUB_DEPTH_LIMIT:
+        return _FILTERED
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return _scrub_string(separator + value).removeprefix(separator)
+    if isinstance(value, dict):
+        return {
+            key: _scrub_query_parameter_value(key, item, depth)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        entries = [_scrub_query_entry(entry, depth) for entry in value]
+        return entries if isinstance(value, list) else tuple(entries)
+    return _scrub_value(value, depth)
+
+
+def _scrub_mapping_item(key: Any, item: Any, depth: int) -> Any:
+    # Sensitive parents stay opaque: recurse would leak unknown
+    # leaves (roomId under invite, ticket parts in lists).
+    if _sensitive_key(key):
+        return _FILTERED
+    if key in _URL_PART_SEPARATORS:
+        return _scrub_url_part(item, _URL_PART_SEPARATORS[key], depth)
+    return _scrub_value(item, depth)
+
+
 def _scrub_value(value: Any, depth: int = 0) -> Any:
     if depth > _SCRUB_DEPTH_LIMIT:
         return _FILTERED
     if isinstance(value, dict):
-        cleaned: dict[Any, Any] = {}
-        for key, item in value.items():
-            # Sensitive parents stay opaque: recurse would leak unknown
-            # leaves (roomId under invite, ticket parts in lists).
-            if _sensitive_key(key):
-                cleaned[key] = _FILTERED
-            else:
-                cleaned[key] = _scrub_value(item, depth + 1)
-        return cleaned
+        return {
+            key: _scrub_mapping_item(key, item, depth + 1)
+            for key, item in value.items()
+        }
     if isinstance(value, collections.abc.Mapping):
         # Non-dict mappings (proxies, immutable views) stay opaque: their
         # iteration contract is unknown, so recursing could leak sensitive
