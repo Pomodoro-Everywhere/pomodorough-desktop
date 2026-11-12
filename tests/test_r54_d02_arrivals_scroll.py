@@ -720,9 +720,13 @@ def test_only_a_font_change_reanchors_the_current_row(app, tmp_path, locale):
 def test_list_font_change_keeps_the_current_row_top(app, tmp_path, locale):
     """A font set on the list alone reanchors the row without a viewport resize."""
     history = [_arrival("short", index) for index in range(30)]
+    # The rows must stay narrower than the view at 24 pt, or the horizontal
+    # bar shows and resizes the viewport. With DejaVu Sans, the only sans
+    # font on the Ubuntu runner, an ar-XB row is 954 pixels wide at 24 pt,
+    # more than the 910-pixel view of a 1024-pixel window.
     with (
         _scaled_font(app, 18.0),
-        _tasks_window(app, tmp_path, locale, 1024, 700) as window,
+        _tasks_window(app, tmp_path, locale, 1280, 700) as window,
     ):
         listing = _show(app, window, history, {})
         bar, height = listing.verticalScrollBar(), listing.viewport().height()
@@ -736,6 +740,7 @@ def test_list_font_change_keeps_the_current_row_top(app, tmp_path, locale):
         listing.setFont(font)
         _process(app, 30)
         rect = listing.visualItemRect(listing.item(20))
+        assert not listing.horizontalScrollBar().isVisible()
         assert listing.viewport().height() == height
         assert (listing.currentRow(), rect.top()) == (20, top), rect
 
