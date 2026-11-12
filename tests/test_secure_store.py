@@ -20,15 +20,29 @@ from pomodorough.secure_store import (
 
 
 @contextmanager
-def linux_secret_store(root):
-    """Select the Linux vault without changing pathlib or native file locking."""
+def posix_store_platform(platform):
+    """Select a POSIX vault on any host without changing native file locking.
+
+    The store checks ``os.name`` for Windows before it reads ``sys.platform``,
+    so a mocked macOS or Linux platform on a Windows host needs a POSIX
+    ``os.name`` too. The file lock keeps the host's ``os`` module, so it still
+    uses ``msvcrt`` on Windows.
+    """
     lock_function = secure_store._file_lock.__wrapped__
     native_lock = FunctionType(lock_function.__code__, {**lock_function.__globals__, "os": os})
     adapter_os = SimpleNamespace(**{**vars(os), "name": "posix"})
     with ExitStack() as stack:
         stack.enter_context(patch.object(secure_store, "os", adapter_os))
         stack.enter_context(patch.object(secure_store, "_file_lock", contextmanager(native_lock)))
-        stack.enter_context(patch.object(secure_store, "sys_platform", return_value="linux"))
+        stack.enter_context(patch.object(secure_store, "sys_platform", return_value=platform))
+        yield
+
+
+@contextmanager
+def linux_secret_store(root):
+    """Select the Linux vault without changing pathlib or native file locking."""
+    with ExitStack() as stack:
+        stack.enter_context(posix_store_platform("linux"))
         stack.enter_context(patch.object(secure_store, "user_config_path", return_value=root))
         for name in ("_macos_load", "_macos_save", "_macos_delete"):
             stack.enter_context(patch.object(secure_store, name, side_effect=AssertionError("Native Keychain access")))

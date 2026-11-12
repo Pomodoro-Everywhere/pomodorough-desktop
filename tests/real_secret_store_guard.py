@@ -27,7 +27,6 @@ a store:
 - ``os.system``, ``os.posix_spawn``, ``os.exec*``, ``os.spawn*`` and
   ``QProcess``;
 - D-Bus calls over a socket, with no tool and no ``ctypes`` load;
-- ``cmdkey.exe`` and other names with an extension on Windows;
 - a child Python started with ``-I``, ``-E`` or ``-S``, or one whose
   ``PYTHONPATH`` puts another ``sitecustomize`` first. A hit inside a child
   also never reaches the state of the parent test process.
@@ -35,6 +34,11 @@ a store:
 A tool that a test wrote into a temporary folder is a fake and stays allowed.
 A tool that is not installed at all stays allowed too: the spawn fails with
 "not found" and reaches nothing.
+
+On Windows a tool is found the way ``CreateProcess`` finds it: the name gets
+``.exe`` when it has no extension, and the Python folder, the working folder
+and the Windows system folders come before ``PATH``. So ``cmdkey`` is the real
+``System32\\cmdkey.exe`` even when ``PATH`` holds only a temporary folder.
 """
 
 from __future__ import annotations
@@ -84,6 +88,7 @@ TOOL_KEY_FLAGS = {
     "cmdkey": "/generic",
 }
 _AUDIT_EVENTS = frozenset({"subprocess.Popen", "ctypes.dlopen", "ctypes.dlsym"})
+_WINDOWS_PROGRAM_EXTENSIONS = frozenset({".exe", ".com", ".bat", ".cmd"})
 # Bound at import so tests that patch shutil.which cannot hide a real tool.
 _which = shutil.which
 _TEMPORARY_ROOTS = tuple(
@@ -159,7 +164,7 @@ def _check_symbol(name: object) -> None:
 def _check_spawn(executable: object, arguments: object, environment: object) -> None:
     argv = _argv(arguments)
     program = os.fsdecode(executable) if executable else (argv[0] if argv else "")
-    tool = os.path.basename(program)
+    tool = _tool_name(program)
     if tool not in STORE_TOOLS:
         return
     path = _environment_path(environment)
@@ -169,11 +174,41 @@ def _check_spawn(executable: object, arguments: object, environment: object) -> 
     raise STATE.reached(f"command {resolved} {' '.join(argv[1:2])}", _tool_key(tool, argv))
 
 
+def _tool_name(program: str) -> str:
+    name = os.path.basename(program)
+    if os.name != "nt":
+        return name
+    # Windows names ignore case, and CMDKEY.EXE runs the same tool as cmdkey.
+    stem, extension = os.path.splitext(name.lower())
+    return stem if extension in _WINDOWS_PROGRAM_EXTENSIONS else name.lower()
+
+
 def resolve_tool(program: str, path: str | None) -> str | None:
     """Find the executable a spawn would run, on the PATH the spawn uses."""
-    if os.sep in program:
+    if os.sep in program or (os.altsep and os.altsep in program):
         return program if os.path.exists(program) else None
+    if os.name == "nt":
+        return _resolve_windows_tool(program)
     return _which(program, path=path)
+
+
+def _resolve_windows_tool(program: str) -> str | None:
+    """Search like CreateProcess, which ignores the PATH of the child environment."""
+    name = program if os.path.splitext(program)[1] else f"{program}.exe"
+    windows = os.environ.get("SystemRoot", r"C:\Windows")
+    folders = [
+        os.path.dirname(sys.executable),
+        os.getcwd(),
+        os.path.join(windows, "System32"),
+        os.path.join(windows, "System"),
+        windows,
+        *os.environ.get("PATH", "").split(os.pathsep),
+    ]
+    for folder in filter(None, folders):
+        candidate = os.path.join(folder, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def _argv(arguments: object) -> list[str]:

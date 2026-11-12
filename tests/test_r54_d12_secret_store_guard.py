@@ -8,6 +8,12 @@ hit, so the conftest teardown does not fail it.
 The proofs stay safe when a guard layer is broken. Spawn tests run the real
 resolver against fake tools on a PATH that holds only one temporary folder,
 and macOS proofs refuse ``ctypes.CDLL`` so they cannot load Security.framework.
+
+The store checks ``os.name`` for Windows before it reads ``sys.platform``, so
+the macOS and Linux proofs select a POSIX ``os.name`` as well. On Windows the
+fake tools are ``.exe`` files, because ``CreateProcess`` appends that
+extension to a bare name. They hold text, so if both guard layers broke the
+spawn would fail as "not a valid Win32 application" and run nothing.
 """
 
 from __future__ import annotations
@@ -25,13 +31,15 @@ import pytest
 import real_secret_store_guard as guard
 from pomodorough import secure_store
 from pomodorough.network import TokenStore
-from pomodorough.secure_store import PlatformSecretStore
+from pomodorough.secure_store import PlatformSecretStore, SecretServiceUnavailableError
+from test_secure_store import posix_store_platform
 
 pytest_plugins = ("pytester",)
 
 SECURITY_FRAMEWORK = "/System/Library/Frameworks/Security.framework/Security"
 FAKE_TOOLS = ("security", "secret-tool", "kwallet-query", "kwalletcli", "cmdkey")
 CONFTEST = Path(__file__).with_name("conftest.py")
+TOOL_SUFFIX = ".exe" if os.name == "nt" else ""
 # Bound at import, before the conftest guard replaces it for each test.
 REAL_MACOS_FRAMEWORKS = secure_store._macos_frameworks
 
@@ -62,7 +70,7 @@ def fake_store_tools(tmp_path, monkeypatch) -> Path:
     folder = tmp_path / "bin"
     folder.mkdir()
     for tool in FAKE_TOOLS:
-        fake = folder / tool
+        fake = folder / f"{tool}{TOOL_SUFFIX}"
         fake.write_text("#!/bin/sh\nexit 0\n")
         fake.chmod(0o700)
     monkeypatch.setattr(guard, "_TEMPORARY_ROOTS", ())
@@ -93,7 +101,7 @@ def test_macos_keychain_operations_fail_closed(
     store_object = PlatformSecretStore(tmp_path)
     arguments = ("proof-macos", b"secret") if operation == "save" else ("proof-macos",)
     with (
-        patch.object(secure_store, "sys_platform", return_value="darwin"),
+        posix_store_platform("darwin"),
         patch.object(PlatformSecretStore, "_tool_availability", return_value=(True, "ready")),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
@@ -128,7 +136,7 @@ def test_store_operation_names_its_key_on_a_keyless_hit(
     store_object = PlatformSecretStore(tmp_path)
     arguments = ("proof-context", b"secret") if operation == "save" else ("proof-context",)
     with (
-        patch.object(secure_store, "sys_platform", return_value="darwin"),
+        posix_store_platform("darwin"),
         patch.object(PlatformSecretStore, "_tool_availability", return_value=(True, "ready")),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
@@ -146,7 +154,7 @@ def test_guard_hit_escapes_broad_exception_handlers(
     assert not issubclass(guard.RealSecretStoreAccess, Exception)
     store_object = PlatformSecretStore(tmp_path)
     with (
-        patch.object(secure_store, "sys_platform", return_value="darwin"),
+        posix_store_platform("darwin"),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
         try:
@@ -167,7 +175,7 @@ def test_default_oauth_store_fails_closed_like_the_r54_d12_tests(
         tokens = TokenStore("device-1", fallback_path=tmp_path / "session.json")
     with (
         patch.object(secure_store, "user_config_path", return_value=tmp_path),
-        patch.object(secure_store, "sys_platform", return_value="darwin"),
+        posix_store_platform("darwin"),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
         tokens.revocations.load_all("https://example.test")
@@ -203,13 +211,13 @@ def test_linux_secret_tool_fails_closed(
     store_object = PlatformSecretStore(tmp_path, kind="oauth")
     assert_path_holds_only(fake_store_tools, tmp_path)
     with (
-        patch.object(secure_store, "sys_platform", return_value="linux"),
+        posix_store_platform("linux"),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
         getattr(store_object, operation)(*arguments)
     assert_single_hit(
         real_secret_store_guard_state, request,
-        f"command {fake_store_tools / 'secret-tool'}", "proof-linux",
+        f"command {fake_store_tools / 'secret-tool'}{TOOL_SUFFIX}", "proof-linux",
     )
 
 
@@ -219,13 +227,13 @@ def test_linux_secret_service_probe_fails_closed(
     store_object = PlatformSecretStore(tmp_path)
     assert_path_holds_only(fake_store_tools, tmp_path)
     with (
-        patch.object(secure_store, "sys_platform", return_value="linux"),
+        posix_store_platform("linux"),
         pytest.raises(guard.RealSecretStoreAccess),
     ):
         store_object.availability()
     assert_single_hit(
         real_secret_store_guard_state, request,
-        f"command {fake_store_tools / 'secret-tool'} lookup", "availability:probe",
+        f"command {fake_store_tools / 'secret-tool'}{TOOL_SUFFIX} lookup", "availability:probe",
     )
 
 
@@ -246,7 +254,8 @@ def test_legacy_secret_tool_mirror_fails_closed(
         getattr(tokens, method)(*arguments)
     assert_single_hit(
         real_secret_store_guard_state, request,
-        f"command {fake_store_tools / 'secret-tool'} {operation}", "proof-legacy-device",
+        f"command {fake_store_tools / 'secret-tool'}{TOOL_SUFFIX} {operation}",
+        "proof-legacy-device",
     )
 
 
@@ -264,14 +273,37 @@ def test_store_tools_outside_platform_secret_store_fail_closed(
     command, key, fake_store_tools, tmp_path, request, real_secret_store_guard_state
 ):
     assert_path_holds_only(fake_store_tools, tmp_path)
+    fake = fake_store_tools / f"{command[0]}{TOOL_SUFFIX}"
+    if os.name == "nt":
+        # CreateProcess finds a bare name in System32 before PATH, so a bare
+        # "cmdkey" would be the real tool if the guard broke. Name the fake.
+        # test_windows_spawn_is_resolved_like_create_process covers bare names.
+        command = [str(fake), *command[1:]]
     with pytest.raises(guard.RealSecretStoreAccess):
         subprocess.run(command, capture_output=True, check=False)
     assert_single_hit(
-        real_secret_store_guard_state, request,
-        f"command {fake_store_tools / command[0]} {command[1]}", key,
+        real_secret_store_guard_state, request, f"command {fake} {command[1]}", key
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="CreateProcess search order exists only on Windows")
+def test_windows_spawn_is_resolved_like_create_process(fake_store_tools, tmp_path, monkeypatch):
+    system_tool = Path(os.environ["SystemRoot"], "System32", "cmdkey.exe")
+    assert system_tool.is_file()
+    resolved = guard.resolve_tool("cmdkey", str(fake_store_tools))
+    assert os.path.normcase(resolved) == os.path.normcase(system_tool)
+    assert guard._tool_name(str(system_tool).upper()) == "cmdkey"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    # CreateProcess ignores PATH in the child environment, so the fake is out of reach.
+    assert guard.resolve_tool("kwallet-query", str(fake_store_tools)) is None
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows subprocess never searches the PATH of env (Python subprocess docs)",
+)
 def test_spawn_is_resolved_on_the_path_of_its_own_environment(
     fake_store_tools, tmp_path, monkeypatch, request, real_secret_store_guard_state
 ):
@@ -375,17 +407,25 @@ def test_windows_dpapi_fails_closed_with_key(tmp_path, request, real_secret_stor
 
 
 def test_fake_and_missing_tools_stay_allowed(tmp_path, real_secret_store_guard_state):
-    fake = tmp_path / "secret-tool"
+    fake = tmp_path / f"secret-tool{TOOL_SUFFIX}"
     fake.write_text(f"#!{sys.executable}\nprint('ZmFrZQ==')\n")
     fake.chmod(0o700)
     store_object = PlatformSecretStore(tmp_path)
     with (
-        patch.object(secure_store, "sys_platform", return_value="linux"),
+        posix_store_platform("linux"),
         patch.dict(os.environ, PATH=str(tmp_path)),
     ):
-        assert store_object.load("proof-fake") == b"fake"
-    with pytest.raises(FileNotFoundError):
-        subprocess.run(["kwallet-query", "-r", "x", "y"], env={"PATH": str(tmp_path / "none")})
+        if os.name != "nt":
+            assert store_object.load("proof-fake") == b"fake"
+        else:
+            # Windows cannot run a script by its shebang. The error from
+            # CreateProcess shows that the guard let the spawn reach the system.
+            with pytest.raises(SecretServiceUnavailableError) as failure:
+                store_object.load("proof-fake")
+            assert getattr(failure.value.__cause__, "winerror", None) == 193
+    missing = str(tmp_path / "none")
+    with patch.dict(os.environ, PATH=missing), pytest.raises(FileNotFoundError):
+        subprocess.run(["kwallet-query", "-r", "x", "y"], env={"PATH": missing})
     assert real_secret_store_guard_state.take() == []
 
 
@@ -394,7 +434,7 @@ def test_swallowed_hit_is_still_recorded_for_teardown(
     tmp_path, request, real_secret_store_guard_state
 ):
     store_object = PlatformSecretStore(tmp_path)
-    with patch.object(secure_store, "sys_platform", return_value="darwin"):
+    with posix_store_platform("darwin"):
         try:
             store_object.load("proof-swallowed")
         except pytest.fail.Exception:

@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
-from test_secure_store import linux_secret_store
+from test_secure_store import linux_secret_store, posix_store_platform
 
 from pomodorough.network import ApiError, CloudService, TokenStore, _request
 from pomodorough.secure_store import PlatformSecretStore, SecureStoreError
@@ -357,7 +357,7 @@ class RevocationWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(TemporaryDirectory()))
         self.keyring = PlatformKeyring()
-        self.enterContext(patch("pomodorough.secure_store.sys_platform", return_value="linux"))
+        self.enterContext(posix_store_platform("linux"))
         self.enterContext(patch("pomodorough.secure_store.shutil.which", return_value="/bin/secret-tool"))
         self.enterContext(patch.object(PlatformSecretStore, "_run", side_effect=self.keyring.run))
         self.addCleanup(QThreadPool.globalInstance().waitForDone, 3000)
