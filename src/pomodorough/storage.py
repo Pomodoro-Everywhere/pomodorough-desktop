@@ -217,6 +217,18 @@ class Store:
         self._iroh_secret_store = iroh_secret_store or PlatformSecretStore()
         self._shared_core = shared_core
         self._open_database(restrict_existing_parent=uses_default_path)
+        try:
+            self._prepare_open_database()
+        except BaseException:
+            # A failed open must release the file. Windows cannot delete,
+            # replace or reopen a database that a leaked connection holds.
+            self.connection.close()
+            raise
+
+    def _prepare_open_database(self) -> None:
+        self.connection.row_factory = sqlite3.Row
+        self._enable_write_ahead_log()
+        self.connection.execute("PRAGMA foreign_keys=ON")
         self._create_local_schema()
         self._migrate_local_schema()
         if self._migrated_iroh_capabilities:
@@ -328,9 +340,6 @@ class Store:
                 # succeeds and permissions are defense-in-depth only).
                 pass
         self.connection = sqlite3.connect(self.path)
-        self.connection.row_factory = sqlite3.Row
-        self._enable_write_ahead_log()
-        self.connection.execute("PRAGMA foreign_keys=ON")
 
     def _enable_write_ahead_log(self) -> None:
         deadline = time.monotonic() + _WAL_SETUP_WAIT_SECONDS

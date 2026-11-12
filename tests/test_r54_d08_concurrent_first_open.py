@@ -241,6 +241,26 @@ class ConcurrentFirstOpenTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "injected WAL setup failure")
         self.assertEqual(len(attempts), 1)
 
+    def test_failed_open_closes_its_connection(self) -> None:
+        """Windows keeps a file locked while any connection to it stays open."""
+        path = self.root / "state.sqlite3"
+        opened: list[sqlite3.Connection] = []
+        failing_connect = connect_with_failing_wal(sqlite3.SQLITE_IOERR, [])
+
+        def connect(database, *args, **kwargs):
+            opened.append(failing_connect(database, *args, **kwargs))
+            return opened[-1]
+
+        with (
+            patch.object(storage.sqlite3, "connect", connect),
+            self.assertRaises(sqlite3.OperationalError),
+        ):
+            Store(path)
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            opened[0].execute("SELECT 1")
+        path.unlink()
 
     def test_extended_busy_code_is_retried_after_the_retry_spacing(self):
         path = self.root / "state.sqlite3"
