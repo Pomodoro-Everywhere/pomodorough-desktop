@@ -21,9 +21,27 @@ lock_file_isolation.WATCH.install()
 # and cannot leave a bare QCoreApplication for a later widget test, which
 # Qt aborts on. Test modules default to offscreen the same way.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 APPLICATION = QApplication.instance() or QApplication([])
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    """Delete the objects a test released with deleteLater.
+
+    The suite never runs a Qt event loop, and processEvents does not deliver
+    a deferred delete posted outside one, so every released window stayed
+    alive for the rest of the process. Thousands of leftover widgets made
+    each later application font, palette or style change and each
+    processEvents call slower, which pushed CI past its time limit. This
+    runs after the fixture finalizers, so their deleteLater calls count too.
+    """
+    try:
+        return (yield)
+    finally:
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def pytest_configure(config: pytest.Config) -> None:
