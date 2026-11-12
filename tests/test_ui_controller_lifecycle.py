@@ -202,7 +202,9 @@ class ApplicationControllerLifecycleTests(unittest.TestCase):
             events,
             [
                 ("discard", "user-1", "request-1"),
-                ("status", "Remote changed. Refreshing", 10_000),
+                # R2-B3: the status bar shows the catalog sentence, never
+                # the server's own conflict text.
+                ("status", "resolution.changed Refreshing", 10_000),
                 ("continue", "preview", None, False),
             ],
         )

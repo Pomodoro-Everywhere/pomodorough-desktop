@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time  # public test seam: patches shared time module
+from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
@@ -16,7 +17,9 @@ from .account_resolution_controller import (
 from .controller_outcomes import (
     ActivatePersistedResolution,
     ControllerOutcome,
+    EmitFailure,
     EmitNotice,
+    EmitTaskFailure,
     LoadState,
     MaybeAutoStartBreak,
     Render,
@@ -27,6 +30,7 @@ from .controller_outcomes import (
     ShowWindow,
     StopSound,
     Synchronize,
+    TaskChange,
 )
 from .core import TERMINAL_STATUSES
 from .network import CloudService
@@ -130,6 +134,8 @@ _CONTROLLER_METHODS: dict[str, tuple[str, str]] = {
     "_task_selection_changed": ("timer", "task_selection_changed"),
     "_add_task": ("timer", "add_task"),
     "_delete_task": ("timer", "delete_task"),
+    "_withdraw_pending_task_delete": ("timer", "withdraw_pending_task_delete"),
+    "_rename_task": ("timer", "rename_task"),
     "_duration_changed": ("timer", "duration_changed"),
     "_auto_breaks_changed": ("timer", "auto_breaks_changed"),
     "_schedule_pending_auto_break": ("timer", "schedule_pending_auto_break"),
@@ -172,10 +178,8 @@ _CONTROLLER_METHODS: dict[str, tuple[str, str]] = {
     "_signed_out": ("account", "signed_out"),
     "_session_expired": ("account", "session_expired"),
     "_set_account_state": ("account", "set_account_state"),
-    "_delete_account_action": ("account", "delete_account_action"),
     "_account_deleted": ("account", "account_deleted"),
     "_account_deletion_failed": ("account", "account_deletion_failed"),
-    "_account_action": ("account", "account_action"),
     "_choose_resolution_account_action": (
         "account",
         "choose_resolution_account_action",
@@ -194,6 +198,26 @@ _SIMPLE_EFFECT_METHODS: dict[type[Any], str] = {
     ShowWindow: "_show_window",
     ActivatePersistedResolution: "_activate_persisted_resolution",
     StopSound: "_stop_sound",
+}
+
+
+# Each entry applies one effect type that carries values to the window.
+_PARAMETERIZED_EFFECT_APPLIERS: dict[type[Any], Callable[[Any, Any], None]] = {
+    SetAccountState: lambda window, effect: window._set_account_state(effect.synced),
+    MaybeAutoStartBreak: lambda window, effect: window._maybe_auto_start_break(
+        sync=effect.sync,
+        allow_busy=effect.allow_busy,
+        require_canonical=effect.require_canonical,
+    ),
+    SchedulePendingAutoBreak: lambda window, effect: (
+        window._schedule_pending_auto_break(require_canonical=effect.require_canonical)
+    ),
+    EmitNotice: lambda window, effect: window.notice.emit(effect.message),
+    EmitFailure: lambda window, effect: window._show_failure(effect),
+    EmitTaskFailure: lambda window, effect: window._show_task_failure(effect),
+    ShowStatus: lambda window, effect: window.statusBar().showMessage(
+        effect.message, effect.duration_ms
+    ),
 }
 
 
@@ -299,6 +323,10 @@ class ApplicationController:
                 stop_sound_timer=lambda: self.sound_timer.stop(),
                 stop_completion_sound=lambda: self.completion_sound.stop(),
                 set_stop_sound_control=self._set_stop_sound_control,
+                complete_pending_task_delete=lambda: (
+                    self.tasks_screen.flush_pending_delete()
+                ),
+                task_delete_attended=self._task_delete_attended,
             )
         )
 
@@ -393,22 +421,113 @@ class ApplicationController:
                 self._apply_parameterized_effect(effect)
 
     def _apply_parameterized_effect(self, effect: Any) -> None:
-        if isinstance(effect, SetAccountState):
-            self._set_account_state(effect.synced)
-        elif isinstance(effect, MaybeAutoStartBreak):
-            self._maybe_auto_start_break(
-                sync=effect.sync,
-                allow_busy=effect.allow_busy,
-                require_canonical=effect.require_canonical,
-            )
-        elif isinstance(effect, SchedulePendingAutoBreak):
-            self._schedule_pending_auto_break(
-                require_canonical=effect.require_canonical
-            )
-        elif isinstance(effect, EmitNotice):
-            self.notice.emit(effect.message)
-        elif isinstance(effect, ShowStatus):
-            self.statusBar().showMessage(effect.message, effect.duration_ms)
+        _PARAMETERIZED_EFFECT_APPLIERS[type(effect)](self, effect)
+
+    # True while a pending task delete completes with no window in view to
+    # carry a Retry dialog: hiding, minimizing, leaving the Tasks page,
+    # quitting, and the replay at start.
+    _task_delete_unattended = False
+
+    # A delete the previous run left recorded, released at start: its task
+    # id, and the store failure when its marker could not be dropped. The
+    # notice is due once the window is in view.
+    _recorded_task_delete_to_report: ControllerOutcome[str | None] | None = None
+
+    def _record_pending_task_delete(self, task_id: str) -> None:
+        timer = self._owned_controller("timer")
+        outcome = timer.begin_pending_task_delete(task_id)
+        if not outcome.value:
+            # No durable record means no undo window: the row stays.
+            self.tasks_screen.undo_pending_delete()
+        self._apply_outcome(outcome)
+
+    def complete_pending_task_delete_unattended(self) -> None:
+        """Complete a pending task delete when no Retry dialog can be shown."""
+        self._run_task_delete_unattended(self.tasks_screen.flush_pending_delete)
+
+    def _replay_pending_task_delete(self) -> None:
+        """Hand a delete the previous run recorded back to the user.
+
+        A marker left at start cannot tell a run that died during the undo
+        window from an Undo whose marker clear kept failing until shutdown.
+        Deleting could remove a task the user restored, so nothing is
+        deleted here: the marker is dropped, the task stays, and the user is
+        told once the window is in view. Only Retry there deletes the task.
+        """
+        timer = self._owned_controller("timer")
+        adopted = timer.adopt_recorded_task_delete()
+        self._apply_outcome(adopted)
+        if not adopted.value:
+            return
+        self._recorded_task_delete_to_report = timer.release_unfinished_task_delete()
+
+    def _run_task_delete_unattended(self, completion: Callable[[], None]) -> None:
+        self._task_delete_unattended = True
+        try:
+            completion()
+        finally:
+            self._task_delete_unattended = False
+
+    def _window_can_ask(self) -> bool:
+        if getattr(self, "_closed", False) or getattr(self, "quitting", False):
+            return False
+        return self.isVisible() and not self.isMinimized()
+
+    def _task_delete_attended(self) -> bool:
+        """True when a delete failure can be shown with Retry right now."""
+        return not self._task_delete_unattended and self._window_can_ask()
+
+    def _hold_unattended_task_delete_failure(self, failure: EmitTaskFailure) -> bool:
+        """Keep a failed delete for a later report; True when it was held."""
+        if failure.change is not TaskChange.DELETE:
+            return False
+        return not self._task_delete_attended()
+
+    def report_unfinished_task_delete(self) -> None:
+        """Tell the user, with the window in view, that a delete is unfinished.
+
+        A delete is unfinished when the previous run left it recorded, or
+        when the timer controller still records it while the Tasks screen
+        has no undo window open for it: a completion failed or was refused
+        with no window in view.
+        """
+        if not self._window_can_ask():
+            return
+        if self.tasks_screen.pending_delete_task_id() is not None:
+            return
+        timer = self._owned_controller("timer")
+        # H1: the delete ends before the question, so Cancel withdraws it
+        # and only Retry, which keeps the task id, deletes the task.
+        released = self._recorded_task_delete_to_report
+        if released is None:
+            released = timer.release_unfinished_task_delete()
+        self._recorded_task_delete_to_report = None
+        # A marker the store kept is a failure the user reads first.
+        self._apply_outcome(released)
+        task_id = released.value
+        if task_id is None:
+            return
+        self._show_failure_sentence(
+            self.strings.text("task.error.delete_unfinished"),
+            lambda: timer.delete_task(task_id),
+        )
+
+    def _account_action(self) -> None:
+        # M1: a pending task delete completes before sign-out can reset the
+        # workspace, so the sign-out count includes the queued delete.
+        self._apply_outcome(
+            self._owned_controller("timer").complete_pending_task_delete_now()
+        )
+        account = self._owned_controller("account")
+        self._apply_outcome(account.account_action())
+
+    def _delete_account_action(self) -> None:
+        # M1: as for sign-out, the pending task delete completes first.
+        self._apply_outcome(
+            self._owned_controller("timer").complete_pending_task_delete_now()
+        )
+        account = self._owned_controller("account")
+        self._apply_outcome(account.delete_account_action())
 
     def _show_screen(self, index: int, *, sync: bool = True) -> None:
         self._display_screen(index)
@@ -426,10 +545,10 @@ class ApplicationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: projection chain guarded; infra reports, keep old state.
             capture_exception(error)
-            self.notice.emit(str(error))
+            self._show_failure(EmitFailure(error))
             return
         except (ValueError, KeyError, TypeError) as error:
-            self.notice.emit(str(error))
+            self._show_failure(EmitFailure(error))
             return
         self._read_resolution_corruption()
         try:
@@ -437,10 +556,10 @@ class ApplicationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: projection install guarded; infra reports, keep old state.
             capture_exception(error)
-            self.notice.emit(str(error))
+            self._show_failure(EmitFailure(error))
             return
         except (ValueError, KeyError, TypeError) as error:
-            self.notice.emit(str(error))
+            self._show_failure(EmitFailure(error))
             return
         self._reconcile_loaded_timer(previous_timer, provisional_ids)
         self._install_projected_tasks(projection)
@@ -560,7 +679,7 @@ class ApplicationController:
 
     def _mutation_blocked(self) -> bool:
         if self.replication.iroh_join_pending:
-            self.notice.emit(self.strings.text("network.wait_join"))
+            self._blocked_notice(self.strings.text("network.wait_join"))
             return True
         if not self.account_resolution.history_resolution_active:
             try:
@@ -568,10 +687,10 @@ class ApplicationController:
             except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D50: bare read guarded; infra reports, fail-closed blocked.
                 capture_exception(error)
-                self.notice.emit(str(error))
+                self._blocked_failure(error)
                 return True
             except ValueError as error:
-                self.notice.emit(str(error))
+                self._blocked_failure(error)
                 return True
             if pending is not None:
                 self._activate_persisted_resolution()
@@ -579,8 +698,19 @@ class ApplicationController:
                 self._set_account_state(False)
         if not self.account_resolution.history_resolution_active:
             return False
-        self.notice.emit(self.strings.text("resolution.blocked"))
+        self._blocked_notice(self.strings.text("resolution.blocked"))
         return True
+
+    # B2 L1: a pending task delete that completes with no window in view
+    # opens no modal when changes are blocked. The delete stays recorded and
+    # report_unfinished_task_delete tells the user once the window is back.
+    def _blocked_notice(self, message: str) -> None:
+        if not self._task_delete_unattended:
+            self.notice.emit(message)
+
+    def _blocked_failure(self, error: Exception) -> None:
+        if not self._task_delete_unattended:
+            self._show_failure(EmitFailure(error))
 
     def _timer_context(self) -> TimerInteractionContext:
         return TimerInteractionContext(
@@ -638,7 +768,10 @@ class ApplicationController:
             button.style().unpolish(button)
             button.style().polish(button)
             button.updateGeometry()
-        button.setText(presentation.text)
+        if button.text() != presentation.text:
+            button.setText(presentation.text)
+            # The label width takes header width from the navigation.
+            self._schedule_nav_reflow()
         button.setToolTip(presentation.tooltip)
         button.setAccessibleName(presentation.accessible_name)
 

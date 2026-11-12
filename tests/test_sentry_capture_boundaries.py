@@ -746,7 +746,7 @@ class D32CaptureOrSilenceTests(unittest.TestCase):
                 coroutine.close()
             capture.assert_called_once()
             self.assertEqual(statuses, ["UNAVAILABLE"])
-            self.assertEqual(failures, ["worker failed"])
+            self.assertEqual(failures, [service.strings.text("failure.generic")])
 
     def test_submit_cancellation_stays_silent(self) -> None:
         from concurrent.futures import Future
@@ -809,7 +809,9 @@ class D32CaptureOrSilenceTests(unittest.TestCase):
         self.assertFalse(controller.iroh_join_pending)
         fake_cloud.restore.assert_called_once()
         self.assertTrue(outcome is not None)
-        self.assertTrue(any("join hung" in str(item) for item in applied))
+        # R2-B3: the status names the failure in product words only.
+        self.assertTrue(any("failure.generic" in str(item) for item in applied))
+        self.assertFalse(any("join hung" in str(item) for item in applied))
 
 
 if __name__ == "__main__":

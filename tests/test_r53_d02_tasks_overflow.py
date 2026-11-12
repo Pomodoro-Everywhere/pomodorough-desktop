@@ -56,7 +56,13 @@ def test_short_populated_page_reaches_delete(app, tmp_path, locale, points):
         with _tasks_window(app, tmp_path, locale, 640, 360) as window:
             _populate(window)
             _process(app, 20)
-            assert window.size().toTuple() == (640, 360)
+            # UX round 2 B1: the navigation collapses instead of stacking,
+            # so the window minimum no longer grows. Shrink to it for the
+            # shortest page.
+            window.resize(640, window.minimumHeight())
+            _process(app, 20)
+            assert window.width() == 640
+            assert window.height() == window.minimumHeight()
             _assert_header_intact(window, "populated")
             _tab_to(app, window.task_input, window.add_task_button)
             _assert_hit_target(window, window.add_task_button)
@@ -71,10 +77,19 @@ def test_short_populated_page_reaches_delete(app, tmp_path, locale, points):
             _process(app, 20)
             assert table.rowCount() == before - 1
             _assert_hit_target(window, app.focusWidget())
-            window.screen_buttons[1].setFocus(Qt.FocusReason.ShortcutFocusReason)
-            _process(app)
-            assert app.focusWidget() is window.screen_buttons[1]
-            QTest.keyClick(window.screen_buttons[1], Qt.Key.Key_Space)
+            navigation = window.navigation
+            if navigation._nav_mode == "menu":
+                # B1: the collapsed navigation takes focus on its menu
+                # button; choosing Tasks in the menu triggers its action.
+                navigation.menu_button.setFocus(Qt.FocusReason.ShortcutFocusReason)
+                _process(app)
+                assert app.focusWidget() is navigation.menu_button
+                navigation.destination_actions[1].trigger()
+            else:
+                window.screen_buttons[1].setFocus(Qt.FocusReason.ShortcutFocusReason)
+                _process(app)
+                assert app.focusWidget() is window.screen_buttons[1]
+                QTest.keyClick(window.screen_buttons[1], Qt.Key.Key_Space)
             _process(app)
             assert window.page_stack.currentWidget() is window.tasks_page
 

@@ -106,7 +106,9 @@ class D66ControllerBoundaryTests(unittest.TestCase):
             except SharedCoreError:
                 self.fail("SharedCoreError escaped synchronization controller")
         capture.assert_called_once_with(error)
-        ports.iroh_failure.assert_called_once_with(str(error))
+        # R2-B3: the status bar gets the sentence for the type, not the text.
+        context.strings.text.assert_called_once_with("failure.core_unavailable")
+        ports.iroh_failure.assert_called_once_with(context.strings.text.return_value)
 
     def test_timer_tick_captures_shared_core_error(self) -> None:
         from pomodorough.timer_interaction_controller import (

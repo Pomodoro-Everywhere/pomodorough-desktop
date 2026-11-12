@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
+from .arrival_minutes_wording import arrival_minutes
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
@@ -166,20 +167,21 @@ def _print_history(
             phase = strings.text(
                 "cli.phase_task", phase=phase, task=item["taskTitle"]
             )
-        status = strings.text(
-            f"arrivals.status.{item.get('status', 'completed')}"
-        )
-        minutes = int(item.get("plannedDurationMs", 0)) // 60_000
+        wording = arrival_minutes(item)
         when = _history_time(
             item.get("completedAt") or item.get("endedAt"), strings
         )
         print(
             strings.text(
-                "cli.history_row",
+                (
+                    "cli.history_row_planned"
+                    if wording.reads_as_planned
+                    else "cli.history_row"
+                ),
                 when=when,
                 phase=phase,
-                status=status,
-                minutes=minutes,
+                status=strings.text(wording.status_key),
+                minutes=wording.minutes,
                 pending=(
                     strings.text("terminal.pending_suffix")
                     if item.get("pending")

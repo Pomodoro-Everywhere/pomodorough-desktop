@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import failure_sentence
 from pomodorough.network import CloudService, TokenStore
 from pomodorough.secure_store import SecureStoreError, TokenCommitPendingError
 from pomodorough.sentry_monitoring import (
@@ -99,7 +100,7 @@ def test_login_preflight_infra_reports_payload_free(cloud) -> None:
         ),
     ):
         cloud.login()
-    assert failures == [str(error)]
+    assert failures == [failure_sentence(error)]
     assert len(calls) == 1
     assert str(calls[0]) == "cloud credential login failed: secure-store-infra"
     assert CANARY_TOKEN not in str(calls[0])
@@ -123,7 +124,7 @@ def test_login_preflight_quiet_stays_silent(cloud) -> None:
                 cloud._accounts, "require_authentication_ready", side_effect=error
             ):
                 cloud.login()
-            assert failures == [str(error)]
+            assert failures == [failure_sentence(error)]
         capture.assert_not_called()
 
 
@@ -142,7 +143,7 @@ def test_revision_stream_preflight_reports_and_quiet(cloud) -> None:
         ),
     ):
         cloud.start_revision_stream()
-    assert failures == [str(infra)]
+    assert failures == [failure_sentence(infra)]
     start.assert_not_called()
     assert len(calls) == 1
     assert str(calls[0]) == "cloud credential revision_stream failed: secure-store-infra"
@@ -162,7 +163,7 @@ def test_revision_stream_malformed_quiet(cloud) -> None:
         patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.start_revision_stream()
-    assert failures == [str(malformed)]
+    assert failures == [failure_sentence(malformed)]
     start.assert_not_called()
     capture.assert_not_called()
 

@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch, sentinel
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import catalog_sentence
 from pomodorough.network import ApiError, CloudService, TokenStore
 from test_secure_store import MemorySecretStore
 
@@ -106,7 +107,7 @@ def test_rotation_is_durable_before_delete_and_survives_503_retry(
 
     cloud._request.side_effect = request
     cloud.delete_account("DELETE")
-    assert failures == ["unavailable"]
+    assert failures == [catalog_sentence("network.error.http", status=503)]
     assert cloud.authenticated and not cloud.deleting_account
     assert cloud.access_token == "rotated-access"
     assert cloud.token_store.load()["refreshToken"] == "rotated-refresh"
@@ -163,7 +164,7 @@ def test_rotation_persistence_failure_prevents_delete_and_memory_acceptance(clou
     }[boundary]
     with patch(f"pomodorough.network.{target}", side_effect=OSError("storage unavailable")):
         cloud.delete_account("DELETE")
-    assert failures == ["storage unavailable"]
+    assert failures == [catalog_sentence("failure.storage")]
     assert cloud._request.call_count == 1
     assert cloud._request.call_args.args[0] == "POST"
     assert cloud.access_token == "original-access"
@@ -212,7 +213,7 @@ def test_post_replace_failure_stops_delete_but_restart_keeps_rotation(cloud_fact
                                       os.O_RDONLY | filesystem.O_DIRECTORY)
     assert directory_close.call_count == 3
     directory_close.assert_called_with(sentinel.directory_descriptor)
-    assert failures == ["directory sync failed"]
+    assert failures == [catalog_sentence("failure.storage")]
     assert cloud._request.call_count == 1
     assert cloud.refresh_token == "original-refresh"
     restarted = cloud_factory()
@@ -243,7 +244,7 @@ def test_rotation_without_directory_sync_persists_before_delete_and_restart(clou
     # R49-D03 journal adds one file fsync (journal, fallback, identity).
     assert filesystem.fsync.call_count == 3
     filesystem.open.assert_not_called()
-    assert failures == ["unavailable"]
+    assert failures == [catalog_sentence("network.error.http", status=503)]
     assert cloud._request.call_args_list == [
         call("POST", "https://example.test/api/v1/auth/refresh", {"refreshToken": "original-refresh"}),
         call("DELETE", "https://example.test/api/v1/account", {"confirmation": "DELETE"},

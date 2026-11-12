@@ -85,6 +85,14 @@ def _read_capped_bytes(path: Path, limit: int) -> bytes:
     return data
 
 
+class SecretToolMissingError(SecureStoreError):
+    """Linux has no ``secret-tool``; the user must install it."""
+
+
+class SecretServiceUnavailableError(SecureStoreError):
+    """Linux ``secret-tool`` ran but no unlocked Secret Service answered."""
+
+
 class TokenCleanupPendingError(SecureStoreError):
     pass
 
@@ -434,6 +442,14 @@ class PlatformSecretStore:
             return False, _LINUX_TOOL_MISSING
         return False, f"{self.label} requires platform secure storage ({command} was not found)."
 
+    def _require_tool(self) -> None:
+        available, reason = self._tool_availability()
+        if available:
+            return
+        if reason == _LINUX_TOOL_MISSING:
+            raise SecretToolMissingError(reason)
+        raise SecureStoreError(reason)
+
     def load(self, key: str) -> bytes | None:
         self._validate_key(key)
         if os.name == "nt":
@@ -467,9 +483,7 @@ class PlatformSecretStore:
         self._validate_key(key)
         if not isinstance(secret, bytes) or not secret:
             raise SecureStoreError("Secure value must contain bytes.")
-        available, reason = self._tool_availability()
-        if not available:
-            raise SecureStoreError(reason)
+        self._require_tool()
         try:
             self._save_after_availability(key, secret)
         except UncertainSecretStoreError:
@@ -510,9 +524,7 @@ class PlatformSecretStore:
         if sys_platform() == "darwin":
             _macos_delete(self.service, key)
             return
-        available, reason = self._tool_availability()
-        if not available:
-            raise SecureStoreError(reason)
+        self._require_tool()
         result = self._run(self._command("delete", key))
         if result.returncode != 0:
             raise self._linux_service_error(result)
@@ -520,7 +532,7 @@ class PlatformSecretStore:
     @staticmethod
     def _linux_service_error(result: subprocess.CompletedProcess[str]) -> SecureStoreError:
         detail = result.stderr.strip() or "Secret Service rejected the operation."
-        error = SecureStoreError(
+        error = SecretServiceUnavailableError(
             f"Linux secure storage is unavailable: {detail} {_LINUX_SERVICE_SETUP}"
         )
         error.__cause__ = subprocess.CalledProcessError(result.returncode, result.args)
@@ -570,10 +582,10 @@ class PlatformSecretStore:
         except FileNotFoundError as error:
             if command[0] != "secret-tool":
                 raise SecureStoreError(f"Platform secure storage failed: {error}") from error
-            raise SecureStoreError(_LINUX_TOOL_MISSING) from error
+            raise SecretToolMissingError(_LINUX_TOOL_MISSING) from error
         except (OSError, subprocess.SubprocessError) as error:
             if command[0] == "secret-tool":
-                raise SecureStoreError(
+                raise SecretServiceUnavailableError(
                     f"Platform secure storage failed: {error} {_LINUX_SERVICE_SETUP}"
                 ) from error
             raise SecureStoreError(f"Platform secure storage failed: {error}") from error

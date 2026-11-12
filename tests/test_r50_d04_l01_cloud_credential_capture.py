@@ -20,6 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import failure_sentence
 from pomodorough.network import (
     ApiError,
     CloudService,
@@ -162,7 +163,7 @@ def test_real_worker_load_failure_reports_once_payload_free(app, cloud, operatio
         else:
             cloud.preview_bootstrap()
         _pump_until(app, failures)
-    assert len(failures) == 1 and str(denied) in failures[0]
+    assert failures == [failure_sentence(denied)]
     assert seen == []
     assert len(calls) == 1
     captured = calls[0]
@@ -187,7 +188,7 @@ def test_real_worker_login_infra_reports_once(app, cloud) -> None:
     ):
         cloud.login()
         _pump_until(app, failures)
-    assert failures == [str(denied)]
+    assert failures == [failure_sentence(denied)]
     assert len(calls) == 1
     assert str(calls[0]) == "cloud credential login failed: filesystem"
     assert CANARY_TOKEN not in str(calls[0])
@@ -331,7 +332,7 @@ def test_expected_and_malformed_stay_silent(cloud) -> None:
                 assert failures == []
                 expired.clear()
             else:
-                assert failures == [str(error)]
+                assert failures == [failure_sentence(error)]
         assert _cloud_credential_cause(pending) is None
         assert _cloud_credential_cause(malformed) is None
     capture.assert_not_called()
@@ -371,7 +372,7 @@ def test_reporter_failure_stays_nonfatal(cloud) -> None:
         ),
     ):
         cloud.sync({"ops": []})
-    assert failures == [str(denied)]
+    assert failures == [failure_sentence(denied)]
 
 
 def test_stale_generation_drops_without_capture(app, cloud) -> None:

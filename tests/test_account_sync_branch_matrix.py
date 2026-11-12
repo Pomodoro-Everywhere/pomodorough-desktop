@@ -10,7 +10,7 @@ from pomodorough.account_resolution_controller import (
     AccountResolutionController,
     AccountResolutionPorts,
 )
-from pomodorough.controller_outcomes import EmitNotice, Synchronize
+from pomodorough.controller_outcomes import EmitFailure, EmitNotice, Synchronize
 from pomodorough.synchronization_controller import (
     SynchronizationContext,
     SynchronizationController,
@@ -105,7 +105,7 @@ class AccountResolutionBranchMatrixTests(unittest.TestCase):
         controller.history_resolution_active = True
         controller.resolution_user = {"id": "user"}
         harness.store.apply_resolution.side_effect = ValueError("invalid")
-        self.assertIsInstance(controller.apply_resolution({}).effects[0], EmitNotice)
+        self.assertIsInstance(controller.apply_resolution({}).effects[0], EmitFailure)
         harness.store.apply_resolution.side_effect = None
         harness.store.apply_resolution.return_value = ["conflict"]
         harness.store.has_sendable_sync_operations.return_value = True
@@ -208,7 +208,8 @@ class SynchronizationBranchMatrixTests(unittest.TestCase):
         harness.controller.sync()
         harness.store.capture_local_iroh_records.side_effect = OSError("capture")
         harness.controller.sync()
-        harness.ports.iroh_failure.assert_called_once_with("capture")
+        # R2-B3: the status bar gets the sentence for the type, not the text.
+        harness.ports.iroh_failure.assert_called_once_with("failure.storage")
 
     def test_centralized_busy_retry_and_resolution_paths(self) -> None:
         harness = SyncHarness()
@@ -229,7 +230,7 @@ class SynchronizationBranchMatrixTests(unittest.TestCase):
         self.assertIsInstance(harness.controller.apply_sync({}).effects[1], EmitNotice)
         harness.controller.sync_request = {"commands": []}
         harness.store.apply_sync.side_effect = ValueError("invalid")
-        self.assertIsInstance(harness.controller.apply_sync({}).effects[0], EmitNotice)
+        self.assertIsInstance(harness.controller.apply_sync({}).effects[0], EmitFailure)
         harness.store.apply_sync.side_effect = None
         harness.store.apply_sync.return_value = ["conflict"]
         harness.store.has_sendable_sync_operations.return_value = True

@@ -97,14 +97,14 @@ def test_sqlite_denial_via_signal_reports_once_with_notice(app, tmp_path) -> Non
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
             patch.object(QMessageBox, "question") as question,
-            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "exec"),
         ):
             view.account_button.click()
             _pump(app)
         assert hooks == []
         capture.assert_called_once()
         assert isinstance(capture.call_args.args[0], sqlite3.Error)
-        assert notices == [str(capture.call_args.args[0])]
+        assert notices == [view.strings.text("failure.storage")]
         question.assert_not_called()
         _assert_preserved(view, store, cloud, before)
 
@@ -123,7 +123,7 @@ def test_oserror_via_signal_reports_once_with_notice(app, tmp_path) -> None:
         assert hooks == []
         capture.assert_called_once()
         assert isinstance(capture.call_args.args[0], OSError)
-        assert notices == ["disk gone"]
+        assert notices == [view.strings.text("failure.storage")]
         question.assert_not_called()
         assert cloud.logout_calls == 0
         assert not store.connection.in_transaction
@@ -142,7 +142,7 @@ def test_shared_core_error_via_signal_reports_once(app, tmp_path) -> None:
             _pump(app)
         assert hooks == []
         capture.assert_called_once()
-        assert notices == ["core down"]
+        assert notices == [view.strings.text("failure.core_unavailable")]
         question.assert_not_called()
         assert cloud.logout_calls == 0
 

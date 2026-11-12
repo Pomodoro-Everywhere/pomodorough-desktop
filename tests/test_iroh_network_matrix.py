@@ -141,7 +141,9 @@ class IrohServiceLifecycleMatrixTests(unittest.TestCase):
         ):
             self.service._ensure_loop()
         self.assertEqual(statuses, ["UNAVAILABLE"])
-        self.assertEqual(failures, ["missing"])
+        self.assertEqual(
+            failures, [self.service.strings.text("network.iroh_not_packaged")]
+        )
 
     def test_submit_closes_coroutine_when_worker_cannot_start(self) -> None:
         async def operation() -> None:

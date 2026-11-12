@@ -75,6 +75,7 @@ def _harness() -> SimpleNamespace:
         stop_sound_timer=Mock(),
         stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     return SimpleNamespace(
         store=store, controller=TimerInteractionController(ports),

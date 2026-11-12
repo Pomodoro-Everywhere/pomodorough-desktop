@@ -2,4 +2,16 @@ secret:
   ignored_matches:
   - match: b3a985549e427fcc2d7a531138f121fbafb4f821075ae77c28f59e7d1db8128a
     name: Bundled Desktop OAuth client secret (intentional, installed-app flow)
+  - match: d71f327c8293fa5920f72e11f19fdcf841cfd4cc560cb14acc42ca4c7c3f33c3
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
+  - match: b635edf47f5bf6c9b93a76272f0c6b67ddc960264bbbdf910486fafca3d7095e
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
+  - match: 541845229a6735ca481b23d83612d43a55c2115f6db52c3b47072f617ccf27d4
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
+  - match: 329003f5232cc442c7cf80ade1feb142d7ec8e559e0b93c935c2a5cadb279030
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
+  - match: 0c0fbe76de530ed6625794497517010cb66b5aaf0c528d1134e0221ad5ac433c
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
+  - match: 64660494a080545c3b911f562f6c211594719d8397852cefca46eea9c783b6e2
+    name: Synthetic canary in R54-L12 JSON key scrub test (not a credential)
 version: 2

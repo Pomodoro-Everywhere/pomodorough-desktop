@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from enum import Enum
+from typing import Any, Generic, TypeVar
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,33 @@ class EmitNotice:
     message: str
 
 
+class TaskChange(Enum):
+    ADD = "add"
+    DELETE = "delete"
+    RENAME = "rename"
+
+
+@dataclass(frozen=True, slots=True)
+class EmitTaskFailure:
+    """A task change failed. The window words it; the error text stays internal."""
+
+    change: TaskChange
+    error: Exception
+    retry: Callable[[], ControllerOutcome[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class EmitFailure:
+    """An action failed. The window words it from the error type.
+
+    The error text stays internal. ``retry`` runs the same action again;
+    leave it out where the user has nothing to repeat.
+    """
+
+    error: Exception
+    retry: Callable[[], ControllerOutcome[Any]] | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ShowStatus:
     message: str
@@ -79,6 +108,8 @@ ControllerEffect = (
     | ActivatePersistedResolution
     | StopSound
     | EmitNotice
+    | EmitTaskFailure
+    | EmitFailure
     | ShowStatus
 )
 

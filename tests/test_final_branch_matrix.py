@@ -781,7 +781,10 @@ class IrohServiceFinalBranchTests(unittest.TestCase):
             future.set_exception(RuntimeError("worker failed"))
             coroutine.close()
         capture.assert_called_once()
-        self.assertEqual((statuses, failures), (["UNAVAILABLE"], ["worker failed"]))
+        self.assertEqual(
+            (statuses, failures),
+            (["UNAVAILABLE"], [self.service.strings.text("failure.generic")]),
+        )
 
     def test_details_include_peers_and_ready_status_distinguishes_routes(self) -> None:
         self.service._room_id = "room-identifier"

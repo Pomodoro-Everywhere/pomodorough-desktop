@@ -11,6 +11,7 @@ reported without configuration. Reporting is strictly opt-out: see the
 from __future__ import annotations
 
 import collections.abc
+import itertools
 import json
 import logging
 import os
@@ -57,6 +58,8 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "invite",
         "ticket",
         "cookie",
+        # Email-named keys fail closed even when values are not address-shaped.
+        "email",
         "dsn",
         "credential",
         "code",
@@ -124,6 +127,39 @@ _KEY_SUFFIX_ALLOWLIST = frozenset(
 )
 _BARE_SECRET_KEYS = frozenset({"key", "value"})
 _SIGNATURE_KEY_SUFFIXES = ("signature", "signatures")
+# R54-L03: a mapping key keeps its exact text only when it reads as a static
+# diagnostic name. Any other key can carry private text (an email, an invite,
+# a task title, an ID, or a secret split by encoding or a control character),
+# so it becomes a numbered placeholder and its whole value is filtered. The
+# numbering keeps colliding keys apart, and no diagnostic name contains `[`.
+# Empty and all-digit names are kept for SDK `_meta` paths (`""`, list
+# indexes) and status counters. Android's SentryScrubber applies the same
+# rule with its own marker text.
+_DIAGNOSTIC_KEY_LENGTH_LIMIT = 64
+_DIAGNOSTIC_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*|[0-9]*")
+# Opaque identifiers: six or more digits in total (UUIDs, timestamps, numeric
+# IDs), or a 16+ letter-and-digit run holding at least two digits (hex and
+# base32 IDs, tokens). Invite prefixes and dotted quads are private as well.
+_OPAQUE_KEY_DIGIT_LIMIT = 6
+_OPAQUE_KEY_RUN_RE = re.compile(r"[A-Za-z0-9]{16,}")
+_PRIVATE_KEY_TEXT_RE = re.compile(r"(?i)pomodorough1|\d+\.\d+\.\d+\.\d+")
+_FILTERED_KEY = "[Filtered key {}]"
+# R54-L03: Sentry's serializer trims these databags (`_is_databag`, and frame
+# vars serialized early with `is_vars=True`) at `MAX_DATABAG_DEPTH` levels and
+# writes the repr of anything deeper as a string at that level. The repr spells
+# raw keys. `_meta` marks it with a `!limit` removal, but frame vars carry no
+# `_meta` and a trimmed `_meta` loses the mark, so each node at that level is
+# filtered by position as well. `None` stands for every item of a list or
+# mapping: the SDK trims `breadcrumbs.values.<any key>` either way.
+_SDK_DATABAG_DEPTH = 5
+_SDK_DATABAG_ROOTS = (
+    ("extra",),
+    ("request", "data"),
+    ("breadcrumbs", "values", None),
+    ("exception", "values", None, "stacktrace", "frames", None, "vars"),
+    ("threads", "values", None, "stacktrace", "frames", None, "vars"),
+    ("stacktrace", "frames", None, "vars"),
+)
 # R54-L02: every URL pattern below scans each character a bounded number of
 # times. Quantifiers are possessive or bounded, and a pattern whose secret part
 # is absent still consumes its head, so a failed start never rescans the text.
@@ -170,7 +206,8 @@ _URL_PART_SEPARATORS = {"http.query": "?", "http.fragment": "#", "query_string":
 # Group 1 is empty for a local-part run that no domain follows. The local
 # part takes RFC 5322 atext except URL delimiters (`/`, `?`, `#`, `&`, `=`).
 _EMAIL_RE = re.compile(
-    r"[A-Za-z0-9._%+!$'*^`{|}~-]++(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?"
+    r"(?:(?!%(?:25)*+40)[A-Za-z0-9._%+!$'*^`{|}~-])++"
+    r"((?:@|%(?:25)*+40)[A-Za-z0-9.-]+\.[A-Za-z]{2,})?"
 )
 _POSIX_HOME_RE = re.compile(r"(/(?:Users|home)/)[^/\s\"']+")
 _WINDOWS_HOME_RE = re.compile(r"(?i)([A-Za-z]:[\\/]Users[\\/])[^\\/\s\"']+")
@@ -234,47 +271,44 @@ _TOKEN_PARAM_RE = re.compile(
     r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)=)"
     r"[^&\s\"';]+"
 )
-# D40: stringified payloads (`{"client_secret":"…"}`) survive as plain
-# strings where dict-key filtering cannot see them. Match the same secret
-# names in `"name":"value"` / `'name':'value'` JSON-string form; the
-# closing quote stays outside the match so it survives the substitution.
-# D51: same `session`/`sid`/`room`/`endpoint`/`device`/`peer`/`ticket`/
-# `invite`/`ssid` family in JSON-string form (`{"session":"…"}`).
-# D56: same suffixed gap as _TOKEN_PARAM_RE (`{"room_id":"…"}`,
-# `{"device_id":"…"}`, `{"peer_id":"…"}`, `{"endpoint_url":"…"}`,
-# `{"ticket_code":"…"}`, `{"invite_code":"…"}` + camelCase); match
-# snake + flat alongside the bare names.
-# D58: same invite-field gap (`{"roomSecret":"…"}`, `{"roomName":"…"}`,
-# `{"endpointTicket":"…"}`, `{"endpointId":"…"}` + snake/flat).
-# D67: stringified JSON also carries unquoted scalars (`{"token":12345}`,
-# `{"session":null}`, `{"room_id": 987}`); the quoted branch above requires
-# an opening quote, so add an unquoted-scalar alternation (`[^,\s\}]+`)
-# with a `(?![\"'])` guard so quoted values stay on the first branch.
+# Keep historical scalar aliases unchanged. New compound numeric diagnostics
+# such as `cookie_count` stay readable; JSON string values use _sensitive_key.
+_JSON_SCALAR_SECRET_RE = re.compile(
+    r"(?i)([\"'](?:"
+    r"access_token|id_token|refresh_token|token|state|nonce|code_verifier|"
+    r"code_challenge|client_secret|clientsecret|secret|password|passwd|api_key|"
+    r"apikey|private_key|privatekey|access_key|accesskey|client_key|clientkey|"
+    r"encryption_key|encryptionkey|signing_key|signingkey|public_key|publickey|"
+    r"session|session_id|sessionid|sid|ssid|room|room_id|roomid|room_secret|"
+    r"roomsecret|room_name|roomname|endpoint|endpoint_url|endpointurl|"
+    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|device_id|"
+    r"deviceid|peer|peer_id|peerid|ticket|ticket_code|ticketcode|invite|"
+    r"invite_code|invitecode"
+    r")[\"']"
+    r"\s*:\s*(?![\"']))[^,\s\}]+"
+)
+# Lookaheads retain overlapping pairs inside safe values and malformed keys.
+# Bound key scans; value ends are indexed once instead of repeatedly searched.
 _JSON_SECRET_RE = re.compile(
-    r"(?i)([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
-    r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
-    r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
-    r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
-    r"signing_key|signingkey|public_key|publickey|session|session_id|"
-    r"sessionid|sid|ssid|room|room_id|roomid|room_secret|roomsecret|"
-    r"room_name|roomname|endpoint|endpoint_url|endpointurl|"
-    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|"
-    r"device_id|deviceid|peer|peer_id|peerid|"
-    r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)[\"']"
-    r"\s*:\s*[\"'])"
-    r"[^\"']+"
-    r"|([\"'](?:access_token|id_token|refresh_token|token|state|nonce|"
-    r"code_verifier|code_challenge|client_secret|clientsecret|secret|"
-    r"password|passwd|api_key|apikey|private_key|privatekey|access_key|"
-    r"accesskey|client_key|clientkey|encryption_key|encryptionkey|"
-    r"signing_key|signingkey|public_key|publickey|session|session_id|"
-    r"sessionid|sid|ssid|room|room_id|roomid|room_secret|roomsecret|"
-    r"room_name|roomname|endpoint|endpoint_url|endpointurl|"
-    r"endpoint_ticket|endpointticket|endpoint_id|endpointid|device|"
-    r"device_id|deviceid|peer|peer_id|peerid|"
-    r"ticket|ticket_code|ticketcode|invite|invite_code|invitecode)[\"']"
-    r"\s*:\s*(?![\"']))"
-    r"[^,\s\}]+"
+    r"(?=(?P<prefix>(?P<quote>[\"'])(?P<key>"
+    r"(?:\\[^\r\n]|(?!(?P=quote))[^\\\r\n]){1,128})"
+    r"(?P=quote)\s*+:\s*+(?P<value_quote>[\"']?)))"
+)
+# Historical free-text rules also filtered keys with mismatched quote styles.
+_JSON_MALFORMED_KEY_RE = re.compile(
+    r"(?=(?P<prefix>[\"'](?P<key>[^\"'\\\r\n]{1,128})[\"']\s*+:\s*+"
+    r"(?P<value_quote>[\"']?)))"
+)
+_JSON_QUOTE_RE = re.compile(r"\\[^\r\n]|[\"']|\\\Z")
+_JSON_CONTAINER_RE = re.compile(r"[{}\[\]]")
+_JSON_UNQUOTED_VALUE_RE = re.compile(r"[^,\s\}\]\"']*+")
+_JSON_ESCAPED_PAIR_RE = re.compile(
+    r"\\++(?=(?P<prefix>(?P<quote>[\"'])(?P<key>[^\"'\\\r\n]{1,128})"
+    r"\\++(?P=quote)\s*+:\s*+\\++(?P<value_quote>[\"'])))?"
+)
+_JSON_ESCAPED_QUOTE_RE = re.compile(r"(\\++)([\"'])?")
+_COOKIE_HEADER_RE = re.compile(
+    r"(?im)^([ \t]*(?:cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*+"
 )
 
 
@@ -494,10 +528,114 @@ def _sensitive_key(key: Any) -> bool:
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS if part != "code")
 
 
-def _json_secret_replacement(match: re.Match[str]) -> str:
-    # D67: first branch keeps the opening value quote in group 1 (closing
-    # quote stays outside the match); the unquoted branch lands in group 2.
-    return (match.group(1) or match.group(2)) + _FILTERED
+def _opaque_key(key: str) -> bool:
+    if sum(char.isdigit() for char in key) >= _OPAQUE_KEY_DIGIT_LIMIT:
+        return True
+    return any(
+        sum(char.isdigit() for char in run.group()) >= 2
+        for run in _OPAQUE_KEY_RUN_RE.finditer(key)
+    )
+
+
+def _diagnostic_key_name(key: Any) -> bool:
+    # A str subclass can override `__str__`, which serializers call on keys.
+    if type(key) is not str or len(key) > _DIAGNOSTIC_KEY_LENGTH_LIMIT:
+        return False
+    if not _DIAGNOSTIC_KEY_RE.fullmatch(key):
+        return False
+    return not _opaque_key(key) and not _PRIVATE_KEY_TEXT_RE.search(key)
+
+
+def _json_quote_ends(text: str) -> dict[int, int]:
+    ends: dict[int, int] = {}
+    next_end = {'"': len(text), "'": len(text)}
+    for match in reversed(tuple(_JSON_QUOTE_RE.finditer(text))):
+        token = match.group(0)
+        if token in next_end:
+            ends[match.start()] = next_end[token]
+            next_end[token] = match.start()
+        elif token == "\\":
+            # An incomplete escape ends a truncated value before its backslash.
+            next_end = {'"': match.start(), "'": match.start()}
+    return ends
+
+
+def _json_container_ends(text: str) -> dict[int, int]:
+    ends: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    for match in _JSON_CONTAINER_RE.finditer(text):
+        token, position = match.group(0), match.start()
+        if token in "{[":
+            stack.append((token, position))
+            ends[position] = len(text)
+        elif stack and stack[-1][0] == {"}": "{", "]": "["}[token]:
+            _, opening = stack.pop()
+            ends[opening] = position + 1
+    return ends
+
+
+def _replace_json_ranges(text: str, secrets: dict[int, int], pairs: dict[int, int]) -> str:
+    if not secrets:
+        return text
+    chunks: list[str] = []
+    containers = _json_container_ends(text)
+    stack: list[int] = []
+    container_depth, end, cursor = 0, -1, 0
+    for position in range(len(text) + 1):
+        while stack and containers[stack[-1]] <= position:
+            stack.pop()
+        if position in containers:
+            stack.append(position)
+        if end >= position:
+            # Malformed nested quotes cannot make an enclosing secret public.
+            end = max(end, pairs.get(position, end))
+            if position in pairs and len(stack) > container_depth:
+                end = max(end, containers[stack[container_depth]])
+        if position in secrets:
+            if end < position:
+                chunks.extend((text[cursor:position], text[position] + _FILTERED))
+                container_depth = len(stack)
+            end = max(end, secrets[position], pairs.get(position, end))
+        if end == position:
+            cursor = position
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+def _scrub_json_strings(text: str) -> str:
+    ends = _json_quote_ends(text)
+    secrets: dict[int, int] = {}
+    pairs: dict[int, int] = {}
+    for pattern in (_JSON_SECRET_RE, _JSON_MALFORMED_KEY_RE):
+        for match in pattern.finditer(text):
+            start = match.end("prefix") - 1
+            end = (
+                ends[start] if match.group("value_quote")
+                else _JSON_UNQUOTED_VALUE_RE.match(text, start + 1).end()
+            )
+            pairs[match.start()] = max(end, pairs.get(match.start(), end))
+            if not match.group("value_quote") or not _sensitive_key(match.group("key")):
+                continue
+            secrets[start] = max(end, secrets.get(start, end))
+    return _replace_json_ranges(text, secrets, pairs)
+
+
+def _scrub_escaped_json_strings(text: str) -> str:
+    # Index quote boundaries once, then inspect overlapping escaped key prefixes.
+    ends = {}
+    next_end = {}
+    for quote in reversed(tuple(_JSON_ESCAPED_QUOTE_RE.finditer(text))):
+        if quote.group(2) is None:
+            continue
+        boundary = (len(quote.group(1)), quote.group(2))
+        ends[quote.end() - 1] = next_end.get(boundary, len(text))
+        next_end[boundary] = quote.start()
+    secrets = {}
+    for match in _JSON_ESCAPED_PAIR_RE.finditer(text):
+        if match.group("key") and _sensitive_key(match.group("key")):
+            start = match.end("prefix") - 1
+            secrets[start] = ends[start]
+    return _replace_json_ranges(text, secrets, {})
 
 
 def _email_replacement(match: re.Match[str]) -> str:
@@ -552,9 +690,13 @@ def _scrub_urls(text: str) -> str:
 
 
 def _scrub_string(text: str) -> str:
-    # R54-L02: userinfo and emails go first. URL rules filter from an escape
-    # onward and would keep a literal secret before `%` (`alice:pw%21@host`).
-    redacted = _URL_USERINFO_RE.sub(r"\1" + _FILTERED + "@", text)
+    # JSON and headers own their complete values before URL rules see separators.
+    redacted = _scrub_escaped_json_strings(text)
+    redacted = _scrub_json_strings(redacted)
+    redacted = _JSON_SCALAR_SECRET_RE.sub(r"\1" + _FILTERED, redacted)
+    redacted = _COOKIE_HEADER_RE.sub(r"\1" + _FILTERED, redacted)
+    # R54-L02: userinfo and emails precede URL rules, which consume escapes.
+    redacted = _URL_USERINFO_RE.sub(r"\1" + _FILTERED + "@", redacted)
     redacted = _EMAIL_RE.sub(_email_replacement, redacted)
     redacted = _scrub_urls(redacted)
     redacted = _POSIX_HOME_RE.sub(r"\1" + _FILTERED, redacted)
@@ -572,7 +714,6 @@ def _scrub_string(text: str) -> str:
     # D40: same for `?client_secret=`/`?password=`/`?secret=` (+ passwd,
     # api_key, D39 compounds) and `"client_secret":"…"` JSON strings.
     redacted = _TOKEN_PARAM_RE.sub(r"\1" + _FILTERED, redacted)
-    redacted = _JSON_SECRET_RE.sub(_json_secret_replacement, redacted)
     # D27: IPv6 before IPv4 so mapped `::ffff:1.2.3.4` drops as one unit.
     redacted = _IPV6_RE.sub(_FILTERED, redacted)
     return _IPV4_RE.sub(_FILTERED, redacted)
@@ -611,14 +752,24 @@ def _scrub_query_parameter_value(key: Any, value: Any, depth: int) -> Any:
     return _scrub_value(value, depth + 1)
 
 
-def _scrub_query_entry(entry: Any, depth: int) -> Any:
+def _filtered_key_names() -> collections.abc.Iterator[str]:
+    # R54-L03: placeholders count from 1 within one mapping or query list.
+    return (_FILTERED_KEY.format(position) for position in itertools.count(1))
+
+
+def _scrub_query_entry(
+    entry: Any, placeholders: collections.abc.Iterator[str], depth: int
+) -> Any:
     # Sentry sends query lists as `[key, value]` pairs. Any other entry can be
     # one half of a flattened pair (`["token", secret]`), so it stays opaque.
+    # R54-L03: a pair key follows the mapping key rule.
     if not isinstance(entry, (list, tuple)) or len(entry) != 2:
         return _FILTERED
     key, value = entry
-    scrubbed_value = _scrub_query_parameter_value(key, value, depth)
-    pair = [_scrub_value(key, depth + 1), scrubbed_value]
+    if _diagnostic_key_name(key):
+        pair = [key, _scrub_query_parameter_value(key, value, depth)]
+    else:
+        pair = [next(placeholders), _FILTERED]
     return pair if isinstance(entry, list) else tuple(pair)
 
 
@@ -631,12 +782,10 @@ def _scrub_url_part(value: Any, separator: str, depth: int) -> Any:
     if isinstance(value, str):
         return _scrub_string(separator + value).removeprefix(separator)
     if isinstance(value, dict):
-        return {
-            key: _scrub_query_parameter_value(key, item, depth)
-            for key, item in value.items()
-        }
+        return _scrub_mapping(value, depth, _scrub_query_parameter_value)
     if isinstance(value, (list, tuple)):
-        entries = [_scrub_query_entry(entry, depth) for entry in value]
+        placeholders = _filtered_key_names()
+        entries = [_scrub_query_entry(entry, placeholders, depth) for entry in value]
         return entries if isinstance(value, list) else tuple(entries)
     return _scrub_value(value, depth)
 
@@ -651,14 +800,26 @@ def _scrub_mapping_item(key: Any, item: Any, depth: int) -> Any:
     return _scrub_value(item, depth)
 
 
+def _scrub_mapping(
+    value: dict[Any, Any],
+    depth: int,
+    scrub_item: collections.abc.Callable[[Any, Any, int], Any] = _scrub_mapping_item,
+) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    placeholders = _filtered_key_names()
+    for key, item in value.items():
+        if _diagnostic_key_name(key):
+            cleaned[key] = scrub_item(key, item, depth)
+        else:
+            cleaned[next(placeholders)] = _FILTERED
+    return cleaned
+
+
 def _scrub_value(value: Any, depth: int = 0) -> Any:
     if depth > _SCRUB_DEPTH_LIMIT:
         return _FILTERED
     if isinstance(value, dict):
-        return {
-            key: _scrub_mapping_item(key, item, depth + 1)
-            for key, item in value.items()
-        }
+        return _scrub_mapping(value, depth + 1)
     if isinstance(value, collections.abc.Mapping):
         # Non-dict mappings (proxies, immutable views) stay opaque: their
         # iteration contract is unknown, so recursing could leak sensitive
@@ -680,6 +841,66 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
     return _scrub_unknown(value)
 
 
+def _depth_limited(meta: dict[Any, Any]) -> bool:
+    annotation = meta.get("")
+    removals = annotation.get("rem") if isinstance(annotation, dict) else None
+    return isinstance(removals, list) and any(
+        isinstance(rule, list) and rule[:1] == ["!limit"] for rule in removals
+    )
+
+
+def _without_depth_reprs(node: Any, meta: Any) -> Any:
+    # R54-L03: the SDK serializes before `before_send`. It replaces a databag
+    # deeper than its depth limit with the repr of the rest, which spells raw
+    # keys inside a string, and marks that spot in `_meta` with a `!limit`
+    # removal. No key rule can read a repr, so the whole repr is filtered.
+    if not isinstance(meta, dict):
+        return node
+    if _depth_limited(meta):
+        return _FILTERED
+    if isinstance(node, dict):
+        return {
+            key: _without_depth_reprs(item, meta.get(key)) for key, item in node.items()
+        }
+    if isinstance(node, list):
+        return [
+            _without_depth_reprs(item, meta.get(str(index)))
+            for index, item in enumerate(node)
+        ]
+    return node
+
+
+def _truncated_databag(node: Any, remaining: int = _SDK_DATABAG_DEPTH) -> Any:
+    # Serialized databags hold only dicts and lists above the trimmed level.
+    if remaining <= 0:
+        return _FILTERED
+    if isinstance(node, dict):
+        return {key: _truncated_databag(item, remaining - 1) for key, item in node.items()}
+    if isinstance(node, list):
+        return [_truncated_databag(item, remaining - 1) for item in node]
+    return node
+
+
+def _at_databag_root(node: Any, path: tuple[str | None, ...]) -> Any:
+    if not path:
+        return _truncated_databag(node)
+    segment, rest = path[0], path[1:]
+    if segment is None and isinstance(node, list):
+        return [_at_databag_root(item, rest) for item in node]
+    if segment is None and isinstance(node, dict):
+        return {key: _at_databag_root(item, rest) for key, item in node.items()}
+    if segment is None or not isinstance(node, dict) or segment not in node:
+        return node
+    return {**node, segment: _at_databag_root(node[segment], rest)}
+
+
+def _without_databag_reprs(event: dict[Any, Any]) -> Any:
+    cleaned = _without_depth_reprs(event, event.get("_meta"))
+    for root in _SDK_DATABAG_ROOTS:
+        cleaned = _at_databag_root(cleaned, root)
+    return cleaned
+
+
 def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
     """Strip tokens, invites, emails, and user paths from a Sentry event.
 
@@ -694,7 +915,7 @@ def scrub_sentry_event(event: Any, hint: Any | None = None) -> Any:
         if not isinstance(event, dict):
             return event
         operation, cause = _extract_cloud_taxonomy(event)
-        cleaned = _scrub_value(event)
+        cleaned = _scrub_value(_without_databag_reprs(event))
         # Privacy: drop hostname even if the SDK re-adds it; init also
         # sets server_name="" (separate hunk, same privacy fix).
         cleaned.pop("server_name", None)

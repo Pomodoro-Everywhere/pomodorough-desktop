@@ -50,10 +50,17 @@ def phase_window(tmp_path, runtime, request):
     assert view._current_timer()["status"] == (
         "completed" if request.param == "terminal" else "idle"
     )
-    yield SimpleNamespace(
-        store=store, view=view, path=path, core=core, cloud=cloud,
-        notices=notices, status=request.param,
-    )
+
+    def decline_retry(_window, _strings, sentence):
+        notices.append(sentence)
+        return False
+
+    # R2-B3: a storage failure asks Retry or Cancel in its own modal.
+    with patch("pomodorough.ui.ask_to_retry", side_effect=decline_retry):
+        yield SimpleNamespace(
+            store=store, view=view, path=path, core=core, cloud=cloud,
+            notices=notices, status=request.param,
+        )
     view.quitting = True
     view.close()
     view.deleteLater()
@@ -105,7 +112,7 @@ def fail_selection(harness, boundary):
     capture.assert_called_once()
     error = capture.call_args.args[0]
     assert isinstance(error, sqlite3.Error)
-    assert harness.notices == [str(error)]
+    assert harness.notices == [harness.view.strings.text("failure.storage")]
     assert not harness.store.connection.in_transaction
     assert durable_rows(harness.store) == before
     assert transactions == {
@@ -220,7 +227,7 @@ def test_invalid_phase_keeps_committed_selection_and_next_start(phase_window):
     with patch("pomodorough.timer_interaction_controller.capture_exception") as capture:
         harness.view._select_phase("unsupported")
     capture.assert_not_called()
-    assert harness.notices == ["Unsupported timer phase."]
+    assert harness.notices == [harness.view.strings.text("failure.rejected")]
     assert durable_rows(harness.store) == before
     assert harness.view.settings == settings
     assert_selected_presentation(harness.view, "long_break")

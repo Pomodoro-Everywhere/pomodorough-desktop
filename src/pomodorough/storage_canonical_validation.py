@@ -99,6 +99,13 @@ def valid_canonical_timer(
     )
 
 
+def valid_history_elapsed(elapsed: Any, planned: int) -> bool:
+    """Accept Core's recorded run time; rows stored before it existed have none."""
+    if elapsed is None:
+        return True
+    return type(elapsed) is int and 0 <= elapsed <= planned
+
+
 def valid_history_item(
     item: Any,
     duration_ms: DurationMs,
@@ -109,8 +116,10 @@ def valid_history_item(
     if required - set(item):
         return False
     try:
-        duration_ms(item["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS)
+        planned = duration_ms(item["plannedDurationMs"], maximum=CANONICAL_DURATION_MAX_MS)
     except ValueError:
+        return False
+    if not valid_history_elapsed(item.get("elapsedMs"), planned):
         return False
     for timestamp_key in ("completedAt", "endedAt"):
         timestamp = item.get(timestamp_key)

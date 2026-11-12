@@ -4,7 +4,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from pomodorough.controller_outcomes import EmitNotice, LoadState, Render, Synchronize
+from pomodorough.controller_outcomes import (
+    EmitFailure,
+    EmitTaskFailure,
+    LoadState,
+    Render,
+    Synchronize,
+)
 from pomodorough.timer_interaction_controller import (
     TimerInteractionContext,
     TimerInteractionController,
@@ -61,6 +67,7 @@ class TimerHarness:
             stop_sound_timer=Mock(),
             stop_completion_sound=Mock(),
             set_stop_sound_control=Mock(),
+            complete_pending_task_delete=lambda: None,
         )
         self.controller = TimerInteractionController(self.ports)
 
@@ -106,9 +113,12 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.store.project_iroh_expiry.assert_called_once_with(123_000)
         harness.store.project_iroh_expiry.side_effect = ValueError("projection failed")
         failed = harness.controller.tick()
-        # D41: failure surfaces via EmitNotice and omits Synchronize.
-        self.assertIsInstance(failed.effects[-1], EmitNotice)
-        self.assertEqual(failed.effects[-1].message, "projection failed")
+        # D41: the failure surfaces and omits Synchronize. R2-B3: it carries
+        # the error for the window to word, not the error text.
+        self.assertIsInstance(failed.effects[-1], EmitFailure)
+        self.assertIs(
+            failed.effects[-1].error, harness.store.project_iroh_expiry.side_effect
+        )
         self.assertNotIn(Synchronize, tuple(map(type, failed.effects)))
         self.assertFalse(harness.controller.auto_finish_in_progress)
 
@@ -131,7 +141,7 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.blocked = False
         harness.store.queue_restart.side_effect = OSError("restart failed")
         outcome = harness.controller.primary_action()
-        self.assertIsInstance(outcome.effects[0], EmitNotice)
+        self.assertIsInstance(outcome.effects[0], EmitFailure)
         harness.current_timer = {"status": "mystery"}
         self.assertEqual(harness.controller.primary_action().effects, ())
 
@@ -144,7 +154,7 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.blocked = False
         self.assertEqual(harness.controller.issue("pause").effects, ())
         harness.store.queue_command.side_effect = ValueError("queue failed")
-        self.assertIsInstance(harness.controller.issue("start").effects[0], EmitNotice)
+        self.assertIsInstance(harness.controller.issue("start").effects[0], EmitFailure)
         harness.store.queue_command.side_effect = None
         harness.store.queue_command.return_value = None
         self.assertEqual(
@@ -164,7 +174,7 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.store.set_selected_task_id.assert_called_with(None)
         harness.store.set_selected_task_id.side_effect = OSError("selection failed")
         outcome = harness.controller.task_selection_changed(0)
-        self.assertIsInstance(outcome.effects[-1], EmitNotice)
+        self.assertIsInstance(outcome.effects[-1], EmitFailure)
         self.assertEqual(harness.invalidations, 2)
 
     def test_add_task_covers_blocked_duplicate_new_and_failure_paths(self) -> None:
@@ -181,7 +191,7 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
             harness.controller.add_task("Task")
             harness.store.queue_task_operation_with_selection.assert_called_once()
             harness.store.queue_task_operation_with_selection.side_effect = ValueError("task failed")
-            self.assertIsInstance(harness.controller.add_task("Task").effects[0], EmitNotice)
+            self.assertIsInstance(harness.controller.add_task("Task").effects[0], EmitTaskFailure)
 
     def test_delete_task_covers_blocked_missing_selected_and_unselected(self) -> None:
         harness = TimerHarness()
@@ -198,7 +208,7 @@ class TimerInteractionBranchMatrixTests(unittest.TestCase):
         harness.controller.delete_task("task-1")
         self.assertEqual(harness.store.queue_task_operation_with_selection.call_count, 1)
         harness.store.queue_task_operation.side_effect = OSError("delete failed")
-        self.assertIsInstance(harness.controller.delete_task("task-1").effects[0], EmitNotice)
+        self.assertIsInstance(harness.controller.delete_task("task-1").effects[0], EmitTaskFailure)
 
     def test_duration_auto_break_and_sound_terminal_branches(self) -> None:
         harness = TimerHarness()

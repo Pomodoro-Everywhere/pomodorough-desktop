@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from .core import parse_timestamp_ms
+from .core import PHASES, parse_timestamp_ms
 from .shared_core import (
     ProjectionApplyV2,
     SharedCoreDispatcher,
@@ -132,6 +132,49 @@ class TimerCompletionPolicy:
             _LOGGER.debug("preview selected-phase plan rejected: %s", error)
             return None
         return plan.selected_phase
+
+    def skip_destination(
+        self,
+        source_phase: str,
+        history: list[dict[str, Any]],
+        reference_time: str,
+    ) -> str | None:
+        """Ask Core which phase an idle-board skip lands on."""
+        if source_phase not in PHASES:
+            return None
+        day_start, day_end = self._bounds(reference_time)
+        core = self._shared_core() or _default_shared_core()
+        try:
+            state = core.dispatch("timer.completionState.v1", {
+                "kind": "skip",
+                "selection": {
+                    "phase": source_phase,
+                    "generation": "0",
+                    "explicit": False,
+                },
+                "sourcePhase": source_phase,
+                "history": [self._core_history_item(item) for item in history],
+                "referenceTime": reference_time,
+                "calendarIntervals": [{"start": day_start, "end": day_end}],
+            })
+        except SharedCoreOperationError as error:
+            # Same best-effort contract as preview_selected_phase: the
+            # skip button degrades to disabled instead of failing render.
+            global _preview_plan_failures
+            _preview_plan_failures += 1
+            _LOGGER.debug("skip destination rejected: %s", error)
+            return None
+        selection = state.get("selection") if isinstance(state, dict) else None
+        phase = selection.get("phase") if isinstance(selection, dict) else None
+        if phase not in PHASES:
+            raise ValueError("Shared core returned an invalid skip destination.")
+        return phase
+
+    @staticmethod
+    def _core_history_item(item: dict[str, Any]) -> dict[str, Any]:
+        # projected_history annotates a client-only pending marker that is
+        # not part of the Core history contract.
+        return {key: value for key, value in item.items() if key != "pending"}
 
     def generated_break(
         self,

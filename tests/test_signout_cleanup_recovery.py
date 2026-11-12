@@ -20,6 +20,7 @@ from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
 from test_secure_store import linux_secret_store
 
+from notice_effects import catalog_sentence
 from pomodorough.network import CloudService, TokenStore
 from pomodorough.network_account import AccountLifecycle, SignOutCleanupError
 from pomodorough.network_session import SessionState
@@ -291,7 +292,7 @@ def test_unreadable_tombstone_reports_retry_without_restoring_or_deleting(recove
         with pytest.raises(PermissionError):
             cloud.token_store.load()
         cloud._retry_sign_out_cleanup(cloud._account_generation)
-    assert len(failures) == 1 and "will be retried" in failures[0]
+    assert failures == [catalog_sentence("failure.credential_cleanup_pending")]
     assert "old-synthetic" not in failures[0]
     assert cloud.token_store.secret_store.load(cloud.token_store.secret_key) == before
 
@@ -362,7 +363,9 @@ def test_crash_restart_resumes_and_reports_cleanup_without_logout(tmp_path, phas
         assert not restarted["secret"] and not restarted["failures"]
     else:
         assert restarted["secret"] and restarted["deletes"] >= 2
-        assert all("will be retried" in error for error in restarted["failures"])
+        assert set(restarted["failures"]) == {
+            catalog_sentence("failure.credential_cleanup_pending")
+        }
         assert len(restarted["failures"]) >= 2
         assert "old-synthetic" not in repr(restarted["failures"])
         recovered = run_startup(tmp_path, "recovered")

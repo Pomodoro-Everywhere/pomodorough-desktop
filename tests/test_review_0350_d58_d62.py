@@ -16,7 +16,7 @@ from pomodorough.account_resolution_controller import (
     AccountResolutionController,
     AccountResolutionPorts,
 )
-from pomodorough.controller_outcomes import EmitNotice
+from notice_effects import notice_texts
 from pomodorough.sentry_monitoring import scrub_sentry_event
 
 
@@ -205,7 +205,7 @@ def _conflict_harness() -> tuple[Mock, AccountResolutionController]:
 
 
 def _conflict_notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 class D61BootstrapConflictSplitTests(unittest.TestCase):

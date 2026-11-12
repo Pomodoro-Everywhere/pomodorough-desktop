@@ -22,6 +22,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEventLoop, QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import catalog_sentence, failure_sentence
 from pomodorough.secure_store import SecureStoreError
 
 from pomodorough.network import (
@@ -534,6 +535,7 @@ class DesktopOAuthTransactionTests(unittest.TestCase):
             "device-1",
             "https://example.test",
             oauth_browser=browser,
+            token_store=_memory_token_store(self),
             token_urlsafe=lambda _size: next(values),
         )
         self.addCleanup(cloud.shutdown)
@@ -989,6 +991,11 @@ class AuthenticationNetworkTests(unittest.TestCase):
         root = Path(self.enterContext(TemporaryDirectory()))
         self.enterContext(patch("pomodorough.network._config_root", return_value=root))
         self.enterContext(patch("pomodorough.network._oauth_secret_store", return_value=secure_store))
+        # R54-D12: an empty memory store falls through to the legacy
+        # secret-tool mirror, which is real on Linux hosts that ship it.
+        self.enterContext(
+            patch.object(TokenStore, "_load_legacy_secret_tool", return_value=None)
+        )
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1410,6 +1417,14 @@ class _MemorySecretStore:
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
+
+
+def _memory_token_store(test: unittest.TestCase) -> TokenStore:
+    """R54-D12: in-memory secrets and a temporary session file, never the real profile."""
+    root = Path(test.enterContext(TemporaryDirectory()))
+    return TokenStore(
+        "device-1", secret_store=_MemorySecretStore(), fallback_path=root / "session.json"
+    )
 
 
 _FULL_TOKEN_RESPONSE = {
@@ -2018,7 +2033,9 @@ class RevisionStreamTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def cloud_with_reply(self, reply: _FakeRevisionReply):
-        cloud = CloudService("device-1", "https://example.test")
+        cloud = CloudService(
+            "device-1", "https://example.test", token_store=_memory_token_store(self)
+        )
         self.addCleanup(cloud.shutdown)
         cloud.authenticated = True
         cloud.access_token = "stream-access"
@@ -2247,7 +2264,7 @@ class CloudOrchestrationTests(unittest.TestCase):
 
                 self.assertEqual(statuses[-1], expected_status)
                 self.assertEqual(expired, [True] if expires else [])
-                self.assertEqual(failures, [] if expires else [str(error)])
+                self.assertEqual(failures, [] if expires else [failure_sentence(error)])
                 self.assertEqual(clear.call_count, 1 if expires else 0)
                 self.assertFalse(cloud.authenticated)
 
@@ -2311,7 +2328,7 @@ class CloudOrchestrationTests(unittest.TestCase):
                 ):
                     failed.sync(payload)
                 self.assertEqual(statuses[-1], expected_status)
-                self.assertEqual(failures, [] if expires else [str(error)])
+                self.assertEqual(failures, [] if expires else [failure_sentence(error)])
 
     def test_bootstrap_guards_success_and_preserved_failure(self) -> None:
         cloud = self.cloud()
@@ -2360,7 +2377,7 @@ class CloudOrchestrationTests(unittest.TestCase):
             patch.object(cloud, "_authorized_request", side_effect=error),
         ):
             cloud.resolve_bootstrap(payload)
-        self.assertEqual(failures, [str(error)])
+        self.assertEqual(failures, [failure_sentence(error)])
         self.assertEqual(statuses[-2:], ["RESOLVING HISTORY", "OFFLINE • HISTORY PRESERVED"])
 
     def test_logout_during_busy_work_clears_local_session_immediately(self) -> None:
@@ -2627,7 +2644,7 @@ class CloudOrchestrationTests(unittest.TestCase):
 
         clear.assert_not_called()
         start_stream.assert_called_once_with()
-        self.assertEqual(failures, ["offline"])
+        self.assertEqual(failures, [catalog_sentence("network.error.http", status=503)])
         self.assertTrue(cloud.authenticated)
         self.assertFalse(cloud.deleting_account)
         self.assertEqual(cloud.access_token, "preserved-access")
@@ -2708,7 +2725,9 @@ class BootstrapNetworkTests(unittest.TestCase):
         self.assertEqual(raised.exception.details()["status"], 409)
 
     def test_cloud_exposes_bootstrap_preview_and_structured_conflict(self) -> None:
-        cloud = CloudService("device-1", "https://example.test")
+        cloud = CloudService(
+            "device-1", "https://example.test", token_store=_memory_token_store(self)
+        )
         cloud.authenticated = True
         preview = {"revision": 4}
         preview_results = []
@@ -2749,7 +2768,9 @@ class BootstrapNetworkTests(unittest.TestCase):
         cloud.shutdown()
 
     def test_worker_preserves_409_type_for_bootstrap_conflict(self) -> None:
-        cloud = CloudService("device-1", "https://example.test")
+        cloud = CloudService(
+            "device-1", "https://example.test", token_store=_memory_token_store(self)
+        )
         cloud.authenticated = True
         conflict = ApiError(
             "revision conflict", 409, {"error": "revision_conflict"}
@@ -2785,7 +2806,9 @@ class BootstrapNetworkTests(unittest.TestCase):
         cloud.shutdown()
 
     def test_terminal_bootstrap_401_expires_session_through_worker(self) -> None:
-        cloud = CloudService("device-1", "https://example.test")
+        cloud = CloudService(
+            "device-1", "https://example.test", token_store=_memory_token_store(self)
+        )
         cloud.authenticated = True
         cloud.access_token = "expired-token"
         payload = {

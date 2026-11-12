@@ -43,6 +43,9 @@ class AuthenticatedSessionLifecycleTests(unittest.TestCase):
             patch.object(cloud.token_store, "load", return_value={"refreshToken": "old"}),
             patch.object(cloud.token_store, "clear"),
             patch.object(cloud.token_store, "save") as save,
+            # R54-D12: logout reads the store; the empty memory store falls
+            # through to the legacy secret-tool mirror, real on Linux.
+            patch.object(cloud.token_store, "_load_legacy_secret_tool", return_value=None),
             patch.object(cloud, "_start_revocation"),
             patch("pomodorough.network._request", side_effect=request),
             self.assertRaisesRegex(ApiError, "cancelled"),

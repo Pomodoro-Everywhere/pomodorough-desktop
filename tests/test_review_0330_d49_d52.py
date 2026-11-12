@@ -9,13 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from pomodorough.controller_outcomes import EmitNotice, SetAccountState
+from pomodorough.controller_outcomes import SetAccountState
+from notice_effects import notice_texts
 from pomodorough.synchronization_controller import (
     SynchronizationContext,
     SynchronizationController,
     SynchronizationPorts,
 )
-from pomodorough.sentry_monitoring import scrub_sentry_event
+from pomodorough.sentry_monitoring import (
+    reset_pending_break_read_incident_budget,
+    scrub_sentry_event,
+)
 from pomodorough.terminal import InvalidAction
 
 
@@ -51,7 +55,7 @@ def _sync_harness(mode: str = "centralized", resolving: bool = False) -> SimpleN
 
 
 def _notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 class D49TuiSplitTests(unittest.TestCase):
@@ -128,6 +132,12 @@ class D49SyncSplitTests(unittest.TestCase):
 
 
 class D50BareReadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # test_tick_pending_break_guarded reports a pending-break read
+        # failure; the same signature inside its report interval would skip
+        # the capture another test in this process expects.
+        reset_pending_break_read_incident_budget()
+
     def test_newly_activated_resolution_blocks_current_mutation(self) -> None:
         from pomodorough.ui_controller import ApplicationController
 
@@ -139,7 +149,11 @@ class D50BareReadTests(unittest.TestCase):
             _activate_persisted_resolution=Mock(
                 side_effect=lambda: setattr(resolution, "history_resolution_active", True)
             ),
-            _render=Mock(), _set_account_state=Mock(),
+            _render=Mock(), _set_account_state=Mock(), _task_delete_unattended=False,
+        )
+        # B2 L1: the real notice gate, so the visible notice is still checked.
+        controller._blocked_notice = lambda message: ApplicationController._blocked_notice(
+            controller, message
         )
         controller.store.pending_resolution.return_value = {"requestId": "pending"}
 
@@ -207,6 +221,7 @@ class D50BareReadTests(unittest.TestCase):
             refresh_duration_spins=Mock(), refresh_auto_breaks=Mock(),
             stop_sound_timer=Mock(), stop_completion_sound=Mock(),
             set_stop_sound_control=Mock(),
+            complete_pending_task_delete=lambda: None,
         )
         controller = TimerInteractionController(ports)
         with patch(

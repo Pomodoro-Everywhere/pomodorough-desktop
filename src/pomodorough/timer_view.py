@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
-from PySide6.QtGui import QFont, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .localization import Strings
+from .railway_palette import STEEL, TICKET, TRACK, progress_track, signal_accent
 
 
 @dataclass(frozen=True)
@@ -111,11 +112,11 @@ class _ClockRenderer:
         radius = self.geometry.radius
         base = self.palette.color(QPalette.ColorRole.Base)
         alternate = self.palette.color(QPalette.ColorRole.AlternateBase)
-        mid = self.palette.color(QPalette.ColorRole.Mid)
+        track = progress_track(self.palette, QColor(signal_accent(self.palette)))
         self.painter.setPen(QPen(base, max(6, side * 0.022)))
         self.painter.setBrush(alternate)
         self.painter.drawEllipse(self.geometry.dial.adjusted(7, 7, -7, -7))
-        self.painter.setPen(QPen(mid, max(10, side * 0.045)))
+        self.painter.setPen(QPen(track, max(10, side * 0.045)))
         self.painter.setBrush(Qt.BrushStyle.NoBrush)
         self.painter.drawEllipse(
             self.geometry.dial.adjusted(
@@ -141,10 +142,9 @@ class _ClockRenderer:
         self.painter.restore()
 
     def _paint_progress(self) -> None:
-        highlight = self.palette.color(QPalette.ColorRole.Highlight)
         self.painter.setPen(
             QPen(
-                highlight,
+                QColor(signal_accent(self.palette)),
                 max(10, self.geometry.side * 0.047),
                 Qt.PenStyle.SolidLine,
                 Qt.PenCapStyle.FlatCap,
@@ -165,10 +165,9 @@ class _ClockRenderer:
             center.y() + math.sin(angle) * pointer_radius,
         )
         text = self.palette.color(QPalette.ColorRole.Text)
-        highlight = self.palette.color(QPalette.ColorRole.Highlight)
         self.painter.setPen(QPen(text, max(4, self.geometry.side * 0.013)))
         self.painter.drawLine(center, pointer)
-        self.painter.setBrush(highlight)
+        self.painter.setBrush(QColor(signal_accent(self.palette)))
         pointer_size = max(5, self.geometry.side * 0.018)
         self.painter.drawEllipse(pointer, pointer_size, pointer_size)
 
@@ -176,8 +175,6 @@ class _ClockRenderer:
         side = self.geometry.side
         radius = self.geometry.radius
         center = self.geometry.center
-        base = self.palette.color(QPalette.ColorRole.Base)
-        text = self.palette.color(QPalette.ColorRole.Text)
         display_font = QFont(
             "DejaVu Sans Mono",
             max(20, round(side * 0.105)),
@@ -195,10 +192,12 @@ class _ClockRenderer:
             board_width,
             radius * 0.54,
         )
-        self.painter.setPen(QPen(base, max(4, side * 0.013)))
-        self.painter.setBrush(text)
+        # Departure board: track-black panel with ticket-gold digits in
+        # both OS themes, the signature every client's dial shares.
+        self.painter.setPen(QPen(QColor(STEEL), max(4, side * 0.013)))
+        self.painter.setBrush(QColor(TRACK))
         self.painter.drawRect(board)
-        self.painter.setPen(base)
+        self.painter.setPen(QColor(TICKET))
         self.painter.drawText(board, Qt.AlignmentFlag.AlignCenter, self.time_text)
 
     def _paint_labels(self) -> None:
@@ -268,6 +267,8 @@ class ClockWidget(QWidget):
         progress: float,
         tick_count: int = 25,
         dots: int = 0,
+        *,
+        ended: bool = False,
     ) -> None:
         self.time_text = time_text
         self.phase_text = phase.upper()
@@ -277,7 +278,9 @@ class ClockWidget(QWidget):
         self.dots = max(0, min(4, int(dots)))
         self.setAccessibleDescription(
             self.strings.text(
-                "status.timer_description",
+                # After a session ends the clock shows the next one at rest,
+                # so its time is not what remains of a running session.
+                "status.timer_description_ended" if ended else "status.timer_description",
                 phase=phase.title(),
                 time=time_text,
                 status=status.lower(),
@@ -302,8 +305,6 @@ class ClockWidget(QWidget):
             dots=self.dots,
         ).paint()
         if self.hasFocus():
-            painter.setPen(
-                QPen(self.palette().color(QPalette.ColorRole.Highlight), 3)
-            )
+            painter.setPen(QPen(QColor(signal_accent(self.palette())), 3))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.rect().adjusted(2, 2, -2, -2))

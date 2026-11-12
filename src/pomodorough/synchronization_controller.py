@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer
 
 from .controller_outcomes import (
     ControllerOutcome,
+    EmitFailure,
     EmitNotice,
     LoadState,
     MaybeAutoStartBreak,
@@ -18,6 +19,7 @@ from .controller_outcomes import (
     Synchronize,
     done,
 )
+from .failure_notice import describe_failure
 from .sentry_monitoring import capture_exception
 from .shared_core import SharedCoreError
 
@@ -77,10 +79,14 @@ class SynchronizationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D49: infra failure reports to Sentry, still notice-only.
             capture_exception(error)
-            self._ports.iroh_failure(str(error))
+            self._ports.iroh_failure(
+                describe_failure(context.strings, error).sentence
+            )
             return done()
         except ValueError as error:
-            self._ports.iroh_failure(str(error))
+            self._ports.iroh_failure(
+                describe_failure(context.strings, error).sentence
+            )
             return done()
         if changed:
             self._ports.apply_outcome(done(LoadState(), Render()))
@@ -97,10 +103,10 @@ class SynchronizationController:
             except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D50: bare read guarded; infra reports, notice-only.
                 capture_exception(error)
-                self._ports.apply_outcome(done(EmitNotice(str(error))))
+                self._ports.apply_outcome(done(EmitFailure(error)))
                 return done()
             except ValueError as error:
-                self._ports.apply_outcome(done(EmitNotice(str(error))))
+                self._ports.apply_outcome(done(EmitFailure(error)))
                 return done()
             if pending is not None:
                 self._ports.activate_persisted_resolution()
@@ -116,9 +122,9 @@ class SynchronizationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: bare read guarded; infra reports, notice-only.
             capture_exception(error)
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         has_pending = bool(
             payload["commands"]
             or payload["taskOperations"]
@@ -172,11 +178,15 @@ class SynchronizationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D49: infra failure reports to Sentry, still failure+notice.
             capture_exception(error)
-            self._ports.apply_outcome(self.cloud_failure(str(error)))
-            return done(EmitNotice(str(error)))
+            self._ports.apply_outcome(
+                self.cloud_failure(describe_failure(context.strings, error).sentence)
+            )
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
-            self._ports.apply_outcome(self.cloud_failure(str(error)))
-            return done(EmitNotice(str(error)))
+            self._ports.apply_outcome(
+                self.cloud_failure(describe_failure(context.strings, error).sentence)
+            )
+            return done(EmitFailure(error))
         self._ports.apply_outcome(
             done(
                 LoadState(),
@@ -195,9 +205,9 @@ class SynchronizationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D50: bare read guarded; infra reports, fail-closed unsynced.
             capture_exception(error)
-            return self._sendable_fallback(context, notices, str(error))
+            return self._sendable_fallback(context, notices, error)
         except (ValueError, KeyError) as error:
-            return self._sendable_fallback(context, notices, str(error))
+            return self._sendable_fallback(context, notices, error)
         effects: list[Any] = [SetAccountState(not has_pending)]
         if has_pending:
             effects.append(Synchronize())
@@ -206,9 +216,9 @@ class SynchronizationController:
         return done(*effects)
 
     def _sendable_fallback(
-        self, context: SynchronizationContext, notices: list[str], message: str
+        self, context: SynchronizationContext, notices: list[str], error: Exception
     ) -> ControllerOutcome[None]:
-        effects: list[Any] = [SetAccountState(False), EmitNotice(message)]
+        effects: list[Any] = [SetAccountState(False), EmitFailure(error)]
         if notices:
             effects.append(self._conflict_notice(context, notices))
         return done(*effects)

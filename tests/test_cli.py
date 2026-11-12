@@ -5,7 +5,10 @@ import io
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +16,46 @@ from pomodorough.cli import _history_time, main, phase_argument
 from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.storage import Store
 from pomodorough.terminal import InvalidAction
+
+
+class _HeldClock:
+    """Wall and monotonic time that stand still until a test advances them.
+
+    The CLI reads `time.time()` and `time.monotonic_ns()` for the timer, so a
+    run's recorded elapsed time is exactly what the test advanced.
+    `time.monotonic()` stays real because storage uses it for busy-wait
+    deadlines.
+    """
+
+    def __init__(self) -> None:
+        self.wall_ms = int(time.time() * 1000)
+        self.monotonic_ms = time.monotonic_ns() // 1_000_000
+
+    def advance(self, milliseconds: int) -> None:
+        self.wall_ms += milliseconds
+        self.monotonic_ms += milliseconds
+
+    def time(self) -> float:
+        # The half millisecond keeps int(time() * 1000) on wall_ms despite
+        # float rounding.
+        return (self.wall_ms + 0.5) / 1000
+
+    def time_ns(self) -> int:
+        return self.wall_ms * 1_000_000
+
+    def monotonic_ns(self) -> int:
+        return self.monotonic_ms * 1_000_000
+
+
+@contextmanager
+def _held_clock() -> Iterator[_HeldClock]:
+    clock = _HeldClock()
+    with (
+        patch("time.time", clock.time),
+        patch("time.time_ns", clock.time_ns),
+        patch("time.monotonic_ns", clock.monotonic_ns),
+    ):
+        yield clock
 
 
 class CliTests(unittest.TestCase):
@@ -244,30 +287,40 @@ class CliTests(unittest.TestCase):
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"])
 
-        for arguments in (
-            ("start", "focus", "--minutes", "2"),
-            ("finish",),
-            ("clear",),
-            ("start", "short-break", "--minutes", "1"),
-            ("finish",),
-        ):
-            with self.subTest(arguments=arguments):
-                result, _output, error = self.invoke(*arguments)
-                self.assertEqual(result, 0)
-                self.assertEqual(error, "")
+        with _held_clock() as clock:
+            for arguments, run_ms in (
+                (("start", "focus", "--minutes", "2"), 0),
+                (("finish",), 0),
+                (("clear",), 0),
+                (("start", "short-break", "--minutes", "1"), 0),
+                (("finish",), 5),
+            ):
+                with self.subTest(arguments=arguments):
+                    clock.advance(run_ms)
+                    result, _output, error = self.invoke(*arguments)
+                    self.assertEqual(result, 0)
+                    self.assertEqual(error, "")
 
-        result, output, error = self.invoke("history")
-        self.assertEqual(result, 0)
-        self.assertIn(
-            "Focus | Write CLI coverage | Completed | 2 min | pending sync",
-            output,
-        )
-        self.assertEqual(error, "")
+            result, output, error = self.invoke("history")
+            self.assertEqual(result, 0)
+            # Each finish comes before the plan ends, so Core records the run
+            # time and the row reads as finished early. A run of 0 ms shows
+            # 0 min; any run above 0 shows at least 1 min.
+            self.assertIn(
+                "Focus | Write CLI coverage | Finished early | 0 min | pending sync",
+                output,
+            )
+            self.assertIn(
+                "Short break | Unassigned | Finished early | 1 min | pending sync",
+                output,
+            )
+            self.assertEqual(error, "")
 
-        result, output, error = self.invoke("history", "--json")
+            result, output, error = self.invoke("history", "--json")
         history = json.loads(output)
         self.assertEqual(result, 0)
         self.assertEqual([item["phase"] for item in history], ["short_break", "focus"])
+        self.assertEqual([item["elapsedMs"] for item in history], [5, 0])
         focus = history[1]
         self.assertEqual(focus["taskTitle"], "Write CLI coverage")
         self.assertEqual(focus["taskContext"], "retained")
@@ -300,17 +353,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(error, "")
 
     def test_cancelled_arrival_and_dismiss_command_use_terminal_semantics(self) -> None:
-        self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
-        self.assertEqual(self.invoke("cancel")[0], 0)
+        with _held_clock() as clock:
+            for run_ms in (0, 5):
+                self.assertEqual(self.invoke("start", "focus", "--minutes", "1")[0], 0)
+                clock.advance(run_ms)
+                self.assertEqual(self.invoke("cancel")[0], 0)
 
-        result, output, error = self.invoke("history")
+            result, output, error = self.invoke("history")
 
-        self.assertEqual((result, error), (0, ""))
-        self.assertIn("Focus | Unassigned | Cancelled | 1 min", output)
+            self.assertEqual((result, error), (0, ""))
+            # Core records the time the session ran, so the row shows it
+            # instead of the planned minute: 0 ms shows 0 min, and any run
+            # above 0 shows at least 1 min.
+            self.assertIn("Focus | Unassigned | Cancelled | 0 min", output)
+            self.assertIn("Focus | Unassigned | Cancelled | 1 min", output)
+            self.assertNotIn("planned", output)
 
-        result, output, error = self.invoke("history", "--json")
+            result, output, error = self.invoke("history", "--json")
         history = json.loads(output)
         self.assertEqual((result, error), (0, ""))
+        self.assertEqual([item["elapsedMs"] for item in history], [5, 0])
         self.assertEqual(history[0]["status"], "cancelled")
         self.assertEqual(history[0]["taskContext"], "unassigned")
 

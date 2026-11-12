@@ -135,14 +135,17 @@ def test_unfocused_scroll_anchor_and_no_loop(app):
         view.task_input.setFocus()
         _settle()
         anchor = table.rowAt(0)
-        v_before = table.verticalScrollBar().value()
+        anchor_offset = table.rowViewportPosition(anchor)
         button = table.cellWidget(0, 3)
         font = QFont(button.font())
         font.setPointSizeF(24.0)
         button.setFont(font)
         _settle()
+        # Row 0 sits above the viewport and grows with the button; the
+        # top row must keep its exact offset, whatever the font metrics.
+        assert table.rowHeight(0) > table.rowHeight(anchor)
         assert table.rowAt(0) == anchor
-        assert table.verticalScrollBar().value() == v_before
+        assert table.rowViewportPosition(anchor) == anchor_offset
         assert QApplication.focusWidget() is view.task_input
         assert not view._row_resize_timer.isActive()
         assert view._in_layout_refresh is False

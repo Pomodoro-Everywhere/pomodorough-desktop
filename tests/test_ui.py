@@ -95,6 +95,14 @@ class FakeCloud(QObject):
     def stop_revision_stream(self) -> None:
         self.revision_stops += 1
 
+    def cancel_restore(self) -> None:
+        # The real service also retires its restore route; the fake has none.
+        self.stop_revision_stream()
+
+    def resume_restore(self) -> None:
+        # The real service restores immediately when idle.
+        self.restore()
+
     def start_revision_stream(self) -> None:
         self.revision_starts += 1
 
@@ -365,7 +373,7 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertFalse(self.window.primary_button.isEnabled())
         self.assertFalse(self.window.auto_breaks.isEnabled())
         self.window.task_input.setText("Blocked task")
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._issue("start")
             self.window._add_task()
             self.window._duration_changed("focus", 30)
@@ -395,7 +403,7 @@ class MainWindowDurationTests(unittest.TestCase):
         before = self.store.load()
 
         self.assertTrue(self.window._history_resolution_active)
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._issue("start")
         self.assertEqual(self.store.load(), before)
         self.assertEqual(self.cloud.resolutions, [])
@@ -416,7 +424,7 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertTrue(self.window._history_resolution_active)
         self.assertEqual(self.cloud.payloads, [])
         self.assertEqual(self.cloud.resolutions, [request])
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._issue("start")
         self.assertEqual(self.store.load(), before)
 
@@ -430,7 +438,7 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertTrue(self.window._history_resolution_active)
         self.assertTrue(self.window._resolution_retry_paused)
         self.assertIn("corrupted", self.window._resolution_corruption)
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._issue("start")
             self.window._add_task()
         self.window._sync()
@@ -683,7 +691,7 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertFalse(self.window.auto_breaks.isEnabled())
         self.assertTrue(self.window._resolution_retry_paused)
         self.window.task_input.setText("Blocked task")
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._issue("start")
             self.window._add_task()
             self.window._duration_changed("focus", 30)
@@ -987,7 +995,7 @@ class MainWindowDurationTests(unittest.TestCase):
 
         malformed = self._bootstrap_response(revision=1)
         malformed.pop("autoStartBreaks")
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._apply_sync(malformed)
         self.assertEqual(self.store.load()["pendingAutoStarts"], [operation])
 
@@ -1106,7 +1114,7 @@ class MainWindowDurationTests(unittest.TestCase):
         first_response["canonicalTimer"] = completed
         first_response["autoStartBreaks"] = True
 
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._apply_sync(first_response)
 
         self.assertEqual(len(self.cloud.payloads), 2)
@@ -1129,7 +1137,7 @@ class MainWindowDurationTests(unittest.TestCase):
         second_response["canonicalTimer"] = running_break
         second_response["autoStartBreaks"] = True
 
-        with patch.object(QMessageBox, "warning"):
+        with patch.object(QMessageBox, "exec"):
             self.window._apply_sync(second_response)
 
         self.assertEqual(self.store.load()["pending"], [])
@@ -1587,7 +1595,7 @@ class MainWindowDurationTests(unittest.TestCase):
                 "singleShot",
                 side_effect=lambda delay, callback: scheduled.append((delay, callback)),
             ),
-            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "exec"),
         ):
             self.window._apply_sync(malformed)
 
@@ -1701,6 +1709,29 @@ class MainWindowDurationTests(unittest.TestCase):
         self.window._show_screen(1)
 
         self.assertEqual(len(self.cloud.payloads), before + 1)
+
+    def test_assistive_toggle_on_nav_button_shows_screen_and_syncs_once(self) -> None:
+        before = len(self.cloud.payloads)
+
+        self.window.screen_buttons[1].toggle()
+
+        self.assertEqual(self.window.page_stack.currentIndex(), 1)
+        self.assertTrue(self.window.screen_buttons[1].isChecked())
+        self.assertEqual(len(self.cloud.payloads), before + 1)
+
+    def test_empty_task_board_keeps_header_labels_at_natural_height(self) -> None:
+        # The empty-state label absorbs the spare board height. Without that
+        # stretch the layout hands the spare rows to the word-wrapped header
+        # labels, which opens a visible gap under TASK BOARD.
+        self.window.resize(1100, 792)
+        self.window.show()
+        self.window._show_screen(1)
+        self.app.processEvents()
+
+        tasks = self.window.tasks_screen
+        self.assertTrue(tasks.tasks_empty.isVisible())
+        for label in (tasks.task_title, tasks.task_subtitle, tasks.task_totals):
+            self.assertLessEqual(label.height(), label.sizeHint().height())
 
     def test_arrivals_is_separate_tab_next_to_tasks(self) -> None:
         self.assertEqual(

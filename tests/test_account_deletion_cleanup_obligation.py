@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import catalog_sentence
 from pomodorough import network_account
 from pomodorough.network import CloudService, TokenStore
 from pomodorough.network_account import AccountLifecycle
@@ -273,7 +274,7 @@ def test_cloud_reports_cleanup_pending_instead_of_deletion_success(tmp_path):
         cloud.delete_account("DELETE")
         assert deleted == []
         assert failures == [
-            "Remote account deleted. Local credential cleanup will be retried."
+            catalog_sentence("failure.account_deleted_cleanup_pending")
         ]
         assert not cloud.authenticated
         assert cloud._accounts._deletion_cleanup_path().exists()
@@ -308,7 +309,7 @@ def test_cloud_rejects_success_after_unbound_durable_rotation(tmp_path):
         cloud.delete_account("DELETE")
         assert deleted == []
         assert failures == [
-            "Remote account deleted. Local credential cleanup will be retried."
+            catalog_sentence("failure.account_deleted_cleanup_pending")
         ]
         assert store.load()["refreshToken"] == "replacement-refresh"
         assert cloud._accounts._deletion_cleanup_path().exists()
@@ -443,8 +444,12 @@ def test_legacy_obligation_clears_only_after_credentials_are_absent(tmp_path):
     vault.delete(store.secret_key)
     store._account_deletion_identity_path().unlink()
 
-    lifecycle.require_authentication_ready()
+    # R54-D12: with the vault empty, the store consults the legacy
+    # secret-tool mirror; an empty fake keeps the real one out of reach.
+    with patch.object(store, "_load_legacy_secret_tool", return_value=None) as mirror:
+        lifecycle.require_authentication_ready()
 
+    mirror.assert_called()
     assert_cleanup_resolved(lifecycle)
     assert state.authenticated and state.refresh_token == "old-refresh"
 
@@ -707,9 +712,7 @@ def test_startup_restore_and_auth_wait_for_failed_cleanup(tmp_path):
         with pytest.raises(SecureStoreError, match="will be retried"):
             cloud._accept_login_tokens(tokens("replacement"))
         assert request.call_count == 0
-        assert failures == [
-            "Account deletion credential cleanup failed and will be retried."
-        ]
+        assert failures == [catalog_sentence("failure.credential_cleanup_pending")]
         assert restarted_store.secret_key in vault.values
         assert cloud._accounts._deletion_cleanup_path().exists()
 

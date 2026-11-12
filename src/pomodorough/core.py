@@ -4,6 +4,7 @@ import hashlib
 import re
 import unicodedata
 import uuid
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
@@ -57,13 +58,41 @@ def task_id_for_title(value: str) -> str:
     return str(uuid.UUID(bytes=bytes(digest)))
 
 
+class TaskTitleError(ValueError):
+    """A task title that the shared title rules reject."""
+
+
+class BlankTaskTitleError(TaskTitleError):
+    pass
+
+
+class TaskTitleTooLongError(TaskTitleError):
+    pass
+
+
 def task_from_title(value: str) -> dict[str, str]:
     title = normalize_task_title(value)
     if not title:
-        raise ValueError("Enter a task name with at least one printable character.")
+        raise BlankTaskTitleError(
+            "Enter a task name with at least one printable character."
+        )
     if len(title.encode("utf-8")) > 512:
-        raise ValueError("Task names must be 512 bytes or fewer.")
+        raise TaskTitleTooLongError("Task names must be 512 bytes or fewer.")
     return {"id": task_id_for_title(title), "title": title}
+
+
+TASK_OPERATION_TYPES = frozenset({"upsert", "delete", "rename"})
+
+
+def titled_task(operation: dict[str, Any]) -> dict[str, str] | None:
+    """The task a task operation's ``title`` names, or None when it names none."""
+    title = operation.get("title")
+    if not isinstance(title, str):
+        return None
+    try:
+        return task_from_title(title)
+    except ValueError:
+        return None
 
 
 def rebuild_tasks(
@@ -86,7 +115,9 @@ def rebuild_tasks(
         task_id = operation.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             continue
-        if operation.get("type") == "delete":
+        if operation.get("type") in {"delete", "rename"}:
+            # A rename removes its old identity like a delete; the plan
+            # upserts the new identity separately (Core 0.56.0).
             tasks.pop(task_id, None)
         elif operation.get("type") == "upsert":
             title = operation.get("title")
@@ -176,10 +207,34 @@ def task_summaries_today(
             continue
         if completed_day == local_day:
             summaries[task_id]["finished"] += 1
-            summaries[task_id]["timeMs"] += max(
-                0, int(item.get("plannedDurationMs") or 0)
-            )
+            summaries[task_id]["timeMs"] += counted_run_ms(item)
     return summaries
+
+
+def recorded_elapsed_ms(item: Mapping[str, Any]) -> int | None:
+    """Return the run time Core recorded, or None for a row stored before it."""
+    elapsed = item.get("elapsedMs")
+    return elapsed if type(elapsed) is int and elapsed >= 0 else None
+
+
+def shown_run_minutes(milliseconds: int) -> int:
+    """Whole minutes for a run time, as every client shows it.
+
+    Half a minute rounds up, and any run above 0 shows at least 1 minute,
+    so a 29 s run never reads as 0 min. Arrival rows and task totals use
+    this one rule.
+    """
+    if milliseconds <= 0:
+        return 0
+    return max(1, (milliseconds + 30_000) // 60_000)
+
+
+def counted_run_ms(item: Mapping[str, Any]) -> int:
+    elapsed = recorded_elapsed_ms(item)
+    if elapsed is not None:
+        return elapsed
+    # Core counts the plan for a completed row stored before elapsedMs existed.
+    return max(0, int(item.get("plannedDurationMs") or 0))
 
 
 def completed_focus_count_for_day(

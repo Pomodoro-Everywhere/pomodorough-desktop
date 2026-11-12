@@ -105,7 +105,7 @@ class IrohWorkerLifecycleTests(unittest.TestCase):
                 sleeping.result(timeout=2)
             self.service.shutdown()
 
-        self.assertEqual(failures, ["native worker failed"])
+        self.assertEqual(failures, [self.service.strings.text("failure.generic")])
         self.assertEqual(len(registered_loops), 1)
         self.assertTrue(registered_loops[0].is_closed())
         self.assertIsNone(self.service._thread)
@@ -129,7 +129,9 @@ class IrohWorkerLifecycleTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIsNone(operation.cr_frame)
         self.assertEqual(statuses, ["UNAVAILABLE"])
-        self.assertEqual(failures, ["native wheel unavailable"])
+        self.assertEqual(
+            failures, [self.service.strings.text("network.iroh_not_packaged")]
+        )
         self.assertEqual(self.service._operations, set())
 
 

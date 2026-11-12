@@ -34,6 +34,37 @@ class ScreenSignalTests(unittest.TestCase):
         self.assertEqual(requested, [2])
         self.assertTrue(navigation.buttons[2].isChecked())
 
+    def test_assistive_toggle_navigates_like_a_click(self) -> None:
+        # VoiceOver and UIA press a checkable button with toggle(), not click().
+        navigation = ScreenNavigation(self.strings)
+        requested: list[int] = []
+        navigation.screen_requested.connect(requested.append)
+
+        navigation.buttons[3].toggle()
+
+        self.assertEqual(requested, [3])
+        self.assertTrue(navigation.buttons[3].isChecked())
+        self.assertFalse(navigation.buttons[0].isChecked())
+
+        # A later click on the same tab is a fresh request, not a duplicate.
+        navigation.buttons[3].click()
+        self.assertEqual(requested, [3, 3])
+
+    def test_select_marks_screen_without_requesting_navigation(self) -> None:
+        navigation = ScreenNavigation(self.strings)
+        requested: list[int] = []
+        navigation.screen_requested.connect(requested.append)
+
+        navigation.select(2)
+
+        self.assertEqual(requested, [])
+        self.assertTrue(navigation.buttons[2].isChecked())
+        self.assertFalse(navigation.buttons[0].isChecked())
+
+        # Re-clicking the current tab still requests it (R52-D05 routing).
+        navigation.buttons[2].click()
+        self.assertEqual(requested, [2])
+
     def test_controller_orders_navigation_render_before_optional_sync(self) -> None:
         class Controller(WindowApplicationController):
             replication_mode = "centralized"
@@ -85,12 +116,14 @@ class ScreenSignalTests(unittest.TestCase):
         screen.stop_sound_requested.connect(
             lambda: actions.append(("stop_sound", None))
         )
+        screen.skip_requested.connect(lambda: actions.append(("skip", None)))
 
         screen.primary_button.click()
         screen.finish_button.click()
         screen.cancel_button.click()
         screen.stop_sound_button.setVisible(True)
         screen.stop_sound_button.click()
+        screen.skip_button.click()
 
         self.assertEqual(
             actions,
@@ -99,6 +132,7 @@ class ScreenSignalTests(unittest.TestCase):
                 ("command", "finish"),
                 ("command", "cancel"),
                 ("stop_sound", None),
+                ("skip", None),
             ],
         )
 
@@ -245,6 +279,9 @@ class ScreenSignalTests(unittest.TestCase):
         delete = screen.task_table.cellWidget(0, 3)
         self.assertIsInstance(delete, QPushButton)
         delete.click()
+        # Deletion waits behind the undo banner until flushed.
+        self.assertEqual(events, [("add", "Architecture")])
+        screen.flush_pending_delete()
 
         self.assertEqual(
             events,

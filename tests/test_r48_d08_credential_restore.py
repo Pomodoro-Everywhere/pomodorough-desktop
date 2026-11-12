@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import catalog_sentence, failure_sentence
 from pomodorough.network import ApiError, CloudService, TokenStore
 from pomodorough.secure_store import SecureStoreError
 from pomodorough.sentry_monitoring import reset_cloud_credential_budget
@@ -107,7 +108,7 @@ def test_real_worker_permission_error_reports_once(app, cloud) -> None:
         while not failures and time.monotonic() < deadline:
             app.processEvents()
             time.sleep(0.01)
-    assert failures == [str(denied)]
+    assert failures == [failure_sentence(denied)]
     assert statuses[-1] == "OFFLINE • RETRYING"
     assert not cloud.authenticated
     assert cloud._state.access_token is None
@@ -126,7 +127,7 @@ def test_permission_error_reports_once_with_offline_notice(cloud) -> None:
     ):
         cloud.restore()
     assert statuses == ["CONNECTING", "OFFLINE • RETRYING"]
-    assert failures == [str(denied)]
+    assert failures == [failure_sentence(denied)]
     assert not cloud.authenticated
     capture.assert_called_once()
     assert isinstance(capture.call_args.args[0], RuntimeError)
@@ -142,7 +143,7 @@ def test_infra_backed_secure_store_error_reports_once(cloud) -> None:
         patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
-    assert failures == [str(error)]
+    assert failures == [failure_sentence(error)]
     capture.assert_called_once()
     assert isinstance(capture.call_args.args[0], RuntimeError)
     assert str(capture.call_args.args[0]) == "cloud credential restore failed: secure-store-infra"
@@ -157,7 +158,7 @@ def test_malformed_secure_store_error_stays_silent(cloud) -> None:
         patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
-    assert failures == [str(error)]
+    assert failures == [failure_sentence(error)]
     capture.assert_not_called()
 
 
@@ -172,7 +173,7 @@ def test_offline_api_error_stays_silent(cloud) -> None:
     ):
         cloud.restore()
     assert statuses[-1] == "OFFLINE • RETRYING"
-    assert failures == [str(error)]
+    assert failures == [failure_sentence(error)]
     capture.assert_not_called()
 
 
@@ -203,7 +204,7 @@ def test_cancel_stays_silent(cloud) -> None:
         patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
-    assert failures == [str(error)]
+    assert failures == [failure_sentence(error)]
     assert not cloud.authenticated
     capture.assert_not_called()
 
@@ -231,7 +232,7 @@ def test_unexpected_error_reports_once(cloud) -> None:
         patch("pomodorough.sentry_monitoring.capture_exception") as capture,
     ):
         cloud.restore()
-    assert failures == ["boom"]
+    assert failures == [catalog_sentence("failure.generic")]
     capture.assert_called_once()
     assert isinstance(capture.call_args.args[0], RuntimeError)
     assert str(capture.call_args.args[0]) == "cloud credential restore failed: unexpected"

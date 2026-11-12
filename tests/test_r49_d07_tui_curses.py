@@ -46,8 +46,14 @@ def native_results(tmp_path_factory):
     master, slave = pty.openpty()
     report_fd, write_fd = os.pipe()
     directory = tmp_path_factory.mktemp("r49-d07-curses")
+    # The child builds stores with the default secret store, which opens lock
+    # files in the app profile. Point its profile at a temp folder.
+    home = tmp_path_factory.mktemp("r49-d07-home")
     environment = os.environ | {"TERM": "xterm-256color", "LANG": "en_US.UTF-8",
-                                "R49_REPORT_FD": str(write_fd), "POMODOROUGH_SENTRY_DISABLE": "1"}
+                                "R49_REPORT_FD": str(write_fd), "POMODOROUGH_SENTRY_DISABLE": "1",
+                                "HOME": str(home), "XDG_CONFIG_HOME": str(home / "config"),
+                                "XDG_DATA_HOME": str(home / "data"),
+                                "XDG_CACHE_HOME": str(home / "cache")}
     script = Path(__file__).with_name("r49_d07_curses_child.py")
     child = subprocess.Popen([sys.executable, str(script), str(directory)], env=environment,
                              stdin=slave, stdout=slave, stderr=slave, pass_fds=(write_fd,))

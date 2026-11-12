@@ -13,6 +13,7 @@ from typing import Any, Coroutine
 
 from PySide6.QtCore import QObject, Signal
 
+from .failure_notice import describe_failure
 from .iroh_protocol import (
     ALPN,
     MAX_FRAME_BODY,
@@ -30,6 +31,7 @@ from .iroh_protocol import (
     parse_invite,
     valid_identifier,
 )
+from .localization import Strings
 from .sentry_monitoring import capture_exception
 from .storage import Store
 from .secure_store import PlatformSecretStore
@@ -70,8 +72,10 @@ class IrohService(QObject):
         device_id: str,
         *,
         key_store: EndpointKeyStore | None = None,
+        strings: Strings | None = None,
     ) -> None:
         super().__init__()
+        self.strings = strings or Strings()
         self.database_path = Path(database_path)
         self.device_id = device_id
         self.key_store = key_store or EndpointKeyStore()
@@ -164,7 +168,7 @@ class IrohService(QObject):
                 operation.close()
                 self.join_pending = False
                 self.join_outcome = "failed"
-                self.failure.emit("Iroh room join could not start.")
+                self.failure.emit(self.strings.text("network.iroh_join_not_started"))
 
     async def _run_join(
         self, room_id: str, invite: RoomInvite | None, generation: int,
@@ -178,7 +182,9 @@ class IrohService(QObject):
                 if generation == self._join_generation:
                     self.join_pending = False
                     self.join_outcome = "cancelled"
-                    self.failure.emit("Iroh room join cancelled.")
+                    self.failure.emit(
+                        self.strings.text("network.iroh_join_cancelled")
+                    )
             raise
         except Exception:
             with self.workspace_lock:
@@ -209,7 +215,7 @@ class IrohService(QObject):
 
     def refresh_invite(self) -> None:
         if self._room_id is None:
-            self.failure.emit("No Iroh room is active.")
+            self.failure.emit(self.strings.text("network.iroh_no_active_room"))
             return
         self._submit(self._emit_invite(), tracked=True)
 
@@ -251,7 +257,7 @@ class IrohService(QObject):
         available, reason = self.availability()
         if not available:
             self.status_changed.emit("UNAVAILABLE")
-            self.failure.emit(reason)
+            self.failure.emit(self.strings.text("network.iroh_not_packaged"))
             raise IrohProtocolError(reason)
         self._ready.clear()
         self._thread = threading.Thread(
@@ -314,7 +320,7 @@ class IrohService(QObject):
                 # Cancellation above stays silent (expected shutdown race).
                 capture_exception(error)
                 self.status_changed.emit("UNAVAILABLE")
-                self.failure.emit(str(error))
+                self.failure.emit(describe_failure(self.strings, error).sentence)
 
         future.add_done_callback(completed)
         return future

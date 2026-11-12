@@ -93,8 +93,10 @@ def test_runtime_font_change_refreshes_sheet_and_geometry(app, tmp_path):
             _process(app, 8)
             # No private refresh call here; production changeEvent must act.
             assert "font-size: 18.0pt" in _root_block(window.styleSheet())
-            assert 30 <= window.primary_button.fontMetrics().lineSpacing() <= 36
-            assert window.primary_button.fontMetrics().lineSpacing() > before_ls
+            after_ls = window.primary_button.fontMetrics().lineSpacing()
+            # Line spacing follows the doubled point size; the absolute
+            # value depends on the platform font (macOS 33, Rocky 38).
+            assert 1.8 * before_ls <= after_ls <= 2.2 * before_ls
             assert window.task_table.rowHeight(0) > before_row
             assert window.invite_input.minimumHeight() > before_invite
 

@@ -23,6 +23,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import failure_sentence
 from pomodorough.network import (
     ApiError,
     CloudService,
@@ -313,7 +314,7 @@ def test_plain_pending_and_offline_stay_quiet(app, setup) -> None:
             service._state.authenticated = True
             with patch.object(service.token_store, "load", side_effect=error):
                 service.sync({"ops": []})
-            assert failures == [str(error)]
+            assert failures == [failure_sentence(error)]
         capture.assert_not_called()
 
 

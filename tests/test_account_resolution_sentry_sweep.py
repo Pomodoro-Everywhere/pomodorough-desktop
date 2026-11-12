@@ -12,7 +12,8 @@ from pomodorough.account_resolution_controller import (
     AccountResolutionController,
     AccountResolutionPorts,
 )
-from pomodorough.controller_outcomes import EmitNotice, SetAccountState, Synchronize
+from pomodorough.controller_outcomes import SetAccountState, Synchronize
+from notice_effects import notice_texts
 
 
 class Strings:
@@ -50,7 +51,7 @@ def _harness() -> tuple[Mock, Mock, AccountResolutionController, list[object]]:
 
 
 def _notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 def _states(outcome) -> list[bool]:

@@ -95,8 +95,12 @@ def test_native_buttons_activate_on_release_once(window, name, expected):
     assert button.isDown()
     assert window.actions == []
     QTest.keyRelease(button, Qt.Key.Key_Space)
-    assert window.actions == [expected]
     assert not button.isDown()
+    if name == "delete":
+        # Deletion waits behind the undo banner until flushed.
+        assert window.actions == []
+        window.tasks.flush_pending_delete()
+    assert window.actions == [expected]
 
 
 def test_checkbox_toggles_in_both_directions(window):

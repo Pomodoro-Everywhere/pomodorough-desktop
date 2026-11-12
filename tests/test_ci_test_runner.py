@@ -124,6 +124,21 @@ def run_tests(command: list[str], directory: Path, home: Path, *arguments: str):
     )
 
 
+def collect_from_checkout(command: list[str], scratch: Path):
+    # The ci.yml command writes pytest-results.xml into its working directory,
+    # and CI uploads that path even when the real run dies before writing its
+    # own. The replay therefore sends its JUnit file to scratch. pytest keeps
+    # the last --junitxml, so the replayed workflow command stays exact.
+    return run_tests(command, ROOT, scratch / "home", "--collect-only", "-qq",
+                     f"--junitxml={scratch / 'pytest-results.xml'}")
+
+
+def file_state(path: Path):
+    if not path.exists():
+        return None
+    return path.stat().st_mtime_ns, path.read_bytes()
+
+
 def assert_full_suite_contract(
     workflow: str, test_step: str, install_step: str, python: str, artifact: str,
 ):
@@ -344,7 +359,7 @@ def test_full_runners_collect_every_test_module(
 ):
     workflow = (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
     command = full_test_command(workflow_step(workflow, test_step))
-    result = run_tests(command, ROOT, tmp_path / "home", "--collect-only", "-qq")
+    result = collect_from_checkout(command, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     expected = {
         path.relative_to(ROOT).as_posix()
@@ -355,6 +370,21 @@ def test_full_runners_collect_every_test_module(
     }
     collected = set(re.findall(r"^(tests/[^:\r\n]+)::", result.stdout, re.MULTILINE))
     assert collected == expected
+
+
+def test_ci_collect_replay_leaves_checkout_results_alone(tmp_path):
+    # After a timeout, cancel, or crash, CI would upload a 0-test file left at
+    # the checkout root as the full suite's evidence.
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    command = full_test_command(workflow_step(workflow, "Run tests"))
+    assert "--junitxml=pytest-results.xml" in command
+    checkout_results = ROOT / "pytest-results.xml"
+    before = file_state(checkout_results)
+    result = collect_from_checkout(command, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert file_state(checkout_results) == before
+    suites = ElementTree.parse(tmp_path / "pytest-results.xml").getroot().iter("testsuite")
+    assert [suite.get("tests") for suite in suites] == ["0"]
 
 
 @pytest.mark.parametrize("filename,test_step,install_step,python,artifact", FULL_RUNS)

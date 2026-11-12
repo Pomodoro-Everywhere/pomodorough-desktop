@@ -1,37 +1,67 @@
 from __future__ import annotations
 
+import sys
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
-    QApplication,
+    QAbstractItemDelegate,
     QAbstractItemView,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
-from .core import task_summaries_today
+from .core import normalize_task_title, shown_run_minutes, task_summaries_today
 from .localization import Strings
+from .railway_palette import PLATFORM, PLATFORM_DEEP, PORCELAIN
+from .task_undo_banner import TaskUndoBanner
+
+_DELETE_KEYS = (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+TITLE_COLUMN = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDeletion:
+    task_id: str
+    title: str
+    # Where the row stood, so Dismiss can focus the row that took its place.
+    row: int
 
 
 class TasksScreen(QFrame):
     add_task_requested = Signal(str)
     delete_task_requested = Signal(str)
+    rename_task_requested = Signal(str, str)
+    # A delete is about to wait in the undo window. The owner of task
+    # changes records it durably inside this emit, before the row hides.
+    pending_delete_started = Signal(str)
+    # The user pressed Undo; the owner forgets the recorded delete.
+    pending_delete_undone = Signal()
+    # The undo window opened or ended; a host re-places the banner.
+    undo_window_changed = Signal()
 
     def __init__(self, strings: Strings) -> None:
         super().__init__()
         self.strings = strings
         self._render_signature: tuple[Any, ...] | None = None
+        self._last_render: tuple[list[dict[str, Any]], list[dict[str, Any]], bool] | None = None
+        self._pending_deletion: PendingDeletion | None = None
+        self._rename_target: tuple[str, str] | None = None
         self._in_layout_refresh = False
         self._row_resize_timer = QTimer(self)
         self._row_resize_timer.setSingleShot(True)
@@ -44,6 +74,8 @@ class TasksScreen(QFrame):
         layout.addLayout(self._build_header())
         layout.addLayout(self._build_form())
         self._build_table(layout)
+        # Below the rows, so the banner never moves a row under the pointer.
+        layout.addWidget(self._build_undo_banner())
 
     def _build_header(self) -> QVBoxLayout:
         header = QVBoxLayout()
@@ -83,7 +115,43 @@ class TasksScreen(QFrame):
         return form
 
     def _request_add_task(self) -> None:
+        self.flush_pending_delete()
         self.add_task_requested.emit(self.task_input.text())
+
+    def _build_undo_banner(self) -> TaskUndoBanner:
+        banner = TaskUndoBanner(self.strings)
+        banner.undo_requested.connect(self.undo_pending_delete)
+        banner.dismiss_requested.connect(self.dismiss_pending_delete)
+        self.undo_banner = banner
+        self.undo_label = banner.label
+        self.undo_button = banner.undo_button
+        self.undo_dismiss_button = banner.dismiss_button
+        return banner
+
+    def rest_undo_banner(self, host_width: int) -> None:
+        """Keep the banner under the table when a host does not dock it."""
+        banner = self.undo_banner
+        inset = self.width() - self.layout().contentsRect().width()
+        banner.fit_width(host_width - inset)
+        if banner.parentWidget() is self:
+            return
+        held_focus = banner.holds_focus()
+        self.layout().addWidget(banner)
+        banner.setVisible(self._pending_deletion is not None)
+        if held_focus and banner.isVisible():
+            banner.undo_button.setFocus()
+
+    def link_undo_tab_order(self) -> None:
+        """Tab reaches Undo, then Dismiss, right after the task rows."""
+        banner = self.undo_banner
+        last_row = self.task_table.rowCount() - 1
+        before = self.task_table.cellWidget(last_row, 3) if last_row >= 0 else None
+        if before is None:
+            before = self.add_task_button
+        if before.window() is not banner.window():
+            return
+        QWidget.setTabOrder(before, banner.undo_button)
+        QWidget.setTabOrder(banner.undo_button, banner.dismiss_button)
 
     def _build_table(self, layout: QVBoxLayout) -> None:
         self.task_table = QTableWidget(0, 4)
@@ -102,18 +170,30 @@ class TasksScreen(QFrame):
             self._schedule_row_resize
         )
         self.task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.task_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.task_table.setTabKeyNavigation(False)
+        self.task_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.task_table.customContextMenuRequested.connect(self._show_task_context_menu)
+        self.task_table.cellDoubleClicked.connect(self._cell_double_clicked)
+        self.task_table.itemDelegate().closeEditor.connect(self._rename_editor_closed)
         self.task_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.task_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         layout.addWidget(self.task_table, 1)
         self.tasks_empty = QLabel(self.strings.text("task.empty"))
         self.tasks_empty.setObjectName("emptyState")
         self.tasks_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.tasks_empty)
+        # B1: the hint wraps, so its longest line never widens the page past
+        # the viewport and pushes the Add button out of view.
+        self.tasks_empty.setWordWrap(True)
+        layout.addWidget(self.tasks_empty, 1)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.KeyPress and self._handle_table_key(
+            watched, event
+        ):
+            return True
         if event.type() in (
             QEvent.Type.FontChange,
             QEvent.Type.StyleChange,
@@ -160,6 +240,7 @@ class TasksScreen(QFrame):
             fresh_v = scheduled[0] == current[0]
             fresh_h = scheduled[1] == current[1]
         anchor = table.rowAt(0)
+        anchor_offset = table.rowViewportPosition(anchor)
         header = table.horizontalHeader()
         was_blocked = header.blockSignals(True)
         try:
@@ -174,13 +255,13 @@ class TasksScreen(QFrame):
             # A newer scroll superseded this pass; leave it alone.
             return None
         table.verticalScrollBar().setValue(current[0])
-        if table.rowAt(0) != anchor and 0 <= anchor < table.rowCount():
-            # Per-pixel values land on a different row after row heights
-            # change; keep the top row instead.
-            table.scrollToItem(
-                table.item(anchor, 0),
-                QAbstractItemView.ScrollHint.PositionAtTop,
-            )
+        if 0 <= anchor < table.rowCount():
+            # Rows above the viewport may have changed height, which moves
+            # every row under the same per-pixel value. Keep the top row
+            # where it was so the content does not jump.
+            drift = table.rowViewportPosition(anchor) - anchor_offset
+            if drift:
+                bar_v.setValue(current[0] + drift)
         return (
             table.verticalScrollBar().value(),
             table.horizontalScrollBar().value(),
@@ -205,10 +286,19 @@ class TasksScreen(QFrame):
         # reveal always runs: it only recenters a settled table.
         QTimer.singleShot(
             0,
-            partial(
-                self._reveal_focused_delete, table_scroll=scroll_at_post
-            ),
+            self,
+            partial(self._deliver_focus_reveal, table_scroll=scroll_at_post),
         )
+
+    def _deliver_focus_reveal(self, table_scroll: tuple[int, int] | None) -> None:
+        # The receiver cancels this callback once the screen is destroyed,
+        # but PySide6 drops exceptions raised by receiver-bound callbacks
+        # instead of calling sys.excepthook. Report them to the installed
+        # hook (the Sentry integration), as the receiver-free form does.
+        try:
+            self._reveal_focused_delete(table_scroll)
+        except Exception:
+            sys.excepthook(*sys.exc_info())
 
     def _reveal_focused_delete(
         self, table_scroll: tuple[int, int] | None = None
@@ -240,16 +330,19 @@ class TasksScreen(QFrame):
         if page is not None and isinstance(page.parentWidget(), QScrollArea):
             page.parentWidget().ensureWidgetVisible(button, 0, 0)
 
-    def _reserve_task_row(self) -> None:
-        # Keep one complete row reachable; the page scrolls instead of crushing it.
+    def tallest_row_height(self) -> int:
         table = self.task_table
-        row_height = max(
+        return max(
             (table.rowHeight(row) for row in range(table.rowCount())),
             default=table.verticalHeader().defaultSectionSize(),
         )
+
+    def _reserve_task_row(self) -> None:
+        # Keep one complete row reachable; the page scrolls instead of crushing it.
+        table = self.task_table
         table.setMinimumHeight(
             table.horizontalHeader().height()
-            + row_height
+            + self.tallest_row_height()
             + table.horizontalScrollBar().sizeHint().height()
             + table.frameWidth() * 2
         )
@@ -287,10 +380,15 @@ class TasksScreen(QFrame):
         *,
         mutations_enabled: bool,
     ) -> None:
+        self._last_render = (tasks, history, mutations_enabled)
+        tasks = self._without_pending_deletion(tasks)
         signature = self._signature(tasks, history, mutations_enabled)
         if signature == self._render_signature:
             return
         self._render_signature = signature
+        # Rows may move under an open title editor; drop the edit instead
+        # of committing it into another task's cell.
+        self._cancel_rename()
         summaries = task_summaries_today(tasks, history)
         self._render_totals(summaries)
         self.task_input.setEnabled(mutations_enabled)
@@ -307,7 +405,26 @@ class TasksScreen(QFrame):
         self.task_table.setVisible(bool(tasks))
         self.tasks_empty.setVisible(not tasks)
         self._restore_delete_focus(focused_id, focused_row)
+        self.link_undo_tab_order()
         self._schedule_row_resize()
+
+    def _without_pending_deletion(
+        self, tasks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        pending = self._pending_deletion
+        if pending is None:
+            return tasks
+        return [
+            task
+            for task in tasks
+            if not (isinstance(task, dict) and task.get("id") == pending.task_id)
+        ]
+
+    def _rerender(self) -> None:
+        if self._last_render is None:
+            return
+        tasks, history, mutations_enabled = self._last_render
+        self.render(tasks, history, mutations_enabled=mutations_enabled)
 
     @staticmethod
     def _signature(
@@ -332,6 +449,7 @@ class TasksScreen(QFrame):
                     item.get("phase"),
                     item.get("status"),
                     item.get("plannedDurationMs"),
+                    item.get("elapsedMs"),
                     item.get("completedAt") or item.get("endedAt"),
                 )
                 for item in history
@@ -406,9 +524,12 @@ class TasksScreen(QFrame):
             cell = QTableWidgetItem(text)
             if alignment is not None:
                 cell.setTextAlignment(alignment)
+            if column != TITLE_COLUMN:
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.task_table.setItem(row, column, cell)
             return
-        existing.setText(text)
+        if existing.text() != text:
+            existing.setText(text)
 
     def _render_delete_cell(
         self, row: int, task_id: str, title: str, mutations_enabled: bool
@@ -428,11 +549,195 @@ class TasksScreen(QFrame):
         delete.setEnabled(mutations_enabled)
         delete.installEventFilter(self)
         delete.clicked.connect(
-            lambda checked=False, task_id=task_id: self.delete_task_requested.emit(
-                task_id
-            )
+            lambda checked=False, task_id=task_id: self._request_delete(task_id)
         )
         self.task_table.setCellWidget(row, 3, delete)
+
+    # Deletion is deferred so the row can be restored from the banner. The
+    # undo window has no timeout: it ends on Undo, Dismiss, another delete,
+    # an add or rename, or when the owner flushes it (leaving the Tasks
+    # screen, a timer action, the window hiding, minimizing or closing).
+    # Switching to another application keeps the window open; the owner's
+    # durable record covers a process that dies meanwhile.
+
+    def _request_delete(self, task_id: str) -> None:
+        if not task_id:
+            return
+        self.flush_pending_delete()
+        title = self._title_for(task_id)
+        row = self._row_for_delete_id(task_id)
+        self._pending_deletion = PendingDeletion(task_id, title, row)
+        self.pending_delete_started.emit(task_id)
+        if self._pending_deletion is None:
+            # The owner could not record the delete and withdrew it.
+            return
+        self.undo_banner.present(title)
+        self.undo_window_changed.emit()
+        self._rerender()
+
+    def _title_for(self, task_id: str) -> str:
+        tasks = self._last_render[0] if self._last_render is not None else []
+        for task in tasks:
+            if isinstance(task, dict) and task.get("id") == task_id:
+                title = task.get("title")
+                return title if isinstance(title, str) else ""
+        return ""
+
+    def pending_delete_task_id(self) -> str | None:
+        pending = self._pending_deletion
+        return pending.task_id if pending is not None else None
+
+    def _clear_pending_delete(self) -> PendingDeletion | None:
+        pending = self._pending_deletion
+        self._pending_deletion = None
+        self.undo_banner.setVisible(False)
+        if pending is not None:
+            self.undo_window_changed.emit()
+        return pending
+
+    def flush_pending_delete(self) -> None:
+        """Request the deferred delete now; a no-op when nothing is pending."""
+        pending = self._clear_pending_delete()
+        if pending is None:
+            return
+        self.delete_task_requested.emit(pending.task_id)
+        # The owner normally re-renders without the task inside the emit;
+        # otherwise the hidden row comes back.
+        self._rerender()
+
+    def dismiss_pending_delete(self) -> None:
+        """Complete the deferred delete because the user dismissed Undo."""
+        held_focus = self.undo_banner.holds_focus()
+        pending = self._pending_deletion
+        self.flush_pending_delete()
+        if not held_focus or pending is None:
+            return
+        # The row that took the deleted row's place, else the last row.
+        neighbour = min(max(pending.row, 0), self.task_table.rowCount() - 1)
+        button = self.task_table.cellWidget(neighbour, 3)
+        (button if button is not None else self.task_input).setFocus()
+
+    def undo_pending_delete(self) -> None:
+        pending = self._clear_pending_delete()
+        if pending is None:
+            return
+        self.pending_delete_undone.emit()
+        self._rerender()
+        row = self._row_for_delete_id(pending.task_id)
+        button = self.task_table.cellWidget(row, 3) if row >= 0 else None
+        if button is not None:
+            button.setFocus()
+
+    # Keyboard: Delete/Backspace remove the targeted row, F2 renames it.
+
+    def _handle_table_key(self, watched: QObject, event: QEvent) -> bool:
+        if not isinstance(event, QKeyEvent) or self._rename_editor() is not None:
+            return False
+        if event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
+            return False
+        key = event.key()
+        if key not in _DELETE_KEYS and key != Qt.Key.Key_F2:
+            return False
+        task_id, row = self._keyboard_target(watched)
+        if task_id is None:
+            return False
+        if key == Qt.Key.Key_F2:
+            self._begin_rename(row)
+        else:
+            self._request_delete(task_id)
+        return True
+
+    def _keyboard_target(self, watched: QObject) -> tuple[str | None, int]:
+        if isinstance(watched, QPushButton):
+            row = self._row_for_delete_id(watched.property("taskId"))
+        else:
+            row = self.task_table.currentRow()
+        task_id = self._task_id_at(row)
+        return (task_id, row) if task_id is not None else (None, -1)
+
+    def _cell_double_clicked(self, row: int, column: int) -> None:
+        if column == TITLE_COLUMN:
+            self._begin_rename(row)
+
+    def _show_task_context_menu(self, position: QPoint) -> None:
+        row = self.task_table.indexAt(position).row()
+        if row < 0:
+            row = self.task_table.currentRow()
+        menu = self._task_context_menu(row)
+        if menu is None:
+            return
+        menu.exec(self.task_table.viewport().mapToGlobal(position))
+
+    def _task_context_menu(self, row: int) -> QMenu | None:
+        if self._task_id_at(row) is None:
+            return None
+        menu = QMenu(self.task_table)
+        rename = menu.addAction(self.strings.text("task.rename"))
+        rename.triggered.connect(
+            lambda checked=False, row=row: self._begin_rename(row)
+        )
+        return menu
+
+    def _begin_rename(self, row: int) -> None:
+        task_id = self._task_id_at(row)
+        item = self.task_table.item(row, TITLE_COLUMN) if row >= 0 else None
+        if task_id is None or item is None or self._rename_editor() is not None:
+            return
+        self._rename_target = (task_id, item.text())
+        self.task_table.setCurrentCell(row, TITLE_COLUMN)
+        self.task_table.editItem(item)
+        if self.task_table.cellWidget(row, TITLE_COLUMN) is None:
+            self._rename_target = None
+
+    def _task_id_at(self, row: int) -> str | None:
+        button = self.task_table.cellWidget(row, 3) if row >= 0 else None
+        if button is None or not button.isEnabled():
+            return None
+        task_id = button.property("taskId")
+        return task_id if isinstance(task_id, str) and task_id else None
+
+    def _rename_editor(self) -> QWidget | None:
+        if self._rename_target is None:
+            return None
+        row = self._row_for_delete_id(self._rename_target[0])
+        if row < 0:
+            self._rename_target = None
+            return None
+        return self.task_table.cellWidget(row, TITLE_COLUMN)
+
+    def _cancel_rename(self) -> None:
+        editor = self._rename_editor()
+        target = self._rename_target
+        self._rename_target = None
+        if editor is None or target is None:
+            return
+        row = self._row_for_delete_id(target[0])
+        item = self.task_table.item(row, TITLE_COLUMN)
+        if item is not None:
+            self.task_table.closePersistentEditor(item)
+            item.setText(target[1])
+
+    def _rename_editor_closed(
+        self, editor: QWidget, hint: QAbstractItemDelegate.EndEditHint
+    ) -> None:
+        target = self._rename_target
+        if target is None:
+            return
+        self._rename_target = None
+        task_id, original = target
+        item = self.task_table.item(self._row_for_delete_id(task_id), TITLE_COLUMN)
+        if item is None:
+            return
+        title = item.text()
+        item.setText(original)
+        if hint == QAbstractItemDelegate.EndEditHint.RevertModelCache:
+            return
+        # A blank title still goes to the controller, which refuses it with
+        # the same sentence as the composer.
+        if normalize_task_title(title) == normalize_task_title(original):
+            return
+        self.flush_pending_delete()
+        self.rename_task_requested.emit(task_id, title)
 
     def _focused_delete_id(self) -> tuple[str | None, int]:
         focused = QApplication.focusWidget()
@@ -474,7 +779,7 @@ class TasksScreen(QFrame):
             total_ms = max(0, int(milliseconds))
         except (TypeError, ValueError):
             total_ms = 0
-        minutes = total_ms // 60_000
+        minutes = shown_run_minutes(total_ms)
         hours, remaining = divmod(minutes, 60)
         if hours and remaining:
             return self.strings.text(
@@ -487,8 +792,9 @@ class TasksScreen(QFrame):
     @staticmethod
     def stylesheet() -> str:
         return """
-        QLabel#countBadge { background: palette(highlight); color: palette(highlighted-text); border: 2px solid palette(mid); padding: 2px 8px; font-weight: bold; }
+        QLabel#countBadge { background: @platform; color: @porcelain; border: 2px solid @platform_deep; padding: 2px 8px; font-weight: bold; }
         QLabel#emptyState { color: palette(text); padding: 24px; }
+        QFrame#undoBanner { background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 8px; }
         QTableWidget { background: palette(base); color: palette(text); border: 2px solid palette(mid); gridline-color: palette(alternate-base); outline: none; }
         QHeaderView::section { background: palette(button); color: palette(button-text); border: 1px solid palette(mid); padding: 6px; font-weight: 800; }
-        """
+        """.replace("@platform_deep", PLATFORM_DEEP).replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN)

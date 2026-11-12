@@ -91,12 +91,20 @@ def _assert_hit(view: TasksScreen, row: int, point: QPoint) -> None:
     hit = viewport.childAt(position)
     requested = []
     view.delete_task_requested.connect(requested.append)
+    scroll = table.verticalScrollBar().value()
     try:
         assert hit is not None
-        QTest.mouseClick(hit, Qt.LeftButton, pos=hit.mapFrom(viewport, position))
-        assert requested == [f"task-{row}"]
         assert hit is button
         assert table.indexAt(position).row() == row
+        QTest.mouseClick(hit, Qt.LeftButton, pos=hit.mapFrom(viewport, position))
+        # Deletion waits behind the undo banner; the click must have
+        # targeted this row's task without requesting anything yet.
+        assert view.pending_delete_task_id() == f"task-{row}"
+        assert requested == []
+        view.undo_pending_delete()
+        _settle()
+        table.verticalScrollBar().setValue(scroll)
+        _settle()
     finally:
         view.delete_task_requested.disconnect(requested.append)
 
@@ -199,13 +207,24 @@ def test_keyboard_delete_after_scroll_and_refresh(app, scale, rtl):
         requested = []
         view.delete_task_requested.connect(requested.append)
         QTest.keyClick(QApplication.focusWidget(), Qt.Key_Space)
+        # Deletion waits behind the undo banner; flushing restores the
+        # row because nothing removed the task from the rendered input.
+        assert view.pending_delete_task_id() == "task-12"
+        assert requested == []
+        view.flush_pending_delete()
+        _settle()
         assert requested == ["task-12"]
+        button = _reveal(view, 12)
+        button.setFocus()
+        _settle()
         QTest.keyClick(button, Qt.Key_Tab)
         assert QApplication.focusWidget() is not button
         neighbor = _reveal(view, 13)
         neighbor.setFocus()
         _settle()
         QTest.keyClick(QApplication.focusWidget(), Qt.Key_Space)
+        view.flush_pending_delete()
+        _settle()
         assert requested == ["task-12", "task-13"]
         _reveal(view, 12)
         _assert_contained(view, 12)

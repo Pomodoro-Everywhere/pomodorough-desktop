@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import time  # noqa: F401 - public test seam patches shared time module
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QColor,
     QCursor,
     QDesktopServices,
     QIcon,
-    QPainter,
     QPalette,
-    QPen,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,10 +23,15 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
 )
 
+from .controller_outcomes import ControllerOutcome, EmitFailure, EmitTaskFailure
+from .failure_notice import describe_failure
 from .localization import Strings
 from .network import CloudService
+from .railway_palette import STEEL, TRACK
 from .sound import CompletionSound
 from .storage import Store
+from .task_failure_notice import ask_to_retry, describe_task_failure
+from .tray_progress_icon import TrayProgressIcon
 from .ui_controller import (
     WindowApplicationController,
     presented_timer as presented_timer,
@@ -36,6 +41,19 @@ from .ui_views import PRIVACY_POLICY_URL, MainWindowViewMixin
 
 def resource_path(name: str) -> Path:
     return Path(__file__).parent / "resources" / name
+
+
+def apply_railway_highlight(app: QApplication) -> None:
+    """Pin the selection colors so native widgets stop leaking OS blue.
+
+    Only Highlight and HighlightedText get a resolve bit, so OS theme
+    changes keep updating every other role. Steel on track stays legible
+    on both light and dark bases, unlike navy platform on dark.
+    """
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(STEEL))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(TRACK))
+    app.setPalette(palette)
 
 
 class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
@@ -58,6 +76,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self._connect_cloud()
         self._connect_iroh()
         self._render()
+        self._replay_pending_task_delete()
         self._start_background_timers()
 
     def _initialize_services(
@@ -115,13 +134,22 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self._resolution_corruption: str | None = None
         self._account_switch_user: dict[str, Any] | None = None
         self._notice_dialog_active = False
+        # L1: task failure sentences that arrived while another dialog was
+        # open, with their Retry action when the change can repeat.
+        self._waiting_failure_sentences: list[
+            tuple[str, Callable[[], ControllerOutcome[Any]] | None]
+        ] = []
 
     def _build_window(self) -> None:
         self.setWindowTitle(self.strings.text("window.title"))
         self.setWindowIcon(self.app_icon)
         self.setMinimumSize(600, 340)
         self.resize(640, 360)
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            apply_railway_highlight(app)
         self._build_ui()
+        self._fit_default_width_to_navigation()
         self._build_tray()
 
     def _start_background_timers(self) -> None:
@@ -193,6 +221,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(self.app_icon, self)
+        self._tray_progress_icon = TrayProgressIcon(resource_path("icon.svg"))
         self.tray.setToolTip("Pomodorough")
         self.tray_menu = QMenu(self)
         show_action = QAction(self.strings.text("tray.show"), self)
@@ -235,32 +264,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         if not active:
             self.tray.setIcon(self.app_icon)
             return
-
-        pixmap = self.app_icon.pixmap(QSize(64, 64))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        arc_rect = QRectF(5, 5, 54, 54)
-        palette = self.palette()
-        painter.setPen(
-            QPen(
-                palette.color(QPalette.ColorRole.Mid),
-                8,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.FlatCap,
-            )
-        )
-        painter.drawEllipse(arc_rect)
-        painter.setPen(
-            QPen(
-                palette.color(QPalette.ColorRole.Highlight),
-                8,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.FlatCap,
-            )
-        )
-        painter.drawArc(arc_rect, 90 * 16, -round(state[1] / 100 * 360 * 16))
-        painter.end()
-        self.tray.setIcon(QIcon(pixmap))
+        self.tray.setIcon(self._tray_progress_icon.icon(state[1] / 100))
 
     def _open_privacy_policy(self) -> None:
         QDesktopServices.openUrl(QUrl(PRIVACY_POLICY_URL))
@@ -274,9 +278,69 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
             return
         self._notice_dialog_active = True
         try:
-            QMessageBox.warning(self, "Pomodorough", message)
+            # A standard OK button keeps Qt's English label in every locale.
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("Pomodorough")
+            dialog.setText(message)
+            dialog.addButton(
+                self.strings.text("notice.ok"), QMessageBox.ButtonRole.AcceptRole
+            )
+            dialog.exec()
         finally:
             self._notice_dialog_active = False
+        self._show_waiting_failure_sentence()
+
+    def _show_task_failure(self, failure: EmitTaskFailure) -> None:
+        if self._hold_unattended_task_delete_failure(failure):
+            # M3: no Retry dialog on a hiding, quitting or hidden window.
+            return
+        notice = describe_task_failure(self.strings, failure.change, failure.error)
+        retry = failure.retry if notice.can_retry else None
+        if self._notice_dialog_active:
+            # L1: a task failure is never dropped; it waits for the open dialog.
+            self._wait_for_open_dialog(notice.sentence, retry)
+            return
+        self._show_failure_sentence(notice.sentence, retry)
+
+    def _show_failure(self, failure: EmitFailure) -> None:
+        notice = describe_failure(self.strings, failure.error)
+        self._show_failure_sentence(
+            notice.sentence, failure.retry if notice.can_retry else None
+        )
+
+    def _show_failure_sentence(
+        self, sentence: str, retry: Callable[[], ControllerOutcome[Any]] | None
+    ) -> None:
+        """Show one failure sentence; offer Retry when the action can repeat."""
+        if retry is None:
+            self.notice.emit(sentence)
+            return
+        if self._notice_dialog_active:
+            self._wait_for_open_dialog(sentence, retry)
+            return
+        self._notice_dialog_active = True
+        try:
+            retry_chosen = ask_to_retry(self, self.strings, sentence)
+        finally:
+            self._notice_dialog_active = False
+        if retry_chosen:
+            self._apply_outcome(retry())
+        self._show_waiting_failure_sentence()
+
+    def _wait_for_open_dialog(
+        self, sentence: str, retry: Callable[[], ControllerOutcome[Any]] | None
+    ) -> None:
+        # L1: one dialog at a time. This sentence waits for the open one to
+        # close; a repeat of a waiting sentence adds nothing.
+        waiting = self._waiting_failure_sentences
+        if all(sentence != queued for queued, _retry in waiting):
+            waiting.append((sentence, retry))
+
+    def _show_waiting_failure_sentence(self) -> None:
+        if self._waiting_failure_sentences:
+            sentence, retry = self._waiting_failure_sentences.pop(0)
+            self._show_failure_sentence(sentence, retry)
 
     def _is_window_foreground(self) -> bool:
         if self.isActiveWindow():
@@ -314,6 +378,15 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
     def shutdown(self) -> None:
         if self._closed:
             return
+        # A deferred task delete must reach the store before it closes. A
+        # failure opens no dialog here; the durable marker makes the next
+        # start ask the user about the delete.
+        self.complete_pending_task_delete_unattended()
+        # M2: the last chance in this run to clear the marker of a delete
+        # that ended, so the next start cannot replay it.
+        self._apply_outcome(
+            self._owned_controller("timer").retry_withdrawn_task_delete_clear()
+        )
         self._closed = True
         self.tick_timer.stop()
         self.sync_timer.stop()

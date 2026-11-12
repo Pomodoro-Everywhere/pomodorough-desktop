@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .localization import Strings
+from .railway_palette import signal_accent
 
 PRIVACY_POLICY_URL = "https://pomodorough.egigoka.me/privacy"
 
@@ -90,7 +91,6 @@ class NetworkScreen(QFrame):
         layout.setSpacing(10)
         layout.addLayout(self._build_header())
         layout.addLayout(self._build_mode_row(replication_mode))
-        layout.addLayout(self._build_account_row())
         self._build_notices(layout)
         layout.addWidget(self._build_iroh_panel())
         self._build_footer(layout)
@@ -256,6 +256,10 @@ class NetworkScreen(QFrame):
             self.strings.text("network.invite_accessible")
         )
         _make_invite_field_growable(self.invite_input)
+        # DSK-02: a multi-line editor takes Tab as text by default, which
+        # traps keyboard focus before JOIN ROOM and every later control.
+        # A pasted ticket still keeps any tab characters it contains.
+        self.invite_input.setTabChangesFocus(True)
         self.join_room_button = QPushButton(self.strings.text("network.join_room"))
         self.join_room_button.setAccessibleName(
             self.strings.text("network.join_room_accessible")
@@ -327,6 +331,9 @@ class NetworkScreen(QFrame):
         privacy.setAccessibleName(self.strings.text("network.privacy_accessible"))
         layout.addWidget(privacy)
         layout.addStretch()
+        # Account & Privacy sits last: it is the rarely used, destructive
+        # end of the screen, with delete as the final control.
+        layout.addLayout(self._build_account_row())
 
     def render(
         self,
@@ -451,8 +458,8 @@ class NetworkScreen(QFrame):
         scale = _app_font_scale()
         sheet = """
         QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
-        QLabel#privacyNotice { color: palette(text); background: palette(alternate-base); border-left: 4px solid palette(highlight); padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
+        QLabel#privacyNotice { color: palette(text); background: palette(alternate-base); border-left: 4px solid @signal; padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
         """
-        return sheet.replace(
+        return sheet.replace("@signal", signal_accent(QApplication.palette())).replace(
             "font-size: 9px", f"font-size: {6.75 * scale:.1f}pt"
         )

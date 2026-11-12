@@ -136,7 +136,7 @@ class ReplicatedStateProjection:
         for item in history:
             cleaned = deepcopy(item)
             cleaned.pop("pending", None)
-            for key in ("commandId", "taskId", "completedAt", "endedAt"):
+            for key in ("commandId", "taskId", "completedAt", "endedAt", "elapsedMs"):
                 if cleaned.get(key) is None:
                     cleaned.pop(key, None)
             clean_history.append(cleaned)

@@ -73,6 +73,7 @@ def _harness(status: str = "completed") -> tuple[TimerInteractionController, Moc
         stop_sound_timer=Mock(),
         stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     return TimerInteractionController(ports), ports, issued
 

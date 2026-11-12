@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 
 from pomodorough.controller_outcomes import (
+    EmitFailure,
     EmitNotice,
     LoadState,
     Render,
@@ -31,13 +32,24 @@ class FakeCloud:
     def __init__(self) -> None:
         self.busy = False
         self.restores = 0
+        self.resumes = 0
         self.stops = 0
 
     def restore(self) -> None:
         self.restores += 1
 
+    def resume_restore(self) -> None:
+        # The real service restores at once when idle and defers while busy.
+        if not self.busy:
+            self.restore()
+            return
+        self.resumes += 1
+
     def stop_revision_stream(self) -> None:
         self.stops += 1
+
+    def cancel_restore(self) -> None:
+        self.stop_revision_stream()
 
 
 class FakeStore:
@@ -188,7 +200,8 @@ class ReplicationControllerTests(unittest.TestCase):
         iroh.available = False
         unavailable = harness.controller.restore_replication()
         self.assertEqual(effect_types(unavailable), (ShowStatus, RenderNetwork))
-        self.assertEqual(unavailable.effects[0].message, "iroh unavailable")
+        # R2-B3: the loader's reason stays internal; the status is ours.
+        self.assertEqual(unavailable.effects[0].message, "network.iroh_not_packaged")
 
         iroh.available = True
         harness.controller.restore_replication()
@@ -221,7 +234,7 @@ class ReplicationControllerTests(unittest.TestCase):
         self.assertTrue(harness.controller.iroh_transition_ready().value)
         harness.store.failure = OSError("mode write failed")
         failed = harness.controller.replication_mode_changed("iroh")
-        self.assertEqual(failed.effects[0].message, "mode write failed")
+        self.assertEqual(failed.effects[0], EmitFailure(harness.store.failure))
         self.assertEqual(harness.controller.mode, "offline")
 
         harness.store.failure = None
@@ -247,7 +260,7 @@ class ReplicationControllerTests(unittest.TestCase):
         harness.iroh = iroh
         iroh.available = False
         unavailable = harness.controller.create_iroh_room()
-        self.assertEqual(unavailable.effects[0].message, "iroh unavailable")
+        self.assertEqual(unavailable.effects[0].message, "network.iroh_not_packaged")
 
         iroh.available = True
         harness.controller.mode = "centralized"
@@ -285,7 +298,7 @@ class ReplicationControllerTests(unittest.TestCase):
             side_effect=IrohProtocolError("bad invite"),
         ):
             rejected = harness.controller.join_iroh_room("bad")
-        self.assertEqual(rejected.effects[0].message, "bad invite")
+        self.assertEqual(rejected.effects[0].message, "network.iroh_invite_invalid")
 
     def test_noop_error_and_clipboard_paths_remain_side_effect_safe(self) -> None:
         harness = ControllerHarness()
@@ -312,9 +325,13 @@ class ReplicationControllerTests(unittest.TestCase):
         harness.iroh = iroh
         iroh.available = False
         self.assertFalse(harness.controller.iroh_transition_ready().value)
-        self.assertEqual(harness.applied[-1].effects[0].message, "iroh unavailable")
+        self.assertEqual(
+            harness.applied[-1].effects[0].message, "network.iroh_not_packaged"
+        )
         unavailable_join = harness.controller.join_iroh_room("invite")
-        self.assertEqual(unavailable_join.effects[0].message, "iroh unavailable")
+        self.assertEqual(
+            unavailable_join.effects[0].message, "network.iroh_not_packaged"
+        )
 
         iroh.available = True
         harness.controller.mode = "centralized"
@@ -327,7 +344,8 @@ class ReplicationControllerTests(unittest.TestCase):
         self.assertEqual(harness.cloud.restores, 1)
         harness.store.failure = OSError("room create failed")
         failed_create = harness.controller.create_iroh_room("Room")
-        self.assertEqual(failed_create.effects[0].message, "room create failed")
+        self.assertIs(failed_create.effects[0].error, harness.store.failure)
+        self.assertIsNotNone(failed_create.effects[0].retry)
 
         harness.store.failure = ValueError("leave failed")
         with patch(
@@ -335,7 +353,7 @@ class ReplicationControllerTests(unittest.TestCase):
             return_value=QMessageBox.StandardButton.Yes,
         ):
             failed_leave = harness.controller.leave_iroh_room()
-        self.assertEqual(failed_leave.effects[0].message, "leave failed")
+        self.assertEqual(failed_leave.effects[0], EmitFailure(harness.store.failure))
 
         clipboard = SimpleClipboard()
         harness.controller.iroh_invite = "invite-to-copy"
@@ -377,7 +395,7 @@ class ReplicationControllerTests(unittest.TestCase):
 
         harness.store.failure = ValueError("capture failed")
         failed = harness.controller.sync_iroh_now()
-        self.assertEqual(failed.effects[0].message, "capture failed")
+        self.assertEqual(failed.effects[0], EmitFailure(harness.store.failure))
         harness.store.failure = None
 
         harness.controller.iroh_details_changed({"peers": 2})
@@ -405,6 +423,42 @@ class ReplicationControllerTests(unittest.TestCase):
         self.assertEqual(effect_types(failure), (RenderNetwork,))
         self.assertEqual(harness.applied[-1].effects[0], ShowStatus("join failed", 15_000))
         self.assertEqual(harness.cloud.restores, 1)
+
+    def test_offline_switch_defers_restore_while_cloud_busy(self) -> None:
+        harness = ControllerHarness(iroh=FakeIroh())
+        harness.cloud.busy = True
+        harness.controller.activate_replication_mode("offline", "centralized")
+        self.assert_restore_deferred(harness.cloud)
+
+    def test_iroh_stop_status_defers_restore_while_cloud_busy(self) -> None:
+        harness = ControllerHarness(iroh=FakeIroh())
+        harness.controller.activate_replication_mode("iroh", "centralized")
+        harness.cloud.busy = True
+        harness.controller.iroh_status_changed("NOT CONNECTED")
+        self.assert_restore_deferred(harness.cloud)
+
+    def test_join_status_defers_restore_while_cloud_busy(self) -> None:
+        iroh = FakeIroh()
+        iroh.join_pending = False  # type: ignore[attr-defined]
+        harness = ControllerHarness(iroh=iroh)
+        harness.controller.mode = harness.store.replication_mode = "centralized"
+        harness.controller.iroh_join_pending = True
+        harness.cloud.busy = True
+        harness.controller.iroh_status_changed("NOT CONNECTED")
+        self.assert_restore_deferred(harness.cloud)
+
+    def test_join_failure_defers_restore_while_cloud_busy(self) -> None:
+        harness = ControllerHarness(iroh=FakeIroh())
+        harness.store.replication_mode = "centralized"
+        harness.controller.iroh_join_pending = True
+        harness.cloud.busy = True
+        harness.controller.iroh_failure("join failed")
+        self.assert_restore_deferred(harness.cloud)
+
+    def assert_restore_deferred(self, cloud: FakeCloud) -> None:
+        # A busy cloud worker may be a login, so the site must ask
+        # resume_restore, which defers, and never call restore() directly.
+        self.assertEqual((cloud.restores, cloud.resumes), (0, 1))
 
 
 def effect_types(outcome: object) -> tuple[type[object], ...]:

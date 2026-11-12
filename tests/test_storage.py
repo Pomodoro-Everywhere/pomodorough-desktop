@@ -5,12 +5,15 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
+from contextlib import closing
 from copy import deepcopy
 from datetime import datetime, timedelta
 from itertools import permutations
 from pathlib import Path
 from queue import Queue
-from threading import Barrier, Event, Thread
+from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
+from traceback import format_exc
 from unittest.mock import patch
 
 import pomodorough.storage as storage
@@ -177,6 +180,44 @@ class StorageTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
+    def _run_store_race(self, operations: dict[str, Callable[[Store], object]]) -> list:
+        barrier = Barrier(len(operations) + 1, timeout=30)
+        initialization = Lock()
+        results = Queue()
+        failures = Queue()
+
+        def run(name: str, operation: Callable[[Store], object]) -> None:
+            try:
+                # Race domain claims, not migrations; concurrent opens have D08 coverage.
+                with initialization:
+                    store = Store(self.path)
+                with closing(store):
+                    barrier.wait()
+                    results.put(operation(store))
+            except BaseException:  # noqa: BLE001 - report every worker failure to the test.
+                failures.put(f"{name}:\n{format_exc()}")
+                barrier.abort()
+
+        threads = [
+            Thread(target=run, args=(name, operation), name=name, daemon=True)
+            for name, operation in operations.items()
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            barrier.wait()
+        except BrokenBarrierError:
+            failures.put(f"main barrier:\n{format_exc()}")
+        for thread in threads:
+            thread.join(timeout=30)
+        errors = list(failures.queue)
+        errors.extend(
+            f"{thread.name} did not stop within 30 seconds"
+            for thread in threads if thread.is_alive()
+        )
+        self.assertFalse(errors, "\n".join(errors))
+        return [results.get_nowait() for _ in threads]
+
     def test_production_projection_reader_matches_protocol_transition_matrix(
         self,
     ) -> None:
@@ -313,6 +354,8 @@ class StorageTests(unittest.TestCase):
                             "status": item["status"],
                             "phase": item["phase"],
                             "durationMs": item["plannedDurationMs"],
+                            # Core 0.55.0 records the time each history row ran.
+                            "elapsedMs": item.get("elapsedMs"),
                             "commandId": item.get("commandId"),
                             "endedMs": relative_ms(item["endedAt"]),
                             "taskId": item.get("taskId"),
@@ -678,35 +721,18 @@ class StorageTests(unittest.TestCase):
             "start", None, "focus", settings["durationsMs"], now_ms=1_000
         )
         timer, _history = rebuild_optimistic(None, [], [start])
-        barrier = Barrier(3)
-        results = Queue()
 
-        def finish() -> None:
-            store = Store(self.path)
-            try:
-                barrier.wait()
-                results.put(
-                    store.queue_command(
-                        "finish",
-                        timer,
-                        "focus",
-                        settings["durationsMs"],
-                        now_ms=1_000 + settings["durationsMs"]["focus"],
-                        automatic=True,
-                    )
-                )
-            finally:
-                store.close()
+        def finish(store: Store) -> dict | None:
+            return store.queue_command(
+                "finish",
+                timer,
+                "focus",
+                settings["durationsMs"],
+                now_ms=1_000 + settings["durationsMs"]["focus"],
+                automatic=True,
+            )
 
-        workers = [Thread(target=finish) for _ in range(2)]
-        for worker in workers:
-            worker.start()
-        barrier.wait()
-        for worker in workers:
-            worker.join(timeout=2)
-            self.assertFalse(worker.is_alive())
-
-        outcomes = [results.get_nowait() for _ in workers]
+        outcomes = self._run_store_race({"finish-1": finish, "finish-2": finish})
         self.assertEqual(sum(outcome is not None for outcome in outcomes), 1)
         finish_commands = [
             command for command in self.store.load()["pending"]
@@ -1248,32 +1274,18 @@ class StorageTests(unittest.TestCase):
         operation = self.store.queue_task_operation(
             "upsert", task_from_title("Owner-bound task"), now_ms=1
         )
-        barrier = Barrier(3)
-        results = Queue()
 
-        def prepare(user_id: str) -> None:
-            store = Store(self.path)
+        def prepare(store: Store, user_id: str) -> tuple:
             try:
-                barrier.wait()
                 request = store.prepare_resolution({"id": user_id}, 4, "merge")
-                results.put(("request", user_id, request))
+                return ("request", user_id, request)
             except ValueError as error:
-                results.put(("error", user_id, str(error)))
-            finally:
-                store.close()
+                return ("error", user_id, str(error))
 
-        threads = [
-            Thread(target=prepare, args=(user_id,))
-            for user_id in ("user-1", "user-2")
-        ]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(5)
-            self.assertFalse(thread.is_alive())
-
-        outcomes = [results.get_nowait(), results.get_nowait()]
+        outcomes = self._run_store_race({
+            "user-1": lambda store: prepare(store, "user-1"),
+            "user-2": lambda store: prepare(store, "user-2"),
+        })
         requests = [outcome for outcome in outcomes if outcome[0] == "request"]
         errors = [outcome for outcome in outcomes if outcome[0] == "error"]
         self.assertEqual(len(requests), 1)
@@ -1394,43 +1406,24 @@ class StorageTests(unittest.TestCase):
     ) -> None:
         task = task_from_title("Concurrent normal and resolution claim")
         self.store.queue_task_operation("upsert", task, now_ms=1)
-        barrier = Barrier(3)
-        results = Queue()
 
-        def claim_normal_sync() -> None:
-            store = Store(self.path)
+        def claim_normal_sync(store: Store) -> tuple:
             try:
-                barrier.wait()
-                results.put(("sync", "request", store.sync_payload()))
+                return ("sync", "request", store.sync_payload())
             except ValueError as error:
-                results.put(("sync", "error", str(error)))
-            finally:
-                store.close()
+                return ("sync", "error", str(error))
 
-        def claim_resolution() -> None:
-            store = Store(self.path)
+        def claim_resolution(store: Store) -> tuple:
             try:
-                barrier.wait()
-                results.put(
-                    (
-                        "resolution",
-                        "request",
-                        store.prepare_resolution({"id": "user-1"}, 0, "merge"),
-                    )
-                )
+                request = store.prepare_resolution({"id": "user-1"}, 0, "merge")
+                return ("resolution", "request", request)
             except ValueError as error:
-                results.put(("resolution", "error", str(error)))
-            finally:
-                store.close()
+                return ("resolution", "error", str(error))
 
-        threads = (Thread(target=claim_normal_sync), Thread(target=claim_resolution))
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join()
-
-        outcomes = [results.get_nowait(), results.get_nowait()]
+        outcomes = self._run_store_race({
+            "claim_normal_sync": claim_normal_sync,
+            "claim_resolution": claim_resolution,
+        })
         successes = [outcome for outcome in outcomes if outcome[1] == "request"]
         errors = [outcome for outcome in outcomes if outcome[1] == "error"]
         self.assertEqual(len(successes), 1)
@@ -2798,8 +2791,8 @@ class StorageTests(unittest.TestCase):
             start_apply.set()
             start_edit.set()
             release_apply.set()
-            apply_thread.join(2)
-            edit_thread.join(2)
+            apply_thread.join(30)
+            edit_thread.join(30)
 
         self.assertFalse(apply_thread.is_alive())
         self.assertFalse(edit_thread.is_alive())
@@ -3937,6 +3930,14 @@ class StorageTests(unittest.TestCase):
         operation = self.store.queue_task_operation("upsert", task, now_ms=1)
         request = self.store.sync_payload()
         response = self._canonical_response(request, revision=1, tasks=[task])
+        loaded_during_commit = self._load_while_sync_commits(response, request)
+        self.assertEqual(loaded_during_commit["snapshot"]["revision"], 0)
+        self.assertEqual(loaded_during_commit["pendingTasks"], [operation])
+        loaded_after_commit = self.store.load()
+        self.assertEqual(loaded_after_commit["snapshot"]["revision"], 1)
+        self.assertEqual(loaded_after_commit["pendingTasks"], [])
+
+    def _load_while_sync_commits(self, response: dict, request: dict) -> dict:
         reached_pending = Event()
         continue_load = Event()
         results = Queue()
@@ -3948,37 +3949,35 @@ class StorageTests(unittest.TestCase):
             ) -> list[dict[str, object]]:
                 pending = super()._pending_commands(sendable_only=sendable_only)
                 reached_pending.set()
-                continue_load.wait()
+                if not continue_load.wait(30):
+                    raise TimeoutError("snapshot load did not resume within 30 seconds")
                 return pending
 
         def load_from_second_connection() -> None:
-            store = PausingStore(self.path)
             try:
-                results.put(store.load())
-            except BaseException as error:
-                errors.put(error)
+                with closing(PausingStore(self.path)) as store:
+                    results.put(store.load())
+            except BaseException:  # noqa: BLE001 - report every worker failure to the test.
+                errors.put(f"load_from_second_connection:\n{format_exc()}")
             finally:
-                store.close()
+                reached_pending.set()
 
-        thread = Thread(target=load_from_second_connection)
+        thread = Thread(target=load_from_second_connection,
+                        name="load_from_second_connection", daemon=True)
         thread.start()
         try:
-            # Readiness wait tolerates slow runners; it gates thread
-            # startup (including WASM engine load), not sync logic.
-            self.assertTrue(reached_pending.wait(15))
-            self.store.apply_sync(response, request)
+            ready = reached_pending.wait(30)
+            if ready and errors.empty():
+                self.store.apply_sync(response, request)
         finally:
             continue_load.set()
-            thread.join(5)
-
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(errors.empty(), list(errors.queue))
-        loaded_during_commit = results.get_nowait()
-        self.assertEqual(loaded_during_commit["snapshot"]["revision"], 0)
-        self.assertEqual(loaded_during_commit["pendingTasks"], [operation])
-        loaded_after_commit = self.store.load()
-        self.assertEqual(loaded_after_commit["snapshot"]["revision"], 1)
-        self.assertEqual(loaded_after_commit["pendingTasks"], [])
+            thread.join(timeout=30)
+        failures = list(errors.queue)
+        if thread.is_alive():
+            failures.append(f"{thread.name} did not stop within 30 seconds")
+        self.assertFalse(failures, "\n".join(failures))
+        self.assertTrue(ready, "snapshot load did not reach pending commands within 30 seconds")
+        return results.get_nowait()
 
     def test_sync_rejects_non_exact_acknowledgements_atomically(self) -> None:
         task = task_from_title("Review sync")
@@ -4813,28 +4812,12 @@ class StorageTests(unittest.TestCase):
             self.store.prepare_resolution({"id": "user-1"}, 2, "merge")
 
     def test_concurrent_auto_start_toggles_serialize_hlc_and_projection(self) -> None:
-        barrier = Barrier(3)
-        results = Queue()
-
-        def toggle(enabled: bool) -> None:
-            store = Store(self.path)
-            try:
-                barrier.wait()
-                results.put(store.set_auto_start_breaks(enabled, now_ms=1_000))
-            finally:
-                store.close()
-
-        threads = [Thread(target=toggle, args=(enabled,)) for enabled in (True, False)]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(5)
-            self.assertFalse(thread.is_alive())
-
+        outcomes = self._run_store_race({
+            "toggle-on": lambda store: store.set_auto_start_breaks(True, now_ms=1_000),
+            "toggle-off": lambda store: store.set_auto_start_breaks(False, now_ms=1_000),
+        })
         operations = sorted(
-            [results.get_nowait(), results.get_nowait()],
-            key=lambda item: (item["hlcWallMs"], item["hlcCounter"]),
+            outcomes, key=lambda item: (item["hlcWallMs"], item["hlcCounter"]),
         )
         self.assertEqual(operations[0]["hlcWallMs"], operations[1]["hlcWallMs"])
         self.assertEqual(
@@ -6160,30 +6143,12 @@ class StorageTests(unittest.TestCase):
         self.store.queue_command(
             "finish", running, "focus", settings["durationsMs"], now_ms=2_000
         )
-        barrier = Barrier(3)
-        results = Queue()
-
-        def process() -> None:
-            store = Store(self.path)
-            try:
-                barrier.wait()
-                results.put(
-                    store.process_auto_break(
-                        require_canonical=False, now_ms=3_000
-                    )
-                )
-            finally:
-                store.close()
-
-        threads = [Thread(target=process) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(5)
-            self.assertFalse(thread.is_alive())
-
-        outcomes = [results.get_nowait(), results.get_nowait()]
+        outcomes = self._run_store_race({
+            f"auto-break-{index}": lambda store: store.process_auto_break(
+                require_canonical=False, now_ms=3_000
+            )
+            for index in range(2)
+        })
         self.assertEqual(sorted(len(outcome) for outcome in outcomes), [0, 1])
         starts = [
             command

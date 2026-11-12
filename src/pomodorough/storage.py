@@ -17,10 +17,12 @@ from .core import (
     ACTIVE_STATUSES,
     PHASES,
     elapsed_ms,
+    TASK_OPERATION_TYPES,
     parse_timestamp_ms,
     project_auto_start_breaks,
-    task_from_title,
+    titled_task,
 )
+from .pending_task_deletion import PENDING_TASK_DELETION_KEY
 from .secure_store import PlatformSecretStore, SecretMutationJournal
 from .shared_core import (
     ProjectionApplyV2,
@@ -59,6 +61,15 @@ from .storage_sync import SyncStorage, SyncStorageDependencies
 from .storage_workspace import WorkspacePersistence
 from .sentry_monitoring import capture_exception
 from .uuid7 import reserve_uuid7, uuid7_parts
+
+# R54-D08: switching a new database to WAL reads the file and then asks for
+# a write lock. When another connection holds that lock, SQLite skips the
+# busy handler because waiting could deadlock, so two first opens of one new
+# file fail at once with SQLITE_BUSY despite the connection's busy timeout.
+# The WAL statement is retried on SQLITE_BUSY only, for as long as the
+# default sqlite3.connect busy timeout; a longer lock still raises.
+_WAL_SETUP_WAIT_SECONDS = 5.0
+_WAL_SETUP_RETRY_SECONDS = 0.01
 
 _LOCAL_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -318,8 +329,20 @@ class Store:
                 pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        self._enable_write_ahead_log()
         self.connection.execute("PRAGMA foreign_keys=ON")
+
+    def _enable_write_ahead_log(self) -> None:
+        deadline = time.monotonic() + _WAL_SETUP_WAIT_SECONDS
+        while True:
+            try:
+                self.connection.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as error:
+                busy = error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+                if not busy or time.monotonic() >= deadline:
+                    raise
+            time.sleep(_WAL_SETUP_RETRY_SECONDS)
 
     def _create_local_schema(self) -> None:
         self.connection.executescript(_LOCAL_SCHEMA_SQL)
@@ -1754,18 +1777,23 @@ class Store:
             not self._valid_identity(operation.get("id"))
             or operation["id"] != row["id"]
             or not self._valid_identity(operation.get("taskId"))
-            or operation.get("type") not in {"upsert", "delete"}
+            or operation.get("type") not in TASK_OPERATION_TYPES
         ):
             raise ValueError("Pending task operation is invalid.")
+        task = titled_task(operation)
         if operation["type"] == "upsert":
-            title = operation.get("title")
-            try:
-                task = task_from_title(title) if isinstance(title, str) else None
-            except ValueError:
-                task = None
-            if task is None or task["id"] != operation["taskId"]:
-                raise ValueError("Pending task operation is invalid.")
-        elif "title" in operation:
+            valid = task is not None and task["id"] == operation["taskId"]
+        elif operation["type"] == "rename":
+            # Core 0.56.0: taskId is the old identity and title the new
+            # normalized title, whose identity must differ (TASK_RENAME.md).
+            valid = (
+                task is not None
+                and task["title"] == operation["title"]
+                and task["id"] != operation["taskId"]
+            )
+        else:
+            valid = "title" not in operation
+        if not valid:
             raise ValueError("Pending task operation is invalid.")
         self._operation_clock(operation)
 
@@ -2552,12 +2580,42 @@ class Store:
         if operation_type not in {"upsert", "delete"}:
             raise ValueError("Unsupported task operation.")
         normalized = self._normalized_task_identity(task)
+        return self._queue_task_operation(operation_type, normalized, now_ms)
+
+    def queue_task_rename(
+        self,
+        task: dict[str, str],
+        renamed: dict[str, str],
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Queue Core 0.56.0's ``rename`` of ``task`` to the ``renamed`` identity.
+
+        The operation keeps the old identity and names the new normalized
+        title, so every reducer moves the task's finished history to the new
+        identity (pomodorough-core TASK_RENAME.md).
+        """
+        old = self._normalized_task_identity(task)
+        renamed = self._normalized_task_identity(renamed)
+        if renamed["id"] == old["id"]:
+            raise ValueError("Unsupported task operation.")
+        return self._queue_task_operation(
+            "rename", old, now_ms, renamed_title=renamed["title"])
+
+    def _queue_task_operation(
+        self,
+        operation_type: str,
+        normalized: dict[str, str],
+        now_ms: int | None,
+        renamed_title: str | None = None,
+    ) -> dict[str, Any]:
         use_server_clock = now_ms is None
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         with self._immediate_transaction():
             self._ensure_no_pending_resolution()
             operation = self._create_task_operation(
                 operation_type, normalized, now_ms, use_server_clock)
+            if renamed_title is not None:
+                operation["title"] = renamed_title
             settings = self._normalize_settings(self.get_meta("settings", {}))
             self._project_task_operation(operation, settings)
             self.connection.execute(
@@ -2909,6 +2967,17 @@ class Store:
         """Read-only Core preview of the phase a finish would advance to."""
         return self._completion_policy.preview_selected_phase(
             timer, history, auto_start_breaks, utc_timestamp(now_ms)
+        )
+
+    def skip_destination(
+        self,
+        phase: str,
+        history: list[dict[str, Any]],
+        now_ms: int,
+    ) -> str | None:
+        """Read-only Core decision for the idle-board skip button."""
+        return self._completion_policy.skip_destination(
+            phase, history, utc_timestamp(now_ms)
         )
 
     def projected_history(
@@ -3463,6 +3532,10 @@ class Store:
             self._set_meta("accountDeletionCleanup", None)
 
     def _reset_account_data_locked(self) -> None:
+        # UX round 2 rule 5 (B2 L2): a reset ends the pending task delete for
+        # every owner, including a same-owner reset. The marker is local meta
+        # outside any saved workspace, so neither branch below restores it.
+        self._set_meta(PENDING_TASK_DELETION_KEY, None)
         room_id = self.active_iroh_room_id
         if self.replication_mode == "iroh" and room_id is not None:
             self._reset_iroh_account_data(room_id)

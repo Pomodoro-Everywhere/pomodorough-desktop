@@ -9,8 +9,14 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtWidgets import QMessageBox
 
-from pomodorough.controller_outcomes import EmitNotice, LoadState, Synchronize
+from pomodorough.controller_outcomes import (
+    EmitFailure,
+    EmitTaskFailure,
+    LoadState,
+    Synchronize,
+)
 from pomodorough.iroh_protocol import IrohProtocolError, RoomInvite
+from notice_effects import notice_texts
 from pomodorough.replication_controller import (
     ReplicationContext,
     ReplicationController,
@@ -26,7 +32,7 @@ INFRA_ERRORS = [OSError("infra boom"), sqlite3.Error("db boom")]
 
 
 def _notice_messages(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 class _Strings:
@@ -145,14 +151,11 @@ class ReplicationD41Tests(unittest.TestCase):
                 self.assertIs(capture.call_args[0][0], error)
                 texts = _notice_messages(outcome)
                 applied_texts = [
-                    e.message
-                    for o in applied
-                    for e in o.effects
-                    if isinstance(e, EmitNotice)
+                    text for o in applied for text in notice_texts(o.effects)
                 ]
                 self.assertTrue(texts or applied_texts)
 
-    def _check_validation(self, run) -> None:
+    def _check_validation(self, run, shown: str = "validation boom") -> None:
         with patch(
             "pomodorough.replication_controller.capture_exception",
         ) as capture:
@@ -160,11 +163,10 @@ class ReplicationD41Tests(unittest.TestCase):
             capture.assert_not_called()
             texts = _notice_messages(outcome)
             applied_texts = [
-                e.message for o in applied for e in o.effects
-                if isinstance(e, EmitNotice)
+                text for o in applied for text in notice_texts(o.effects)
             ]
             combined = texts + applied_texts
-            self.assertTrue(any("validation boom" in m for m in combined))
+            self.assertTrue(any(shown in m for m in combined))
 
     def test_mode_changed_splits_infra_and_validation(self) -> None:
         harness = ReplicationHarness()
@@ -217,7 +219,8 @@ class ReplicationD41Tests(unittest.TestCase):
                 return harness.controller.join_iroh_room("inv"), []
 
         self._check_infra(run)
-        self._check_validation(run)
+        # R2-B3: a rejected invite names what to change, not the store's text.
+        self._check_validation(run, shown="network.iroh_invite_invalid")
 
     def test_join_invite_parse_stays_validation_only(self) -> None:
         harness = ReplicationHarness()
@@ -230,7 +233,10 @@ class ReplicationD41Tests(unittest.TestCase):
             ):
                 outcome = harness.controller.join_iroh_room("bad")
         capture.assert_not_called()
-        self.assertIn("bad invite", _notice_messages(outcome))
+        # R2-B3: the parser's text stays internal; the notice is a sentence.
+        self.assertEqual(
+            _notice_messages(outcome), ["network.iroh_invite_invalid"]
+        )
 
     def test_leave_cancel_join_splits_infra_and_validation(self) -> None:
         harness = ReplicationHarness()
@@ -314,6 +320,7 @@ class TimerHarness:
             stop_sound_timer=Mock(),
             stop_completion_sound=Mock(),
             set_stop_sound_control=Mock(),
+            complete_pending_task_delete=lambda: None,
         )
         self.controller = TimerInteractionController(self.ports)
 
@@ -335,10 +342,21 @@ class TimerHarness:
 
 class TimerD41Tests(unittest.TestCase):
     def _assert_infra(self, outcome, error) -> None:
-        self.assertTrue(
-            any(isinstance(e, EmitNotice) for e in outcome.effects),
+        # R2-B3: the failure carries the error for the window to word.
+        self.assertIn(
+            error,
+            [e.error for e in outcome.effects if isinstance(e, EmitFailure)],
             "infra failure must surface a notice",
         )
+
+    def _assert_task_failure(self, outcome, error) -> None:
+        # UX round 2 A2: task failures carry the error object for the window
+        # to classify; the error text is not a notice any more.
+        self.assertEqual(
+            [e.error for e in outcome.effects if isinstance(e, EmitTaskFailure)],
+            [error],
+        )
+        self.assertEqual(_notice_messages(outcome), [])
 
     def test_expired_iroh_projection_splits_and_unmasks(self) -> None:
         for error in INFRA_ERRORS:
@@ -472,9 +490,10 @@ class TimerD41Tests(unittest.TestCase):
                 ) as capture:
                     outcome = harness.controller.add_task("Task")
             capture.assert_called_once()
-            self._assert_infra(outcome, error)
+            self._assert_task_failure(outcome, error)
         harness = TimerHarness()
-        harness.store.queue_task_operation_with_selection.side_effect = ValueError("bad add")
+        rejected = ValueError("bad add")
+        harness.store.queue_task_operation_with_selection.side_effect = rejected
         with patch(
             "pomodorough.timer_interaction_controller.task_from_title",
             return_value={"id": "task-1", "title": "Task"},
@@ -484,7 +503,7 @@ class TimerD41Tests(unittest.TestCase):
             ) as capture:
                 outcome = harness.controller.add_task("Task")
         capture.assert_not_called()
-        self.assertIn("bad add", _notice_messages(outcome))
+        self._assert_task_failure(outcome, rejected)
 
     def test_delete_task_splits(self) -> None:
         for error in INFRA_ERRORS:
@@ -497,16 +516,17 @@ class TimerD41Tests(unittest.TestCase):
             ) as capture:
                 outcome = harness.controller.delete_task("task-1")
             capture.assert_called_once()
-            self._assert_infra(outcome, error)
+            self._assert_task_failure(outcome, error)
         harness = TimerHarness()
         harness.known_tasks = {"task-1": {"id": "task-1", "title": "Task"}}
-        harness.store.queue_task_operation.side_effect = ValueError("bad delete")
+        rejected = ValueError("bad delete")
+        harness.store.queue_task_operation.side_effect = rejected
         with patch(
             "pomodorough.timer_interaction_controller.capture_exception",
         ) as capture:
             outcome = harness.controller.delete_task("task-1")
         capture.assert_not_called()
-        self.assertIn("bad delete", _notice_messages(outcome))
+        self._assert_task_failure(outcome, rejected)
 
     def test_duration_changed_splits(self) -> None:
         for error in INFRA_ERRORS:

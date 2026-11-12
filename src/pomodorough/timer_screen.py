@@ -33,7 +33,10 @@ from .core import (
     timer_for_display,
 )
 from .localization import Strings
+from .railway_palette import PLATFORM, PORCELAIN, SIGNAL
+from .timer_controls_scroll import TimerControlsScroll
 from .timer_view import ClockWidget, ceiling_minutes
+from .wrapping_push_button import WrappingPushButton
 
 
 def _default_duration_minutes(phase: str) -> int:
@@ -104,6 +107,7 @@ class TimerScreen(QWidget):
     primary_action_requested = Signal()
     command_requested = Signal(str)
     stop_sound_requested = Signal()
+    skip_requested = Signal()
     phase_selected = Signal(str)
     duration_changed = Signal(str, int)
     task_selection_changed = Signal(int)
@@ -131,6 +135,7 @@ class TimerScreen(QWidget):
         )
         self.controls_layout.setContentsMargins(0, 0, 0, 0)
         self._controls_centered = False
+        self._landscape = False
         self.active_task_context = QLabel("")
         self.active_task_context.setObjectName("taskSubtitle")
         self.active_task_context.setAccessibleName(
@@ -147,7 +152,42 @@ class TimerScreen(QWidget):
         self.actions_layout.setSpacing(8)
         self.actions_layout.setContentsMargins(0, 0, 0, 0)
         self._build_task_selector()
-        self.primary_button = QPushButton(
+        self._build_action_buttons()
+        # iPad rule: portrait stacking in every orientation. Task picker
+        # on top, primary full width, secondaries share one row below.
+        # The column is width-capped and centered so wide windows keep
+        # phone-like proportions instead of stretching one long strip.
+        self.controls_column = QFrame()
+        self.controls_column.setObjectName("controlsPanel")
+        column_layout = QBoxLayout(
+            QBoxLayout.Direction.TopToBottom, self.controls_column
+        )
+        column_layout.setContentsMargins(10, 10, 10, 10)
+        column_layout.setSpacing(8)
+        column_layout.addWidget(self.task_selector_panel)
+        column_layout.addWidget(self.primary_button)
+        # Idle shows skip alone; active timers swap in finish and cancel.
+        # One set is always visible, so the row never collapses.
+        secondary_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        secondary_layout.setSpacing(8)
+        self._secondary_layout = secondary_layout
+        secondary_layout.addWidget(self.finish_button, 1)
+        secondary_layout.addWidget(self.cancel_button, 1)
+        secondary_layout.addWidget(self.skip_button, 1)
+        secondary_layout.addWidget(self.stop_sound_button, 1)
+        column_layout.addLayout(secondary_layout)
+        # B1: the column scrolls so the primary action keeps its height.
+        self.controls_scroll = TimerControlsScroll(
+            self.controls_column, self.primary_button
+        )
+        self.controls_scroll.column_hints_changed.connect(self._bound_controls_width)
+        self.actions_layout.addStretch(1)
+        self.actions_layout.addWidget(self.controls_scroll)
+        self.actions_layout.addStretch(1)
+        self.controls_layout.addLayout(self.actions_layout)
+
+    def _build_action_buttons(self) -> None:
+        self.primary_button = WrappingPushButton(
             self.strings.text(
                 "status.primary.start",
                 phase=self.strings.text("phase.focus").upper(),
@@ -155,39 +195,69 @@ class TimerScreen(QWidget):
         )
         self.primary_button.setObjectName("primaryButton")
         self.primary_button.clicked.connect(self.primary_action_requested)
-        self.finish_button = QPushButton(self.strings.text("status.finish"))
+        self.finish_button = WrappingPushButton(self.strings.text("status.finish"))
         self.finish_button.clicked.connect(
             lambda: self.command_requested.emit("finish")
         )
-        self.cancel_button = QPushButton(self.strings.text("status.cancel"))
+        self.cancel_button = WrappingPushButton(self.strings.text("status.cancel"))
         self.cancel_button.setObjectName("dangerButton")
         self.cancel_button.clicked.connect(
             lambda: self.command_requested.emit("cancel")
         )
-        self.stop_sound_button = QPushButton(self.strings.text("status.stop_sound"))
+        self.skip_button = WrappingPushButton(self._skip_label(None))
+        self.skip_button.setObjectName("skipButton")
+        self.skip_button.clicked.connect(self.skip_requested)
+        self.stop_sound_button = WrappingPushButton(self.strings.text("status.stop_sound"))
         self.stop_sound_button.clicked.connect(self.stop_sound_requested)
         self.stop_sound_button.setVisible(False)
-        # iPad rule: portrait stacking in every orientation. Task picker
-        # on top, primary full width, secondaries share one row below.
-        # The column is width-capped and centered so wide windows keep
-        # phone-like proportions instead of stretching one long strip.
-        column = QWidget()
-        column.setMaximumWidth(480)
-        column_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom, column)
-        column_layout.setContentsMargins(0, 0, 0, 0)
-        column_layout.setSpacing(8)
-        column_layout.addWidget(self.task_selector_panel)
-        column_layout.addWidget(self.primary_button)
-        secondary_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
-        secondary_layout.setSpacing(8)
-        secondary_layout.addWidget(self.finish_button, 1)
-        secondary_layout.addWidget(self.cancel_button, 1)
-        secondary_layout.addWidget(self.stop_sound_button, 1)
-        column_layout.addLayout(secondary_layout)
-        self.actions_layout.addStretch(1)
-        self.actions_layout.addWidget(column)
-        self.actions_layout.addStretch(1)
-        self.controls_layout.addLayout(self.actions_layout)
+
+    def _bound_controls_width(self) -> None:
+        # Landscape caps the controls at the 2/5 share the dial split
+        # promises; portrait caps the column at 3/5 of the screen so wide
+        # windows do not stretch the buttons into one long strip. Both caps
+        # are proportions of the measured widget width, never fixed pixels.
+        width = self.width()
+        # L3: the wrapper also holds the vertical bar when one shows.
+        bar = self.controls_scroll.bar_allowance()
+        self._apply_button_budgets(self._controls_room() - bar)
+        column_need = self.controls_column.minimumSizeHint().width()
+        if self._landscape:
+            self.controls_panel.setMaximumWidth(max(column_need + bar, width * 2 // 5))
+        else:
+            self.controls_panel.setMaximumWidth(16777215)
+        self.controls_column.setMaximumWidth(max(column_need, width * 3 // 5))
+        self.controls_scroll.setMaximumWidth(self.controls_column.maximumWidth() + bar)
+
+    def _controls_room(self) -> int:
+        """C M3: width the page leaves for the controls wrapper.
+
+        Measured from this screen's width minus what sits beside the
+        controls: the settings column when shown, and in landscape the
+        clock's minimum width and the spacing between them.
+        """
+        margins = self.content_layout.contentsMargins()
+        room = self.width() - margins.left() - margins.right()
+        settings = getattr(self, "settings_scroll", None)
+        if settings is not None and not settings.isHidden():
+            room -= settings.minimumWidth() + self.content_layout.spacing()
+        if self._landscape:
+            clock_min = max(self.clock.minimumWidth(), self.clock.minimumSizeHint().width())
+            room -= clock_min + self.left_layout.spacing()
+        controls = self.controls_layout.contentsMargins()
+        return room - controls.left() - controls.right()
+
+    def _apply_button_budgets(self, column_room: int) -> None:
+        # C M3: a button whose one-line label is wider than its share of the
+        # column wraps the label instead of widening the column past the page.
+        column_margins = self.controls_column.layout().contentsMargins()
+        frame = self.controls_column.frameWidth() * 2
+        inner = column_room - frame - column_margins.left() - column_margins.right()
+        self.primary_button.set_width_budget(inner)
+        row = (self.finish_button, self.cancel_button, self.skip_button, self.stop_sound_button)
+        shown = max(1, sum(not button.isHidden() for button in row))
+        share = (inner - self._secondary_layout.spacing() * (shown - 1)) // shown
+        for button in row:
+            button.set_width_budget(share)
 
     def _build_task_selector(self) -> None:
         self.task_selector_panel = QFrame()
@@ -322,6 +392,8 @@ class TimerScreen(QWidget):
         self.right_panel.setVisible(visible)
         if hasattr(self, "settings_scroll"):
             self.settings_scroll.setVisible(visible)
+        # C M3: the settings column takes width from the controls.
+        self._bound_controls_width()
 
     def apply_responsive_layout(self, *, landscape: bool, compact: bool) -> None:
         # Landscape: dial left, controls right (vertically centered).
@@ -330,7 +402,7 @@ class TimerScreen(QWidget):
             self.left_layout.setDirection(QBoxLayout.Direction.LeftToRight)
             self.left_layout.setStretch(0, 3)
             self.left_layout.setStretch(1, 2)
-            self.controls_panel.setMaximumWidth(460)
+            self._landscape = True
             if not self._controls_centered:
                 self.controls_layout.insertStretch(0, 1)
                 self.controls_layout.addStretch(1)
@@ -339,11 +411,12 @@ class TimerScreen(QWidget):
             self.left_layout.setDirection(QBoxLayout.Direction.TopToBottom)
             self.left_layout.setStretch(0, 1)
             self.left_layout.setStretch(1, 0)
-            self.controls_panel.setMaximumWidth(16777215)
+            self._landscape = False
             if self._controls_centered:
                 self.controls_layout.takeAt(0)
                 self.controls_layout.takeAt(self.controls_layout.count() - 1)
                 self._controls_centered = False
+        self._bound_controls_width()
         self.content_layout.setSpacing(12 if compact else 22)
         self.left_layout.setSpacing(6 if compact else 10)
         margin = 12 if compact else 18
@@ -519,6 +592,7 @@ class TimerScreen(QWidget):
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
+        self._bound_controls_width()
         self._schedule_settings_reflow()
 
     def render(
@@ -610,6 +684,7 @@ class TimerScreen(QWidget):
             state.elapsed / state.planned,
             ceiling_minutes(state.display_timer.get("plannedDurationMs", state.planned)),
             dots=progress,
+            ended=state.status in TERMINAL_STATUSES,
         )
 
     def render_controls(
@@ -619,6 +694,7 @@ class TimerScreen(QWidget):
         selected_phase: str,
         mutations_enabled: bool,
         sound_active: bool,
+        skip_destination: str | None = None,
     ) -> None:
         self.primary_button.setText(
             self.strings.text("status.primary.pause")
@@ -634,10 +710,12 @@ class TimerScreen(QWidget):
             mutations_enabled
             and state.status in {"idle"} | ACTIVE_STATUSES | TERMINAL_STATUSES
         )
-        self.finish_button.setEnabled(mutations_enabled and state.active)
-        self.cancel_button.setEnabled(mutations_enabled and state.active)
-        self.stop_sound_button.setVisible(sound_active)
-        self.stop_sound_button.setEnabled(sound_active)
+        self._render_secondary_actions(
+            state,
+            mutations_enabled=mutations_enabled,
+            sound_active=sound_active,
+            skip_destination=skip_destination,
+        )
         for spin in self.duration_spins.values():
             spin.setEnabled(mutations_enabled)
         for phase, button in self.phase_buttons.items():
@@ -646,6 +724,36 @@ class TimerScreen(QWidget):
         self.auto_breaks.setEnabled(mutations_enabled)
         self.pattern_scope.setText(
             self.strings.text("pattern.next_scope") if state.active else ""
+        )
+
+    def _render_secondary_actions(
+        self,
+        state: TimerRenderState,
+        *,
+        mutations_enabled: bool,
+        sound_active: bool,
+        skip_destination: str | None,
+    ) -> None:
+        # Idle boards offer a skip; active timers offer finish and cancel.
+        # Inapplicable buttons hide instead of greying out.
+        self.finish_button.setVisible(state.active)
+        self.cancel_button.setVisible(state.active)
+        self.finish_button.setEnabled(mutations_enabled and state.active)
+        self.cancel_button.setEnabled(mutations_enabled and state.active)
+        self.skip_button.setVisible(not state.active)
+        self.skip_button.setText(self._skip_label(skip_destination))
+        self.skip_button.setEnabled(
+            mutations_enabled and skip_destination in PHASES
+        )
+        self.stop_sound_button.setVisible(sound_active)
+        self.stop_sound_button.setEnabled(sound_active)
+
+    def _skip_label(self, destination: str | None) -> str:
+        if destination not in PHASES:
+            return self.strings.text("status.skip_unknown")
+        return self.strings.text(
+            "status.skip",
+            phase=self.strings.text(f"phase.{destination}").upper(),
         )
 
     @staticmethod
@@ -735,7 +843,7 @@ class TimerScreen(QWidget):
     ) -> None:
         self.task_combo.blockSignals(True)
         self.task_combo.clear()
-        self.task_combo.addItem(self.strings.text("task.unassigned"), None)
+        self.task_combo.addItem(self.strings.text("task.none"), None)
         self._align_task_item(0)
         selected_index = 0
         for task in choices:
@@ -778,8 +886,10 @@ class TimerScreen(QWidget):
     @staticmethod
     def stylesheet() -> str:
         return """
-        QPushButton[phase="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
+        QPushButton[phase="true"]:checked { background: @platform; color: @porcelain; border-bottom: 5px solid @signal; }
+        QFrame#controlsPanel { background: palette(alternate-base); border: 2px solid palette(mid); }
+        QScrollArea#timerControlsScroll, QScrollArea#timerControlsScroll > QWidget { background: transparent; }
         QFrame#taskSelector { background: palette(base); border: 2px solid palette(mid); }
         QSpinBox { font-family: "DejaVu Sans Mono"; }
         QCheckBox { spacing: 8px; }
-        """
+        """.replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN).replace("@signal", SIGNAL)

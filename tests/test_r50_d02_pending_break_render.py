@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from pomodorough.controller_outcomes import EmitNotice, Render
+from pomodorough.controller_outcomes import Render
+from notice_effects import notice_texts
 from pomodorough.sentry_monitoring import (
     note_pending_break_read_recovery,
     reset_clock_incident_budget,
@@ -93,13 +94,14 @@ def _harness(
         stop_sound_timer=Mock(),
         stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     controller = TimerInteractionController(ports)
     return SimpleNamespace(store=store, controller=controller, ports=ports)
 
 
 def _notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 def _has_render(outcome) -> bool:
@@ -329,7 +331,7 @@ class RealSqliteDenialTests(unittest.TestCase):
         window.tick_timer.stop()
         window.sync_timer.stop()
         self.addCleanup(window.close)
-        with patch("pomodorough.ui.QMessageBox.warning"):
+        with patch("pomodorough.ui.QMessageBox.exec"):
             window._issue("start")
         self.assertEqual(window._current_timer()["status"], "running")
         return window, store
@@ -369,7 +371,8 @@ class RealSqliteDenialTests(unittest.TestCase):
                 self.assertEqual(renders["count"], 20)
                 self.assertEqual(capture.call_count, 1)
                 self.assertEqual(len(notices), 1)
-                self.assertIn("not authorized", notices[0].lower())
+                # R2-B3: the window words the read failure; SQLite text stays out.
+                self.assertEqual(notices, [window.strings.text("failure.storage")])
                 store.connection.set_authorizer(None)
                 self.assertEqual(list(store.connection.iterdump()), before)
                 window._tick()
@@ -390,17 +393,19 @@ class RealSqliteDenialTests(unittest.TestCase):
         reset_pending_break_read_incident_budget()
         window, _ = self._window_with_running_timer(tempfile.mkdtemp())
         self.assertFalse(window._notice_dialog_active)
-        with patch.object(QMessageBox, "warning") as warning:
+        # R2-B3: the notice is a QMessageBox instance with a localized OK
+        # button, so the modal call is exec, not the static warning.
+        with patch.object(QMessageBox, "exec") as shown:
             window._show_notice("first")
-            self.assertEqual(warning.call_count, 1)
+            self.assertEqual(shown.call_count, 1)
             self.assertFalse(window._notice_dialog_active)
         with patch.object(
-            QMessageBox, "warning", side_effect=lambda *a, **k: (
+            QMessageBox, "exec", side_effect=lambda *a, **k: (
                 window._show_notice("nested") or 0
             ),
-        ) as warning:
+        ) as shown:
             window._show_notice("outer")
-            self.assertEqual(warning.call_count, 1)
+            self.assertEqual(shown.call_count, 1)
             self.assertFalse(window._notice_dialog_active)
 
 

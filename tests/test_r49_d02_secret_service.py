@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from pomodorough.localization import Strings
 from pomodorough.network import TokenStore
 from pomodorough.secure_store import PlatformSecretStore, SecureStoreError, is_infra_secure_store_error
 from test_secure_store import linux_secret_store
@@ -41,10 +42,16 @@ def run_child(root: Path, mode: str, *, prefix=(), environment=None) -> dict:
     return json.loads(result.stdout)
 
 
-def assert_failure(receipt: dict, detail: str) -> None:
+def window_sentence(key: str) -> str:
+    return Strings("en").text(key)
+
+
+def assert_failure(receipt: dict, detail: str, sentence_key: str) -> None:
     assert not receipt["ready"] and not receipt["authenticated"]
     assert detail in receipt["reason"] and "GNOME Keyring" in receipt["reason"]
-    assert len(receipt["failures"]) == 1 and detail in receipt["failures"][0]
+    # UX round 2 B3: the window shows the catalog sentence for the error
+    # type; the provider detail stays in the availability reason only.
+    assert receipt["failures"] == [window_sentence(sentence_key)]
     assert receipt["statuses"] == ["CONNECTING", "OFFLINE • RETRYING"]
     assert receipt["users"] == [] and not receipt["fallback_exists"]
     assert len(receipt["events"]) == 1
@@ -58,8 +65,9 @@ def test_fresh_missing_executable_reports_actionable_failure_once(tmp_path):
     environment = child_environment(tmp_path)
     environment["PATH"] = str(tmp_path / "empty-path")
     receipt = run_child(tmp_path, "missing", environment=environment)
-    assert_failure(receipt, "secret-tool was not found")
+    assert_failure(receipt, "secret-tool was not found", "failure.secret_tool_missing")
     assert "libsecret-tools" in receipt["reason"]
+    assert "libsecret-tools" in receipt["failures"][0]
     assert len(receipt["events"][0]["exception"]["values"]) == 1
     assert receipt["events"][0]["exception"]["values"][0]["type"] == "RuntimeError"
 
@@ -77,7 +85,7 @@ def test_missing_executable_retains_legacy_authority(tmp_path, mode):
     else:
         # Restore reads the retained token. Rotation still requires secure storage.
         assert len(receipt["failures"]) == 1 and len(receipt["events"]) == 1
-        assert "secret-tool was not found" in receipt["failures"][0]
+        assert receipt["failures"] == [window_sentence("failure.secret_tool_missing")]
     if os.name != "nt":
         assert (tmp_path / "session.json").stat().st_mode & 0o777 == 0o600
 
@@ -142,11 +150,14 @@ def isolated_bus(tmp_path: Path) -> list[str]:
 
 
 @pytest.mark.skipif(not NATIVE_TOOLS, reason="Native Linux Secret Service tooling required")
+@pytest.mark.isolated_secret_service
 @pytest.mark.parametrize("mode", ["provider", "signed-out", "legacy"])
 def test_real_provider_unavailable_controls(tmp_path, mode):
     receipt = run_child(tmp_path, mode, prefix=isolated_bus(tmp_path))
     if mode == "provider":
-        assert_failure(receipt, "org.freedesktop.secrets")
+        assert_failure(
+            receipt, "org.freedesktop.secrets", "failure.secret_service_unavailable"
+        )
         assert len(receipt["events"][0]["exception"]["values"]) == 1
         assert receipt["events"][0]["exception"]["values"][0]["type"] == "RuntimeError"
     else:
@@ -156,6 +167,7 @@ def test_real_provider_unavailable_controls(tmp_path, mode):
 
 
 @pytest.mark.skipif(not NATIVE_TOOLS, reason="Native Linux Secret Service tooling required")
+@pytest.mark.isolated_secret_service
 def test_real_unlocked_provider_secure_save_and_restart_restore(tmp_path):
     command = ["dbus-run-session", "--", "bash", "-euo", "pipefail", "-c",
                'eval "$(printf "\\n" | gnome-keyring-daemon --components=secrets --unlock)"; exec "$@"',
@@ -172,6 +184,7 @@ def test_real_unlocked_provider_secure_save_and_restart_restore(tmp_path):
 
 
 @pytest.mark.skipif(not NATIVE_TOOLS, reason="Native Linux Secret Service tooling required")
+@pytest.mark.isolated_secret_service
 def test_real_provider_failure_rejects_new_write_and_retains_legacy_file(tmp_path):
     script = (
         "from pathlib import Path; from pomodorough.network import TokenStore; "

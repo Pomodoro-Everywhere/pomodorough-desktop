@@ -396,14 +396,14 @@ def _validate_genesis_history(history: Any) -> None:
         _exact_keys(
             item,
             {"id", "timerId", "phase", "status", "plannedDurationMs"},
-            {"commandId", "taskId", "completedAt", "endedAt"},
+            {"commandId", "taskId", "completedAt", "endedAt", "elapsedMs"},
         )
         for key in ("id", "timerId", "commandId", "taskId"):
             if item.get(key) is not None and not valid_identifier(item[key]):
                 raise IrohProtocolError("Genesis history identity is invalid.")
         if any(
             key in item and item[key] is None
-            for key in ("commandId", "taskId", "completedAt", "endedAt")
+            for key in ("commandId", "taskId", "completedAt", "endedAt", "elapsedMs")
         ):
             raise IrohProtocolError("Genesis history is not canonical.")
     if len({item["id"] for item in history}) != len(history):

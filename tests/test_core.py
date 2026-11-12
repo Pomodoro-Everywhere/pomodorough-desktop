@@ -51,13 +51,22 @@ def command(
     return result
 
 
+def _held_elapsed_ms(
+    timer: dict | None, history: list[dict], timer_id: str = "timer-00000001"
+) -> int:
+    """Return the run time the matrix timer held before the action."""
+    if timer is not None and timer["id"] == timer_id:
+        return timer["elapsedAtAnchorMs"]
+    return next(item["elapsedMs"] for item in history if item["timerId"] == timer_id)
+
+
 class CoreTests(unittest.TestCase):
     def test_portable_canonical_convergence_fixture(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures" / "convergence-v1.json"
         fixture_bytes = fixture_path.read_bytes()
         self.assertEqual(
             hashlib.sha256(fixture_bytes).hexdigest(),
-            "51c357d8fd63e7200c1316ef36fc45821bea9ac2fbe11f255832fa21110ea104",
+            "60ee91bed591a89fb728e6d252cfc47a202ca87cac3adc7f4c4bfab3de7038f3",
         )
         fixture = json.loads(fixture_bytes)
         self.assertEqual(fixture["version"], 2)
@@ -234,6 +243,7 @@ class CoreTests(unittest.TestCase):
                         "status": item["status"],
                         "phase": item["phase"],
                         "durationMs": item["plannedDurationMs"],
+                        "elapsedMs": item.get("elapsedMs"),
                         "commandId": item.get("commandId"),
                         "endedMs": int(
                             (
@@ -385,7 +395,13 @@ class CoreTests(unittest.TestCase):
                             elif command_type == "resume":
                                 self.assertEqual(timer["elapsedAtAnchorMs"], 123_000)
                             elif command_type == "finish":
-                                self.assertEqual(timer["elapsedAtAnchorMs"], 1_500_000)
+                                # Core 0.55.0 finishes with the time already run.
+                                # No wall time passes between these commands, and
+                                # the observed 123_000 is ignored.
+                                self.assertEqual(
+                                    timer["elapsedAtAnchorMs"],
+                                    _held_elapsed_ms(setup_timer, setup_history),
+                                )
                             elif command_type == "cancel":
                                 self.assertEqual(timer["elapsedAtAnchorMs"], 123_000)
                         cases += 1
@@ -697,7 +713,9 @@ class CoreTests(unittest.TestCase):
         summaries = task_summaries_today(
             [task], history, datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
         )
-        self.assertEqual(summaries[task["id"]], {"finished": 1, "timeMs": 1_500_000})
+        # Both commands share one instant, so Core records a run of 0 ms.
+        self.assertEqual(history[0]["elapsedMs"], 0)
+        self.assertEqual(summaries[task["id"]], {"finished": 1, "timeMs": 0})
 
     def test_historical_finish_keeps_displaced_and_target_history(self) -> None:
         current, _ = reduce_command(None, [], command("start", timer_id="timer-a"))

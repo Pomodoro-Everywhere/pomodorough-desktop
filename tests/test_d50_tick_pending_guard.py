@@ -7,7 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from pomodorough.controller_outcomes import EmitNotice, Render
+from pomodorough.controller_outcomes import Render
+from notice_effects import notice_texts
 from pomodorough.sentry_monitoring import reset_clock_incident_budget
 from pomodorough.shared_core import SharedCoreError
 from pomodorough.timer_interaction_controller import (
@@ -69,6 +70,7 @@ def _harness(
         stop_sound_timer=Mock(),
         stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     return SimpleNamespace(
         store=store, controller=TimerInteractionController(ports),
@@ -76,7 +78,7 @@ def _harness(
 
 
 def _notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 class D50TickPendingGuardTests(unittest.TestCase):

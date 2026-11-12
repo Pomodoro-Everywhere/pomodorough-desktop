@@ -18,6 +18,7 @@ from test_network_account_lifecycle import _run_immediately
 from test_network_revocation import PlatformKeyring, token_response
 from test_secure_store import linux_secret_store
 
+from notice_effects import catalog_sentence
 from pomodorough.network import ApiError, CloudService, TokenStore
 from pomodorough.network_account import SignOutCleanupError
 from pomodorough.secure_store import PlatformSecretStore, SecureStoreError
@@ -288,7 +289,7 @@ def test_cleanup_retry_storage_failure_remains_explicit_and_recoverable(signout,
     with patch.object(cloud.token_store, method, side_effect=OSError("storage")):
         signout.retries.popleft()[1]()
     assert len(failures) == len(signout.retries) == 1
-    assert "will be retried" in failures[0]
+    assert failures[0] == catalog_sentence("failure.credential_cleanup_pending")
     assert_signed_out(cloud)
     signout.keyring.reject = lambda _command, _input: False
     signout.retries.popleft()[1]()

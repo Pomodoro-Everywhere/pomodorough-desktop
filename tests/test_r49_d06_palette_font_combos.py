@@ -82,6 +82,7 @@ def _root_block(sheet: str) -> str:
 def test_font_then_palette_preserves_new_scale(app, tmp_path):
     with _scaled_font(app, 9.0):
         with _main_window(app, tmp_path) as window:
+            before_ls = window.primary_button.fontMetrics().lineSpacing()
             scaled = QFont(QApplication.font())
             scaled.setPointSizeF(18.0)
             QApplication.setFont(scaled)
@@ -93,7 +94,10 @@ def test_font_then_palette_preserves_new_scale(app, tmp_path):
             _process(app, 6)
             try:
                 assert "font-size: 18.0pt" in _root_block(window.styleSheet())
-                assert 30 <= window.primary_button.fontMetrics().lineSpacing() <= 36
+                after_ls = window.primary_button.fontMetrics().lineSpacing()
+                # Platform fonts differ in absolute spacing; the doubled
+                # point size must survive the palette change.
+                assert 1.8 * before_ls <= after_ls <= 2.2 * before_ls
             finally:
                 QApplication.setPalette(QApplication.style().standardPalette())
                 _process(app)

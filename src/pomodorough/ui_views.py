@@ -5,15 +5,13 @@ import sqlite3
 import time
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
-    QButtonGroup,
     QComboBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
@@ -31,6 +29,19 @@ from PySide6.QtWidgets import (
 from .arrivals_screen import ArrivalsScreen
 from .core import format_remaining
 from .network_screen import PRIVACY_POLICY_URL as PRIVACY_POLICY_URL, NetworkScreen
+from .screen_navigation import ScreenNavigation as ScreenNavigation
+from .railway_palette import (
+    DANGER,
+    PLATFORM,
+    PLATFORM_DEEP,
+    PORCELAIN,
+    SIGNAL,
+    STEEL,
+    TICKET,
+    TRACK,
+    danger_text,
+    signal_accent,
+)
 from .secure_store import SecureStoreError, should_capture_secure_store_error
 from .sentry_monitoring import (
     capture_exception,
@@ -40,6 +51,8 @@ from .sentry_monitoring import (
     should_capture_room_read_failure,
 )
 from .shared_core import SharedCoreError
+from .task_undo_lifetime import TaskUndoLifetime
+from .tasks_page import TasksPage
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
 
@@ -56,92 +69,55 @@ def _app_font_scale() -> float:
     return 1.0
 
 
-class ScreenNavigation(QWidget):
-    screen_requested = Signal(int)
+class PageStack(QStackedWidget):
+    """Page area that gives way to the header in a short window.
 
-    # R52-D05: measured reflow cells. Buttons keep identity, group,
-    # and signals; only grid cells change, so focus and routing
-    # survive. QGridLayout mirrors columns under RTL by itself.
-    _NAV_CELLS = {
-        "row": ((0, 0), (0, 1), (0, 2), (0, 3)),
-        "grid": ((0, 0), (0, 1), (1, 0), (1, 1)),
-        "column": ((0, 0), (1, 0), (2, 0), (3, 0)),
-    }
+    A box layout takes the minimum of a height-for-width item from its
+    content and ignores the minimum set on the widget. Reporting no
+    height-for-width lets the header fit set how short the page may get.
+    """
 
-    def __init__(self, strings: Any, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.group = QButtonGroup(self)
-        self.group.setExclusive(True)
-        self.buttons: list[QPushButton] = []
-        self._nav_layout = QGridLayout(self)
-        self._nav_layout.setContentsMargins(0, 0, 0, 0)
-        self._nav_mode = "row"
-        destinations = (
-            ("timer", strings.text("nav.timer")),
-            ("tasks", strings.text("nav.tasks")),
-            ("arrivals", strings.text("nav.arrivals")),
-            ("network", strings.text("nav.network")),
-        )
-        for index, (destination, label) in enumerate(destinations):
-            button = self._button(strings, destination, label)
-            button.clicked.connect(
-                lambda checked=False, page=index: self.screen_requested.emit(page)
-            )
-            self.group.addButton(button)
-            self.buttons.append(button)
-        self._place_nav_buttons()
-        self.buttons[0].setChecked(True)
+    def hasHeightForWidth(self) -> bool:
+        return False
 
-    def _place_nav_buttons(self) -> None:
-        for button, cell in zip(self.buttons, self._NAV_CELLS[self._nav_mode]):
-            self._nav_layout.addWidget(button, *cell)
 
-    def set_nav_mode(self, mode: str) -> None:
-        if mode == self._nav_mode:
-            return
-        self._nav_mode = mode
-        self._place_nav_buttons()
-        self.updateGeometry()
+def _railway_stylesheet() -> str:
+    """Brand surfaces painted in fixed railway colors in both OS themes.
 
-    def measured_nav_needs(self) -> tuple[int, int, int]:
-        hints = [button.minimumSizeHint().width() for button in self.buttons]
-        margins = self._nav_layout.contentsMargins()
-        chrome = margins.left() + margins.right()
-        gap = self._nav_gap(horizontal=True)
-        need_row = sum(hints) + gap * (len(hints) - 1) + chrome
-        need_grid = max(hints[0], hints[2]) + max(hints[1], hints[3]) + gap + chrome
-        return need_row, need_grid, max(hints) + chrome
-
-    def _nav_gap(self, *, horizontal: bool) -> int:
-        raw = (
-            self._nav_layout.horizontalSpacing()
-            if horizontal
-            else self._nav_layout.verticalSpacing()
-        )
-        if raw >= 0:
-            return raw
-        try:
-            metric = (
-                QStyle.PixelMetric.PM_LayoutHorizontalSpacing
-                if horizontal
-                else QStyle.PixelMetric.PM_LayoutVerticalSpacing
-            )
-            return max(0, self.style().pixelMetric(metric))
-        except RuntimeError:
-            return 0
-
-    @staticmethod
-    def _button(strings: Any, destination: str, label: str) -> QPushButton:
-        button = QPushButton(label)
-        button.setAccessibleName(
-            strings.text(
-                "nav.show",
-                destination=strings.text(f"destination.{destination}"),
-            )
-        )
-        button.setCheckable(True)
-        button.setProperty("screen", True)
-        return button
+    Everything else stays on Qt palette roles so text and inputs follow
+    the system theme; only the station chrome is pinned.
+    """
+    return (
+        f"QWidget#headerBand {{ background: {PLATFORM}; }}\n"
+        "QScrollArea#navScroll, QScrollArea#navScroll > QWidget > QWidget { background: transparent; }\n"
+        f"QFrame#rule {{ color: {SIGNAL}; background: {SIGNAL}; }}\n"
+        # Qt paints a native bevel when background and border are both
+        # transparent, so the idle tab wears the band color as its border.
+        f'QPushButton[screen="true"] {{ background: {PLATFORM}; color: {PORCELAIN}; border: 2px solid {PLATFORM}; border-left: 4px solid {STEEL}; }}\n'
+        f'QPushButton[screen="true"]:hover {{ border-left-color: {TICKET}; }}\n'
+        f'QPushButton[screen="true"]:checked {{ background: {PLATFORM_DEEP}; color: {TICKET}; border-color: {PLATFORM_DEEP}; border-left-color: {SIGNAL}; }}\n'
+        f'QPushButton[screen="true"]:focus {{ border-color: {TICKET}; }}\n'
+        # The collapsed navigation names the current screen, so it wears
+        # the current-tab colors. An ID rule outranks the :focus rule above.
+        f"QPushButton#navigationMenuButton {{ background: {PLATFORM_DEEP}; color: {TICKET}; border-color: {PLATFORM_DEEP}; border-left-color: {SIGNAL}; }}\n"
+        f"QPushButton#navigationMenuButton:focus {{ border-color: {TICKET}; border-left-color: {SIGNAL}; }}\n"
+        f"QToolButton#settingsButton {{ background: transparent; color: {PORCELAIN}; border: 2px solid transparent; }}\n"
+        f"QToolButton#settingsButton:hover {{ border-color: {STEEL}; }}\n"
+        f"QToolButton#settingsButton:checked {{ background: {PLATFORM_DEEP}; color: {TICKET}; }}\n"
+        f"QToolButton#settingsButton:focus {{ border-color: {TICKET}; }}\n"
+        f"QPushButton#accountButton {{ background: transparent; color: {PORCELAIN}; border-color: {STEEL}; }}\n"
+        f"QPushButton#accountButton:hover {{ border-color: {TICKET}; }}\n"
+        f"QPushButton#accountButton:focus {{ border: 3px solid {TICKET}; }}\n"
+        f"QPushButton#primaryButton {{ background: {TICKET}; color: {TRACK}; border-color: {TRACK}; }}\n"
+        # ID rules outrank the generic :focus rule, so these two buttons
+        # name their own focus border. Coral is below 3:1 against DANGER.
+        "QPushButton#primaryButton:hover, QPushButton#primaryButton:focus { border-color: @signal; }\n"
+        "QPushButton#dangerButton:focus { border-color: palette(text); }\n"
+        # DSK-11: the label colour follows the palette (see danger_text). The
+        # border keeps DANGER so the focus ring still differs from it.
+        f"QPushButton#dangerButton {{ color: @danger; border-color: {DANGER}; }}\n"
+        f"QPushButton#dangerButton:hover {{ background: {DANGER}; color: {PORCELAIN}; }}\n"
+    )
 
 
 class MainWindowViewMixin:
@@ -160,22 +136,30 @@ class MainWindowViewMixin:
         self._apply_responsive_layout()
 
     def _build_header(self) -> None:
+        # The header is a platform-navy band: navigation, settings and the
+        # account action sit on it, and the signal rule closes it below.
+        band = QWidget()
+        band.setObjectName("headerBand")
+        band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._header_band = band
+        self._band_layout = QVBoxLayout(band)
+        self._band_layout.setContentsMargins(0, 0, 0, 0)
+        self._band_layout.setSpacing(0)
         header = QHBoxLayout()
+        header.setContentsMargins(14, 10, 14, 10)
         self._header_layout = header
         self.navigation = ScreenNavigation(self.strings, self)
         self.screen_group = self.navigation.group
         self.screen_buttons = self.navigation.buttons
-        # R52-D05: the nav group scrolls instead of overlapping when the
-        # measured stack still exceeds the header (short window, huge
-        # font). No frame, bars only on overflow; fitting modes are
-        # visually unchanged.
+        # R52-D05: a frameless wrapper keeps the navigation from overlapping
+        # the header actions. Since UX round 2 B1 the navigation collapses
+        # into its menu instead of overflowing, so the bars stay off.
         self._nav_scroll = QScrollArea()
         self._nav_scroll.setObjectName("navScroll")
         self._nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._nav_scroll.setWidgetResizable(True)
         # R52-D05: QScrollArea reports a fixed 88x88 minimum of its own.
-        # Height follows the header (same as the bare nav widget before);
-        # the viewport scrolls when the measured stack needs more.
+        # Height follows the header (same as the bare nav widget before).
         self._nav_scroll.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored
         )
@@ -189,7 +173,8 @@ class MainWindowViewMixin:
         header.addWidget(self._nav_scroll)
         header.addStretch()
         self._build_header_actions(header)
-        self.outer_layout.addLayout(header)
+        self._band_layout.addLayout(header)
+        self.outer_layout.addWidget(band)
 
     def _build_header_actions(self, header: QHBoxLayout) -> None:
         self.settings_button = QToolButton()
@@ -222,21 +207,21 @@ class MainWindowViewMixin:
         rule = QFrame()
         rule.setFrameShape(QFrame.Shape.HLine)
         rule.setObjectName("rule")
-        self.outer_layout.addWidget(rule)
+        self._band_layout.addWidget(rule)
 
     def _build_pages(self) -> None:
-        self.page_stack = QStackedWidget()
+        self.page_stack = PageStack()
         self.timer_screen = TimerScreen(self.strings, self.settings)
         self.tasks_screen = TasksScreen(self.strings)
-        self.tasks_page = QScrollArea()
-        self.tasks_page.setFrameShape(QFrame.Shape.NoFrame)
-        self.tasks_page.setWidgetResizable(True)
-        self.tasks_page.setWidget(self.tasks_screen)
+        self.tasks_page = TasksPage(self.tasks_screen)
         self.arrivals_screen = ArrivalsScreen(self.strings, self.store.device_id)
         self.network_screen = NetworkScreen(self.strings, self.replication_mode)
         for screen in self._screens():
             self.page_stack.addWidget(screen)
         self.outer_layout.addWidget(self.page_stack, 1)
+        self.task_undo_lifetime = TaskUndoLifetime(
+            self, self.page_stack, self.tasks_page
+        )
         self._expose_timer_seams()
         self._expose_tasks_seams()
         self._expose_arrivals_seams()
@@ -264,6 +249,7 @@ class MainWindowViewMixin:
             "finish_button",
             "cancel_button",
             "stop_sound_button",
+            "skip_button",
             "right_panel",
             "settings_scroll",
             "right_layout",
@@ -327,6 +313,7 @@ class MainWindowViewMixin:
         timer.primary_action_requested.connect(self._primary_action)
         timer.command_requested.connect(self._issue)
         timer.stop_sound_requested.connect(self._stop_sound)
+        timer.skip_requested.connect(self._skip_phase)
         timer.phase_selected.connect(self._select_phase)
         timer.duration_changed.connect(self._duration_changed)
         timer.task_selection_changed.connect(self._task_selection_changed)
@@ -334,6 +321,9 @@ class MainWindowViewMixin:
         tasks = self.tasks_screen
         tasks.add_task_requested.connect(self._add_task)
         tasks.delete_task_requested.connect(self._delete_task)
+        tasks.pending_delete_started.connect(self._record_pending_task_delete)
+        tasks.pending_delete_undone.connect(self._withdraw_pending_task_delete)
+        tasks.rename_task_requested.connect(self._rename_task)
         self._connect_network_signals()
 
     def _connect_network_signals(self) -> None:
@@ -448,21 +438,24 @@ class MainWindowViewMixin:
         return hint + chrome
 
     def _available_screen_width(self) -> int:
+        return self._available_screen_size().width()
+
+    @staticmethod
+    def _available_screen_size() -> QSize:
         try:
             screen = QApplication.primaryScreen()
+            if screen is None:
+                return QSize(0, 0)
+            return screen.availableGeometry().size()
         except RuntimeError:
-            return 0
-        if screen is None:
-            return 0
-        try:
-            return screen.availableGeometry().width()
-        except RuntimeError:
-            return 0
+            return QSize(0, 0)
 
     def _display_screen(self, index: int) -> None:
         self.page_stack.setCurrentIndex(index)
-        self.screen_buttons[index].setChecked(True)
+        self.navigation.select(index)
         self.settings_button.setVisible(index == 0)
+        # The settings action takes header width from the navigation.
+        self._schedule_nav_reflow()
         self._render()
         focus_targets = (
             self.primary_button,
@@ -489,10 +482,33 @@ class MainWindowViewMixin:
             12 if compact else 22,
         )
         self.outer_layout.setSpacing(8 if compact else 15)
+        # Compact windows keep the header band flush so the page below
+        # keeps the same height it had before the band existed.
+        self._header_layout.setContentsMargins(
+            12 if compact else 14,
+            0 if compact else 10,
+            12 if compact else 14,
+            0 if compact else 10,
+        )
         self.timer_screen.apply_responsive_layout(
             landscape=landscape,
             compact=compact,
         )
+
+    def _fit_default_width_to_navigation(self) -> None:
+        # DSK-01: platform fonts differ (macOS 13 pt, Fusion 9 pt), so no
+        # single default width fits the navigation everywhere. Open wide
+        # enough for the measured one-row navigation when the screen
+        # allows it. Polish first: the root style sheet sets the font the
+        # header inherits, and an unshown window has not applied it yet.
+        self.centralWidget().ensurePolished()
+        need_row, _need_menu = self.navigation.measured_nav_needs()
+        width = need_row + self._header_chrome_width()
+        available = self._available_screen_width()
+        if available > 0:
+            width = min(width, available)
+        if width > self.width():
+            self.resize(width, self.height())
 
     def _schedule_nav_reflow(self) -> None:
         # R52-D05: resize/change events run inside Qt event propagation,
@@ -508,72 +524,80 @@ class MainWindowViewMixin:
             timer.start()
 
     def _reflow_navigation(self) -> None:
+        # UX round 2 B1: the destinations either fit one row or collapse
+        # into the menu button. They never stack, so the header keeps its
+        # one-row height and the window minimum never grows for it.
         navigation = getattr(self, "navigation", None)
         if navigation is None:
             return
-        need_row, need_grid, _need_column = navigation.measured_nav_needs()
+        need_row, need_menu = navigation.measured_nav_needs()
         avail = self._header_nav_avail()
         if avail <= 0:
             return
         if avail >= need_row:
             navigation.set_nav_mode("row")
-        elif avail >= need_grid:
-            navigation.set_nav_mode("grid")
+            width = need_row
         else:
-            navigation.set_nav_mode("column")
-        self._sync_nav_scrollbars(navigation)
+            navigation.set_nav_mode("menu")
+            width = min(need_menu, avail)
+            navigation.fit_menu_label(width)
+        self._sync_nav_extent(navigation, width)
 
-    def _sync_nav_scrollbars(self, navigation: ScreenNavigation) -> None:
-        # R52-D05: the row fit is exact, so bars stay off and the base
-        # header keeps its height. Stacked modes scroll on demand for
-        # short windows or extreme fonts.
-        mode = navigation._nav_mode
+    def _sync_nav_extent(self, navigation: ScreenNavigation, width: int) -> None:
+        # DSK-01: QScrollArea caches the first size hint of its widget, so
+        # the measured width is pinned here; a later font change would
+        # otherwise leave a stale, clipping width. The pinned height keeps
+        # the one-row navigation whole when the header actions are shorter.
         scroll = getattr(self, "_nav_scroll", None)
         if scroll is None:
             return
-        stacked = mode != "row"
-        horizontal = (
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            if stacked
-            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        vertical = (
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            if stacked
-            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        if scroll.horizontalScrollBarPolicy() != horizontal:
-            scroll.setHorizontalScrollBarPolicy(horizontal)
-        if scroll.verticalScrollBarPolicy() != vertical:
-            scroll.setVerticalScrollBarPolicy(vertical)
-        size_policy = scroll.sizePolicy()
-        vertical_policy = (
-            QSizePolicy.Policy.Preferred
-            if stacked
-            else QSizePolicy.Policy.Ignored
-        )
-        if size_policy.verticalPolicy() != vertical_policy:
-            size_policy.setVerticalPolicy(vertical_policy)
-            scroll.setSizePolicy(size_policy)
+        scroll.setMinimumWidth(width)
+        scroll.setMinimumHeight(navigation.minimumSizeHint().height())
+        self._keep_header_whole(self.minimumHeight())
+
+    def _keep_header_whole(self, minimum_height: int) -> None:
+        # A layout short of room shrinks its tallest item first. That cuts
+        # the header and lets the page cover it. The page minimum is what
+        # the window minimum leaves below the header, so the page gives
+        # way instead and the header stays whole.
+        margins = self.outer_layout.contentsMargins()
+        chrome = margins.top() + margins.bottom() + self.outer_layout.spacing()
+        # Activate first: the nested header row still caches the height
+        # it had before the navigation minimum changed.
+        self._band_layout.activate()
+        header = self._header_band.minimumSizeHint().height()
+        self.page_stack.setMinimumHeight(max(0, minimum_height - chrome - header))
 
     def _header_nav_avail(self) -> int:
         central = self.centralWidget()
         if central is None or central.width() <= 0:
             return 0
+        return central.width() - self._header_chrome_width()
+
+    def _header_chrome_width(self) -> int:
+        """Header width spent on everything except the navigation."""
         margins = self.outer_layout.contentsMargins()
-        avail = central.width() - margins.left() - margins.right()
+        band = self._header_layout.contentsMargins()
+        chrome = margins.left() + margins.right() + band.left() + band.right()
         # Header holds nav scroll, stretch, settings, account: 3 gaps.
-        avail -= 3 * self._header_gap()
-        avail -= self._action_need(getattr(self, "settings_button", None))
-        avail -= self._action_need(getattr(self, "account_button", None))
-        return avail
+        chrome += 3 * self._header_gap()
+        chrome += self._action_need(getattr(self, "settings_button", None))
+        chrome += self._action_need(getattr(self, "account_button", None))
+        return chrome
 
     @staticmethod
     def _action_need(action: QWidget | None) -> int:
-        if action is None or not action.isVisible():
+        if action is None or action.isHidden():
             return 0
         try:
-            return max(action.width(), action.minimumSizeHint().width())
+            # The width the layout grants when nothing squeezes the action:
+            # its hint, raised to any explicit minimum. The laid-out width
+            # is not used: right after a font change it is still the old
+            # one, and the navigation would stay stacked without need.
+            return max(
+                action.sizeHint().expandedTo(action.minimumSize()).width(),
+                action.minimumSizeHint().width(),
+            )
         except RuntimeError:
             return 0
 
@@ -598,6 +622,7 @@ class MainWindowViewMixin:
             selected_phase=self._selected_phase(),
             mutations_enabled=not self._history_resolution_active,
             sound_active=self._sound_active,
+            skip_destination=self._skip_destination(state),
         )
         labels = self.timer_screen.status_labels()
         self._render_tray(state.status, state.remaining, labels)
@@ -642,6 +667,32 @@ class MainWindowViewMixin:
             return max(1, int(time.time() * 1000))
         except (OSError, ValueError, TypeError, OverflowError):
             return 1
+
+    def _skip_destination(self, state: TimerRenderState) -> str | None:
+        """Core-decided phase the idle skip button jumps to, or None."""
+        if state.active:
+            return None
+        phase = self._selected_phase()
+        now_ms = self._fallback_timer_now_ms()
+        # One Core dispatch per minute and history revision, not per tick.
+        memo_key = (phase, now_ms // 60_000, id(self.history), len(self.history))
+        memo = getattr(self, "_skip_destination_memo", None)
+        if memo is not None and memo[0] == memo_key:
+            return memo[1]
+        try:
+            destination = self.store.skip_destination(phase, self.history, now_ms)
+        except (ValueError, SharedCoreError) as error:
+            capture_exception(error)
+            destination = None
+        self._skip_destination_memo = (memo_key, destination)
+        return destination
+
+    def _skip_phase(self) -> None:
+        self._skip_destination_memo = None
+        destination = self._skip_destination(self._render_timer_state())
+        if destination is None:
+            return
+        self._select_phase(destination)
 
     def _preview_completed_phase(
         self, source_timer: dict[str, Any], now_ms: int
@@ -808,32 +859,40 @@ class MainWindowViewMixin:
         QWidget#root { background: palette(window); color: palette(window-text); font-family: "Noto Sans", "Segoe UI", sans-serif; font-size: 12px; }
         QLabel#brand { color: palette(window-text); font-family: "DejaVu Sans Condensed"; font-size: 24px; font-weight: 900; letter-spacing: 2px; }
         QLabel#tagline, QLabel#device { color: palette(window-text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 2px; }
-        QFrame#rule { color: palette(highlight); background: palette(highlight); max-height: 4px; min-height: 4px; border: 0; }
-        QFrame#ticket { background: palette(base); color: palette(text); border: 3px solid palette(highlight); }
+        QFrame#rule { max-height: 4px; min-height: 4px; border: 0; }
+        QFrame#ticket { background: palette(base); color: palette(text); border: 3px solid @steel; }
         QLabel#sectionTitle { color: palette(text); font-family: "DejaVu Sans Condensed"; font-size: 14px; font-weight: 900; letter-spacing: 1px; }
         QPushButton { min-height: 29px; background: palette(button); color: palette(text); border: 2px solid palette(text); padding: 3px 7px; font-weight: 800; }
-        QPushButton:hover { border-color: palette(highlight); }
+        QPushButton:hover { border-color: @steel; }
         QPushButton:pressed { padding-top: 5px; padding-left: 9px; }
-        QPushButton:focus { border: 3px solid palette(highlight); }
+        QPushButton:focus { border: 3px solid @signal; }
         QPushButton:disabled { color: palette(window-text); border-color: palette(dark); background: palette(midlight); }
         QPushButton#primaryButton:disabled { color: palette(window-text); border-color: palette(dark); background: palette(midlight); }
-        QPushButton#primaryButton { background: palette(highlight); color: palette(highlighted-text); min-height: 36px; font-size: 14px; }
-        QPushButton#accountButton { border-color: palette(highlight); min-width: 72px; max-width: 150px; }
+        QPushButton#dangerButton:disabled { color: palette(window-text); border-color: palette(dark); background: palette(midlight); }
+        QPushButton#primaryButton { min-height: 36px; font-size: 14px; }
+        QPushButton#accountButton { min-width: 72px; max-width: 150px; }
         QPushButton#accountButton[authenticated="true"] { min-width: 36px; max-width: 36px; min-height: 36px; max-height: 36px; padding: 0; }
         QPushButton[screen="true"] { min-width: 64px; font-family: "DejaVu Sans Condensed"; letter-spacing: 1px; }
-        QPushButton[screen="true"]:checked { background: palette(highlight); color: palette(highlighted-text); border-bottom: 5px solid palette(highlighted-text); }
         QToolButton#settingsButton { font-size: 24px; }
         QLabel#microLabel { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QLabel#taskSubtitle { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QComboBox, QLineEdit, QPlainTextEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 6px; }
-        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid palette(highlight); }
+        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid @signal; }
+        QCheckBox::indicator { border: 2px solid palette(text); background: palette(base); }
+        QCheckBox::indicator:checked { background: @signal; background-clip: content; padding: 2px; }
+        QCheckBox::indicator:disabled { border-color: palette(dark); }
+        QCheckBox::indicator:checked:disabled { background: palette(dark); }
         QStatusBar { background: palette(window); color: palette(window-text); }
         """
+        sheet += _railway_stylesheet()
         sheet = (
             sheet.replace("font-size: 12px", f"font-size: {9.0 * scale:.1f}pt")
             .replace("font-size: 24px", f"font-size: {18.0 * scale:.1f}pt")
             .replace("font-size: 14px", f"font-size: {10.5 * scale:.1f}pt")
             .replace("font-size: 9px", f"font-size: {6.75 * scale:.1f}pt")
+            .replace("@steel", STEEL)
+            .replace("@signal", signal_accent(QApplication.palette()))
+            .replace("@danger", danger_text(QApplication.palette()))
         )
         # R52-D04: scale each pixel dimension once. Chained str.replace
         # calls re-scaled values just created (36px->72px, then 72px->144px).

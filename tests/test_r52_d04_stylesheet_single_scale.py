@@ -114,8 +114,22 @@ def _tasks_window(app, tmp_path, locale):
             entered.__exit__(None, None, None)
 
 
+def _scroll_into_view(window, widget) -> None:
+    """Scroll the Tasks page until widget shows whole, as a reader scrolls to it.
+
+    A header stacked by long labels or a large font leaves the page short, so
+    the button can start below the fold at the default window size.
+    """
+    page = window.tasks_page
+    page.ensureWidgetVisible(widget, 0, 0)
+    _process(QApplication.instance())
+    shown = QRect(widget.mapTo(page.viewport(), QPoint(0, 0)), widget.size())
+    assert page.viewport().rect().contains(shown), shown
+
+
 def _button_table_state(window):
     button = window.add_task_button
+    _scroll_into_view(window, button)
     table = window.task_table
     button_rect = QRect(button.mapTo(window, QPoint(0, 0)), button.size())
     table_rect = QRect(table.mapTo(window, QPoint(0, 0)), table.size())

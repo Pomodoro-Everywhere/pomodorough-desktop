@@ -3,8 +3,10 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QInputDialog
 
+from pomodorough.account_resolution_controller import AccountResolutionController
 from pomodorough.network_session import ApiError
 from pomodorough.storage import Store
 from test_r52_d01_reset_fence import (
@@ -103,6 +105,23 @@ def test_definitive_http_denial_preserves_workspace(app, tmp_path):
         assert store.get_meta("accountDeletionCleanup") is None
 
 
+@contextmanager
+def _hold_deletion_retry():
+    """Hold only deletion recovery; preserve startup restore and focus delivery."""
+    armed = []
+    real_single_shot = QTimer.singleShot
+    retry = AccountResolutionController._retry_deletion_callback
+
+    def single_shot(*timer):
+        if getattr(timer[-1], "__func__", None) is retry:
+            armed.append(timer)
+        else:
+            real_single_shot(*timer)
+
+    with patch.object(QTimer, "singleShot", single_shot):
+        yield armed
+
+
 def test_reopen_without_credentials_recovers_pending_scrub(app, tmp_path):
     with workspace(app, tmp_path) as (store, tokens, cloud, window, notices):
         def request(*args, **kwargs):
@@ -112,17 +131,24 @@ def test_reopen_without_credentials_recovers_pending_scrub(app, tmp_path):
         delete(cloud, window, request)
         assert tokens.load() is None
         assert store.get_meta("accountDeletionCleanup") is not None
-    with fixture_environment(tmp_path), _quiet(), _blocked_workers():
+    with (
+        fixture_environment(tmp_path), _quiet(), _blocked_workers(),
+        # Hold the startup retry: on a loaded machine its one-second timer can
+        # fire inside _window() and finish the scrub before the first assert.
+        _hold_deletion_retry() as armed,
+    ):
         vault = FileVault(tmp_path)
         store = Store(tmp_path / "state.sqlite3", iroh_secret_store=vault)
         from pomodorough.network import CloudService, TokenStore
         tokens = TokenStore(store.device_id, vault, tmp_path / "session.json")
         cloud = CloudService(store.device_id, token_store=tokens)
         window, _, _ = _window(app, store, cloud)
+        retry = window.account_resolution._retry_deletion_callback
         try:
             assert window._mutation_blocked()
             assert window.tasks == []
-            window.account_resolution._retry_deletion_callback()
+            assert [timer for timer in armed if timer[1] == retry] == [(1000, retry)]
+            retry()
             _process(app)
             assert store.get_meta("accountDeletionCleanup") is None
             assert store.load()["snapshot"]["user"] is None

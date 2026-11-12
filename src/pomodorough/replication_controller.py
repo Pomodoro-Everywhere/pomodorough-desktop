@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .controller_outcomes import (
     ControllerOutcome,
+    EmitFailure,
     EmitNotice,
     LoadState,
     Render,
@@ -20,6 +21,7 @@ from .controller_outcomes import (
     done,
     returning,
 )
+from .failure_notice import describe_failure
 from .iroh_protocol import IrohProtocolError, parse_invite, room_id_for_secret
 from .sentry_monitoring import capture_exception
 from .shared_core import SharedCoreError
@@ -105,6 +107,7 @@ class ReplicationController:
         if self.mode == "centralized":
             context.cloud.restore()
             return done()
+        context.cloud.cancel_restore()
         if self.mode != "iroh":
             return done(RenderNetwork())
         room_id = context.store.active_iroh_room_id
@@ -114,10 +117,13 @@ class ReplicationController:
                 context.strings.text("network.iroh_saved_unavailable")
             )
             return done()
-        available, reason = context.iroh.availability()
+        available, _reason = context.iroh.availability()
         if not available:
             self.iroh_status = context.strings.text("network.unavailable")
-            return done(ShowStatus(reason), RenderNetwork())
+            return done(
+                ShowStatus(context.strings.text("network.iroh_not_packaged")),
+                RenderNetwork(),
+            )
         context.iroh.start_room(room_id)
         return done()
 
@@ -136,6 +142,8 @@ class ReplicationController:
         elif mode == self.mode:
             return done()
         if not self._replication_transition_ready_value(mode):
+            if cancelled_join:
+                self._resume_route_after_cancelled_join()
             return done()
         context = self._context()
         try:
@@ -143,17 +151,29 @@ class ReplicationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
-            self._ports.set_replication_mode(self.mode)
-            effects = (LoadState(), Render()) if cancelled_join else ()
-            return done(EmitNotice(str(error)), *effects)
+            return self._mode_persist_failed(error, cancelled_join=cancelled_join)
         except ValueError as error:
-            self._ports.set_replication_mode(self.mode)
-            effects = (LoadState(), Render()) if cancelled_join else ()
-            return done(EmitNotice(str(error)), *effects)
+            return self._mode_persist_failed(error, cancelled_join=cancelled_join)
         previous = self.mode
         self.mode = mode
         self._activate_replication_mode_value(previous, mode)
         return done(LoadState(), Render())
+
+    def _mode_persist_failed(
+        self, error: Exception, *, cancelled_join: bool
+    ) -> ControllerOutcome[None]:
+        self._ports.set_replication_mode(self.mode)
+        if not cancelled_join:
+            return done(EmitFailure(error))
+        self._resume_route_after_cancelled_join()
+        return done(EmitFailure(error), LoadState(), Render())
+
+    def _resume_route_after_cancelled_join(self) -> None:
+        # Join start retired the cloud route. A cancellation that cannot
+        # complete its transition leaves the controller centralized, so the
+        # route must resume or the revision stream never restarts.
+        if self.mode == "centralized":
+            self._context().cloud.resume_restore()
 
     def replication_transition_ready(self, mode: str) -> ControllerOutcome[bool]:
         return returning(self._replication_transition_ready_value(mode))
@@ -189,10 +209,12 @@ class ReplicationController:
                 done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
             )
             return False
-        available, reason = context.iroh.availability()
+        available, _reason = context.iroh.availability()
         if not available:
             self._ports.set_replication_mode(self.mode)
-            self._ports.apply_outcome(done(EmitNotice(reason)))
+            self._ports.apply_outcome(
+                done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
+            )
             return False
         if context.store.active_iroh_room_id is not None:
             return True
@@ -203,11 +225,11 @@ class ReplicationController:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
             self._ports.set_replication_mode(self.mode)
-            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            self._ports.apply_outcome(done(EmitFailure(error)))
             return False
         except ValueError as error:
             self._ports.set_replication_mode(self.mode)
-            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            self._ports.apply_outcome(done(EmitFailure(error)))
             return False
         self._ports.set_replication_mode(self.mode)
         self._ports.show_screen(3, False)
@@ -247,18 +269,19 @@ class ReplicationController:
 
     def _activate_replication_mode_value(self, previous: str, mode: str) -> None:
         context = self._context()
+        if mode != "centralized":
+            self.cloud_restore_after_iroh_stop = False
+            context.cloud.cancel_restore()
         if previous == "iroh" and context.iroh is not None:
+            # Centralized restores after Iroh reports NOT CONNECTED.
             self.cloud_restore_after_iroh_stop = mode == "centralized"
             context.iroh.stop()
-        if mode == "centralized" and previous != "iroh":
-            context.cloud.restore()
-        elif mode == "iroh" and context.iroh is not None:
-            context.cloud.stop_revision_stream()
+        elif mode == "centralized":
+            context.cloud.resume_restore()
+        if mode == "iroh" and context.iroh is not None:
             room_id = context.store.active_iroh_room_id
             if room_id:
                 context.iroh.start_room(room_id)
-        else:
-            context.cloud.stop_revision_stream()
 
     @_workspace_transition
     def create_iroh_room(
@@ -269,9 +292,9 @@ class ReplicationController:
             return done(EmitNotice(context.strings.text("network.wait_join")))
         if context.iroh is None:
             return done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
-        available, reason = context.iroh.availability()
+        available, _reason = context.iroh.availability()
         if not available:
-            return done(EmitNotice(reason))
+            return done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
         if self.mode == "centralized" and context.cloud.busy:
             return done(EmitNotice(context.strings.text("network.wait_cloud_open")))
         name = (
@@ -284,11 +307,15 @@ class ReplicationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
-            return done(EmitNotice(str(error)))
+            return done(
+                EmitFailure(error, lambda: self.create_iroh_room(requested_name))
+            )
         except ValueError as error:
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         self.mode = "iroh"
-        context.cloud.stop_revision_stream()
+        # A late NOT CONNECTED from the room stopped for Cloud must not restore it now.
+        self.cloud_restore_after_iroh_stop = False
+        context.cloud.cancel_restore()
         self._ports.set_replication_mode(self.mode)
         self._ports.apply_outcome(done(LoadState(), Render()))
         context.iroh.start_room(room_id, emit_invite=True)
@@ -301,9 +328,9 @@ class ReplicationController:
         context = self._context()
         if context.iroh is None:
             return done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
-        available, reason = context.iroh.availability()
+        available, _reason = context.iroh.availability()
         if not available:
-            return done(EmitNotice(reason))
+            return done(EmitNotice(context.strings.text("network.iroh_not_packaged")))
         if self.mode == "centralized" and context.cloud.busy:
             return done(EmitNotice(context.strings.text("network.wait_cloud_join")))
         try:
@@ -326,15 +353,17 @@ class ReplicationController:
             # D41: infra failure reports to Sentry, still notice-only for user.
             # IrohProtocolError subclasses ValueError and stays validation-only.
             capture_exception(error)
-            return done(EmitNotice(str(error)))
-        except (IrohProtocolError, ValueError) as error:
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
+        except (IrohProtocolError, ValueError):
+            # The invite text is the user's own input; name what to change.
+            return done(EmitNotice(context.strings.text("network.iroh_invite_invalid")))
         return self._start_iroh_join(invite)
 
     def _start_iroh_join(self, invite: Any) -> ControllerOutcome[None]:
         context = self._context()
         self.iroh_status = context.strings.text("network.status.joining_room")
         self.iroh_join_pending = True
+        self.cloud_restore_after_iroh_stop = False
         self._joining_room_id = invite.room_id
         self._join_generation += 1
         generation = self._join_generation
@@ -343,7 +372,7 @@ class ReplicationController:
             and not self._context().closed
         )
         try:
-            context.cloud.stop_revision_stream()
+            context.cloud.cancel_restore()
             self._ports.apply_outcome(done(RenderNetwork()))
             context.iroh.join_room(invite)
         except Exception as error:
@@ -354,7 +383,7 @@ class ReplicationController:
             self._cancel_iroh_join()
             if self.mode == "centralized":
                 context.cloud.restore()
-            return self.iroh_failure(str(error))
+            return self.iroh_failure(describe_failure(context.strings, error).sentence)
         return done()
 
     def _cancel_iroh_join(self) -> None:
@@ -379,11 +408,9 @@ class ReplicationController:
             except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry, still notice-only.
                 capture_exception(error)
-                self._ports.set_replication_mode(self.mode)
-                return done(EmitNotice(str(error)), LoadState(), Render())
+                return self._mode_persist_failed(error, cancelled_join=True)
             except ValueError as error:
-                self._ports.set_replication_mode(self.mode)
-                return done(EmitNotice(str(error)), LoadState(), Render())
+                return self._mode_persist_failed(error, cancelled_join=True)
             self.mode = "offline"
             self._ports.set_replication_mode(self.mode)
             return done(LoadState(), Render())
@@ -401,9 +428,9 @@ class ReplicationController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D41: infra failure reports to Sentry, still notice-only for user.
             capture_exception(error)
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except ValueError as error:
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         if context.iroh is not None:
             context.iroh.stop()
         self.mode = "offline"
@@ -425,9 +452,9 @@ class ReplicationController:
             except (OSError, sqlite3.Error, SharedCoreError) as error:
                 # D41: infra failure reports to Sentry, still notice-only.
                 capture_exception(error)
-                return done(EmitNotice(str(error)))
+                return done(EmitFailure(error, self.sync_iroh_now))
             except ValueError as error:
-                return done(EmitNotice(str(error)))
+                return done(EmitFailure(error))
             context.iroh.sync_now()
         return done()
 
@@ -450,10 +477,10 @@ class ReplicationController:
                 and getattr(context.iroh, "join_outcome", None) != "joined"):
             self._cancel_iroh_join()
             if self.mode == "centralized":
-                context.cloud.restore()
+                context.cloud.resume_restore()
         if status == "NOT CONNECTED" and self.cloud_restore_after_iroh_stop:
             self.cloud_restore_after_iroh_stop = False
-            context.cloud.restore()
+            context.cloud.resume_restore()
         return done(RenderNetwork())
 
     def iroh_details_changed(self, details: dict[str, Any]) -> ControllerOutcome[None]:
@@ -503,5 +530,5 @@ class ReplicationController:
         self._join_generation += 1
         self._ports.apply_outcome(done(ShowStatus(message, 15_000)))
         if join_failed and context.store.replication_mode == "centralized":
-            context.cloud.restore()
+            context.cloud.resume_restore()
         return done(RenderNetwork())

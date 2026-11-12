@@ -14,6 +14,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from .credential_cleanup_errors import (
+    AccountDeletedCleanupPendingError,
+    CredentialCleanupRetryError,
+)
 from .network_session import ApiError, Request, SessionState, Text, TokenStorePort
 from .secure_store import (
     SecureStoreError,
@@ -541,11 +545,11 @@ class AccountLifecycle:
             try:
                 resolved = self._resolve_deletion_cleanup_locked(cleanup)
             except (OSError, subprocess.SubprocessError):
-                raise TokenCleanupPendingError(
+                raise AccountDeletedCleanupPendingError(
                     "Remote account deleted. Local credential cleanup will be retried."
                 ) from None
             if not resolved:
-                raise TokenCleanupPendingError(
+                raise AccountDeletedCleanupPendingError(
                     "Remote account deleted. Local credential cleanup will be retried."
                 )
 
@@ -693,7 +697,7 @@ class AccountLifecycle:
             try:
                 self.token_store.clear_if_signed_out()
             except (OSError, subprocess.SubprocessError):
-                raise SecureStoreError(
+                raise CredentialCleanupRetryError(
                     "Signed out locally. Secure credential cleanup failed and will be retried."
                 ) from None
 
@@ -705,13 +709,13 @@ class AccountLifecycle:
         try:
             cleanup = self._resolve_pending_deletion_cleanup()
         except TokenCleanupPendingError:
-            raise SecureStoreError(
+            raise CredentialCleanupRetryError(
                 "Account deletion credential cleanup failed and will be retried."
             ) from None
         except SecureStoreError:
             raise
         except (OSError, subprocess.SubprocessError):
-            raise SecureStoreError(
+            raise CredentialCleanupRetryError(
                 "Account deletion credential cleanup failed and will be retried."
             ) from None
         if cleanup is not None:

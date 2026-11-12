@@ -1,10 +1,11 @@
 """R52-D05: nav buttons reflow without overlap/clip in narrow windows.
 
 Qt 6.x verified; layout-only like R51-D03 (no WASM envelopes here).
-Narrow windows with enlarged fonts stack the measured nav group
-(row -> 2x2 grid -> column, preserving buttons, group, and signals)
-and a frameless scroll area absorbs what the window cannot grant.
-Focus and routing survive every transition, including RTL.
+Narrow windows with enlarged fonts used to stack the measured nav group
+(row -> 2x2 grid -> column). UX round 2 B1 replaced the stacking: a row
+that does not fit collapses into one menu button, preserving buttons,
+group, and signals. Focus and routing survive every transition,
+including RTL.
 """
 
 from __future__ import annotations
@@ -78,11 +79,19 @@ def _main_window(app: QApplication, tmp_path: Path, locale: str, width: int, hei
         store.close()
 
 
+def _shown_nav_controls(window: MainWindow) -> list:
+    """The row buttons, or the one menu button once the row collapsed."""
+    navigation = window.navigation
+    if navigation._nav_mode == "menu":
+        return [navigation.menu_button]
+    return list(navigation.buttons)
+
+
 def _assert_nav_reachable(window: MainWindow) -> None:
     scroll = window._nav_scroll
     viewport = scroll.viewport().rect()
     origin = window.navigation.geometry().topLeft()
-    for button in window.navigation.buttons:
+    for button in _shown_nav_controls(window):
         shown = QRect(button.geometry()).translated(origin)
         if not viewport.contains(shown):
             if shown.left() < 0 or shown.right() > viewport.width():
@@ -92,8 +101,15 @@ def _assert_nav_reachable(window: MainWindow) -> None:
 
 
 def _assert_nav_intact(window: MainWindow) -> None:
-    buttons = window.navigation.buttons
-    assert len(buttons) == 4
+    navigation = window.navigation
+    assert len(navigation.buttons) == 4
+    if navigation._nav_mode == "menu":
+        # B1: the collapsed navigation offers all four screens in its menu.
+        assert all(button.isHidden() for button in navigation.buttons)
+        assert [action.text() for action in navigation.destination_actions] == [
+            button.text() for button in navigation.buttons
+        ]
+    buttons = _shown_nav_controls(window)
     for button in buttons:
         assert button.width() + 1 >= button.minimumSizeHint().width()
         # Checked screen buttons carry a 5px bottom border instead of 2px,
@@ -129,13 +145,13 @@ _R52_D05_WIN32_SKIP = pytest.mark.skipif(
 _CASES = [
     pytest.param("en", 9.0, 640, 360, "row", marks=_R52_D05_WIN32_SKIP),
     ("en", 9.0, 480, 360, None),
-    pytest.param("en", 18.0, 640, 360, "grid", marks=_R52_D05_WIN32_SKIP),
-    pytest.param("en", 18.0, 480, 360, "grid", marks=_R52_D05_WIN32_SKIP),
+    pytest.param("en", 18.0, 640, 360, "menu", marks=_R52_D05_WIN32_SKIP),
+    pytest.param("en", 18.0, 480, 360, "menu", marks=_R52_D05_WIN32_SKIP),
     ("en", 18.0, 1200, 800, "row"),
     ("ar-XB", 9.0, 640, 360, None),
     pytest.param("ar-XB", 9.0, 1200, 800, "row", marks=_R52_D05_WIN32_SKIP),
     ("ar-XB", 18.0, 640, 360, None),
-    pytest.param("ar-XB", 18.0, 480, 360, "column", marks=_R52_D05_WIN32_SKIP),
+    pytest.param("ar-XB", 18.0, 480, 360, "menu", marks=_R52_D05_WIN32_SKIP),
     pytest.param("ar-XB", 18.0, 1200, 800, "row", marks=_R52_D05_WIN32_SKIP),
 ]
 
@@ -148,7 +164,7 @@ def test_modes_and_geometry_intact(app, tmp_path, locale, point_size, width, hei
             if mode is not None:
                 assert _nav_mode(window) == mode
             else:
-                assert _nav_mode(window) in ("row", "grid", "column")
+                assert _nav_mode(window) in ("row", "menu")
             assert not window._nav_reflow_timer.isActive()
 
 
@@ -184,32 +200,37 @@ def test_focus_and_routing_survive_stacked_reflow(app, tmp_path, locale, point_s
     with _scaled_font(app, point_size):
         with _main_window(app, tmp_path, locale, 640, 360) as window:
             _assert_nav_intact(window)
-            assert _nav_mode(window) in ("grid", "column")
-            buttons = window.navigation.buttons
-            for index, button in enumerate(buttons):
-                button.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            assert _nav_mode(window) == "menu"
+            navigation = window.navigation
+            buttons = navigation.buttons
+            menu_button = navigation.menu_button
+            for index in range(len(buttons)):
+                menu_button.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 _process(app)
-                assert QApplication.focusWidget() is button
+                assert QApplication.focusWidget() is menu_button
                 window._reflow_navigation()
                 _process(app)
-                assert QApplication.focusWidget() is button
+                assert QApplication.focusWidget() is menu_button
                 _assert_nav_intact(window)
             delivered: list[int] = []
-            window.navigation.screen_requested.connect(delivered.append)
+            navigation.screen_requested.connect(delivered.append)
             try:
-                for index, button in enumerate(buttons):
-                    button.click()
+                for index, action in enumerate(navigation.destination_actions):
+                    # Triggering the action is what choosing it in the open
+                    # menu does; the menu itself is not run modally here.
+                    action.trigger()
                     _process(app)
                     assert delivered[-1] == index
                     assert window.page_stack.currentIndex() == index
-                    assert button.isChecked()
+                    assert buttons[index].isChecked()
+                    assert action.isChecked()
                     assert sum(b.isChecked() for b in buttons) == 1
                     _assert_nav_intact(window)
             finally:
-                window.navigation.screen_requested.disconnect(delivered.append)
+                navigation.screen_requested.disconnect(delivered.append)
             for index in range(4):
                 # Shortcuts ignore text editing (D75); focus leaves the page.
-                buttons[index].setFocus(Qt.FocusReason.ShortcutFocusReason)
+                menu_button.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 _process(app)
                 window._shortcut_show_screen(index)
                 _process(app)
@@ -222,7 +243,7 @@ def test_focus_and_routing_survive_stacked_reflow(app, tmp_path, locale, point_s
 def test_widen_restores_row_and_shrink_keeps_intact(app, tmp_path):
     with _scaled_font(app, 18.0):
         with _main_window(app, tmp_path, "ar-XB", 480, 360) as window:
-            assert _nav_mode(window) == "column"
+            assert _nav_mode(window) == "menu"
             _assert_nav_intact(window)
             before = "\n".join(window.store.connection.iterdump())
             window.resize(1200, 800)

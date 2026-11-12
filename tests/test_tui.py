@@ -115,6 +115,12 @@ class TuiTests(unittest.TestCase):
                     "taskTitle": "Unassigned",
                     "plannedDurationMs": 60_000,
                 },
+                {
+                    "phase": "long_break",
+                    "status": "completed",
+                    "taskTitle": "Rest",
+                    "plannedDurationMs": 900_000,
+                },
             ],
             80,
             "Cannot pause now",
@@ -129,8 +135,9 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Cannot pause now", rendered)
         self.assertIn("c dismiss", rendered)
         self.assertIn("Focus: Ship release", rendered)
-        self.assertIn("Cancelled | 2 min *", rendered)
-        self.assertIn("Short Break: Unassigned | Superseded | 1 min", rendered)
+        self.assertIn("Cancelled | planned 2 min *", rendered)
+        self.assertIn("Short Break: Unassigned | Superseded | planned 1 min", rendered)
+        self.assertIn("Long Break: Rest | Completed | 15 min", rendered)
 
     def test_build_lines_hides_task_during_breaks(self) -> None:
         for phase in ("short_break", "long_break"):

@@ -34,6 +34,12 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtNetwork import QNetworkReply
 
 from . import __version__
+from .cloud_request_errors import (
+    ServiceUnreachableError,
+    SignInRejectedError,
+    UnsupportedSignInPlatformError,
+)
+from .failure_notice import describe_failure
 from .localization import Strings
 from .network_account import (
     AccountLifecycle,
@@ -115,7 +121,7 @@ def _desktop_oauth_platform(platform: str) -> str:
     try:
         return supported[platform]
     except KeyError as error:
-        raise ApiError(
+        raise UnsupportedSignInPlatformError(
             f"{os.strerror(errno.ENOTSUP)}: {platform!r}",
             document={
                 "platform": platform,
@@ -224,7 +230,7 @@ def _request(
     except _ResponseBodyTooLarge as error:
         raise ApiError(_text("network.error.invalid_response")) from error
     except (urllib.error.URLError, TimeoutError) as error:
-        raise ApiError(
+        raise ServiceUnreachableError(
             _text(
                 "network.error.unreachable",
                 error=error.reason if hasattr(error, "reason") else error,
@@ -1264,13 +1270,12 @@ class DesktopOAuthContract:
         if not hmac.compare_digest(callback.get("state", ""), expected_state):
             raise ApiError(_text("network.error.invalid_state"))
         code = callback.get("code", "").strip()
-        if not code:
-            raise ApiError(
-                callback.get("error_description")
-                or callback.get("error")
-                or _text("network.error.sign_in_cancelled")
-            )
-        return code
+        if code:
+            return code
+        provider_reply = callback.get("error_description") or callback.get("error")
+        if provider_reply:
+            raise SignInRejectedError(provider_reply)
+        raise ApiError(_text("network.error.sign_in_cancelled"))
 
     @staticmethod
     def token_payload(
@@ -1366,6 +1371,10 @@ def _report_cloud_credential(operation: str, error: Exception) -> bool:
     return capture_cloud_credential(operation, cause)
 
 
+class _RestoreRefreshRejected(ApiError):
+    """A restore refresh got 401; the session already cleared stored credentials."""
+
+
 class CloudService(QObject):
     status_changed = Signal(str)
     signed_in = Signal(object)
@@ -1451,8 +1460,8 @@ class CloudService(QObject):
         self._oauth_browser = oauth_browser or SystemOAuthBrowserTransport()
         self._token_urlsafe = token_urlsafe
         self._prepare_sign_out: Callable[[], bool] | None = None
-        self._restore_attempt = 0
-        self._restore_epoch = 0
+        self._restore_attempt = self._restore_epoch = 0
+        self._restore_enabled = True
         self._configure_sign_out_cleanup()
 
     # Compatibility methods remain patchable, but resolve the current collaborator
@@ -1531,7 +1540,7 @@ class CloudService(QObject):
             lambda error: (
                 on_error(error)
                 if on_error is not None
-                else self.failure.emit(str(error))
+                else self.failure.emit(describe_failure(self.strings, error).sentence)
             )
             if generation == self._state.account_generation
             else None
@@ -1556,23 +1565,39 @@ class CloudService(QObject):
             self.sync(payload)
 
     def restore(self) -> None:
+        self._restore_enabled = True
         self._restore_epoch += 1
         self._restore_attempt = 0
         self._restore_session(is_retry=False)
 
+    def cancel_restore(self) -> None:
+        """Retire cloud route work without retiring the saved account credentials."""
+        self._restore_enabled = False
+        self._restore_epoch += 1
+        self._restore_attempt = 0
+        self.stop_revision_stream()
+
+    def resume_restore(self) -> None:
+        """Re-enter the cloud route after it was retired or a departure failed."""
+        if not self._state.busy:
+            self.restore()
+            return
+        # Defer like a retained retry so a busy worker, such as an OAuth login,
+        # does not race this restore for the stored credentials.
+        self._restore_enabled = True
+        self._restore_epoch += 1
+        self._restore_attempt = 0
+        self._retry_restore(
+            self._state.account_generation, self.api_base, self._restore_epoch
+        )
+
     def _restore_session(self, *, is_retry: bool) -> None:
+        epoch = self._restore_epoch
         self.status_changed.emit(self.strings.text("cloud.status.connecting"))
 
-        def restore_session() -> dict[str, Any] | None:
-            self._accounts.require_authentication_ready()
-            if not self.token_store.load():
-                return None
-            token = self._ensure_access()
-            return self._request(
-                "GET", f"{self.api_base}/api/v1/me", access_token=token
-            )["user"]
-
         def restored(user: dict[str, Any] | None) -> None:
+            if epoch != self._restore_epoch:
+                return
             self._restore_attempt = 0
             if user:
                 note_cloud_credential_recovery()
@@ -1584,6 +1609,13 @@ class CloudService(QObject):
                 self.status_changed.emit(self.strings.text("cloud.status.sign_in"))
 
         def failed(error: Exception) -> None:
+            # A rejected refresh already cleared this account generation's
+            # stored credentials, so its expiry must reach the UI even after
+            # the route departed. Other stale results stay fenced.
+            if epoch != self._restore_epoch and not isinstance(
+                error, _RestoreRefreshRejected
+            ):
+                return
             if isinstance(error, ApiError) and error.status == 401:
                 self._restore_attempt = 0
                 self._expire_session()
@@ -1593,10 +1625,31 @@ class CloudService(QObject):
             self._state.authenticated = False
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))
             if not is_retry:
-                self.failure.emit(str(error))
+                self.failure.emit(describe_failure(self.strings, error).sentence)
             self._schedule_restore_retry()
 
-        self._start(restore_session, restored, failed)
+        self._start(lambda: self._restore_user(epoch), restored, failed)
+
+    def _restore_user(self, epoch: int) -> dict[str, Any] | None:
+        if epoch != self._restore_epoch:
+            return None
+        self._accounts.require_authentication_ready()
+        if not self.token_store.load():
+            return None
+        token = self._restore_access()
+        if epoch != self._restore_epoch:
+            return None
+        return self._request(
+            "GET", f"{self.api_base}/api/v1/me", access_token=token
+        )["user"]
+
+    def _restore_access(self) -> str:
+        try:
+            return self._ensure_access()
+        except ApiError as error:
+            if error.status != 401:
+                raise
+            raise _RestoreRefreshRejected(str(error), 401, error.document) from error
 
     def _schedule_restore_retry(self) -> None:
         if self._state.shutting_down or self._state.sign_out_pending:
@@ -1619,6 +1672,7 @@ class CloudService(QObject):
             or self._state.sign_out_pending
             or self._state.deleting_account
             or self._state.authenticated
+            or not self._restore_enabled
             or epoch != self._restore_epoch
             or generation != self._state.account_generation
             or api_base != self.api_base
@@ -1640,7 +1694,7 @@ class CloudService(QObject):
         except SecureStoreError as error:
             _report_cloud_credential("login", error)
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
             return
         self.status_changed.emit(self.strings.text("cloud.status.waiting_google"))
 
@@ -1654,7 +1708,7 @@ class CloudService(QObject):
         def failed(error: Exception) -> None:
             _report_cloud_credential("login", error)
             self.status_changed.emit(self.strings.text("cloud.status.sign_in_failed"))
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
 
         with self._state.lock:
             generation = self._state.account_generation
@@ -1783,7 +1837,7 @@ class CloudService(QObject):
                 return
             _report_cloud_credential("sync", error)
             self.status_changed.emit(self.strings.text("cloud.status.offline_retrying"))
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
 
         self._start(synchronize, synchronized, failed)
 
@@ -1806,7 +1860,7 @@ class CloudService(QObject):
                 return
             _report_cloud_credential("preview_bootstrap", error)
             self.status_changed.emit(self.strings.text("cloud.status.history_preserved"))
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
 
         self._start(preview, ready, failed)
 
@@ -1836,13 +1890,14 @@ class CloudService(QObject):
                 return
             _report_cloud_credential("resolve_bootstrap", error)
             self.status_changed.emit(self.strings.text("cloud.status.history_preserved"))
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
 
         self._start(resolve, resolved, failed)
 
     def start_revision_stream(self) -> None:
         if (
-            self._state.shutting_down
+            not self._restore_enabled
+            or self._state.shutting_down
             or self._state.sign_out_pending
             or not self._state.authenticated
             or not self._state.access_token
@@ -1853,7 +1908,7 @@ class CloudService(QObject):
             self._accounts.require_authentication_ready()
         except SecureStoreError as error:
             _report_cloud_credential("revision_stream", error)
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
             return
         self._revisions.start(
             self._state.access_token,
@@ -1934,11 +1989,11 @@ class CloudService(QObject):
                 1000, lambda generation=error.generation: self._retry_sign_out_cleanup(generation)
             )
             self._publish_sign_out(error.credentials)
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
             raise
         except (OSError, subprocess.SubprocessError):
             message = "Sign out could not be persisted. Session retained; retry sign out."
-            self.failure.emit(message)
+            self.failure.emit(self.strings.text("failure.sign_out_not_persisted"))
             raise SecureStoreError(message) from None
         self._publish_sign_out(credentials)
 
@@ -1969,7 +2024,7 @@ class CloudService(QObject):
         try:
             self._accounts.retry_sign_out_cleanup(generation)
         except SecureStoreError as error:
-            self.failure.emit(str(error))
+            self.failure.emit(describe_failure(self.strings, error).sentence)
             attempt = min(attempt + 1, 6)
             QTimer.singleShot(
                 min(30_000, 1000 * 2 ** (attempt - 1)),
@@ -2006,7 +2061,7 @@ class CloudService(QObject):
         if not self._accounts.fail_deletion(credentials):
             return
         self.status_changed.emit(self.strings.text("cloud.status.sync_ready"))
-        self.account_deletion_failed.emit(str(error))
+        self.account_deletion_failed.emit(describe_failure(self.strings, error).sentence)
         self.start_revision_stream()
 
     def _start_revocation(

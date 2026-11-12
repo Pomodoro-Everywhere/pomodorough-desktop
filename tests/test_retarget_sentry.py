@@ -9,7 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from pomodorough.controller_outcomes import EmitNotice, Render
+from pomodorough.controller_outcomes import Render
+from notice_effects import notice_texts
 from pomodorough.core import task_from_title
 from pomodorough.storage import Store
 from pomodorough.terminal import LocalTimer
@@ -21,11 +22,7 @@ from pomodorough.timer_interaction_controller import (
 
 
 def _notices(outcome) -> list[str]:
-    return [
-        effect.message
-        for effect in outcome.effects
-        if isinstance(effect, EmitNotice)
-    ]
+    return notice_texts(outcome.effects)
 
 INFRA_ERRORS = [OSError("infra boom"), sqlite3.Error("db boom")]
 VALIDATION_ERRORS = [ValueError("bad value"), KeyError("bad key")]
@@ -249,6 +246,7 @@ def _harness() -> TimerInteractionController:
         stop_sound_timer=Mock(),
         stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     controller = TimerInteractionController(ports)
     controller._test_store = store  # type: ignore[attr-defined]

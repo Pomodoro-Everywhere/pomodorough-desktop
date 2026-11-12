@@ -7,7 +7,7 @@ import pytest
 from test_iroh_storage import CommitFailingConnection, MemorySecretStore
 from test_replication_controller import ControllerHarness, FakeIroh
 
-from pomodorough.controller_outcomes import EmitNotice, LoadState, Render, ShowStatus
+from pomodorough.controller_outcomes import EmitFailure, LoadState, Render, ShowStatus
 from pomodorough.core import task_from_title
 from pomodorough.iroh_protocol import room_id_for_secret
 from pomodorough.storage import Store
@@ -84,10 +84,11 @@ def assert_failed_activation(harness, before, outcome):
     effects = list(outcome.effects)
     effects.extend(effect for applied in harness.applied for effect in applied.effects)
     assert len(effects) == 1
-    assert isinstance(effects[0], EmitNotice)
+    # R2-B3: the failure carries the error; the window words it by type.
+    assert isinstance(effects[0], EmitFailure)
     assert harness.screens == []
     assert not harness.store.connection.in_transaction
-    return effects[0].message
+    return str(effects[0].error)
 
 
 @pytest.mark.parametrize("origin", ["offline", "centralized"])

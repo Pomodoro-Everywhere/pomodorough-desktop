@@ -12,7 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from pomodorough.cli import main
-from pomodorough.controller_outcomes import EmitNotice
+from pomodorough.sentry_monitoring import reset_pending_break_read_incident_budget
+from notice_effects import notice_texts
 from pomodorough.storage import Store
 from pomodorough.timer_interaction_controller import (
     TimerInteractionContext,
@@ -22,7 +23,7 @@ from pomodorough.timer_interaction_controller import (
 
 
 def _notices(outcome) -> list[str]:
-    return [e.message for e in outcome.effects if isinstance(e, EmitNotice)]
+    return notice_texts(outcome.effects)
 
 
 class CliCaptureSplitTests(unittest.TestCase):
@@ -98,6 +99,7 @@ def _timer_harness() -> SimpleNamespace:
         refresh_duration_spins=Mock(), refresh_auto_breaks=Mock(),
         stop_sound_timer=Mock(), stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     return SimpleNamespace(
         store=store, controller=TimerInteractionController(ports),
@@ -105,6 +107,11 @@ def _timer_harness() -> SimpleNamespace:
 
 
 class SchedulePendingGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # An earlier test in the same process may leave the same failure
+        # signature inside its report interval, which then skips the capture.
+        reset_pending_break_read_incident_budget()
+
     def test_infra_captures_with_notice(self) -> None:
         harness = _timer_harness()
         harness.store.has_pending_auto_break.side_effect = sqlite3.Error("db")

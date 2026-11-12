@@ -175,6 +175,10 @@ def test_mainwindow_1x_metrics_wrap_scroll(app, tmp_path):
                 screen._scroll.verticalScrollBar().maximum()
             )
             _process(app)
+            # Account & Privacy is the page's last row; details sit above it.
+            assert not screen.delete_account_button.visibleRegion().isEmpty()
+            screen._scroll.ensureWidgetVisible(screen.network_details)
+            _process(app)
             assert not screen.network_details.visibleRegion().isEmpty()
 
 
@@ -213,6 +217,10 @@ def test_mainwindow_2x_grows_and_scrolls(app, tmp_path):
             screen._scroll.verticalScrollBar().setValue(
                 screen._scroll.verticalScrollBar().maximum()
             )
+            _process(app)
+            # Account & Privacy is the page's last row; details sit above it.
+            assert not screen.delete_account_button.visibleRegion().isEmpty()
+            screen._scroll.ensureWidgetVisible(screen.network_details)
             _process(app)
             assert not screen.network_details.visibleRegion().isEmpty()
 

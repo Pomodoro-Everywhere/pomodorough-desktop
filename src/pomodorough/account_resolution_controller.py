@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox, QWidget
 from .controller_outcomes import (
     ActivatePersistedResolution,
     ControllerOutcome,
+    EmitFailure,
     EmitNotice,
     LoadState,
     MaybeAutoStartBreak,
@@ -23,6 +24,7 @@ from .controller_outcomes import (
     done,
     returning,
 )
+from .pending_task_deletion import unfinished_task_deletion_count
 from .sentry_monitoring import capture_exception
 from .secure_store import SecureStoreError
 from .shared_core import SharedCoreError
@@ -97,7 +99,7 @@ class AccountResolutionController:
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
             self._enter_corrupted_resolution_value(context.user, str(error))
-            return returning(True, EmitNotice(str(error)))
+            return returning(True, EmitFailure(error))
         except ValueError as error:
             # validation stays silent
             self._enter_corrupted_resolution_value(context.user, str(error))
@@ -158,11 +160,11 @@ class AccountResolutionController:
             except (OSError, sqlite3.Error, SharedCoreError) as error:
                 capture_exception(error)
                 self.resolution_retry_paused = True
-                return done(EmitNotice(str(error)))
+                return done(EmitFailure(error))
             except ValueError as error:
                 # validation stays silent
                 self.resolution_retry_paused = True
-                return done(EmitNotice(str(error)))
+                return done(EmitFailure(error))
             if pending is None:
                 self.resolution_phase = "preview"
             else:
@@ -192,13 +194,13 @@ class AccountResolutionController:
             self.resolution_phase = "preview"
             self.resolution_preview = None
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
             # validation stays silent
             self.resolution_phase = "preview"
             self.resolution_preview = None
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         self.resolution_preview = response
         strategy = plan["strategy"]
         if strategy is None:
@@ -216,11 +218,11 @@ class AccountResolutionController:
             # D53: infra failure reports to Sentry, still pause+notice.
             capture_exception(error)
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
             # validation stays silent
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         self.resolution_phase = "resolve"
         return self.continue_history_resolution()
 
@@ -298,11 +300,11 @@ class AccountResolutionController:
             # D53: infra failure reports to Sentry, still pause+notice.
             capture_exception(error)
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
             # validation stays silent
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         self._clear_history_resolution_value()
         self._ports.apply_outcome(
             done(
@@ -316,10 +318,10 @@ class AccountResolutionController:
             has_pending = context.store.has_sendable_sync_operations()
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
-            return self._sendable_fallback_value(context, notices, str(error))
+            return self._sendable_fallback_value(context, notices, error)
         except ValueError as error:
             # validation stays silent
-            return self._sendable_fallback_value(context, notices, str(error))
+            return self._sendable_fallback_value(context, notices, error)
         effects: list[Any] = [SetAccountState(not has_pending)]
         if has_pending:
             effects.append(Synchronize())
@@ -337,9 +339,9 @@ class AccountResolutionController:
         )
 
     def _sendable_fallback_value(
-        self, context: AccountResolutionContext, notices: list[str], message: str
+        self, context: AccountResolutionContext, notices: list[str], error: Exception
     ) -> ControllerOutcome[None]:
-        effects: list[Any] = [SetAccountState(False), EmitNotice(message)]
+        effects: list[Any] = [SetAccountState(False), EmitFailure(error)]
         if notices:
             effects.append(self._history_conflict_notice_value(context, notices))
         return done(*effects)
@@ -360,11 +362,11 @@ class AccountResolutionController:
             # pause+notice so the Qt slot never raises and retry stays held.
             capture_exception(error)
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         except (KeyError, TypeError, ValueError) as error:
             # validation stays silent
             self.resolution_retry_paused = True
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         if not discarded:
             self.resolution_retry_paused = True
             return done(EmitNotice(context.strings.text("resolution.discard_failed")))
@@ -372,11 +374,11 @@ class AccountResolutionController:
         self.resolution_preview = None
         self.resolution_request_id = None
         self.resolution_retry_paused = False
-        message = details.get("message") if isinstance(details, dict) else None
+        # ``details`` holds the server's own text; the status bar shows ours.
         self._ports.apply_outcome(
             done(
                 ShowStatus(
-                    (message or context.strings.text("resolution.changed"))
+                    context.strings.text("resolution.changed")
                     + context.strings.text("resolution.refreshing"),
                     10_000,
                 )
@@ -455,7 +457,7 @@ class AccountResolutionController:
         self.resolution_corruption = str(error)
         self._begin_history_resolution_value(context.user or user, None, paused=True)
         self._ports.clear_sync_request()
-        return done(Render(), SetAccountState(False), EmitNotice(str(error)))
+        return done(Render(), SetAccountState(False), EmitFailure(error))
 
     def quarantine_account_switch(
         self,
@@ -490,10 +492,10 @@ class AccountResolutionController:
                 context.store.reset_account_data()
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             capture_exception(error)
-            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            self._ports.apply_outcome(done(EmitFailure(error)))
             return False
         except (ValueError, KeyError, TypeError) as error:
-            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            self._ports.apply_outcome(done(EmitFailure(error)))
             return False
         self._sign_out_phase = "credentials"
         self._ports.apply_outcome(done(LoadState(), Render()))
@@ -504,7 +506,7 @@ class AccountResolutionController:
             self._context().cloud.logout()
         except SecureStoreError as error:
             # CloudService already classified and published credential failures.
-            return done(EmitNotice(str(error)))
+            return done(EmitFailure(error))
         return done()
 
     def signed_out(self) -> ControllerOutcome[None]:
@@ -646,7 +648,7 @@ class AccountResolutionController:
             self._context().store.set_meta("accountDeletionCleanup", {"version": 1})
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             self._deletion_phase("prepare_failed")
-            self._ports.apply_outcome(done(EmitNotice(str(error))))
+            self._ports.apply_outcome(done(EmitFailure(error)))
             return False
         self._fence_deletion()
         self._deletion_phase("prepared")
@@ -685,7 +687,7 @@ class AccountResolutionController:
         except (OSError, sqlite3.Error, SharedCoreError, SecureStoreError, ValueError) as error:
             self._deletion_phase("scrub_pending")
             self._schedule_deletion_retry()
-            return done(LoadState(), Render(), EmitNotice(str(error)))
+            return done(LoadState(), Render(), EmitFailure(error))
         self.deletion_pending = False
         self._clear_history_resolution_value()
         self._deletion_phase("denied" if self._deletion_denied else "complete")
@@ -707,13 +709,16 @@ class AccountResolutionController:
                     "pendingSelectedTasks",
                 )
             )
+            # M1: a task delete still waiting for its completion is lost
+            # with the workspace too.
+            queued += unfinished_task_deletion_count(context.store)
         except (OSError, sqlite3.Error, SharedCoreError) as error:
             # D05: queue-count read guarded; infra reports once, no logout.
             capture_exception(error)
-            return None, done(EmitNotice(str(error)))
+            return None, done(EmitFailure(error))
         except (ValueError, KeyError, TypeError) as error:
             # validation stays silent
-            return None, done(EmitNotice(str(error)))
+            return None, done(EmitFailure(error))
         return queued, None
 
     def account_action(self) -> ControllerOutcome[None]:

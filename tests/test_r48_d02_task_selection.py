@@ -13,7 +13,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-from pomodorough.controller_outcomes import EmitNotice, LoadState, Render, Synchronize
+from pomodorough.controller_outcomes import (
+    EmitFailure,
+    EmitNotice,
+    EmitTaskFailure,
+    LoadState,
+    Render,
+    Synchronize,
+)
 from pomodorough.core import task_from_title
 from pomodorough.shared_core import SharedCore
 from pomodorough.storage import Store
@@ -70,6 +77,7 @@ def _harness(store: Store, title_override: str | None = None):
         refresh_duration_spins=Mock(), refresh_auto_breaks=Mock(),
         stop_sound_timer=Mock(), stop_completion_sound=Mock(),
         set_stop_sound_control=Mock(),
+        complete_pending_task_delete=lambda: None,
     )
     return SimpleNamespace(store=store, ctx=ctx, ports=ports, controller=TimerInteractionController(ports))
 
@@ -161,9 +169,11 @@ def _fail_add(harness, boundary: str, title: str):
         outcome = harness.controller.add_task(title)
     cap.assert_called_once()
     assert isinstance(cap.call_args.args[0], sqlite3.Error)
-    assert [e.message for e in outcome.effects if isinstance(e, EmitNotice)] == [
-        str(cap.call_args.args[0])
+    # UX round 2 A2: the window words the failure; the error text stays internal.
+    assert [e.error for e in outcome.effects if isinstance(e, EmitTaskFailure)] == [
+        cap.call_args.args[0]
     ]
+    assert not any(isinstance(e, (EmitNotice, EmitFailure)) for e in outcome.effects)
     assert not any(isinstance(e, (LoadState, Render, Synchronize)) for e in outcome.effects)
     assert not store.connection.in_transaction
     _assert_snapshot_equal(store, before)
@@ -181,9 +191,11 @@ def _fail_delete_selected(harness, boundary: str, task_id: str):
         outcome = harness.controller.delete_task(task_id)
     cap.assert_called_once()
     assert isinstance(cap.call_args.args[0], sqlite3.Error)
-    assert [e.message for e in outcome.effects if isinstance(e, EmitNotice)] == [
-        str(cap.call_args.args[0])
+    # UX round 2 A2: the window words the failure; the error text stays internal.
+    assert [e.error for e in outcome.effects if isinstance(e, EmitTaskFailure)] == [
+        cap.call_args.args[0]
     ]
+    assert not any(isinstance(e, (EmitNotice, EmitFailure)) for e in outcome.effects)
     assert not any(isinstance(e, (LoadState, Render, Synchronize)) for e in outcome.effects)
     assert not store.connection.in_transaction
     _assert_snapshot_equal(store, before)

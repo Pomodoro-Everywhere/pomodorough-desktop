@@ -13,8 +13,8 @@ from typing import Any, Final, Protocol, Self
 
 from wasmtime import Engine, Func, Instance, Memory, Module, Store, WasmtimeError
 
-CORE_COMMIT: Final = "0f52a27aa24941bf873bda65612f2c9ede43825f"
-CORE_SHA256: Final = "1e72c2bbc178b077fdcc98210f06f66f4bc5332b77be5de83be19792376f4bd4"
+CORE_COMMIT: Final = "f3ab43a348d4e17bb32b61b8325664351e2ed70e"
+CORE_SHA256: Final = "f57b411f47ef614e78ebb1ed4aea9ae58e0f1156b385c25222ee5c006837ebfd"
 WASM_RESOURCE: Final = "pomodorough_core.wasm"
 
 _MAX_OPERATION_BYTES: Final = 256
@@ -667,6 +667,13 @@ def _validated_timer(value: object) -> dict[str, Any] | None:
     return timer
 
 
+def _history_elapsed(value: object, planned: int, label: str) -> int:
+    elapsed = _integer(value, label)
+    if not 0 <= elapsed <= planned:
+        raise _projection_error(f"{label} is outside the planned duration")
+    return elapsed
+
+
 def _validated_history(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise _projection_error("history is not an array")
@@ -677,7 +684,7 @@ def _validated_history(value: object) -> list[dict[str, Any]]:
         item = _exact_object(
             raw_item,
             {"id", "timerId", "phase", "status", "plannedDurationMs"},
-            optional={"taskId", "commandId", "completedAt", "endedAt"},
+            optional={"taskId", "commandId", "completedAt", "endedAt", "elapsedMs"},
             label=label,
         )
         item_id = _nonempty_string(item["id"], f"{label}.id")
@@ -688,7 +695,9 @@ def _validated_history(value: object) -> list[dict[str, Any]]:
         timer_ids.add(timer_id)
         if item["phase"] not in _PHASES or item["status"] not in _TERMINAL_STATUSES:
             raise _projection_error(f"{label} phase or status is invalid")
-        _duration(item["plannedDurationMs"], f"{label}.plannedDurationMs")
+        planned = _duration(item["plannedDurationMs"], f"{label}.plannedDurationMs")
+        if "elapsedMs" in item:
+            _history_elapsed(item["elapsedMs"], planned, f"{label}.elapsedMs")
         for key in ("taskId", "commandId"):
             if key in item:
                 _nonempty_string(item[key], f"{label}.{key}")

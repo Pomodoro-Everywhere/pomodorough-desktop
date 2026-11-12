@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt
 from test_iroh_storage import CommitFailingConnection, MemorySecretStore
 from test_replication_controller import ControllerHarness, FakeIroh
 
-from pomodorough.controller_outcomes import EmitNotice, LoadState, Render
+from pomodorough.controller_outcomes import EmitFailure, EmitNotice, LoadState, Render
 from pomodorough.core import task_from_title
 from pomodorough.iroh_network import EndpointKeyStore, IrohService
 from pomodorough.iroh_protocol import RoomInvite, room_id_for_secret
@@ -608,7 +608,7 @@ async def cancellation_failure_scenario(rig, monkeypatch, completed, action):
     assert not rig.controller.iroh_join_pending
     assert not rig.controller._transition_busy
     assert rig.controller.mode == rig.store.replication_mode
-    assert tuple(type(effect) for effect in outcome.effects) == (EmitNotice, LoadState, Render)
+    assert tuple(type(effect) for effect in outcome.effects) == (EmitFailure, LoadState, Render)
     rig.controller.replication_mode_changed("offline")
     assert rig.store._workspace_storage.capture() == original
 

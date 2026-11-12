@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
+import time
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 
 from .core import parse_timestamp_ms
@@ -240,24 +241,65 @@ class CanonicalReconciliationHooks(Protocol):
     ) -> None: ...
 
 
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 def generated_break_day_bounds(source_ms: int) -> tuple[str, str]:
-    source_day = (
-        datetime.fromtimestamp(source_ms / 1000, UTC)
-        .astimezone()
-        .replace(hour=0, minute=0, second=0, microsecond=0)
+    # R54-D11: the local day runs from the first instant of its local date to
+    # the first instant of the next date. Each bound uses the zone offset in
+    # force at its own midnight, so a daylight-saving change day is 23 or 25
+    # hours long. Android atStartOfDay(zone) and Apple dateInterval(of: .day)
+    # give the same bounds.
+    local_date = datetime.fromtimestamp(source_ms / 1000, UTC).astimezone().date()
+    day_start = _local_day_start(local_date)
+    day_end = _local_day_start(local_date + timedelta(days=1))
+    return _utc_wire(day_start), _utc_wire(day_end)
+
+
+def _local_day_start(local_date: date) -> datetime:
+    # Midnight on the wall clock, read as UTC, lies within a day of the real
+    # midnight, and its offset gives a first guess. The offset at that guess
+    # and the offset a day before it cover a rule change on either side of
+    # midnight. A midnight inside a gap starts the day at the transition,
+    # where the pre-gap offset lands. A repeated midnight takes its earlier
+    # pass, which is the smallest candidate.
+    wall_midnight = datetime(
+        local_date.year, local_date.month, local_date.day, tzinfo=UTC
     )
-    start = (
-        source_day.astimezone(UTC)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
+    first_guess = wall_midnight - _local_offset(wall_midnight)
+    offsets = {
+        _local_offset(first_guess),
+        _local_offset(first_guess - timedelta(days=1)),
+    }
+    candidate = min(
+        candidate
+        for candidate in (wall_midnight - offset for offset in offsets)
+        if (candidate + _local_offset(candidate)).date() >= local_date
     )
-    end = (
-        (source_day + timedelta(days=1))
-        .astimezone(UTC)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
-    return start, end
+    if candidate + _local_offset(candidate) == wall_midnight:
+        return candidate
+    # A forward jump can cross midnight rather than begin at midnight.
+    # Find the first instant of the date inside the enclosing offset interval.
+    lower = candidate - timedelta(days=2)
+    upper = candidate
+    while (upper - lower).total_seconds() > 1:
+        middle = lower + timedelta(seconds=int((upper - lower).total_seconds() // 2))
+        if (middle + _local_offset(middle)).date() >= local_date:
+            upper = middle
+        else:
+            lower = middle
+    return upper
+
+
+def _local_offset(instant: datetime) -> timedelta:
+    # Windows localtime rejects instants before the Unix epoch, so the epoch
+    # offset stands in for them. No timer history reaches back that far.
+    seconds = max(instant, _UNIX_EPOCH).timestamp()
+    return timedelta(seconds=time.localtime(seconds).tm_gmtoff)
+
+
+def _utc_wire(instant: datetime) -> str:
+    return instant.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def core_canonical_timer(timer: Any) -> dict[str, Any] | None:
@@ -289,7 +331,7 @@ def core_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
             key: item[key]
             for key in ("id", "timerId", "phase", "status", "plannedDurationMs")
         }
-        for key in ("taskId", "commandId", "completedAt", "endedAt"):
+        for key in ("taskId", "commandId", "completedAt", "endedAt", "elapsedMs"):
             if item.get(key) is not None:
                 core_item[key] = item[key]
         normalized.append(core_item)

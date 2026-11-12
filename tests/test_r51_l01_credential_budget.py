@@ -22,6 +22,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from notice_effects import failure_sentence
 from pomodorough import sentry_monitoring as monitoring
 from pomodorough.network import ApiError, CloudService, TokenStore
 from pomodorough.secure_store import SecureStoreError
@@ -370,7 +371,7 @@ def test_expected_restore_errors_stay_silent(cloud) -> None:
             if isinstance(error, ApiError) and error.status == 401:
                 assert failures == []
             else:
-                assert failures == [str(error)]
+                assert failures == [failure_sentence(error)]
     capture.assert_not_called()
 
 

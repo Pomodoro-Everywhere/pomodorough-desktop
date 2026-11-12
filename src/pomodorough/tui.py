@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from wcwidth import SequenceTextWrapper, iter_graphemes, wcwidth, wcswidth
 
+from .arrival_minutes_wording import arrival_minutes
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
@@ -170,16 +171,17 @@ def _history_lines(
             phase = strings.text(
                 "tui.phase_task", phase=phase, task=item["taskTitle"]
             )
-        status = strings.text(
-            f"arrivals.status.{item.get('status', 'completed')}"
-        )
-        minutes = int(item.get("plannedDurationMs", 0)) // 60_000
+        wording = arrival_minutes(item)
         lines.append(
             strings.text(
-                "tui.history_row",
+                (
+                    "tui.history_row_planned"
+                    if wording.reads_as_planned
+                    else "tui.history_row"
+                ),
                 phase=phase,
-                status=status,
-                minutes=minutes,
+                status=strings.text(wording.status_key),
+                minutes=wording.minutes,
                 pending=(strings.text("tui.pending_mark") if item.get("pending") else ""),
             )
         )
