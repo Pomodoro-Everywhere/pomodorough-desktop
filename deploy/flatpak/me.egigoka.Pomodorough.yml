@@ -77,13 +77,13 @@ modules:
         only-arches:
           - aarch64
       - type: file
-        url: https://files.pythonhosted.org/packages/a2/92/e144fcf578fc394678c24b042efe45f3b0614acdb87ea95d8b839b208842/wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl
-        sha256: 58544d539053dff7bd4cf30c40d7a540862d683013c0dfa6ba46a063f5b682f7
+        url: https://files.pythonhosted.org/packages/d5/9d/97c109d4a25c716c4045644398d7e684e1d4fa5ec6c99412b5cba35a9a98/wasmtime-50.0.1-py3-none-manylinux1_x86_64.whl
+        sha256: cc14c3a17654e0394e0225b11813532ef0cd7bd1e222a0c5494cdedaabeddac4
         only-arches:
           - x86_64
       - type: file
-        url: https://files.pythonhosted.org/packages/1c/c3/a957b226979daaeb09ec024562e9aac05e475a954537e6f150eb60bca84d/wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl
-        sha256: 26fce3613fefbe29a28e9d659dca3326e800593858e5758cad086eb802b3b766
+        url: https://files.pythonhosted.org/packages/8e/c4/58709b73e613e5366e4783537e2a861272d95f500c43fddf9b378d98415a/wasmtime-50.0.1-py3-none-manylinux2014_aarch64.whl
+        sha256: 675484e525c028dc02762b777f1db4477ea70caa3fec6775426daff4d64edfb1
         only-arches:
           - aarch64
       - type: file

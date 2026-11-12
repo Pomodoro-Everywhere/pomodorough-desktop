@@ -109,7 +109,7 @@ class SharedCoreTests(unittest.TestCase):
         cls.core = SharedCore()
 
     def test_core_version_through_wasm_abi(self) -> None:
-        self.assertEqual(version("wasmtime"), "48.0.0")
+        self.assertEqual(version("wasmtime"), "50.0.1")
         self.assertEqual(
             self.core.dispatch("core.version", {}),
             {"schemaVersion": 1, "coreVersion": "0.56.0"},

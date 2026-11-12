@@ -362,19 +362,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
         flake = FLAKE.read_text(encoding="utf-8")
 
         self.assertIn(
-            "wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl", flatpak
+            "wasmtime-50.0.1-py3-none-manylinux1_x86_64.whl", flatpak
         )
         self.assertIn(
-            "wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flatpak
+            "wasmtime-50.0.1-py3-none-manylinux2014_aarch64.whl", flatpak
         )
         self.assertIn('resource "wasmtime" do', homebrew)
         self.assertIn(
             "wasmtime.stage { venv.pip_install Pathname.pwd/wasmtime.downloader.basename",
             homebrew,
         )
-        self.assertIn('version = "48.0.0";', flake)
-        self.assertIn("wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl", flake)
-        self.assertIn("wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl", flake)
+        self.assertIn('version = "50.0.1";', flake)
+        self.assertIn("wasmtime-50.0.1-py3-none-manylinux1_x86_64.whl", flake)
+        self.assertIn("wasmtime-50.0.1-py3-none-manylinux2014_aarch64.whl", flake)
 
     def test_draft_is_verified_exactly_before_publication(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

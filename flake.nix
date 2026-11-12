@@ -14,17 +14,17 @@
           pkgs = import nixpkgs { inherit system; };
           wasmtimeWheel =
             if system == "x86_64-linux" then {
-              url = "https://files.pythonhosted.org/packages/a2/92/e144fcf578fc394678c24b042efe45f3b0614acdb87ea95d8b839b208842/wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl";
-              hash = "sha256-WFRNU5BT3/e9TPMMQNelQIYtaDATwN+mukagY/W2gvc=";
-              name = "wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl";
+              url = "https://files.pythonhosted.org/packages/d5/9d/97c109d4a25c716c4045644398d7e684e1d4fa5ec6c99412b5cba35a9a98/wasmtime-50.0.1-py3-none-manylinux1_x86_64.whl";
+              hash = "sha256-zBTDoXZU4DlOAiWxGBNTLvDNe9HiIqDFSUze2qvt2sQ=";
+              name = "wasmtime-50.0.1-py3-none-manylinux1_x86_64.whl";
             } else {
-              url = "https://files.pythonhosted.org/packages/1c/c3/a957b226979daaeb09ec024562e9aac05e475a954537e6f150eb60bca84d/wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl";
-              hash = "sha256-JvzjYT/vvimijp1lncozJugAWThY5XWMrQhuuAKzt2Y=";
-              name = "wasmtime-48.0.0-py3-none-manylinux2014_aarch64.whl";
+              url = "https://files.pythonhosted.org/packages/8e/c4/58709b73e613e5366e4783537e2a861272d95f500c43fddf9b378d98415a/wasmtime-50.0.1-py3-none-manylinux2014_aarch64.whl";
+              hash = "sha256-Z1SE5SXAKNwCdit3fx20R36nDKo/7Gd1Qm2v9NZO37E=";
+              name = "wasmtime-50.0.1-py3-none-manylinux2014_aarch64.whl";
             };
           wasmtime = pkgs.python3.pkgs.buildPythonPackage {
             pname = "wasmtime";
-            version = "48.0.0";
+            version = "50.0.1";
             format = "wheel";
             src = pkgs.fetchurl wasmtimeWheel;
             doCheck = false;
