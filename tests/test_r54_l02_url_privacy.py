@@ -1,5 +1,6 @@
 """Final-hook URL privacy regressions; synthetic canaries, no SDK or network."""
 
+import gc
 import json
 import time
 
@@ -423,11 +424,24 @@ def _adversarial_text(shape, size):
 
 
 def _scrub_cpu_seconds(text, count):
-    """Return thread CPU seconds per breadcrumb scrub over `count` scrubs."""
-    started = time.thread_time()
-    for _ in range(count):
-        assert isinstance(scrub_sentry_breadcrumb({"message": text}), dict)
-    elapsed = time.thread_time() - started
+    """Return thread CPU seconds per breadcrumb scrub over `count` scrubs.
+
+    Cyclic garbage collection is off while timing, as timeit does. The scrub
+    keeps one match object per quote or escape, so the 4n text can start a
+    full collection that the n text does not. That collection walks every
+    object the suite keeps alive, which made linear work look quadratic on
+    Python 3.11 in the full CI run.
+    """
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        started = time.thread_time()
+        for _ in range(count):
+            assert isinstance(scrub_sentry_breadcrumb({"message": text}), dict)
+        elapsed = time.thread_time() - started
+    finally:
+        if collecting:
+            gc.enable()
     assert elapsed < _SCRUB_HANG_SECONDS, (
         f"{elapsed:.2f}s for {count} x {len(text)} characters")
     return elapsed / count
