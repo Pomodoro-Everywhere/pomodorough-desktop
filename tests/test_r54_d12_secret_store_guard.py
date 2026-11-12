@@ -419,10 +419,12 @@ def test_fake_and_missing_tools_stay_allowed(tmp_path, real_secret_store_guard_s
             assert store_object.load("proof-fake") == b"fake"
         else:
             # Windows cannot run a script by its shebang. The error from
-            # CreateProcess shows that the guard let the spawn reach the system.
+            # CreateProcess shows that the guard let the spawn reach the system:
+            # ERROR_BAD_EXE_FORMAT (193), or ERROR_EXE_MACHINE_TYPE_MISMATCH
+            # (216) when Windows takes the small file for a 16-bit DOS program.
             with pytest.raises(SecretServiceUnavailableError) as failure:
                 store_object.load("proof-fake")
-            assert getattr(failure.value.__cause__, "winerror", None) == 193
+            assert getattr(failure.value.__cause__, "winerror", None) in {193, 216}
     missing = str(tmp_path / "none")
     with patch.dict(os.environ, PATH=missing), pytest.raises(FileNotFoundError):
         subprocess.run(["kwallet-query", "-r", "x", "y"], env={"PATH": missing})
