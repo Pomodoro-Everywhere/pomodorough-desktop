@@ -21,6 +21,14 @@ lock_file_isolation.WATCH.install()
 # and cannot leave a bare QCoreApplication for a later widget test, which
 # Qt aborts on. Test modules default to offscreen the same way.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if os.name == "nt" and os.environ["QT_QPA_PLATFORM"] == "offscreen":
+    # Offscreen Qt on Windows loads fonts only from QT_QPA_FONTDIR and finds
+    # none without it, so every label measured placeholder glyphs instead of
+    # text. Point it at the system fonts so layout tests measure real text.
+    os.environ.setdefault(
+        "QT_QPA_FONTDIR",
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Fonts"),
+    )
 from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
