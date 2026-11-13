@@ -17,6 +17,8 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPaintEvent
 from PySide6.QtWidgets import QPushButton, QStyle, QStyleOptionButton, QStylePainter
 
+from .word_wrap import wrap_words
+
 
 class WrappingPushButton(QPushButton):
     def __init__(self, text: str = "") -> None:
@@ -76,13 +78,4 @@ class WrappingPushButton(QPushButton):
         )
 
     def _wrapped_lines(self, room: int) -> list[str]:
-        # Greedy breaks between words. A word wider than the room keeps its
-        # own line; the button then asks for that word's width.
-        lines: list[str] = []
-        for word in self.text().split():
-            candidate = f"{lines[-1]} {word}" if lines else word
-            if lines and self._text_width(candidate) <= room:
-                lines[-1] = candidate
-            else:
-                lines.append(word)
-        return lines or [self.text()]
+        return wrap_words(self.text(), room, self._text_width)

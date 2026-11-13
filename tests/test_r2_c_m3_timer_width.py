@@ -41,7 +41,6 @@ from pomodorough.shared_core import SharedCore
 from pomodorough.storage import Store
 from pomodorough.timer_screen import TimerScreen
 from pomodorough.ui import MainWindow
-from pomodorough.ui_views import MainWindowViewMixin
 
 POINT_SIZES = (9.0, 18.0, 20.0, 24.0, 27.0, 30.0)
 
@@ -194,19 +193,16 @@ def test_a_narrow_primary_paints_its_label_on_whole_words(app, tmp_path):
 # From 24 pt the settings column alone needs more width than the window
 # minimum may take on an 800-pixel screen (D76 caps it at the screen width),
 # so this case stops at the largest font that can fit beside the dial.
-# Where that limit falls depends on the font: with DejaVu Sans, the only sans
-# font on the Ubuntu runner, ar-XB needs 813 pixels at 20 pt. The window gets
-# no screen cap here, because this checks the budget beside the column; the
-# cap itself is covered by the D76 tests in test_desktop_high_findings.py.
+# R54-D17: with DejaVu Sans, the only sans font on the Ubuntu runner, the
+# one-line auto-start label made ar-XB need 815 pixels at 20 pt, so the
+# capped window cut the Timer page off. The label now wraps, and the window
+# keeps the real screen cap here.
 @pytest.mark.parametrize("points", (18.0, 20.0))
 @pytest.mark.parametrize("locale", ["en", "ar-XB"])
 def test_primary_stays_whole_with_the_settings_column_shown(app, tmp_path, locale, points):
     # The settings column takes width beside the controls, so the width
     # budget must shrink when it shows.
-    with (
-        _scaled_font(app, points),
-        patch.object(MainWindowViewMixin, "_available_screen_width", return_value=0),
-    ):
+    with _scaled_font(app, points):
         with _timer_window(app, tmp_path, locale, "minimum") as window:
             window.settings_button.setChecked(True)
             _process(app, 12)
@@ -214,15 +210,21 @@ def test_primary_stays_whole_with_the_settings_column_shown(app, tmp_path, local
             _process(app, 12)
             screen = window.timer_screen
             assert screen.settings_scroll.isVisible()
+            available = window._available_screen_width()
+            assert available > 0
+            assert window.minimumSizeHint().width() <= available
             _assert_whole(screen.primary_button, window)
             _assert_label_room(screen.primary_button)
             assert screen.minimumSizeHint().width() <= window.page_stack.width()
 
 
 # The ar-XB labels are longer, so 18 pt already needs the new budget: without
-# it the screen asks for 956 to 999 pixels. At 20 pt with DejaVu Sans, the
-# settings column, the clock and the controls at their narrowest take 809.
-@pytest.mark.parametrize(("locale", "points"), [("en", 20.0), ("ar-XB", 18.0)])
+# it the screen asks for 956 to 999 pixels. R54-D17: at 20 pt with DejaVu
+# Sans the one-line auto-start label made the settings column, the clock and
+# the controls at their narrowest take 809; the label now wraps.
+@pytest.mark.parametrize(
+    ("locale", "points"), [("en", 20.0), ("ar-XB", 18.0), ("ar-XB", 20.0)]
+)
 def test_showing_settings_rebudgets_without_a_resize(app, locale, points):
     # Toggling the settings column keeps the page width, so no resize event
     # reaches the Timer screen. The host is not a window, so the screen

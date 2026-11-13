@@ -7,7 +7,6 @@ from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -36,6 +35,7 @@ from .localization import Strings
 from .railway_palette import PLATFORM, PORCELAIN, SIGNAL
 from .timer_controls_scroll import TimerControlsScroll
 from .timer_view import ClockWidget, ceiling_minutes
+from .wrapping_check_box import WrappingCheckBox
 from .wrapping_push_button import WrappingPushButton
 
 
@@ -362,7 +362,7 @@ class TimerScreen(QWidget):
         self.right_layout.addLayout(grid)
 
     def _build_auto_break_controls(self, settings: dict[str, Any]) -> None:
-        self.auto_breaks = QCheckBox(self.strings.text("pattern.auto_breaks"))
+        self.auto_breaks = WrappingCheckBox(self.strings.text("pattern.auto_breaks"))
         self.auto_breaks.setChecked(bool(settings.get("autoStartBreaks")))
         self.auto_breaks.toggled.connect(self.auto_breaks_changed)
         self.right_layout.addWidget(self.auto_breaks)
@@ -524,9 +524,10 @@ class TimerScreen(QWidget):
         # duration rows. Wrapped labels report a small minimum width.
         # Duration need is measured per row as label hint plus spin
         # hint so Windows font metrics cannot overflow a fixed width.
-        # Single-line controls such as the auto-breaks checkbox report
-        # their full text width; every direct settings child is measured
-        # so longer fonts never hide behind a horizontal scrollbar.
+        # Single-line controls report their full text width; the
+        # auto-breaks checkbox wraps and reports its widest word (R54-D17).
+        # Every direct settings child is measured so longer fonts never
+        # hide behind a horizontal scrollbar.
         # No fixed width is added here.
         needs = []
         for label in getattr(self, "_settings_heading_labels", ()):
