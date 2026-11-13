@@ -4,11 +4,13 @@
 `QCoreApplication.instance() or QCoreApplication([])`. When it ran first in a
 process, the next module that asked for `QApplication.instance()` got that
 bare core application and Qt aborted at its first widget. The suite
-conftest now creates the one QApplication before any test module runs.
+conftest now creates the one QApplication before any test module runs, and
+the user agent helper makes a QApplication itself when it runs first.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +20,18 @@ from PySide6.QtWidgets import QApplication
 ROOT = Path(__file__).resolve().parents[1]
 FIRST = "tests/test_release_version_user_agent_d6.py"
 SECOND = "tests/test_review_0400_d70_d76.py"
+# Runs the user agent helper with no conftest, so the application it leaves
+# behind is the one the helper made, not the suite's.
+HELPER_PROBE = """
+from PySide6.QtCore import QCoreApplication
+
+from pomodorough import network_revision
+import test_release_version_user_agent_d6 as user_agent
+
+assert QCoreApplication.instance() is None
+user_agent._capture_revision_request(network_revision)
+print(type(QCoreApplication.instance()).__name__)
+"""
 
 
 def _pytest_arguments() -> list[str]:
@@ -44,3 +58,22 @@ def test_the_user_agent_module_then_a_widget_module_run_in_one_process() -> None
     output = completed.stdout + completed.stderr
     assert "Fatal Python error" not in output, output[-2000:]
     assert completed.returncode == 0, output[-2000:]
+
+
+def test_the_user_agent_helper_alone_leaves_a_widget_application() -> None:
+    environment = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(ROOT / "src"), str(ROOT / "tests"), os.environ.get("PYTHONPATH")])
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", HELPER_PROBE],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output[-2000:]
+    assert completed.stdout.split()[-1:] == ["QApplication"], output[-2000:]

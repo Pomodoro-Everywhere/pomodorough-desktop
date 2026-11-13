@@ -9,8 +9,9 @@ import sys
 from unittest.mock import patch
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QObject
+from PySide6.QtCore import QObject
 from PySide6.QtNetwork import QNetworkRequest
+from PySide6.QtWidgets import QApplication
 
 import pomodorough
 from pomodorough import network, network_revision
@@ -100,7 +101,9 @@ class _CapturingNetwork:
 
 
 def _capture_revision_request(module: object) -> QNetworkRequest:
-    _application = QCoreApplication.instance() or QCoreApplication([])
+    # R54-D14: a bare QCoreApplication made here would outlive this module
+    # and abort the next widget test in the same process.
+    _application = QApplication.instance() or QApplication([])
     parent = QObject()
     stream = module.RevisionStream(
         parent,
