@@ -5,7 +5,6 @@ from typing import Any
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .eliding_combo import ElidingComboBox
 from .localization import Strings
 from .railway_palette import control_border, signal_accent
 from .reflow_row import ReflowRow
@@ -123,9 +123,19 @@ class NetworkScreen(QFrame):
     def _reflow_rows(self) -> None:
         margins = self._content.layout().contentsMargins()
         width = self._scroll.viewport().width() - margins.left() - margins.right()
+        self._fit_route_selector(width)
         for row in (self._mode_row, self._account_row):
             row.fit(width)
         self._room_actions_row.fit(width - _panel_inset(self.iroh_panel))
+
+    def _fit_route_selector(self, width: int) -> None:
+        """A route name wider than the page ends with an ellipsis. The
+        selector's least width otherwise widens the page, which then
+        scrolls sideways (DSK-13)."""
+        combo = self.replication_mode_combo
+        least = min(combo.minimumSizeHint().width(), max(width, 0))
+        if combo.minimumWidth() != least:
+            combo.setMinimumWidth(least)
 
     def _connect_focus_scroll(self) -> None:
         try:
@@ -174,7 +184,7 @@ class NetworkScreen(QFrame):
         row = self._mode_row = ReflowRow()
         label = QLabel(self.strings.text("network.route"))
         label.setObjectName("microLabel")
-        self.replication_mode_combo = QComboBox()
+        self.replication_mode_combo = ElidingComboBox()
         self.replication_mode_combo.setAccessibleName(
             self.strings.text("network.mode_accessible")
         )

@@ -10,8 +10,9 @@ title in the tooltip.
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QPaintEvent
-from PySide6.QtWidgets import QComboBox, QStyle, QStyleOptionComboBox, QStylePainter
+from PySide6.QtWidgets import QComboBox, QStyleOptionComboBox
+
+from .eliding_combo import ElidingComboBox
 
 # Widths in characters of the font, so they grow with the font size. The
 # picker asks for room for the preferred count and no more, so a long title
@@ -21,7 +22,7 @@ _LEAST_CHARACTERS = 4
 _PREFERRED_CHARACTERS = 20
 
 
-class TaskPicker(QComboBox):
+class TaskPicker(ElidingComboBox):
     def __init__(self) -> None:
         super().__init__()
         self._hint = ""
@@ -29,7 +30,6 @@ class TaskPicker(QComboBox):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.setMinimumContentsLength(_LEAST_CHARACTERS)
-        self.view().setTextElideMode(Qt.TextElideMode.ElideRight)
         self.currentIndexChanged.connect(self._refresh_tool_tip)
 
     def set_hint(self, hint: str) -> None:
@@ -62,25 +62,5 @@ class TaskPicker(QComboBox):
         option = QStyleOptionComboBox()
         self.initStyleOption(option)
         option.rect = QRect(0, 0, width, self.sizeHint().height())
-        room = self._text_field(option).width()
+        room = self.text_field(option).width()
         return self.fontMetrics().horizontalAdvance(title) <= room
-
-    def _text_field(self, option: QStyleOptionComboBox) -> QRect:
-        return self.style().subControlRect(
-            QStyle.ComplexControl.CC_ComboBox,
-            option,
-            QStyle.SubControl.SC_ComboBoxEditField,
-            self,
-        )
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        del event
-        painter = QStylePainter(self)
-        option = QStyleOptionComboBox()
-        self.initStyleOption(option)
-        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
-        field = self._text_field(option)
-        option.currentText = self.fontMetrics().elidedText(
-            option.currentText, Qt.TextElideMode.ElideRight, field.width()
-        )
-        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)

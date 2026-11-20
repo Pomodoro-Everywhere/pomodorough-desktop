@@ -113,7 +113,12 @@ def test_settings_spin_boxes_share_the_field_border(app, themed_window) -> None:
 
     assert len(spins) == 3
     for spin in spins:
-        outside, border, inside = _left_edge(image, _rect_in_window(themed_window, spin))
+        rect = _rect_in_window(themed_window, spin)
+        outside, border, _ = _left_edge(image, rect)
+        # Mid height, a few pixels in, the digits can start where the style
+        # gives the spin box less padding (PySide6 6.11.3). The row just
+        # under the top border is clear of text.
+        inside = QColor(image.pixel(rect.left() + 4, rect.top() + 2))
         assert border == field_border, (border.name(), field_border.name())
         assert contrast(border, outside) >= NON_TEXT_LIMIT, (border.name(), outside.name())
         assert contrast(border, inside) >= NON_TEXT_LIMIT, (border.name(), inside.name())

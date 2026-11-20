@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from . import __version__, task_picker_row
 from .core import (
     ACTIVE_STATUSES,
     PHASES,
@@ -234,7 +234,10 @@ class TimerScreen(QWidget):
         width = self.width()
         # L3: the wrapper also holds the vertical bar when one shows.
         bar = self.controls_scroll.bar_allowance()
-        self._apply_button_budgets(self._controls_room() - bar)
+        column_room = self._controls_room() - bar
+        self._apply_button_budgets(column_room)
+        if not self.clock.compact_readout:
+            self._fit_task_selector(column_room)
         column_need = self.controls_column.minimumSizeHint().width()
         measured = self._compact_controls_width
         if measured is not None and self._landscape and self.clock.compact_readout:
@@ -309,6 +312,15 @@ class TimerScreen(QWidget):
         )
         for button in buttons:
             button.set_width_budget(inner)
+
+    def _fit_task_selector(self, column_room: int) -> None:
+        """Beside or above the round dial, the task picker's label goes
+        above the picker when the controls column cannot hold the two side
+        by side, as the buttons wrap their labels (C M3). Under the compact
+        readout the dial form decides the arrangement."""
+        panel = self.task_selector_panel
+        row = task_picker_row.row_width(panel, preferred=False)
+        task_picker_row.set_stacked(panel, self._button_budget(column_room) < row)
 
     def _button_budget(self, column_room: int) -> int:
         column_margins = self.controls_column.layout().contentsMargins()

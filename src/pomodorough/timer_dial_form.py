@@ -60,6 +60,13 @@ class TimerDialForm(QObject):
         screen = self._screen
         page = screen.left_layout.geometry().size()
         if page.isEmpty():
+            # An invalidated layout forgets its geometry until Qt lays it
+            # out again, and the event loop can run this before that
+            # layout request. Lay the page out now so the form follows a
+            # change of orientation instead of waiting for the next resize.
+            screen.left_layout.activate()
+            page = screen.left_layout.geometry().size()
+        if page.isEmpty():
             # Not laid out yet: there is nothing to measure against.
             return
         compact = self.compact_readout_suits(page)
@@ -128,15 +135,15 @@ class TimerDialForm(QObject):
         picker = self._picker_under_readout(page, room)
         holds = picker.holds(screen.room_below_readout(page.height()))
         overflow = compact_column - page.height()
-        if overflow <= 0:
+        if overflow <= 0 or screen.margins_absorb(overflow):
             # R55-D01: the readout's side must hold what moves there. A
             # font with a taller line leaves the readout less than its
             # least height above the picker, or cuts the task title.
-            return holds
-        if not holds and (screen.margins_absorb(overflow) or not picker.stacked):
             # The trimmed margins take up the overflow, so nothing scrolls
-            # and the side must hold the readout and the whole title. Or
-            # the label beside the picker cuts the title or takes the
+            # and the side must hold the readout and the whole title.
+            return holds
+        if not holds and not picker.stacked:
+            # The label beside the picker cuts the title or takes the
             # readout's least height, and stacking does not suit the page.
             return False
         # Both forms scroll. The swap must then bring Stop Sound higher;

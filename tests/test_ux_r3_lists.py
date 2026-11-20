@@ -604,6 +604,34 @@ def test_network_room_actions_stack_when_the_panel_cannot_hold_them(app, tmp_pat
         assert _room_actions_side_by_side(page)
 
 
+def test_network_route_name_wider_than_the_page_does_not_scroll_it_sideways(
+    app, tmp_path
+):
+    """The route selector narrows to the page and ends the name with an
+    ellipsis. Its least width followed the name, and on Linux fonts the
+    pseudo-locale name at twice the font widened the page past its view.
+
+    The font grows until the name is wider than the page on the host.
+    """
+    with _tasks_window(app, tmp_path, "ar-XB", 600, 340) as window:
+        window._show_screen(3)
+        page = window.network_screen
+        combo = page.replication_mode_combo
+        base = QApplication.font().pointSizeF()
+        for scale in (2.1, 2.5, 3.0):
+            with _scaled_font(app, base * scale):
+                _process(app, 30)
+                margins = page._content.layout().contentsMargins()
+                room = page._scroll.viewport().width() - margins.left() - margins.right()
+                if combo.minimumSizeHint().width() <= room:
+                    continue
+                # Other controls may widen the page at this font; the route
+                # row must not be one of them.
+                assert page._mode_row.minimumSize().width() <= room
+                return
+        pytest.skip("the host font keeps the route name inside the page")
+
+
 # DSK-16 ---------------------------------------------------------------------
 
 

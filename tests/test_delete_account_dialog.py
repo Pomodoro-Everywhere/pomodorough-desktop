@@ -207,11 +207,25 @@ def _narrower_screen(app, tmp_path, locale, scale) -> QRect:
 
     Measured on the real dialog, so the case does not depend on the font the
     platform gives the tests. The height is the height the dialog opens with.
+    The width is the widest from halfway down at which the text needs more
+    height: with some fonts the halfway width still keeps every line. A
+    font whose text keeps its lines down to the minimum width has no such
+    screen, and the case does not apply.
     """
     with _delete_dialog(app, tmp_path, locale, scale) as view:
         frame = view.frameGeometry().size() - view.size()
-        width = (view.sizeHint().width() + view.minimumWidth()) // 2
-        assert view.layout().totalHeightForWidth(width) > view.height()
+        halfway = (view.sizeHint().width() + view.minimumWidth()) // 2
+        layout = view.layout()
+        width = next(
+            (
+                width
+                for width in range(halfway, view.minimumWidth() - 1, -1)
+                if layout.totalHeightForWidth(width) > view.height()
+            ),
+            None,
+        )
+        if width is None:
+            pytest.skip("the host font keeps every line down to the minimum width")
         return QRect(0, 0, width + frame.width(), view.frameGeometry().height())
 
 

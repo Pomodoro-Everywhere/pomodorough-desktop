@@ -348,6 +348,29 @@ def test_tall_window_keeps_the_round_dial(app, tmp_path, scale, locale):
         )
 
 
+def test_turning_tall_brings_the_round_dial_back_before_the_page_lays_out(
+    app, tmp_path
+):
+    # The turn invalidates the page layout, which forgets its geometry until
+    # Qt lays the page out. On Windows the form settled first, found no page
+    # and kept the compact readout in the tall window.
+    with (
+        _scaled_font(app, BASE_POINTS * 2),
+        _timer_window(app, tmp_path, "en", "minimum") as window,
+    ):
+        screen = window.timer_screen
+        with patch.object(TimerDialForm, "compact_readout_suits", return_value=True):
+            screen.dial_form.settle()
+        assert screen.landscape and screen.clock.compact_readout
+        window.resize(QSize(window.minimumWidth(), window.minimumWidth()))
+        assert not screen.landscape
+        assert screen.left_layout.geometry().isEmpty()
+        screen.dial_form.settle()
+        assert not screen.clock.compact_readout
+        _process(app, 12)
+        assert not screen.clock.compact_readout
+
+
 @pytest.mark.parametrize("locale", LOCALES)
 def test_compact_controls_keep_their_width_when_the_window_grows(
     app, tmp_path, locale
