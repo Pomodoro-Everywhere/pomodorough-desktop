@@ -3,8 +3,6 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtWidgets import QMessageBox
-
 from pomodorough.account_resolution_controller import (
     AccountResolutionContext,
     AccountResolutionController,
@@ -132,11 +130,11 @@ class AccountResolutionBranchMatrixTests(unittest.TestCase):
         harness.cloud.deleting_account = True
         self.assertEqual(harness.controller.delete_account_action().effects, ())
         harness.cloud.deleting_account = False
-        with patch("pomodorough.account_resolution_controller.QInputDialog.getText", return_value=("", False)):
+        with patch("pomodorough.account_resolution_controller.ask_delete_account_confirmation", return_value=None):
             self.assertEqual(harness.controller.delete_account_action().effects, ())
-        with patch("pomodorough.account_resolution_controller.QInputDialog.getText", return_value=("wrong", True)):
+        with patch("pomodorough.account_resolution_controller.ask_delete_account_confirmation", return_value="wrong"):
             self.assertEqual(harness.controller.delete_account_action().effects[0].duration_ms, 10_000)
-        with patch("pomodorough.account_resolution_controller.QInputDialog.getText", return_value=("DELETE", True)):
+        with patch("pomodorough.account_resolution_controller.ask_delete_account_confirmation", return_value="DELETE"):
             harness.controller.delete_account_action()
         harness.cloud.delete_account.assert_called_once_with("DELETE")
 
@@ -153,7 +151,7 @@ class AccountResolutionBranchMatrixTests(unittest.TestCase):
         controller.account_action()
         self.assertEqual(harness.cloud.logout.call_count, 2)
         controller.history_resolution_active = False
-        with patch("pomodorough.account_resolution_controller.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        with patch("pomodorough.account_resolution_controller.confirm_destructive_action", return_value=True):
             controller.account_action()
         self.assertEqual(harness.cloud.logout.call_count, 3)
         harness.cloud.authenticated = False

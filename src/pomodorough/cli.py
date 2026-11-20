@@ -5,11 +5,11 @@ import io
 import json
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 from .arrival_minutes_wording import arrival_minutes
+from .arrival_time_wording import arrival_ended_at
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
@@ -32,6 +32,9 @@ class CLIArgumentParser(argparse.ArgumentParser):
         raise CLIArgumentError(self, message)
 
 
+HISTORY_LIMIT_DEFAULT = 10
+
+
 def phase_argument(value: str) -> str:
     try:
         return normalize_phase(value)
@@ -49,19 +52,23 @@ def build_parser(strings: Strings | None = None) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     status = commands.add_parser("status", help=strings.text("cli.status_help"))
-    status.add_argument("--json", action="store_true", dest="as_json")
+    _add_json_argument(status, strings)
 
     start = commands.add_parser("start", help=strings.text("cli.start_help"))
-    start.add_argument("phase", nargs="?", type=phase_argument)
-    start.add_argument("-m", "--minutes", type=int)
-    start.add_argument("--json", action="store_true", dest="as_json")
+    start.add_argument(
+        "phase", nargs="?", type=phase_argument, help=strings.text("cli.phase_help")
+    )
+    start.add_argument(
+        "-m", "--minutes", type=int, help=strings.text("cli.minutes_help")
+    )
+    _add_json_argument(start, strings)
 
     for action in ("pause", "resume", "finish", "cancel"):
         command = commands.add_parser(
             action,
             help=strings.text("cli.action_help", action=strings.text(f"action.{action}")),
         )
-        command.add_argument("--json", action="store_true", dest="as_json")
+        _add_json_argument(command, strings)
 
     dismiss = commands.add_parser(
         "dismiss",
@@ -71,12 +78,24 @@ def build_parser(strings: Strings | None = None) -> argparse.ArgumentParser:
         ),
     )
     dismiss.set_defaults(timer_action="dismiss")
-    dismiss.add_argument("--json", action="store_true", dest="as_json")
+    _add_json_argument(dismiss, strings)
 
     history = commands.add_parser("history", help=strings.text("cli.history_help"))
-    history.add_argument("-n", "--limit", type=int, default=10)
-    history.add_argument("--json", action="store_true", dest="as_json")
+    history.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=HISTORY_LIMIT_DEFAULT,
+        help=strings.text("cli.limit_help", default=HISTORY_LIMIT_DEFAULT),
+    )
+    _add_json_argument(history, strings)
     return parser
+
+
+def _add_json_argument(command: argparse.ArgumentParser, strings: Strings) -> None:
+    command.add_argument(
+        "--json", action="store_true", dest="as_json", help=strings.text("cli.json_help")
+    )
 
 
 def _print_state(state: dict[str, Any], stream: TextIO, strings: Strings) -> None:
@@ -101,19 +120,6 @@ def _print_state(state: dict[str, Any], stream: TextIO, strings: Strings) -> Non
             print(strings.plural(key, count), file=stream)
     if state["historyResolutionPending"]:
         print(strings.text("terminal.history_resolution_pending"), file=stream)
-
-
-def _history_time(value: str | None, strings: Strings | None = None) -> str:
-    if not value:
-        return (strings or Strings()).text("terminal.unknown_time")
-    try:
-        return (
-            datetime.fromisoformat(value.replace("Z", "+00:00"))
-            .astimezone()
-            .strftime("%Y-%m-%d %H:%M")
-        )
-    except ValueError:
-        return value
 
 
 def _print_json_error(
@@ -168,9 +174,6 @@ def _print_history(
                 "cli.phase_task", phase=phase, task=item["taskTitle"]
             )
         wording = arrival_minutes(item)
-        when = _history_time(
-            item.get("completedAt") or item.get("endedAt"), strings
-        )
         print(
             strings.text(
                 (
@@ -178,7 +181,7 @@ def _print_history(
                     if wording.reads_as_planned
                     else "cli.history_row"
                 ),
-                when=when,
+                when=arrival_ended_at(item, strings),
                 phase=phase,
                 status=strings.text(wording.status_key),
                 minutes=wording.minutes,

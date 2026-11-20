@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox
 
 from pomodorough.controller_outcomes import (
     EmitFailure,
@@ -309,8 +308,8 @@ class ReplicationControllerTests(unittest.TestCase):
         self.assertEqual(harness.controller.copy_iroh_invite().effects, ())
         harness.controller.activate_replication_mode("offline", "iroh")
         with patch(
-            "pomodorough.replication_controller.QMessageBox.warning",
-            return_value=QMessageBox.StandardButton.Yes,
+            "pomodorough.replication_controller.confirm_destructive_action",
+            return_value=True,
         ):
             no_service_leave = harness.controller.leave_iroh_room()
         self.assertEqual(effect_types(no_service_leave), (LoadState, Render))
@@ -349,8 +348,8 @@ class ReplicationControllerTests(unittest.TestCase):
 
         harness.store.failure = ValueError("leave failed")
         with patch(
-            "pomodorough.replication_controller.QMessageBox.warning",
-            return_value=QMessageBox.StandardButton.Yes,
+            "pomodorough.replication_controller.confirm_destructive_action",
+            return_value=True,
         ):
             failed_leave = harness.controller.leave_iroh_room()
         self.assertEqual(failed_leave.effects[0], EmitFailure(harness.store.failure))
@@ -372,15 +371,15 @@ class ReplicationControllerTests(unittest.TestCase):
         harness.store.active_iroh_room_id = "room-1"
 
         with patch(
-            "pomodorough.replication_controller.QMessageBox.warning",
-            return_value=QMessageBox.StandardButton.Cancel,
+            "pomodorough.replication_controller.confirm_destructive_action",
+            return_value=False,
         ):
             self.assertEqual(harness.controller.leave_iroh_room().effects, ())
         self.assertNotIn(("leave",), harness.store.calls)
 
         with patch(
-            "pomodorough.replication_controller.QMessageBox.warning",
-            return_value=QMessageBox.StandardButton.Yes,
+            "pomodorough.replication_controller.confirm_destructive_action",
+            return_value=True,
         ):
             left = harness.controller.leave_iroh_room()
         self.assertEqual(effect_types(left), (LoadState, Render))

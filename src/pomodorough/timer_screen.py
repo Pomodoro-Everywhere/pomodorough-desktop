@@ -3,11 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMargins, QObject, QTimer, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QBoxLayout,
     QButtonGroup,
-    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -32,8 +32,13 @@ from .core import (
     timer_for_display,
 )
 from .localization import Strings
-from .railway_palette import PLATFORM, PORCELAIN, SIGNAL
+from .railway_palette import PLATFORM, PORCELAIN, SIGNAL, control_border
+from .task_picker import TaskPicker
+from .timer_action_flow import TimerActionFlow
+from .timer_action_labels import primary_label, skip_label
 from .timer_controls_scroll import TimerControlsScroll
+from .timer_dial_fit import ROUND_DIAL_SHARES
+from .timer_dial_form import TimerDialForm
 from .timer_view import ClockWidget, ceiling_minutes
 from .wrapping_check_box import WrappingCheckBox
 from .wrapping_push_button import WrappingPushButton
@@ -124,11 +129,17 @@ class TimerScreen(QWidget):
         self._settings_reflow_timer.timeout.connect(self._settings_reflow)
         self._build_left_panel()
         self._build_settings_panel(settings)
+        self.dial_form = TimerDialForm(self)
 
     def _build_left_panel(self) -> None:
         self.left_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom)
         self.clock = ClockWidget(self.strings)
-        self.left_layout.addWidget(self.clock, 1)
+        # DSK-12: the dial's side of the page. The compact readout shares
+        # it with the task picker.
+        self.readout_layout = QVBoxLayout()
+        self.readout_layout.setContentsMargins(0, 0, 0, 0)
+        self.readout_layout.addWidget(self.clock, 1)
+        self.left_layout.addLayout(self.readout_layout, 1)
         self.controls_panel = QWidget()
         self.controls_layout = QBoxLayout(
             QBoxLayout.Direction.TopToBottom, self.controls_panel
@@ -136,6 +147,7 @@ class TimerScreen(QWidget):
         self.controls_layout.setContentsMargins(0, 0, 0, 0)
         self._controls_centered = False
         self._landscape = False
+        self._compact_controls_width: int | None = None
         self.active_task_context = QLabel("")
         self.active_task_context.setObjectName("taskSubtitle")
         self.active_task_context.setAccessibleName(
@@ -162,23 +174,29 @@ class TimerScreen(QWidget):
         column_layout = QBoxLayout(
             QBoxLayout.Direction.TopToBottom, self.controls_column
         )
-        column_layout.setContentsMargins(10, 10, 10, 10)
+        self._full_column_margins = QMargins(10, 10, 10, 10)
+        column_layout.setContentsMargins(self._full_column_margins)
         column_layout.setSpacing(8)
         column_layout.addWidget(self.task_selector_panel)
         column_layout.addWidget(self.primary_button)
         # Idle shows skip alone; active timers swap in finish and cancel.
-        # One set is always visible, so the row never collapses.
-        secondary_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        # One set is always visible, so the flow never collapses. DSK-05:
+        # buttons that do not fit beside each other start a new line instead
+        # of widening the column into the dial.
+        secondary_layout = TimerActionFlow()
         secondary_layout.setSpacing(8)
-        self._secondary_layout = secondary_layout
-        secondary_layout.addWidget(self.finish_button, 1)
-        secondary_layout.addWidget(self.cancel_button, 1)
-        secondary_layout.addWidget(self.skip_button, 1)
-        secondary_layout.addWidget(self.stop_sound_button, 1)
+        self.secondary_actions = secondary_layout
+        secondary_layout.addWidget(self.finish_button)
+        secondary_layout.addWidget(self.cancel_button)
+        secondary_layout.addWidget(self.skip_button)
+        secondary_layout.addWidget(self.stop_sound_button)
         column_layout.addLayout(secondary_layout)
         # B1: the column scrolls so the primary action keeps its height.
         self.controls_scroll = TimerControlsScroll(
-            self.controls_column, self.primary_button
+            self.controls_column,
+            self.task_selector_panel,
+            self.primary_button,
+            self.stop_sound_button,
         )
         self.controls_scroll.column_hints_changed.connect(self._bound_controls_width)
         self.actions_layout.addStretch(1)
@@ -188,10 +206,7 @@ class TimerScreen(QWidget):
 
     def _build_action_buttons(self) -> None:
         self.primary_button = WrappingPushButton(
-            self.strings.text(
-                "status.primary.start",
-                phase=self.strings.text("phase.focus").upper(),
-            )
+            primary_label(self.strings, "idle", "focus")
         )
         self.primary_button.setObjectName("primaryButton")
         self.primary_button.clicked.connect(self.primary_action_requested)
@@ -221,48 +236,147 @@ class TimerScreen(QWidget):
         bar = self.controls_scroll.bar_allowance()
         self._apply_button_budgets(self._controls_room() - bar)
         column_need = self.controls_column.minimumSizeHint().width()
-        if self._landscape:
-            self.controls_panel.setMaximumWidth(max(column_need + bar, width * 2 // 5))
-        else:
-            self.controls_panel.setMaximumWidth(16777215)
-        self.controls_column.setMaximumWidth(max(column_need, width * 3 // 5))
-        self.controls_scroll.setMaximumWidth(self.controls_column.maximumWidth() + bar)
+        measured = self._compact_controls_width
+        if measured is not None and self._landscape and self.clock.compact_readout:
+            # DSK-12: beside the compact readout the controls keep the
+            # measured width at which every action stays on the page. A
+            # shown bar takes its width from the wrapper, not the column.
+            for controls, fixed in (
+                (self.controls_panel, measured),
+                (self.controls_scroll, measured),
+                (self.controls_column, measured - bar),
+            ):
+                controls.setFixedWidth(fixed)
+            return
+        column_cap = max(column_need, self._controls_width_cap())
+        panel_cap = max(column_need + bar, width * 2 // 5)
+        for controls, cap in (
+            (self.controls_panel, panel_cap if self._landscape else 16777215),
+            (self.controls_column, column_cap),
+            (self.controls_scroll, column_cap + bar),
+        ):
+            controls.setMinimumWidth(0)
+            controls.setMaximumWidth(cap)
 
     def _controls_room(self) -> int:
         """C M3: width the page leaves for the controls wrapper.
 
         Measured from this screen's width minus what sits beside the
         controls: the settings column when shown, and in landscape the
-        clock's minimum width and the spacing between them.
+        minimum width of the dial's side and the spacing between them.
         """
+        return self._controls_room_beside(self.dial_side_minimum_width())
+
+    def dial_side_minimum_width(self) -> int:
+        """Least width of the dial's side of a landscape page."""
+        return self.dial_side_width_for(self.clock.compact_readout)
+
+    def dial_side_width_for(self, compact_readout: bool) -> int:
+        """DSK-12: least width of the dial's side in one form of the dial."""
+        if not compact_readout:
+            return ClockWidget.round_minimum().width()
+        return self.dial_form.compact_side_width()
+
+    def room_below_readout(self, page_height: int) -> int:
+        """Height a page this tall leaves on the dial's side under a
+        compact readout of least height."""
+        readout = self.clock.readout_minimum().height() + self.readout_layout.spacing()
+        return page_height - readout
+
+    def _controls_room_beside(self, dial_side_width: int) -> int:
         margins = self.content_layout.contentsMargins()
         room = self.width() - margins.left() - margins.right()
         settings = getattr(self, "settings_scroll", None)
         if settings is not None and not settings.isHidden():
             room -= settings.minimumWidth() + self.content_layout.spacing()
         if self._landscape:
-            clock_min = max(self.clock.minimumWidth(), self.clock.minimumSizeHint().width())
-            room -= clock_min + self.left_layout.spacing()
+            room -= dial_side_width + self.left_layout.spacing()
         controls = self.controls_layout.contentsMargins()
         return room - controls.left() - controls.right()
 
     def _apply_button_budgets(self, column_room: int) -> None:
-        # C M3: a button whose one-line label is wider than its share of the
-        # column wraps the label instead of widening the column past the page.
+        # C M3: a button whose one-line label is wider than the column room
+        # wraps the label instead of widening the column past the page.
+        # DSK-22: each secondary action may take a whole flow line, so it
+        # gets the full room rather than a share of one row.
+        inner = self._button_budget(column_room)
+        buttons = (
+            self.primary_button,
+            self.finish_button,
+            self.cancel_button,
+            self.skip_button,
+            self.stop_sound_button,
+        )
+        for button in buttons:
+            button.set_width_budget(inner)
+
+    def _button_budget(self, column_room: int) -> int:
         column_margins = self.controls_column.layout().contentsMargins()
         frame = self.controls_column.frameWidth() * 2
-        inner = column_room - frame - column_margins.left() - column_margins.right()
-        self.primary_button.set_width_budget(inner)
-        row = (self.finish_button, self.cancel_button, self.skip_button, self.stop_sound_button)
-        shown = max(1, sum(not button.isHidden() for button in row))
-        share = (inner - self._secondary_layout.spacing() * (shown - 1)) // shown
-        for button in row:
-            button.set_width_budget(share)
+        return column_room - frame - column_margins.left() - column_margins.right()
+
+    def button_budget_beside(self, dial_side_width: int) -> int:
+        """DSK-12: the buttons' width budget when the dial's side is this wide."""
+        bar = self.controls_scroll.bar_allowance()
+        return self._button_budget(self._controls_room_beside(dial_side_width) - bar)
+
+    @property
+    def landscape(self) -> bool:
+        return self._landscape
+
+    def _controls_width_cap(self) -> int:
+        """Widest the controls column grows, as a share of this screen."""
+        return self.width() * 3 // 5
+
+    def full_column_margins(self) -> QMargins:
+        """Margins of the controls column before any trim."""
+        return QMargins(self._full_column_margins)
+
+    def follow_dial_form(
+        self, compact_controls_width: int | None, column_overflow: int = 0
+    ) -> None:
+        """DSK-12: share the page between the dial's side and the controls.
+
+        compact_controls_width is the measured width of the controls beside
+        the compact readout; None when they do not sit beside it.
+        column_overflow is how far the tallest controls column beside the
+        compact readout is taller than the page.
+        """
+        self._compact_controls_width = compact_controls_width
+        self._trim_column_margins(column_overflow)
+        self._share_page_with_dial()
+
+    def margins_absorb(self, column_overflow: int) -> bool:
+        """Whether trimming the column margins takes up this overflow, so
+        the controls show without a scroll range."""
+        full = self._full_column_margins
+        trim = (column_overflow + 1) // 2
+        return column_overflow > 0 and trim <= min(full.top(), full.bottom()) // 2
+
+    def _trim_column_margins(self, overflow: int) -> None:
+        """DSK-12: a column a few pixels taller than the page gives them up
+        from its top and bottom margins, down to half of each, instead of
+        showing a scroll bar for them."""
+        full = self._full_column_margins
+        trim = (overflow + 1) // 2 if self.margins_absorb(overflow) else 0
+        margins = QMargins(full.left(), full.top() - trim, full.right(), full.bottom() - trim)
+        layout = self.controls_column.layout()
+        if layout.contentsMargins() != margins:
+            layout.setContentsMargins(margins)
+
+    def _share_page_with_dial(self) -> None:
+        dial, controls = 1, 0
+        if self._landscape and not self.clock.compact_readout:
+            dial, controls = ROUND_DIAL_SHARES
+        # Beside the compact readout the controls keep their measured
+        # width, and the readout and the task picker take the rest.
+        self.left_layout.setStretch(0, dial)
+        self.left_layout.setStretch(1, controls)
+        self._bound_controls_width()
 
     def _build_task_selector(self) -> None:
         self.task_selector_panel = QFrame()
         self.task_selector_panel.setObjectName("taskSelector")
-        self.task_selector_panel.setMinimumWidth(190)
         # Med: no fixed maximum height; the layout size hint (font
         # metrics) drives height so localized/large fonts never clip.
         layout = QHBoxLayout(self.task_selector_panel)
@@ -271,7 +385,8 @@ class TimerScreen(QWidget):
         label = QLabel(self.strings.text("task.focus").upper())
         label.setObjectName("microLabel")
         label.setWordWrap(True)
-        self.task_combo = QComboBox()
+        # DSK-06: the picker's width follows the font, not a fixed minimum.
+        self.task_combo = TaskPicker()
         self.task_combo.setAccessibleName(self.strings.text("task.focus"))
         self.task_combo.currentIndexChanged.connect(self.task_selection_changed)
         layout.addWidget(label)
@@ -394,14 +509,13 @@ class TimerScreen(QWidget):
             self.settings_scroll.setVisible(visible)
         # C M3: the settings column takes width from the controls.
         self._bound_controls_width()
+        self.dial_form.schedule()
 
     def apply_responsive_layout(self, *, landscape: bool, compact: bool) -> None:
         # Landscape: dial left, controls right (vertically centered).
         # Portrait: stacked column, controls pinned under the dial.
         if landscape:
             self.left_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-            self.left_layout.setStretch(0, 3)
-            self.left_layout.setStretch(1, 2)
             self._landscape = True
             if not self._controls_centered:
                 self.controls_layout.insertStretch(0, 1)
@@ -409,16 +523,16 @@ class TimerScreen(QWidget):
                 self._controls_centered = True
         else:
             self.left_layout.setDirection(QBoxLayout.Direction.TopToBottom)
-            self.left_layout.setStretch(0, 1)
-            self.left_layout.setStretch(1, 0)
             self._landscape = False
             if self._controls_centered:
                 self.controls_layout.takeAt(0)
                 self.controls_layout.takeAt(self.controls_layout.count() - 1)
                 self._controls_centered = False
-        self._bound_controls_width()
         self.content_layout.setSpacing(12 if compact else 22)
         self.left_layout.setSpacing(6 if compact else 10)
+        self.readout_layout.setSpacing(self.left_layout.spacing())
+        self._share_page_with_dial()
+        self.dial_form.schedule()
         margin = 12 if compact else 18
         self.right_layout.setContentsMargins(margin, margin, margin, margin)
         self.right_layout.setSpacing(7 if compact else 12)
@@ -590,11 +704,13 @@ class TimerScreen(QWidget):
         super().changeEvent(event)
         if event.type() in (QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange, QEvent.Type.StyleChange, QEvent.Type.LayoutDirectionChange):
             self._schedule_settings_reflow()
+            self.dial_form.schedule()
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
         self._bound_controls_width()
         self._schedule_settings_reflow()
+        self.dial_form.schedule()
 
     def render(
         self,
@@ -698,14 +814,7 @@ class TimerScreen(QWidget):
         skip_destination: str | None = None,
     ) -> None:
         self.primary_button.setText(
-            self.strings.text("status.primary.pause")
-            if state.status == "running"
-            else self.strings.text("status.primary.resume")
-            if state.status == "paused"
-            else self.strings.text(
-                "status.primary.start",
-                phase=self.strings.text(f"phase.{selected_phase}").upper(),
-            )
+            primary_label(self.strings, state.status, selected_phase)
         )
         self.primary_button.setEnabled(
             mutations_enabled
@@ -750,12 +859,7 @@ class TimerScreen(QWidget):
         self.stop_sound_button.setEnabled(sound_active)
 
     def _skip_label(self, destination: str | None) -> str:
-        if destination not in PHASES:
-            return self.strings.text("status.skip_unknown")
-        return self.strings.text(
-            "status.skip",
-            phase=self.strings.text(f"phase.{destination}").upper(),
-        )
+        return skip_label(self.strings, destination)
 
     @staticmethod
     def status_labels_for(strings: Strings) -> dict[str, str]:
@@ -844,24 +948,15 @@ class TimerScreen(QWidget):
     ) -> None:
         self.task_combo.blockSignals(True)
         self.task_combo.clear()
-        self.task_combo.addItem(self.strings.text("task.none"), None)
-        self._align_task_item(0)
+        self.task_combo.add_choice(self.strings.text("task.none"), None)
         selected_index = 0
         for task in choices:
-            self.task_combo.addItem(task["title"], task["id"])
+            self.task_combo.add_choice(task["title"], task["id"])
             index = self.task_combo.count() - 1
-            self._align_task_item(index)
             if task["id"] == selected_task_id:
                 selected_index = index
         self.task_combo.setCurrentIndex(selected_index)
         self.task_combo.blockSignals(False)
-
-    def _align_task_item(self, index: int) -> None:
-        self.task_combo.setItemData(
-            index,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            Qt.ItemDataRole.TextAlignmentRole,
-        )
 
     def _configure_task_selector(
         self,
@@ -869,9 +964,7 @@ class TimerScreen(QWidget):
     ) -> None:
         self.task_combo.setEnabled(mutations_enabled)
         self.task_combo.setAccessibleName(self.strings.text("task.focus"))
-        description = self.strings.text("task.retarget_hint")
-        self.task_combo.setAccessibleDescription(description)
-        self.task_combo.setToolTip(description)
+        self.task_combo.set_hint(self.strings.text("task.retarget_hint"))
 
     def refresh_duration_spins(self, settings: dict[str, Any]) -> None:
         for phase, spin in self.duration_spins.items():
@@ -888,9 +981,11 @@ class TimerScreen(QWidget):
     def stylesheet() -> str:
         return """
         QPushButton[phase="true"]:checked { background: @platform; color: @porcelain; border-bottom: 5px solid @signal; }
-        QFrame#controlsPanel { background: palette(alternate-base); border: 2px solid palette(mid); }
+        QFrame#controlsPanel { background: palette(alternate-base); border: 2px solid @border; }
         QScrollArea#timerControlsScroll, QScrollArea#timerControlsScroll > QWidget { background: transparent; }
-        QFrame#taskSelector { background: palette(base); border: 2px solid palette(mid); }
-        QSpinBox { font-family: "DejaVu Sans Mono"; }
+        QFrame#taskSelector { background: palette(base); border: 2px solid @border; }
+        QSpinBox { font-family: "DejaVu Sans Mono"; background: palette(base); color: palette(text); border: 2px solid @border; padding: 2px 6px; }
         QCheckBox { spacing: 8px; }
-        """.replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN).replace("@signal", SIGNAL)
+        """.replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN).replace("@signal", SIGNAL).replace(
+            "@border", control_border(QApplication.palette())
+        )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from .localization import Strings
-from .railway_palette import signal_accent
+from .railway_palette import control_border, signal_accent
+from .reflow_row import ReflowRow
 
 PRIVACY_POLICY_URL = "https://pomodorough.egigoka.me/privacy"
 
@@ -63,6 +64,13 @@ def _make_invite_field_growable(field: QPlainTextEdit) -> None:
         pass
 
 
+def _panel_inset(panel: QFrame) -> int:
+    """Width the panel's border and layout margins take from its rows."""
+    border = panel.contentsMargins()
+    margins = panel.layout().contentsMargins()
+    return border.left() + border.right() + margins.left() + margins.right()
+
+
 class NetworkScreen(QFrame):
     replication_mode_requested = Signal(str)
     privacy_policy_requested = Signal()
@@ -77,6 +85,11 @@ class NetworkScreen(QFrame):
     def __init__(self, strings: Strings, replication_mode: str) -> None:
         super().__init__()
         self.strings = strings
+        # First-room guidance inputs. They are kept so the guidance can
+        # answer a route request at once, before the next render.
+        self._rendered_mode = replication_mode
+        self._first_room_missing = False
+        self._iroh_route_requested = False
         self.setObjectName("ticket")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -84,6 +97,8 @@ class NetworkScreen(QFrame):
         self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # DSK-04: the page is no Tab stop; focus goes to its controls.
+        self._scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         outer.addWidget(self._scroll, 1)
         self._content = QWidget(self._scroll)
         layout = QVBoxLayout(self._content)
@@ -96,6 +111,21 @@ class NetworkScreen(QFrame):
         self._build_footer(layout)
         self._scroll.setWidget(self._content)
         self._connect_focus_scroll()
+        # DSK-13: rows reflow when the page width or the font changes.
+        self._scroll.viewport().installEventFilter(self)
+        self._content.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+            self._reflow_rows()
+        return super().eventFilter(watched, event)
+
+    def _reflow_rows(self) -> None:
+        margins = self._content.layout().contentsMargins()
+        width = self._scroll.viewport().width() - margins.left() - margins.right()
+        for row in (self._mode_row, self._account_row):
+            row.fit(width)
+        self._room_actions_row.fit(width - _panel_inset(self.iroh_panel))
 
     def _connect_focus_scroll(self) -> None:
         try:
@@ -140,8 +170,8 @@ class NetworkScreen(QFrame):
         header.addWidget(self.network_status)
         return header
 
-    def _build_mode_row(self, replication_mode: str) -> QHBoxLayout:
-        row = QHBoxLayout()
+    def _build_mode_row(self, replication_mode: str) -> ReflowRow:
+        row = self._mode_row = ReflowRow()
         label = QLabel(self.strings.text("network.route"))
         label.setObjectName("microLabel")
         self.replication_mode_combo = QComboBox()
@@ -162,8 +192,13 @@ class NetworkScreen(QFrame):
 
     def _request_replication_mode(self, index: int) -> None:
         mode = self.replication_mode_combo.itemData(index)
-        if isinstance(mode, str):
-            self.replication_mode_requested.emit(mode)
+        if not isinstance(mode, str):
+            return
+        # The Iroh route is refused until a room exists and the selector
+        # snaps back. The guidance then explains the refusal on any route.
+        self._iroh_route_requested = mode == "iroh"
+        self._render_first_room_guidance()
+        self.replication_mode_requested.emit(mode)
 
     def set_replication_mode(self, mode: str) -> None:
         combo = getattr(self, "replication_mode_combo", None)
@@ -173,8 +208,8 @@ class NetworkScreen(QFrame):
         combo.setCurrentIndex(max(0, combo.findData(mode)))
         combo.blockSignals(previous)
 
-    def _build_account_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
+    def _build_account_row(self) -> ReflowRow:
+        row = self._account_row = ReflowRow()
         label = QLabel(self.strings.text("account.heading"))
         label.setObjectName("microLabel")
         # D48: pseudo-locale strings at 1.5x exceed the 640px viewport;
@@ -294,7 +329,9 @@ class NetworkScreen(QFrame):
         # the account row's buttons in RTL (the scroller will not reveal
         # them). Two lines keep every button fully visible via vertical
         # scroll on every platform.
-        primary = QHBoxLayout()
+        # DSK-13: at twice the font the first line alone can be wider than
+        # the panel, so its buttons stack when they do not fit side by side.
+        primary = self._room_actions_row = ReflowRow()
         self.refresh_invite_button = QPushButton(
             self.strings.text("network.refresh_ticket")
         )
@@ -357,6 +394,14 @@ class NetworkScreen(QFrame):
         self.delete_account_button.setEnabled(
             cloud_authenticated and not cloud_deleting_account
         )
+        self._explain_when_disabled(
+            self.delete_account_button,
+            self.strings.text(
+                "account.delete_disabled_in_progress"
+                if cloud_deleting_account
+                else "account.delete_disabled_signed_out"
+            ),
+        )
         self._render_controls(
             replication_mode,
             room,
@@ -385,12 +430,11 @@ class NetworkScreen(QFrame):
         active = replication_mode == "iroh" and room is not None
         self.network_unavailable.setText(unavailable_reason)
         self.network_unavailable.setVisible(bool(unavailable_reason))
-        self.iroh_first_room_guidance.setVisible(available and room is None)
-        self.replication_mode_combo.setAccessibleDescription(
-            self.strings.text("iroh.first_room_guidance")
-            if available and room is None
-            else ""
-        )
+        self._rendered_mode = replication_mode
+        self._first_room_missing = available and room is None
+        if room is not None:
+            self._iroh_route_requested = False
+        self._render_first_room_guidance()
         self.iroh_panel.setEnabled(available or joining)
         self.create_room_button.setEnabled(available and not active and not joining)
         self.join_room_button.setEnabled(available and not active and not joining)
@@ -400,8 +444,57 @@ class NetworkScreen(QFrame):
         self.leave_room_button.setText(self.strings.text("network.leave_room"))
         self.leave_room_button.setAccessibleName(self.strings.text("network.leave_room"))
         self.copy_invite_button.setEnabled(bool(invite))
+        self._explain_disabled_room_controls(available, unavailable_reason, joining)
         if self.invite_output.toPlainText() != invite:
             self.invite_output.setPlainText(invite)
+
+    def _render_first_room_guidance(self) -> None:
+        """Show how to reach the Iroh route while no usable room exists.
+
+        On the Cloud route the guidance read as a warning about the route
+        in use, so there it shows only after the user asks for the Iroh
+        route.
+        """
+        guided = self._first_room_missing and (
+            self._rendered_mode != "centralized" or self._iroh_route_requested
+        )
+        self.iroh_first_room_guidance.setVisible(guided)
+        self.replication_mode_combo.setAccessibleDescription(
+            self.strings.text("iroh.first_room_guidance") if guided else ""
+        )
+
+    def _explain_disabled_room_controls(
+        self, available: bool, unavailable_reason: str, joining: bool
+    ) -> None:
+        if not available and not joining:
+            unavailable = unavailable_reason or self.strings.text(
+                "network.iroh_not_packaged"
+            )
+            room_reason = invite_reason = unavailable
+        else:
+            room_reason = self.strings.text(
+                "network.room_controls_disabled_joining"
+                if joining
+                else "network.room_controls_disabled"
+            )
+            invite_reason = self.strings.text("network.copy_invite_disabled")
+        for button in (
+            self.refresh_invite_button,
+            self.sync_iroh_button,
+            self.leave_room_button,
+        ):
+            self._explain_when_disabled(button, room_reason)
+        self._explain_when_disabled(self.copy_invite_button, invite_reason)
+
+    def _explain_when_disabled(self, button: QPushButton, reason: str) -> None:
+        """Say why a control is off, in its tooltip and to screen readers.
+
+        Only the screen's own state counts. When an outer container disables
+        the whole screen, the reason given here would not be the real one.
+        """
+        explanation = "" if button.isEnabledTo(self) else reason
+        button.setToolTip(explanation)
+        button.setAccessibleDescription(explanation)
 
     def _render_without_room(self, available: bool, unavailable_reason: str) -> None:
         self.network_details.setText(
@@ -457,9 +550,12 @@ class NetworkScreen(QFrame):
     def stylesheet() -> str:
         scale = _app_font_scale()
         sheet = """
-        QFrame#networkPanel { background: palette(base); border: 2px solid palette(mid); }
+        QFrame#networkPanel { background: palette(base); border: 2px solid @border; }
         QLabel#privacyNotice { color: palette(text); background: palette(alternate-base); border-left: 4px solid @signal; padding: 8px; font-family: "DejaVu Sans Mono"; font-size: 9px; }
         """
-        return sheet.replace("@signal", signal_accent(QApplication.palette())).replace(
-            "font-size: 9px", f"font-size: {6.75 * scale:.1f}pt"
+        palette = QApplication.palette()
+        return (
+            sheet.replace("@signal", signal_accent(palette))
+            .replace("@border", control_border(palette))
+            .replace("font-size: 9px", f"font-size: {6.75 * scale:.1f}pt")
         )

@@ -4,26 +4,42 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QDateTime, QEvent, QLocale, QObject, QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QKeyEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFrame,
-    QHBoxLayout,
     QLabel,
+    QListView,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
     QVBoxLayout,
+    QWidget,
 )
 
 from .arrival_minutes_wording import arrival_minutes
 from .core import TERMINAL_STATUSES
 from .localization import Strings
-from .railway_palette import PLATFORM, PLATFORM_DEEP, PORCELAIN
+from .railway_palette import (
+    PLATFORM,
+    PLATFORM_DEEP,
+    PORCELAIN,
+    STEEL,
+    TRACK,
+    control_border,
+    signal_accent,
+)
+from .reflow_row import ReflowRow
 
 _DOWNWARD_KEYS = (Qt.Key.Key_Down, Qt.Key.Key_PageDown)
 _UPWARD_KEYS = (Qt.Key.Key_Up, Qt.Key.Key_PageUp)
 _PAGE_KEYS = (Qt.Key.Key_PageDown, Qt.Key.Key_PageUp)
+
+
+# Three arrivals of two text lines each.
+_PREFERRED_TEXT_LINES = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +50,15 @@ class CutStep:
     rect: QRect
     step: int
     start: int
+
+
+@dataclass(frozen=True, slots=True)
+class PagedStep:
+    """A page between rows: its key, and the positions it left and reached."""
+
+    key: int
+    start: tuple[int, int]
+    landed: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,18 +87,30 @@ class ArrivalsList(QListWidget):
     Up/Down scroll one text line and PageUp/PageDown one viewport through the
     current row before moving to its neighbor, and the reverse key retraces
     each step; Home/End reach the scroll limits at the boundary rows. Paging
-    never skips content, and the current row keeps its reading position when
-    the font or the rows above change, also while the window reflows for a
-    new font.
+    never skips content, a page between rows and its reverse return to the
+    same row, and the current row keeps its reading position when the font
+    or the rows above change, also while the window reflows for a new font.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._line_spacing = self.fontMetrics().lineSpacing()
         self._cut_step: CutStep | None = None
+        self._paged_step: PagedStep | None = None
         self._held_anchor: HeldAnchor | None = None
 
+    def sizeHint(self) -> QSize:
+        # DSK-13: the page scrolls once the list would get less than this
+        # height. Qt's stock hint is a fixed height, which made the page
+        # scroll at the default font; three two-line arrivals follow the font.
+        hint = super().sizeHint()
+        lines = _PREFERRED_TEXT_LINES * self.fontMetrics().lineSpacing()
+        height = max(self.minimumSizeHint().height(), lines + 2 * self.frameWidth())
+        return QSize(hint.width(), height)
+
     def doItemsLayout(self) -> None:
+        # A new layout moves the rows, so a remembered page no longer holds.
+        self._paged_step = None
         # A new font reaches the widget before its rows are laid out again,
         # so their positions still match what the user was reading.
         spacing = self.fontMetrics().lineSpacing()
@@ -157,16 +194,39 @@ class ArrivalsList(QListWidget):
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
         if self._scroll_within_current_row(key):
+            self._paged_step = None
             event.accept()
             return
         self._cut_step = None
+        if self._retrace_page(key):
+            event.accept()
+            return
         before = self._position()
         super().keyPressEvent(event)
         settled = self._settle_navigation(key, before[0])
         if self._page_stalled(key, before):
             settled = self._page_viewport(key, before)
+        if key in _PAGE_KEYS and self._position() != before:
+            self._paged_step = PagedStep(key, before, self._position())
         if settled:
             event.accept()
+
+    def _retrace_page(self, key: int) -> bool:
+        # Qt pages short rows by a count of rows and stops short beside a
+        # tall row or a list end. The reverse page then moves the full count
+        # and lands on another row than the page left. The reverse of the
+        # page just made returns to where that page began instead; any other
+        # key, a moved view or a new layout forgets the page.
+        paged, self._paged_step = self._paged_step, None
+        if paged is None or key not in _PAGE_KEYS or key == paged.key:
+            return False
+        if self._position() != paged.landed:
+            return False
+        row, value = paged.start
+        self.verticalScrollBar().setValue(value)
+        self._set_current_keeping_view(row)
+        self._paged_step = PagedStep(key, paged.landed, paged.start)
+        return True
 
     def _scroll_within_current_row(self, key: int) -> bool:
         rect = self._tall_current_rect()
@@ -335,27 +395,67 @@ class ArrivalsScreen(QFrame):
         self._render_signature: tuple[Any, ...] | None = None
         self.strings = strings
         self.setObjectName("ticket")
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        # DSK-13: large fonts in a small window outgrow the page, so the page
+        # scrolls instead of clipping the subtitle and crushing the list. The
+        # scroll area is no Tab stop; the list inside it takes focus.
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        outer.addWidget(self._scroll, 1)
+        self._content = QWidget(self._scroll)
+        layout = QVBoxLayout(self._content)
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(10)
         layout.addLayout(self._build_header())
         self._build_body(layout, device_id)
+        self._scroll.setWidget(self._content)
+        # DSK-13: the header reflows when the page width, the font or the
+        # count changes. The page's own events cover the font and the count.
+        # They do not cover every width: once the viewport is narrower than
+        # the page's minimum width, the scroll area keeps the page at that
+        # width and the page gets no resize. The viewport's events do.
+        self._scroll.viewport().installEventFilter(self)
+        self._content.installEventFilter(self)
 
-    def _build_header(self) -> QHBoxLayout:
-        header = QHBoxLayout()
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+            self._reflow_header()
+        return super().eventFilter(watched, event)
+
+    def _reflow_header(self) -> None:
+        margins = self._content.layout().contentsMargins()
+        width = self._scroll.viewport().width() - margins.left() - margins.right()
+        self._header.fit(width)
+
+    def _build_header(self) -> ReflowRow:
+        # DSK-13: at large fonts the title and the count badge are wider than
+        # the page together. The badge then moves under the heading, so the
+        # page never has to scroll sideways to show it. The sideways bar
+        # stays as needed for a title that is wider than the page by itself.
+        header = self._header = ReflowRow()
         heading = QVBoxLayout()
         title = QLabel(self.strings.text("arrivals.title"))
         title.setObjectName("sectionTitle")
         self.history_scope = QLabel(self.strings.text("arrivals.scope"))
         self.history_scope.setObjectName("taskSubtitle")
         self.history_scope.setWordWrap(True)
+        self.sync_hint = QLabel(self.strings.text("arrivals.sync_hint"))
+        self.sync_hint.setObjectName("taskSubtitle")
+        self.sync_hint.setWordWrap(True)
+        self.sync_hint.hide()
         heading.addWidget(title)
         heading.addWidget(self.history_scope)
+        heading.addWidget(self.sync_hint)
         self.history_count = QLabel("0")
         self.history_count.setObjectName("countBadge")
         header.addLayout(heading)
         header.addStretch()
-        header.addWidget(self.history_count)
+        # Leading: a stacked badge keeps its own width instead of the page's.
+        header.addWidget(self.history_count, 0, Qt.AlignmentFlag.AlignLeading)
         return header
 
     def _build_body(self, layout: QVBoxLayout, device_id: str) -> None:
@@ -365,6 +465,12 @@ class ArrivalsScreen(QFrame):
         self.history_list.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
+        # DSK-09: rows wrap at word boundaries to the list width, so status
+        # and duration never hide behind a horizontal scroll bar. Only a
+        # single word wider than the list still needs the bar; it stays as
+        # needed so that word is never cut off.
+        self.history_list.setWordWrap(True)
+        self.history_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.history_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.history_list, 1)
         self.device_label = QLabel(
@@ -377,8 +483,15 @@ class ArrivalsScreen(QFrame):
         self,
         history: list[dict[str, Any]],
         known_tasks: dict[str, dict[str, Any]],
+        *,
+        sync_route_active: bool = True,
     ) -> None:
         retained = [item for item in history if item.get("status") in TERMINAL_STATUSES]
+        # Without a signed-in account or an Iroh room every arrival stays
+        # "Pending sync", so the header says what starts the sync.
+        self.sync_hint.setVisible(
+            not sync_route_active and any(item.get("pending") for item in retained)
+        )
         signature = self._signature(retained, known_tasks)
         if signature == self._render_signature:
             return
@@ -454,16 +567,12 @@ class ArrivalsScreen(QFrame):
         return False
 
     def _render_header(self, retained: list[dict[str, Any]]) -> None:
-        displayed = len(retained)
-        self.history_count.setText(
-            self.strings.text(
-                "arrivals.count", displayed=displayed, total=len(retained)
-            )
-        )
+        # DSK-18: every retained arrival is listed, so the badge counts them
+        # instead of reading "N of N".
+        count = len(retained)
+        self.history_count.setText(self.strings.plural("arrivals.total", count))
         self.history_list.setAccessibleDescription(
-            self.strings.text(
-                "arrivals.description", displayed=displayed, total=len(retained)
-            )
+            self.strings.plural("arrivals.total_description", count)
         )
 
     def _render_item(
@@ -512,26 +621,46 @@ class ArrivalsScreen(QFrame):
 
     def _time_label(self, when: object) -> str:
         try:
-            return (
-                datetime.fromisoformat(
-                    str(when).replace("Z", "+00:00")  # noqa: FURB162
-                )
-                .astimezone()
-                .strftime("%a %H:%M")
+            moment = datetime.fromisoformat(
+                str(when).replace("Z", "+00:00")  # noqa: FURB162
             )
         except (ValueError, TypeError):
             return self.strings.text("arrivals.time_pending")
+        # DSK-18: arrivals are retained for weeks, so a weekday alone is
+        # ambiguous. The short date and time follow the system locale.
+        local = QDateTime.fromMSecsSinceEpoch(round(moment.timestamp() * 1000))
+        return QLocale().toString(local, QLocale.FormatType.ShortFormat)
 
     def _render_empty(self) -> None:
         text = self.strings.text("arrivals.empty")
         item = QListWidgetItem(text, self.history_list)
         item.setData(Qt.ItemDataRole.AccessibleTextRole, text.replace("\n", ", "))
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        # DSK-04: the notice is no arrival, so focus never marks it current;
+        # the list description already announces the empty count.
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
 
     @staticmethod
     def stylesheet() -> str:
+        # DSK-04: focus recolors the list border without changing its width,
+        # so the viewport and the R54-D02 reading anchors keep their geometry.
+        # The current row is painted only while the list has focus; the list
+        # keeps NoSelection, so nothing reads as a selected arrival. The row
+        # uses the railway tokens the window pins its highlight colors to.
+        # DSK-09: rows carry no side padding. Qt wraps an item's text to the
+        # full row width and adds item padding afterwards, so side padding
+        # would make a wrapped row wider than the list and clip its last
+        # line. The list's own padding keeps the text off the border.
         return """
         QLabel#countBadge { background: @platform; color: @porcelain; border: 2px solid @platform_deep; padding: 2px 8px; font-weight: bold; }
-        QListWidget { background: palette(base); color: palette(text); border: 2px solid palette(mid); outline: none; padding: 3px; }
-        QListWidget::item { border-bottom: 1px solid palette(alternate-base); padding: 7px 5px; }
-        """.replace("@platform_deep", PLATFORM_DEEP).replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN)
+        QListWidget { background: palette(base); color: palette(text); border: 2px solid @border; outline: none; padding: 3px 8px; }
+        QListWidget:focus { border-color: @signal; }
+        QListWidget::item { border-bottom: 1px solid palette(alternate-base); padding: 7px 0px; }
+        QListWidget::item:focus { background: @steel; color: @track; }
+        """.replace("@platform_deep", PLATFORM_DEEP).replace("@platform", PLATFORM).replace(
+            "@porcelain", PORCELAIN
+        ).replace("@signal", signal_accent(QApplication.palette())).replace(
+            "@steel", STEEL
+        ).replace("@track", TRACK).replace(
+            "@border", control_border(QApplication.palette())
+        )

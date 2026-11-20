@@ -31,7 +31,7 @@ from test_r52_d06_task_header_wrap import _process, _tasks_window
 from test_ui import MemorySecretStore
 
 MARKER_KEY = "pendingTaskDeletion"
-QUESTION = "pomodorough.account_resolution_controller.QMessageBox.question"
+QUESTION = "pomodorough.account_resolution_controller.confirm_destructive_action"
 ACCOUNT = {"id": "account-a", "email": "a@example.invalid"}
 
 
@@ -250,9 +250,9 @@ def test_sign_out_completes_the_delete_and_counts_it(app, tmp_path):
         queued = _queued_changes(window.store)
         asked: list[str] = []
 
-        def question(_parent, _title, detail, *_rest):
+        def question(_parent, *, detail, **_kwargs):
             asked.append(detail)
-            return QMessageBox.StandardButton.Cancel
+            return False
 
         with patch(QUESTION, question):
             window._account_action()
@@ -275,7 +275,7 @@ def test_sign_out_during_the_window_then_sign_in_keeps_the_task_deleted(app, tmp
         store.set_user(ACCOUNT)
     with _tasks_window(app, tmp_path, "en", 640, 360) as window:
         task_id, requested = _pending_delete(app, window)
-        with patch(QUESTION, return_value=QMessageBox.StandardButton.Yes):
+        with patch(QUESTION, return_value=True):
             window._account_action()
         _process(app)
         assert requested == [task_id]

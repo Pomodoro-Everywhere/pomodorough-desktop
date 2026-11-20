@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.localization import Strings
@@ -736,22 +736,21 @@ class MainWindowDurationTests(unittest.TestCase):
         self.assertEqual(self.cloud.resolutions[-1]["strategy"], "merge")
         self.assertIsNotNone(self.store.pending_resolution("user-1"))
 
-    def test_sign_out_warning_reports_zero_queued_changes_and_cancel_is_safe_default(self) -> None:
-        with patch.object(
-            QMessageBox,
-            "question",
-            return_value=QMessageBox.StandardButton.Cancel,
+    def test_sign_out_warning_without_queued_changes_names_the_action(self) -> None:
+        with patch(
+            "pomodorough.account_resolution_controller.confirm_destructive_action", return_value=False
         ) as question:
             self.window._account_action()
 
         self.assertEqual(self.cloud.logout_calls, 0)
-        self.assertIn("0 queued changes", question.call_args.args[2])
+        detail = question.call_args.kwargs["detail"]
         self.assertEqual(
-            question.call_args.args[3],
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            detail, self.window.strings.text("account.signout_detail_no_queue")
         )
+        self.assertNotIn("0 queued", detail)
         self.assertEqual(
-            question.call_args.args[4], QMessageBox.StandardButton.Cancel
+            question.call_args.kwargs["action"],
+            self.window.strings.text("account.sign_out"),
         )
 
     def test_sign_out_warning_reports_exact_total_across_all_outboxes(self) -> None:
@@ -766,14 +765,12 @@ class MainWindowDurationTests(unittest.TestCase):
         )
         self.window._load_state()
 
-        with patch.object(
-            QMessageBox,
-            "question",
-            return_value=QMessageBox.StandardButton.Cancel,
+        with patch(
+            "pomodorough.account_resolution_controller.confirm_destructive_action", return_value=False
         ) as question:
             self.window._account_action()
 
-        self.assertIn("5 queued changes", question.call_args.args[2])
+        self.assertIn("5 queued changes", question.call_args.kwargs["detail"])
         self.assertEqual(self.cloud.logout_calls, 0)
 
     def test_pending_resolution_account_action_can_sign_out(self) -> None:
@@ -1767,9 +1764,13 @@ class MainWindowDurationTests(unittest.TestCase):
 
         self.window._render_history()
 
-        self.assertEqual(self.window.history_count.text(), "10 of 10")
+        self.assertEqual(self.window.history_count.text(), "10 ARRIVALS")
         self.assertIn("completed, cancelled, and superseded", self.window.history_scope.text())
-        self.assertIn("Showing 10 of 10", self.window.history_list.accessibleDescription())
+        self.assertTrue(
+            self.window.history_list.accessibleDescription().startswith(
+                "10 retained arrivals:"
+            )
+        )
         self.assertEqual(self.window.history_list.count(), 10)
         rows = [self.window.history_list.item(index).text() for index in range(10)]
         self.assertIn("Completed", rows[0])
@@ -1885,13 +1886,17 @@ class MainWindowDurationTests(unittest.TestCase):
         )
 
         for confirmation in ("delete", "DELETE "):
-            with patch.object(
-                QInputDialog, "getText", return_value=(confirmation, True)
+            with patch(
+                "pomodorough.account_resolution_controller.ask_delete_account_confirmation",
+                return_value=confirmation,
             ):
                 self.window._delete_account_action()
         self.assertEqual(self.cloud.delete_confirmations, [])
 
-        with patch.object(QInputDialog, "getText", return_value=("DELETE", True)):
+        with patch(
+            "pomodorough.account_resolution_controller.ask_delete_account_confirmation",
+            return_value="DELETE",
+        ):
             self.window._delete_account_action()
         self.assertEqual(self.cloud.delete_confirmations, ["DELETE"])
 

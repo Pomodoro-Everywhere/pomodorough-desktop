@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
-    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -39,7 +38,9 @@ from .railway_palette import (
     STEEL,
     TICKET,
     TRACK,
+    control_border,
     danger_text,
+    placeholder_text,
     signal_accent,
 )
 from .secure_store import SecureStoreError, should_capture_secure_store_error
@@ -51,10 +52,12 @@ from .sentry_monitoring import (
     should_capture_room_read_failure,
 )
 from .shared_core import SharedCoreError
+from .sync_route import sync_route_active
 from .task_undo_lifetime import TaskUndoLifetime
 from .tasks_page import TasksPage
 from .tasks_screen import TasksScreen
 from .timer_screen import TimerRenderState, TimerScreen
+from .wrapping_push_button import WrappingPushButton
 
 _BASE_APP_PT = 9.0
 
@@ -156,6 +159,7 @@ class MainWindowViewMixin:
         # into its menu instead of overflowing, so the bars stay off.
         self._nav_scroll = QScrollArea()
         self._nav_scroll.setObjectName("navScroll")
+        self._nav_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # DSK-04
         self._nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._nav_scroll.setWidgetResizable(True)
         # R52-D05: QScrollArea reports a fixed 88x88 minimum of its own.
@@ -197,7 +201,10 @@ class MainWindowViewMixin:
         self.settings_button.setToolTip(label)
         self.settings_button.setAccessibleName(label)
         self.settings_button.toggled.connect(self._settings_toggled)
-        self.account_button = QPushButton(self.strings.text("account.sign_in"))
+        # DSK-14: without a width budget the button never wraps; it drops the
+        # style sheet's explicit min-width, so the header cannot squeeze the
+        # label below its size hint.
+        self.account_button = WrappingPushButton(self.strings.text("account.sign_in"))
         self.account_button.setObjectName("accountButton")
         self.account_button.clicked.connect(self._account_action)
         header.addWidget(self.settings_button)
@@ -408,8 +415,10 @@ class MainWindowViewMixin:
         # (settings_scroll) covers short heights.
         if hasattr(self, "setMinimumWidth"):
             try:
+                width_before = self.width()
                 self.setMinimumWidth(self._settings_minimum_width(visible))
                 self.updateGeometry()
+                self._follow_settings_width(visible, width_before)
             except RuntimeError:
                 pass
         label = self.strings.text(
@@ -417,6 +426,29 @@ class MainWindowViewMixin:
         )
         self.settings_button.setToolTip(label)
         self.settings_button.setAccessibleName(label)
+
+    def _follow_settings_width(self, visible: bool, width_before: int) -> None:
+        """DSK-12: closing Settings gives back the width opening it took.
+
+        Opening Settings may widen the window to the new minimum. Closing
+        it restores the earlier width, unless the user resized the window
+        while Settings was open or the window is maximized or full screen.
+        """
+        if visible:
+            # The new minimum, not width(): a platform window may report
+            # the resize later than setMinimumWidth returns.
+            widened = max(width_before, self.minimumWidth())
+            self._settings_width_restore = (
+                (width_before, widened) if widened > width_before else None
+            )
+            return
+        restore = getattr(self, "_settings_width_restore", None)
+        self._settings_width_restore = None
+        if restore is None or self.isMaximized() or self.isFullScreen():
+            return
+        earlier, widened = restore
+        if self.width() == widened:
+            self.resize(earlier, self.height())
 
     def _settings_minimum_width(self, visible: bool) -> int:
         base = 600
@@ -726,7 +758,21 @@ class MainWindowViewMixin:
         )
 
     def _render_history(self) -> None:
-        self.arrivals_screen.render(self.history, self.known_tasks)
+        self.arrivals_screen.render(
+            self.history,
+            self.known_tasks,
+            sync_route_active=self._sync_route_active(),
+        )
+
+    def _sync_route_active(self) -> bool:
+        """Whether changes have somewhere to sync to right now.
+
+        The Iroh route is saved only once a usable room exists; the Cloud
+        route syncs only while signed in.
+        """
+        return sync_route_active(
+            self.replication_mode, signed_in=bool(self.cloud.authenticated)
+        )
 
     def _render_network(self) -> None:
         if not hasattr(self, "network_screen"):
@@ -876,8 +922,8 @@ class MainWindowViewMixin:
         QToolButton#settingsButton { font-size: 24px; }
         QLabel#microLabel { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
         QLabel#taskSubtitle { color: palette(text); font-family: "DejaVu Sans Mono"; font-size: 9px; letter-spacing: 1px; }
-        QComboBox, QLineEdit, QPlainTextEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 6px; }
-        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 3px solid @signal; }
+        QComboBox, QLineEdit, QPlainTextEdit { min-height: 29px; background: palette(base); color: palette(text); border: 2px solid @border; padding: 2px 6px; placeholder-text-color: @placeholder; }
+        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus { border: 3px solid @signal; }
         QCheckBox::indicator { border: 2px solid palette(text); background: palette(base); }
         QCheckBox::indicator:checked { background: @signal; background-clip: content; padding: 2px; }
         QCheckBox::indicator:disabled { border-color: palette(dark); }
@@ -893,6 +939,8 @@ class MainWindowViewMixin:
             .replace("@steel", STEEL)
             .replace("@signal", signal_accent(QApplication.palette()))
             .replace("@danger", danger_text(QApplication.palette()))
+            .replace("@border", control_border(QApplication.palette()))
+            .replace("@placeholder", placeholder_text(QApplication.palette()))
         )
         # R52-D04: scale each pixel dimension once. Chained str.replace
         # calls re-scaled values just created (36px->72px, then 72px->144px).

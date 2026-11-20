@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from wcwidth import SequenceTextWrapper, iter_graphemes, wcwidth, wcswidth
 
 from .arrival_minutes_wording import arrival_minutes
+from .arrival_time_wording import arrival_ended_at
 from .core import BREAK_PHASES
 from .localization import Strings
 from .sentry_monitoring import capture_exception, init_sentry_from_environment
@@ -93,9 +94,7 @@ def _feedback_lines(message: str, height: int, width: int) -> list[str]:
 def _reserved_lines(message: str, height: int, width: int, strings: Strings) -> list[str]:
     if height < 2:
         return _wrap_line(message, width)[:max(0, height)]
-    secondary = strings.text("tui.keys_secondary")
-    # The key is fixed; its label and trailing catalog decoration are localized.
-    quit_tail = _wrap_line("q " + secondary.rsplit("q ", 1)[1], width)[:height]
+    quit_tail = _wrap_line(strings.text("tui.keys_quit"), width)[:height]
     feedback_rows = height - len(quit_tail)
     return _feedback_lines(message, feedback_rows, width) + quit_tail
 
@@ -138,6 +137,7 @@ def _timer_lines(
         "",
         strings.text("tui.keys_primary"),
         strings.text("tui.keys_secondary"),
+        strings.text("tui.keys_quit"),
     ]
     if display["taskTitle"] and display.get("phase") not in BREAK_PHASES:
         lines.insert(6, strings.text("terminal.task_upper", task=display["taskTitle"]))
@@ -166,7 +166,7 @@ def _history_lines(
         empty_title, empty_detail = strings.text("terminal.history_empty").split("\n", 1)
         lines.extend((empty_title.center(width), empty_detail.center(width)))
     for item in history[:5]:
-        phase = strings.text(f"phase.{item.get('phase', 'timer')}").title()
+        phase = strings.text(f"phase.{item.get('phase', 'timer')}")
         if item.get("taskTitle"):
             phase = strings.text(
                 "tui.phase_task", phase=phase, task=item["taskTitle"]
@@ -179,6 +179,7 @@ def _history_lines(
                     if wording.reads_as_planned
                     else "tui.history_row"
                 ),
+                when=arrival_ended_at(item, strings),
                 phase=phase,
                 status=strings.text(wording.status_key),
                 minutes=wording.minutes,
@@ -240,9 +241,11 @@ def _screen_lines(
     primary = strings.text("tui.keys_primary")
     secondary = strings.text("tui.keys_secondary")
     tagline = strings.text("brand.tagline")
+    # The quit key lives in the reserved tail, so the legend leaves it out.
+    legend = (primary, secondary, strings.text("tui.keys_quit"))
     core = [
         line for line in _timer_lines(state, width, strings)
-        if line not in ("", tagline, primary, secondary)
+        if line not in ("", tagline, *legend)
     ]
     core_wrapped = [row for line in core for row in _wrap_line(line, width)]
     # Keep one row per timer field, but a long task cannot consume feedback space.
@@ -250,11 +253,22 @@ def _screen_lines(
     content_rows = height - len(reserved)
     ordered = core_wrapped[:content_rows] + reserved
     optional = _pending_lines(state, strings)
-    optional += [primary, secondary]
+    optional += _legend_lines(width, strings)
     optional += [strings.text("arrivals.title")]
     optional += _history_lines(history, width, strings) + [tagline]
     optional_wrapped = [row for line in optional for row in _wrap_line(line, width)]
     return ordered + optional_wrapped[:height - len(ordered)]
+
+
+def _legend_lines(width: int, strings: Strings) -> list[str]:
+    """The key legend, in its short wording when the full one would wrap."""
+    full = [strings.text("tui.keys_primary"), strings.text("tui.keys_secondary")]
+    if all(len(_wrap_line(line, width)) == 1 for line in full):
+        return full
+    return [
+        strings.text("tui.keys_primary_narrow"),
+        strings.text("tui.keys_secondary_narrow"),
+    ]
 
 
 def _report_loop_failure(error: Exception, next_capture_at: float) -> float:

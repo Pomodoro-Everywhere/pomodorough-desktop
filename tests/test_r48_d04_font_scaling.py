@@ -192,7 +192,9 @@ def test_mainwindow_1_5x_grows_and_scrolls(app, tmp_path):
             screen = window.network_screen
             assert window.primary_button.fontMetrics().lineSpacing() > base_ls
             assert window.primary_button.sizeHint().height() >= base_btn_h
-            assert window.primary_button.minimumHeight() > 36
+            # UX round 3 DSK-23: the wrapping button drops the style sheet's
+            # explicit minimum; its minimum size hint carries the same floor.
+            assert window.primary_button.minimumSizeHint().height() > 36
             assert screen.network_details.wordWrap()
             assert _window_overlaps(window, screen) == []
             assert screen._scroll.verticalScrollBar().maximum() > 0
@@ -207,7 +209,7 @@ def test_mainwindow_2x_grows_and_scrolls(app, tmp_path):
         with _main_window(app, tmp_path, "en", 640, 360) as window:
             screen = window.network_screen
             assert window.primary_button.fontMetrics().lineSpacing() > base_ls
-            assert window.primary_button.minimumHeight() > 44
+            assert window.primary_button.minimumSizeHint().height() > 44
             micro_ls = screen.replication_mode_combo.fontMetrics().lineSpacing()
             assert micro_ls >= base_ls
             assert screen.network_details.wordWrap()

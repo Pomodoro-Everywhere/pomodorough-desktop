@@ -12,7 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from pomodorough.cli import _history_time, main, phase_argument
+from pomodorough.arrival_time_wording import arrival_time
+from pomodorough.cli import main, phase_argument
 from pomodorough.core import rebuild_optimistic, task_from_title
 from pomodorough.storage import Store
 from pomodorough.terminal import InvalidAction
@@ -283,6 +284,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("History limit must be at least 1.", error)
 
     def test_history_uses_real_store_task_json_and_limit(self) -> None:
+        self.store.set_user({"id": "user-1"})
         task = task_from_title("Write CLI coverage")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"])
@@ -383,14 +385,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("Short break | idle", output)
 
     def test_history_time_handles_missing_invalid_and_iso_values(self) -> None:
-        self.assertEqual(_history_time(None), "unknown time")
-        self.assertEqual(_history_time("not-a-time"), "not-a-time")
+        self.assertEqual(arrival_time(None), "unknown time")
+        self.assertEqual(arrival_time("not-a-time"), "not-a-time")
         self.assertRegex(
-            _history_time("2026-07-25T12:34:56Z"),
+            arrival_time("2026-07-25T12:34:56Z"),
             r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$",
         )
 
     def test_status_prints_task_and_pending_operation_counts(self) -> None:
+        self.store.set_user({"id": "user-1"})
         task = task_from_title("Prepare release")
         self.store.queue_task_operation("upsert", task, now_ms=1)
         self.store.set_selected_task_id(task["id"], now_ms=2)
@@ -404,9 +407,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn("Task: Prepare release\n", output)
-        self.assertIn("1 command(s) pending sync\n", output)
-        self.assertIn("1 duration preference(s) pending sync\n", output)
-        self.assertIn("1 auto-start preference operation(s) pending sync\n", output)
+        self.assertIn("1 timer change pending sync\n", output)
+        self.assertIn("1 duration change pending sync\n", output)
+        self.assertIn("1 auto-start change pending sync\n", output)
         self.assertEqual(error, "")
 
     def test_status_hides_task_during_break(self) -> None:

@@ -10,6 +10,9 @@ from .storage_model import (
 )
 
 
+CANONICAL_HEAD_FIELDS = ("canonicalHlcWallMs", "canonicalHlcCounter")
+
+
 class CanonicalValidationDependencies(Protocol):
     def _canonical_durations(self, durations_ms: Any) -> dict[str, int]: ...
 
@@ -168,6 +171,52 @@ def require_sync_response_fields(response: Any) -> None:
         raise ValueError(f"Server response omitted canonical fields: {fields}.")
 
 
+def _safe_wire_integer(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 0 <= value <= MAX_SAFE_INTEGER
+    )
+
+
+def validated_canonical_head_fields(
+    response: dict[str, Any], server_head: tuple[int, int]
+) -> dict[str, int]:
+    """Validate the optional canonicalHlcWallMs/canonicalHlcCounter pair.
+
+    The pair is the highest HLC the server ordered into canonical state, so
+    unlike serverHlc* it never includes the server's clock. Both fields come
+    together or not at all, and the pair cannot exceed serverHlc*. An older
+    server sends neither field. A lone field reads its partner as None, which
+    fails the integer check.
+    """
+    if not any(key in response for key in CANONICAL_HEAD_FIELDS):
+        return {}
+    wall = response.get("canonicalHlcWallMs")
+    counter = response.get("canonicalHlcCounter")
+    if (
+        not _safe_wire_integer(wall)
+        or not _safe_wire_integer(counter)
+        or (wall, counter) > server_head
+    ):
+        raise ValueError("Server returned an invalid logical clock.")
+    return {"canonicalHlcWallMs": wall, "canonicalHlcCounter": counter}
+
+
+def reports_canonical_head(canonical: dict[str, Any]) -> bool:
+    return all(key in canonical for key in CANONICAL_HEAD_FIELDS)
+
+
+def response_canonical_head(canonical: dict[str, Any]) -> tuple[int, int]:
+    """Apply the receiver rule to a validated sync response.
+
+    The canonical pair when the server sent it, otherwise serverHlc*.
+    """
+    if reports_canonical_head(canonical):
+        return canonical["canonicalHlcWallMs"], canonical["canonicalHlcCounter"]
+    return canonical["serverHlcWallMs"], canonical["serverHlcCounter"]
+
+
 def validated_sync_scalars(response: dict[str, Any]) -> tuple[int, bool]:
     revision = response["revision"]
     preference = response["autoStartBreaks"]
@@ -241,6 +290,9 @@ class CanonicalWireValidator:
         server_time, server_time_ms, server_hlc_wall_ms, server_hlc_counter = (
             self._hooks._validated_sync_server_clock(response)
         )
+        canonical_head = validated_canonical_head_fields(
+            response, (server_hlc_wall_ms, server_hlc_counter)
+        )
         return {
             **acknowledgements,
             "revision": revision,
@@ -254,6 +306,7 @@ class CanonicalWireValidator:
             "serverTimeMs": server_time_ms,
             "serverHlcWallMs": server_hlc_wall_ms,
             "serverHlcCounter": server_hlc_counter,
+            **canonical_head,
         }
 
     def _validated_sync_server_clock(

@@ -272,21 +272,13 @@ def test_width_budgets_leave_the_column_chrome_inside_the_measured_room(
             room = screen._controls_room() - screen.controls_scroll.bar_allowance()
             inner = room - column.frameWidth() * 2 - margins.left() - margins.right()
             assert screen.primary_button._width_budget == inner
-            row = [
-                button
-                for button in (
-                    screen.finish_button,
-                    screen.cancel_button,
-                    screen.skip_button,
-                    screen.stop_sound_button,
-                )
-                if not button.isHidden()
-            ]
-            assert row
-            spacing = screen._secondary_layout.spacing() * (len(row) - 1)
-            for button in row:
-                # The widest equal share that still fits the inner width.
-                share = button._width_budget
-                assert share * len(row) + spacing <= inner
-                assert (share + 1) * len(row) + spacing > inner
+            # UX round 3 DSK-22: the secondary actions flow onto new lines,
+            # so each one may use the whole inner width, not a share of it.
+            for button in (
+                screen.finish_button,
+                screen.cancel_button,
+                screen.skip_button,
+                screen.stop_sound_button,
+            ):
+                assert button._width_budget == inner
             assert column.minimumSizeHint().width() <= room

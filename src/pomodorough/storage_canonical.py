@@ -105,6 +105,7 @@ class CanonicalStorageDependencies:
     _project_operation: Callable[..., Any]
     _project_canonical_with_pending: Callable[..., Any]
     _set_canonical_head: _SetCanonicalHeadCallback
+    canonical_head: Callable[[], tuple[int, int] | None]
     _retire_delivery_proof: _RetireDeliveryProofCallback
     _prune_command_physical_times: Callable[[], None]
     _set_trusted_time_anchor: _SetTrustedTimeAnchorCallback

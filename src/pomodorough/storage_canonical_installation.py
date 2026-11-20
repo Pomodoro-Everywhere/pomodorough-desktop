@@ -8,6 +8,10 @@ from typing import Any, Protocol
 from .core import ACTIVE_STATUSES, PHASES, parse_timestamp_ms
 from .shared_core import SharedCoreOperationError, plan_timer_completion_v1
 from .storage_canonical_reconciliation import generated_break_day_bounds
+from .storage_canonical_validation import (
+    reports_canonical_head,
+    response_canonical_head,
+)
 from .storage_model import (
     MAX_CLOCK_SKEW_MS,
     _default_shared_core,
@@ -88,6 +92,8 @@ class CanonicalInstallationDependencies(Protocol):
     def _retire_delivery_proof(self, retired: dict[str, list[str]]) -> None: ...
 
     def _set_canonical_head(self, wall_ms: int, counter: int) -> None: ...
+
+    def canonical_head(self) -> tuple[int, int] | None: ...
 
     def _project_canonical_with_pending(
         self,
@@ -193,6 +199,7 @@ class CanonicalInstallationHooks(Protocol):
         trusted_response_ms: int,
         expected_projection: dict[str, Any] | None = None,
         safe_pending: dict[str, list[dict[str, Any]]] | None = None,
+        canonical_head: tuple[int, int] | None = None,
     ) -> None: ...
 
     def _validated_pending_resolution_apply(
@@ -264,6 +271,7 @@ class AtomicCanonicalInstaller:
         trusted_response_ms: int,
         expected_projection: dict[str, Any] | None = None,
         safe_pending: dict[str, list[dict[str, Any]]] | None = None,
+        canonical_head: tuple[int, int] | None = None,
     ) -> None:
         pending = self._dependencies._preflight_pending_queues(require_clock_coverage=False)
         merged_clock = self._hooks._merged_install_clock(
@@ -280,9 +288,9 @@ class AtomicCanonicalInstaller:
         self._dependencies._set_meta(
             "hlc", {"wallMs": merged_clock[0], "counter": merged_clock[1]}
         )
-        self._dependencies._set_canonical_head(
-            canonical["serverHlcWallMs"], canonical["serverHlcCounter"]
-        )
+        if canonical_head is None:
+            canonical_head = response_canonical_head(canonical)
+        self._dependencies._set_canonical_head(*canonical_head)
         if clock_sample is not None:
             self._dependencies._set_meta("serverClockSample", clock_sample)
 
@@ -509,10 +517,33 @@ class AtomicCanonicalInstaller:
             trusted_response_ms=trusted_response_ms,
             expected_projection=reconciliation["projection"],
             safe_pending=reconciliation["projectionPending"],
+            canonical_head=self._covering_head(canonical, previous),
         )
         self._advance_selected_phase_for_remote_finish(canonical, previous.get("history", []))
         self._dependencies._prune_command_physical_times()
         return notices
+
+    def _covering_head(
+        self, canonical: dict[str, Any], previous: dict[str, Any]
+    ) -> tuple[int, int]:
+        """Return the HLC bound that covers the installed canonical snapshot.
+
+        A server that sends canonicalHlc* names the exact head, which never
+        includes the server's clock (receiver rule). An older server sends
+        only serverHlc*, its HLC at render time. An operation queued while
+        that request was in flight is older than that stamp, so projection
+        would hide it until the next sync acknowledged it: the user's Start
+        blinks back to idle. When the revision did not move, the server
+        reduced the same operations as before, so the stored bound still
+        covers the snapshot, and the smaller of two covering bounds does too.
+        """
+        response_head = response_canonical_head(canonical)
+        if reports_canonical_head(canonical):
+            return response_head
+        stored_head = self._dependencies.canonical_head()
+        if stored_head is None or canonical["revision"] != int(previous.get("revision", 0)):
+            return response_head
+        return min(stored_head, response_head)
 
     def _has_active_canonical_timer(self, canonical: dict[str, Any]) -> bool:
         timer = canonical.get("canonicalTimer")

@@ -26,6 +26,10 @@ NON_TEXT_CONTRAST = 3.0
 TEXT_CONTRAST = 4.5
 _TRACK_STEPS = 10
 _DANGER_STEPS = 20
+_BORDER_STEPS = 20
+_PLACEHOLDER_STEPS = 20
+# Qt draws placeholder text at half the text colour's alpha by default.
+_PLACEHOLDER_START = 0.5
 
 
 def signal_accent(palette: QPalette) -> str:
@@ -73,6 +77,62 @@ def progress_track(palette: QPalette, arc: QColor) -> QColor:
         if contrast_ratio(arc, track) >= NON_TEXT_CONTRAST:
             return track
     return face
+
+
+def control_border(palette: QPalette) -> str:
+    """The border of inputs, lists, tables and panels, at least 3:1.
+
+    Palette Mid is 1.6:1 to 2.4:1 against the window and the field
+    backgrounds in common palettes, so field and panel edges are hard to
+    find. The border moves from Mid toward the text colour in twentieths
+    until it clears the WCAG non-text limit against the window, base and
+    alternate-base surfaces it separates. The last step is the text colour.
+
+    A focused button draws its ring in the text colour and can sit right
+    against a table border, so the first step that also leaves the ring
+    3:1 against the border wins. The button colour is not a counted
+    surface: only table header dividers sit on it, and in dark palettes a
+    border that clears 3:1 there comes within 3:1 of the ring.
+    """
+    mid = palette.color(QPalette.ColorRole.Mid)
+    text = palette.color(QPalette.ColorRole.Text)
+    surfaces = [
+        palette.color(role)
+        for role in (
+            QPalette.ColorRole.Window,
+            QPalette.ColorRole.Base,
+            QPalette.ColorRole.AlternateBase,
+        )
+    ]
+    visible = [
+        candidate
+        for candidate in (
+            _blend(mid, text, step / _BORDER_STEPS) for step in range(_BORDER_STEPS + 1)
+        )
+        if all(contrast_ratio(candidate, s) >= NON_TEXT_CONTRAST for s in surfaces)
+    ]
+    for candidate in visible:
+        if contrast_ratio(text, candidate) >= NON_TEXT_CONTRAST:
+            return candidate.name()
+    return visible[0].name() if visible else text.name()
+
+
+def placeholder_text(palette: QPalette) -> str:
+    """Placeholder text for fields on the palette's base, at least 4.5:1.
+
+    Qt's default placeholder is the text colour at half alpha, 3.9:1 on a
+    white base. This starts from the same half-way colour and moves toward
+    the text colour in twentieths until it clears the WCAG text limit, so
+    the placeholder stays as light as the palette allows.
+    """
+    base = palette.color(QPalette.ColorRole.Base)
+    text = palette.color(QPalette.ColorRole.Text)
+    for step in range(_PLACEHOLDER_STEPS + 1):
+        share = _PLACEHOLDER_START + (1 - _PLACEHOLDER_START) * step / _PLACEHOLDER_STEPS
+        candidate = _blend(base, text, share)
+        if contrast_ratio(candidate, base) >= TEXT_CONTRAST:
+            return candidate.name()
+    return text.name()
 
 
 def contrast_ratio(first: QColor, second: QColor) -> float:

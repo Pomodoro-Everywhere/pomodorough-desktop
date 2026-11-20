@@ -26,9 +26,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .core import normalize_task_title, shown_run_minutes, task_summaries_today
+from .core import (
+    normalize_task_title,
+    shown_run_minutes,
+    task_id_for_title,
+    task_summaries_today,
+)
 from .localization import Strings
-from .railway_palette import PLATFORM, PLATFORM_DEEP, PORCELAIN
+from .railway_palette import (
+    PLATFORM,
+    PLATFORM_DEEP,
+    PORCELAIN,
+    control_border,
+    signal_accent,
+)
+from .task_rename_merge import confirm_rename_merge
 from .task_undo_banner import TaskUndoBanner
 
 _DELETE_KEYS = (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
@@ -156,6 +168,8 @@ class TasksScreen(QFrame):
     def _build_table(self, layout: QVBoxLayout) -> None:
         self.task_table = QTableWidget(0, 4)
         self.task_table.setAccessibleName(self.strings.text("task.board_accessible"))
+        # DSK-16: name every way to rename, so a screen reader announces it.
+        self.task_table.setAccessibleDescription(self.strings.text("task.rename_hint"))
         self.task_table.setHorizontalHeaderLabels(
             tuple(
                 self.strings.text(f"task.column.{key}")
@@ -527,9 +541,12 @@ class TasksScreen(QFrame):
             if column != TITLE_COLUMN:
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.task_table.setItem(row, column, cell)
-            return
-        if existing.text() != text:
+            existing = cell
+        elif existing.text() != text:
             existing.setText(text)
+        if column == TITLE_COLUMN:
+            # DSK-16: an elided title shows in full, with the ways to rename.
+            existing.setToolTip(self.strings.text("task.title_tooltip", task=text))
 
     def _render_delete_cell(
         self, row: int, task_id: str, title: str, mutations_enabled: bool
@@ -686,8 +703,13 @@ class TasksScreen(QFrame):
         self._rename_target = (task_id, item.text())
         self.task_table.setCurrentCell(row, TITLE_COLUMN)
         self.task_table.editItem(item)
-        if self.task_table.cellWidget(row, TITLE_COLUMN) is None:
+        editor = self.task_table.cellWidget(row, TITLE_COLUMN)
+        if editor is None:
             self._rename_target = None
+            return
+        editor.setAccessibleName(
+            self.strings.text("task.rename_accessible", task=item.text())
+        )
 
     def _task_id_at(self, row: int) -> str | None:
         button = self.task_table.cellWidget(row, 3) if row >= 0 else None
@@ -736,8 +758,18 @@ class TasksScreen(QFrame):
         # the same sentence as the composer.
         if normalize_task_title(title) == normalize_task_title(original):
             return
+        if not self._merge_confirmed(task_id, original, title):
+            return
         self.flush_pending_delete()
         self.rename_task_requested.emit(task_id, title)
+
+    def _merge_confirmed(self, task_id: str, original: str, title: str) -> bool:
+        # DSK-16: a title that names another row joins the two tasks.
+        target_row = self._row_for_delete_id(task_id_for_title(title))
+        existing = self.task_table.item(target_row, TITLE_COLUMN)
+        if target_row < 0 or existing is None:
+            return True
+        return confirm_rename_merge(self, self.strings, original, existing.text())
 
     def _focused_delete_id(self) -> tuple[str | None, int]:
         focused = QApplication.focusWidget()
@@ -791,10 +823,17 @@ class TasksScreen(QFrame):
 
     @staticmethod
     def stylesheet() -> str:
+        # DSK-04: focus recolors the table border without changing its width,
+        # so focusing the table never reflows the rows.
         return """
         QLabel#countBadge { background: @platform; color: @porcelain; border: 2px solid @platform_deep; padding: 2px 8px; font-weight: bold; }
         QLabel#emptyState { color: palette(text); padding: 24px; }
-        QFrame#undoBanner { background: palette(base); color: palette(text); border: 2px solid palette(mid); padding: 2px 8px; }
-        QTableWidget { background: palette(base); color: palette(text); border: 2px solid palette(mid); gridline-color: palette(alternate-base); outline: none; }
-        QHeaderView::section { background: palette(button); color: palette(button-text); border: 1px solid palette(mid); padding: 6px; font-weight: 800; }
-        """.replace("@platform_deep", PLATFORM_DEEP).replace("@platform", PLATFORM).replace("@porcelain", PORCELAIN)
+        QFrame#undoBanner { background: palette(base); color: palette(text); border: 2px solid @border; padding: 2px 8px; }
+        QTableWidget { background: palette(base); color: palette(text); border: 2px solid @border; gridline-color: palette(alternate-base); outline: none; }
+        QTableWidget:focus { border-color: @signal; }
+        QHeaderView::section { background: palette(button); color: palette(button-text); border: 1px solid @border; padding: 6px; font-weight: 800; }
+        """.replace("@platform_deep", PLATFORM_DEEP).replace("@platform", PLATFORM).replace(
+            "@porcelain", PORCELAIN
+        ).replace("@signal", signal_accent(QApplication.palette())).replace(
+            "@border", control_border(QApplication.palette())
+        )

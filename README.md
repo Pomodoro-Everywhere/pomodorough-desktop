@@ -1,4 +1,4 @@
-# Pomodorough for Linux and Windows
+# Pomodorough for Linux, macOS, and Windows
 
 <p align="center">
   <img src="src/pomodorough/resources/icon.svg" alt="Pomodorough" width="96">
@@ -26,7 +26,7 @@ on screen, then reconciled with the Pomodorough service when signed in.
 
 ## Highlights
 
-- Native PySide6 desktop interface for Linux and Windows
+- Native PySide6 desktop interface for Linux, macOS, and Windows
 - Standalone Windows executable with no Python installation required
 - CLI with human-readable and JSON output for scripts and status integrations
 - Lightweight TUI for keyboard-first timer control
@@ -92,6 +92,18 @@ Windows builds are currently unsigned and may trigger a Microsoft Defender
 SmartScreen warning. Verify the downloaded executable against its published
 SHA-256 checksum before running it.
 
+### macOS
+
+Install with [Homebrew](#homebrew), or build the app bundle from a source
+checkout:
+
+```sh
+./install-this-mac.sh
+```
+
+The script builds `Pomodorough Desktop.app` with PyInstaller and installs it in
+`/Applications`. Set `INSTALL_DIR` to install it somewhere else.
+
 ### Linux distributions
 
 Install Python and its virtual environment support with your distribution's
@@ -112,9 +124,9 @@ Download the release source and install the desktop entry, icon, virtual
 environment, and all three executables below `~/.local`:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.56.1/pomodorough_linux-0.56.1.tar.gz
-tar -xzf pomodorough_linux-0.56.1.tar.gz
-cd pomodorough_linux-0.56.1
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.57.0/pomodorough_linux-0.57.0.tar.gz
+tar -xzf pomodorough_linux-0.57.0.tar.gz
+cd pomodorough_linux-0.57.0
 ./deploy/install.sh
 ```
 
@@ -171,7 +183,7 @@ immutable system root.
 Install the package directly from the tagged GitHub release:
 
 ```sh
-nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.56.1
+nix profile install github:Pomodoro-Everywhere/pomodorough-desktop/v0.57.0
 ```
 
 The package wrapper includes `secret-tool` from `libsecret`. Enable a provider
@@ -183,8 +195,8 @@ in the NixOS configuration, then log in again and unlock the keyring.
 Download and install the x86-64 bundle attached to the GitHub release:
 
 ```sh
-curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.56.1/Pomodorough-0.56.1-x86_64.flatpak
-flatpak install --user ./Pomodorough-0.56.1-x86_64.flatpak
+curl -LO https://github.com/Pomodoro-Everywhere/pomodorough-desktop/releases/download/v0.57.0/Pomodorough-0.57.0-x86_64.flatpak
+flatpak install --user ./Pomodorough-0.57.0-x86_64.flatpak
 flatpak run me.egigoka.Pomodorough
 ```
 

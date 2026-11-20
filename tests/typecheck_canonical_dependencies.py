@@ -35,6 +35,7 @@ def canonical_dependencies_from_store(store: Store) -> CanonicalStorageDependenc
         _project_operation=store._project_operation,
         _project_canonical_with_pending=store._project_canonical_with_pending,
         _set_canonical_head=store._set_canonical_head_locked,
+        canonical_head=store.canonical_head,
         _retire_delivery_proof=store._retire_delivery_proof_locked,
         _prune_command_physical_times=store._prune_command_physical_times,
         _set_trusted_time_anchor=lambda anchor: store._set_trusted_time_anchor(anchor),

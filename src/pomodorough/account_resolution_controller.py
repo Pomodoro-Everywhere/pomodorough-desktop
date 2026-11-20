@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox, QWidget
+from PySide6.QtWidgets import QMessageBox, QWidget
 
 from .controller_outcomes import (
     ActivatePersistedResolution,
@@ -24,6 +24,8 @@ from .controller_outcomes import (
     done,
     returning,
 )
+from .delete_account_dialog import CONFIRMATION_WORD, ask_delete_account_confirmation
+from .destructive_confirmation import confirm_destructive_action
 from .pending_task_deletion import unfinished_task_deletion_count
 from .sentry_monitoring import capture_exception
 from .secure_store import SecureStoreError
@@ -586,16 +588,14 @@ class AccountResolutionController:
         context = self._context()
         if not context.cloud.authenticated or context.cloud.deleting_account:
             return done()
-        confirmation, accepted = QInputDialog.getText(
-            self._ports.dialog_parent(),
-            context.strings.text("account.delete_prompt_title"),
-            context.strings.text("account.delete_prompt"),
-            QLineEdit.EchoMode.Normal,
-            "",
+        confirmation = ask_delete_account_confirmation(
+            self._ports.dialog_parent(), context.strings
         )
-        if not accepted:
+        if confirmation is None:
             return done()
-        if confirmation != "DELETE":
+        # The dialog accepts only the exact word; this keeps the request
+        # fail-closed if that ever changes.
+        if confirmation != CONFIRMATION_WORD:
             return done(
                 ShowStatus(context.strings.text("account.delete_mismatch"), 10_000)
             )
@@ -750,15 +750,12 @@ class AccountResolutionController:
             if failure is not None:
                 return failure
             assert queued_changes is not None
-            queue_label = context.strings.plural("queue.changes", queued_changes)
-            answer = QMessageBox.question(
+            if confirm_destructive_action(
                 self._ports.dialog_parent(),
-                context.strings.text("account.signout_title"),
-                context.strings.text("account.signout_detail", queue=queue_label),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
+                title=context.strings.text("account.signout_title"),
+                detail=_signout_detail(context.strings, queued_changes),
+                action=context.strings.text("account.sign_out"),
+            ):
                 return self._request_sign_out()
         else:
             context.cloud.login()
@@ -810,3 +807,13 @@ class AccountResolutionController:
         return returning(
             {switch: "switch", sign_out: "sign_out"}.get(dialog.clickedButton())
         )
+
+
+def _signout_detail(strings: Any, queued_changes: int) -> str:
+    """Sign-out warning text; it mentions the queue only when changes exist."""
+    if not queued_changes:
+        return strings.text("account.signout_detail_no_queue")
+    return strings.text(
+        "account.signout_detail",
+        queue=strings.plural("queue.changes", queued_changes),
+    )

@@ -73,7 +73,7 @@ def _start(timer, title):
 
 def _observation(timer, screen, before, error=""):
     frame = screen.frames[-1] if screen.frames else ""
-    quit_text = "q " + timer.strings.text("tui.keys_secondary").split("q ", 1)[1]
+    quit_text = timer.strings.text("tui.keys_quit")
     return {"width": screen.getmaxyx()[1], "writes": screen.writes, "error": error,
             "sql_unchanged": _dump(timer.store) == before,
             "quit_present": all(quit_text in frame for frame in screen.frames) and bool(frame),

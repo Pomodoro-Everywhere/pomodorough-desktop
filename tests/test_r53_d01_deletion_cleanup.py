@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import pytest
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QInputDialog
 
 from pomodorough.account_resolution_controller import AccountResolutionController
 from pomodorough.network_session import ApiError
@@ -44,7 +43,10 @@ def delete(cloud, window, request):
             success(result)
 
     with patch.object(cloud, "_start", side_effect=run):
-        with patch.object(QInputDialog, "getText", return_value=("DELETE", True)):
+        with patch(
+            "pomodorough.account_resolution_controller.ask_delete_account_confirmation",
+            return_value="DELETE",
+        ):
             window._delete_account_action()
 
 

@@ -53,4 +53,4 @@ def test_shared_core_survives_signals_caught_on_other_threads() -> None:
         check=False,
     )
     assert result.returncode == 0, (result.returncode, result.stderr)
-    assert result.stdout.strip() == "0.56.0"
+    assert result.stdout.strip() == "0.57.0"

@@ -382,6 +382,7 @@ class LocalTimerTests(unittest.TestCase):
         )
 
     def test_tui_duration_adjustment_queues_compacted_preference(self) -> None:
+        self.store.set_user({"id": "user-1"})
         handle_key(self.timer, ord("+"))
         handle_key(self.timer, ord("+"))
 
@@ -393,7 +394,7 @@ class LocalTimerTests(unittest.TestCase):
         rendered = "\n".join(
             build_lines(self.timer.state(now_ms=1_000), [], 80)
         )
-        self.assertIn("1 duration preference(s) pending sync", rendered)
+        self.assertIn("1 duration change pending sync", rendered)
 
     def test_duration_edit_does_not_change_active_timer_plan(self) -> None:
         self.timer.issue("start", now_ms=1_000)
@@ -407,6 +408,7 @@ class LocalTimerTests(unittest.TestCase):
         self.assertEqual(self.store.load()["settings"]["durations"]["focus"], 26)
 
     def test_tui_lines_include_timer_and_history(self) -> None:
+        self.store.set_user({"id": "user-1"})
         self.timer.issue("start", minutes=1, now_ms=1_000)
         self.timer.issue("finish", now_ms=31_000)
         state = self.timer.state(now_ms=31_000)

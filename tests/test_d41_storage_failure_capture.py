@@ -7,7 +7,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from PySide6.QtWidgets import QMessageBox
 
 from pomodorough.controller_outcomes import (
     EmitFailure,
@@ -256,8 +255,8 @@ class ReplicationD41Tests(unittest.TestCase):
         def run(error: Exception):
             harness.store.failure = error
             with patch(
-                "pomodorough.replication_controller.QMessageBox.warning",
-                return_value=QMessageBox.StandardButton.Yes,
+                "pomodorough.replication_controller.confirm_destructive_action",
+                return_value=True,
             ):
                 return harness.controller.leave_iroh_room(), []
 

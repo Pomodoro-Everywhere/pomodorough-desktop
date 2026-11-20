@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QMargins, QObject, QTimer
+from PySide6.QtCore import QEvent, QMargins, QObject, Qt, QTimer
 from PySide6.QtGui import QResizeEvent, QShowEvent
 from PySide6.QtWidgets import QFrame, QScrollArea, QWidget
 
@@ -27,6 +27,8 @@ class TasksPage(QScrollArea):
         self.screen = screen
         self._placing = False
         self.setFrameShape(QFrame.Shape.NoFrame)
+        # DSK-04: the page is no Tab stop; focus goes to the screen's controls.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setWidgetResizable(True)
         self.setWidget(screen)
         screen.undo_window_changed.connect(self.place_undo_banner)

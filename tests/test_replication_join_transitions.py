@@ -272,7 +272,7 @@ def test_synchronous_storage_failure_does_not_latch_transition(rig, monkeypatch,
     before = persisted(rig)
     connection = rig.store.connection
     rig.store.connection = CommitFailingConnection(connection)
-    monkeypatch.setattr("pomodorough.replication_controller.QMessageBox.warning", lambda *args: 16384)
+    monkeypatch.setattr("pomodorough.replication_controller.confirm_destructive_action", lambda *args, **kwargs: True)
     actions = {
         "create": lambda: rig.controller.create_iroh_room("Commit failure"),
         "join": lambda: begin_join(rig, monkeypatch),

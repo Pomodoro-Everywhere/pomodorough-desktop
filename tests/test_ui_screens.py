@@ -197,6 +197,8 @@ class ScreenSignalTests(unittest.TestCase):
         known_tasks = {"task-1": {"id": "task-1", "title": "Swift"}}
         settings = {"selectedTaskId": "task-1"}
         expected_hint = "Applies to the current running focus timer and the next timer."
+        # DSK-06: the tooltip names the selected task, then the hint.
+        expected_tip = f"Swift\n{expected_hint}"
 
         for phase in ("short_break", "long_break"):
             with self.subTest(phase=phase):
@@ -214,7 +216,7 @@ class ScreenSignalTests(unittest.TestCase):
                 self.assertTrue(screen.active_task_context.isHidden())
                 self.assertTrue(screen.task_combo.isEnabled())
                 self.assertEqual(screen.task_combo.accessibleName(), "Focus task")
-                self.assertEqual(screen.task_combo.toolTip(), expected_hint)
+                self.assertEqual(screen.task_combo.toolTip(), expected_tip)
                 self.assertEqual(screen.task_combo.accessibleDescription(), expected_hint)
 
         screen.invalidate_task_selector()
@@ -231,7 +233,7 @@ class ScreenSignalTests(unittest.TestCase):
         self.assertTrue(screen.active_task_context.isHidden())
         self.assertTrue(screen.task_combo.isEnabled())
         self.assertEqual(screen.task_combo.accessibleName(), "Focus task")
-        self.assertEqual(screen.task_combo.toolTip(), expected_hint)
+        self.assertEqual(screen.task_combo.toolTip(), expected_tip)
 
     def test_single_task_selector_stays_enabled_while_running(self) -> None:
         screen = TimerScreen(

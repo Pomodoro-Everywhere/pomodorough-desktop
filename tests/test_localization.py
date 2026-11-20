@@ -40,7 +40,7 @@ class LocalizationTests(unittest.TestCase):
         strings = Strings("en")
 
         self.assertEqual(
-            strings.text("arrivals.count", displayed=8, total=11), "8 of 11"
+            strings.text("task.delete_accessible", task="Write"), "Delete Write"
         )
         self.assertEqual(strings.plural("queue.changes", 1), "1 queued change")
         self.assertEqual(strings.plural("queue.changes", 2), "2 queued changes")

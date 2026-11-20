@@ -4,12 +4,13 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .localization import Strings
 from .railway_palette import STEEL, TICKET, TRACK, progress_track, signal_accent
+from .timer_readout_face import LEAST_SCALE, ReadoutFace, ReadoutState
 
 
 @dataclass(frozen=True)
@@ -253,11 +254,59 @@ class ClockWidget(QWidget):
         # Med: keyboard/screen-reader reachable; Tab focuses the dial and
         # assistive tech announces name + description.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(170, 150)
+        self._compact_readout = False
+        self.setMinimumSize(self.round_minimum())
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
+    @staticmethod
+    def round_minimum() -> QSize:
+        """Least size at which the round dial stays readable."""
+        return QSize(170, 150)
+
+    @property
+    def compact_readout(self) -> bool:
+        return self._compact_readout
+
+    def set_compact_readout(self, compact: bool) -> None:
+        """DSK-12: show the compact readout instead of the round dial.
+
+        The readout asks for its content's size, so it takes no more of
+        the page than the font needs.
+        """
+        if compact == self._compact_readout:
+            return
+        self._compact_readout = compact
+        grow = QSizePolicy.Policy.Preferred if compact else QSizePolicy.Policy.Expanding
+        self.setMinimumSize(QSize(0, 0) if compact else self.round_minimum())
+        self.setSizePolicy(grow, grow)
+        self.updateGeometry()
+        self.update()
+
     def sizeHint(self) -> QSize:
+        if self._compact_readout:
+            return self._readout_face().natural_size().toSize()
         return QSize(360, 360)
+
+    def minimumSizeHint(self) -> QSize:
+        if self._compact_readout:
+            return self.readout_minimum()
+        return super().minimumSizeHint()
+
+    def readout_minimum(self) -> QSize:
+        """Least size of the compact readout at this font."""
+        return (self._readout_face().natural_size() * LEAST_SCALE).toSize()
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            # The readout's size follows the font.
+            self.updateGeometry()
+
+    def _readout_face(self) -> ReadoutFace:
+        state = ReadoutState(
+            self.time_text, self.phase_text, self.status_text, self.progress, self.dots
+        )
+        return ReadoutFace(self.font(), state, self.layoutDirection())
 
     def set_state(
         self,
@@ -270,29 +319,48 @@ class ClockWidget(QWidget):
         *,
         ended: bool = False,
     ) -> None:
+        digits_changed = len(time_text) != len(self.time_text)
         self.time_text = time_text
         self.phase_text = phase.upper()
         self.status_text = status.upper()
         self.progress = max(0.0, min(1.0, progress))
         self.tick_count = max(1, int(tick_count))
         self.dots = max(0, min(4, int(dots)))
+        description = self.strings.text(
+            # After a session ends the clock shows the next one at rest,
+            # so its time is not what remains of a running session.
+            "status.timer_description_ended" if ended else "status.timer_description",
+            phase=phase.title(),
+            time=time_text,
+            status=status.lower(),
+        )
         self.setAccessibleDescription(
             self.strings.text(
-                # After a session ends the clock shows the next one at rest,
-                # so its time is not what remains of a running session.
-                "status.timer_description_ended" if ended else "status.timer_description",
-                phase=phase.title(),
-                time=time_text,
-                status=status.lower(),
+                "status.timer_description_with_progress",
+                description=description,
+                progress=self.strings.text(
+                    "status.pomodoro_progress_value", count=self.dots
+                ),
             )
-            + " "
-            + self.strings.text("status.pomodoro_progress_value", count=self.dots)
         )
+        if digits_changed:
+            # The readout is as wide as its countdown.
+            self.updateGeometry()
         self.update()
 
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._compact_readout:
+            self._readout_face().paint(painter, QRectF(self.rect()), self.palette())
+        else:
+            self._paint_round_dial(painter)
+        if self.hasFocus():
+            painter.setPen(QPen(QColor(signal_accent(self.palette())), 3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
+
+    def _paint_round_dial(self, painter: QPainter) -> None:
         _ClockRenderer(
             painter,
             _ClockGeometry.for_widget(self),
@@ -304,7 +372,3 @@ class ClockWidget(QWidget):
             tick_count=self.tick_count,
             dots=self.dots,
         ).paint()
-        if self.hasFocus():
-            painter.setPen(QPen(QColor(signal_accent(self.palette())), 3))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.rect().adjusted(2, 2, -2, -2))

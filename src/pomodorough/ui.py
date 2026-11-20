@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time  # noqa: F401 - public test seam patches shared time module
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,7 @@ from .failure_notice import describe_failure
 from .localization import Strings
 from .network import CloudService
 from .railway_palette import STEEL, TRACK
+from .shown_failure_report import report_shown_failure
 from .sound import CompletionSound
 from .storage import Store
 from .task_failure_notice import ask_to_retry, describe_task_failure
@@ -220,8 +222,8 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self.tray_menu: QMenu | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self.tray = QSystemTrayIcon(self.app_icon, self)
         self._tray_progress_icon = TrayProgressIcon(resource_path("icon.svg"))
+        self.tray = QSystemTrayIcon(self._tray_progress_icon.icon(None), self)
         self.tray.setToolTip("Pomodorough")
         self.tray_menu = QMenu(self)
         show_action = QAction(self.strings.text("tray.show"), self)
@@ -257,14 +259,15 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
     def _update_tray_progress(self, progress: float, active: bool) -> None:
         if not self.tray:
             return
-        state = (active, round(max(0.0, min(1.0, progress)) * 100))
+        # Whole percents round down, so an unfinished timer never shows the
+        # full ring that marks 100%.
+        state = (active, math.floor(max(0.0, min(1.0, progress)) * 100))
         if state == self._tray_progress_state:
             return
         self._tray_progress_state = state
-        if not active:
-            self.tray.setIcon(self.app_icon)
-            return
-        self.tray.setIcon(self._tray_progress_icon.icon(state[1] / 100))
+        self.tray.setIcon(
+            self._tray_progress_icon.icon(state[1] / 100 if active else None)
+        )
 
     def _open_privacy_policy(self) -> None:
         QDesktopServices.openUrl(QUrl(PRIVACY_POLICY_URL))
@@ -292,6 +295,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self._show_waiting_failure_sentence()
 
     def _show_task_failure(self, failure: EmitTaskFailure) -> None:
+        report_shown_failure(failure.error)
         if self._hold_unattended_task_delete_failure(failure):
             # M3: no Retry dialog on a hiding, quitting or hidden window.
             return
@@ -304,6 +308,7 @@ class MainWindow(MainWindowViewMixin, WindowApplicationController, QMainWindow):
         self._show_failure_sentence(notice.sentence, retry)
 
     def _show_failure(self, failure: EmitFailure) -> None:
+        report_shown_failure(failure.error)
         notice = describe_failure(self.strings, failure.error)
         self._show_failure_sentence(
             notice.sentence, failure.retry if notice.can_retry else None

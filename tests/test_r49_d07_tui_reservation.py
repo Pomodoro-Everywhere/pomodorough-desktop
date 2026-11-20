@@ -63,7 +63,7 @@ def _start_task(timer, title):
 
 def _assert_feedback_and_quit(frame, strings, feedback="Cannot pause now"):
     assert feedback in frame
-    assert "q " + strings.text("tui.keys_secondary").split("q ", 1)[1] in frame
+    assert strings.text("tui.keys_quit") in frame
 
 
 @pytest.mark.parametrize("title", MAXIMUM_TITLES, ids=["words", "unbroken", "wide"])

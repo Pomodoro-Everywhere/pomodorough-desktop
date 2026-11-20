@@ -96,7 +96,7 @@ def test_sqlite_denial_via_signal_reports_once_with_notice(app, tmp_path) -> Non
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
-            patch.object(QMessageBox, "question") as question,
+            patch("pomodorough.account_resolution_controller.confirm_destructive_action") as question,
             patch.object(QMessageBox, "exec"),
         ):
             view.account_button.click()
@@ -116,7 +116,7 @@ def test_oserror_via_signal_reports_once_with_notice(app, tmp_path) -> None:
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
-            patch.object(QMessageBox, "question") as question,
+            patch("pomodorough.account_resolution_controller.confirm_destructive_action") as question,
         ):
             view.account_button.click()
             _pump(app)
@@ -136,7 +136,7 @@ def test_shared_core_error_via_signal_reports_once(app, tmp_path) -> None:
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
-            patch.object(QMessageBox, "question") as question,
+            patch("pomodorough.account_resolution_controller.confirm_destructive_action") as question,
         ):
             view.account_button.click()
             _pump(app)
@@ -163,7 +163,7 @@ def test_malformed_state_notice_only_without_capture(app, tmp_path, bad_state) -
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
-            patch.object(QMessageBox, "question") as question,
+            patch("pomodorough.account_resolution_controller.confirm_destructive_action") as question,
         ):
             view.account_button.click()
             _pump(app)
@@ -186,11 +186,11 @@ def test_success_yes_logs_out_with_queue_count(app, tmp_path) -> None:
         seen: dict[str, str] = {}
 
         def fake_question(*args, **kwargs):
-            seen["detail"] = args[2] if len(args) >= 3 else ""
-            return QMessageBox.StandardButton.Yes
+            seen["detail"] = kwargs["detail"]
+            return True
 
         with (
-            patch.object(QMessageBox, "question", side_effect=fake_question),
+            patch("pomodorough.account_resolution_controller.confirm_destructive_action", side_effect=fake_question),
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"
             ) as capture,
@@ -211,10 +211,9 @@ def test_cancel_preserves_queues_without_logout(app, tmp_path) -> None:
         )
         before = tuple(store.connection.iterdump())
         with (
-            patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.StandardButton.Cancel,
+            patch(
+                "pomodorough.account_resolution_controller.confirm_destructive_action",
+                return_value=False,
             ) as question,
             patch(
                 "pomodorough.account_resolution_controller.capture_exception"

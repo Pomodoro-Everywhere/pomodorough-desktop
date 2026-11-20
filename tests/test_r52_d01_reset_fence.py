@@ -26,7 +26,7 @@ os.environ.setdefault("POMODOROUGH_SENTRY_DISABLE", "1")
 import pytest
 from PySide6.QtCore import QThreadPool
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from pomodorough.core import task_from_title
 from pomodorough.network import CloudService, TokenStore
@@ -129,13 +129,16 @@ def _deny(mode: str, denials: list):
 
 
 def _click_sign_out(window: MainWindow, arm=None) -> None:
-    def confirm(*args):
+    def confirm(*args, **kwargs):
         if arm is not None:
             arm()
-        return QMessageBox.StandardButton.Yes
+        return True
 
     with (
-        patch.object(QMessageBox, "question", side_effect=confirm),
+        patch(
+            "pomodorough.account_resolution_controller.confirm_destructive_action",
+            side_effect=confirm,
+        ),
         patch.object(
             window, "_choose_resolution_account_action", return_value="sign_out"
         ),

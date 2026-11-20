@@ -97,7 +97,12 @@ class V2EmulatingSharedCore:
         output = deepcopy(resolved)
         self._restore_immutable_clocks(output, local)
         self._enforce_drop_guard(output, local, never_sent)
-        head = (response["serverHlcWallMs"], response["serverHlcCounter"])
+        # Receiver rule (R55-C14): the canonical pair when present.
+        head = (
+            (response["canonicalHlcWallMs"], response["canonicalHlcCounter"])
+            if "canonicalHlcWallMs" in response
+            else (response["serverHlcWallMs"], response["serverHlcCounter"])
+        )
         pending = {
             domain: output[output_key] for domain, output_key in _OUTPUT_KEYS.items()
         }

@@ -17,6 +17,7 @@ from .core import (
 )
 from .localization import Strings
 from .storage import Store
+from .sync_route import sync_route_active
 
 PHASE_ALIASES = {
     "focus": "focus",
@@ -56,6 +57,7 @@ class LocalTimer:
         self.pending_durations: list[dict[str, Any]] = []
         self.pending_auto_starts: list[dict[str, Any]] = []
         self.resolution_pending = False
+        self.sync_route_active = False
         self.reload()
 
     def reload(self, *, now_ms: int | None = None) -> None:
@@ -73,6 +75,12 @@ class LocalTimer:
         self.pending_durations = state["pendingDurations"]
         self.pending_auto_starts = state["pendingAutoStarts"]
         self.resolution_pending = state["pendingResolution"] is not None
+        # The terminal has no cloud session. The stored account stands for
+        # one, and so does an account whose history still waits for resolution.
+        self.sync_route_active = sync_route_active(
+            self.store.replication_mode,
+            signed_in=snapshot.get("user") is not None or self.resolution_pending,
+        )
         self.tasks = projection.tasks
         self.known_tasks = {
             task["id"]: task
@@ -278,11 +286,20 @@ class LocalTimer:
             "remaining": metrics["remaining"],
             "progress": metrics["progress"],
             "display": self._timer_metrics(display_timer, projection_now_ms),
-            "pendingCommands": len(self.pending),
-            "pendingDurationOperations": len(self.pending_durations),
-            "pendingAutoStartOperations": len(self.pending_auto_starts),
+            "pendingCommands": self._pending_sync_count(self.pending),
+            "pendingDurationOperations": self._pending_sync_count(
+                self.pending_durations
+            ),
+            "pendingAutoStartOperations": self._pending_sync_count(
+                self.pending_auto_starts
+            ),
             "historyResolutionPending": self.resolution_pending,
         }
+
+    def _pending_sync_count(self, queued: list[dict[str, Any]]) -> int:
+        # Nothing waits for a sync that has no route: an "On device" timer
+        # with no account would otherwise show a counter that only grows.
+        return len(queued) if self.sync_route_active else 0
 
     def _store_action(self, action: Callable[[], Any]) -> Any:
         # D55: boundary-capture contract — infra (OSError/sqlite3.Error)
@@ -472,6 +489,7 @@ class LocalTimer:
             if item.get("status") not in TERMINAL_STATUSES:
                 continue
             result = dict(item)
+            result["pending"] = bool(item.get("pending")) and self.sync_route_active
             context, title = self._task_context(item.get("taskId"))
             result["taskContext"] = context
             result["taskTitle"] = title

@@ -531,6 +531,40 @@ def test_paging_back_returns_to_the_paged_row(app, tmp_path, locale, tall):
         )
 
 
+def _show_view_of_short_rows(app, window, tall, rows):
+    """Show a tall row among short rows in a view that holds rows short rows."""
+    listing = _show_sized_tall_row(app, window, 6, tall)
+    short = listing.visualItemRect(listing.item(1 if tall == 0 else 0)).height()
+    _fit_viewport(app, window, listing, int(rows * short))
+    listing = _show_sized_tall_row(app, window, 6, tall)
+    assert listing.viewport().height() == int(rows * short)
+    return listing
+
+
+@LOCALES
+@pytest.mark.parametrize("tall", [0, 5], ids=["first", "last"])
+@pytest.mark.parametrize("rows", [4.05, 4.5, 4.9])
+def test_paging_back_returns_after_a_page_shortened_by_a_tall_row(
+    app, tmp_path, locale, tall, rows
+):
+    """A view of four short rows pages three rows, but one beside a tall row.
+
+    Qt stopped the page one row on beside the tall row, and its reverse then
+    moved three rows, to a row the first page never left.
+    """
+    with _tasks_window(app, tmp_path, locale, 600, 520) as window:
+        listing = _show_view_of_short_rows(app, window, tall, rows)
+        _assert_mixed_heights(listing)
+        bar = listing.verticalScrollBar()
+        last = (listing.count() - 1, bar.maximum())
+        _assert_pages_return_to_row(
+            app, listing, Qt.Key.Key_PageDown, Qt.Key.Key_PageUp, last
+        )
+        _assert_pages_return_to_row(
+            app, listing, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown, (0, 0)
+        )
+
+
 def _enter_row(app, listing, row):
     """Press Down until row becomes current, reading through rows above it."""
     for _ in range(listing.verticalScrollBar().maximum() + listing.count()):

@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 from .controller_outcomes import (
     ControllerOutcome,
@@ -21,6 +21,7 @@ from .controller_outcomes import (
     done,
     returning,
 )
+from .destructive_confirmation import confirm_destructive_action
 from .failure_notice import describe_failure
 from .iroh_protocol import IrohProtocolError, parse_invite, room_id_for_secret
 from .sentry_monitoring import capture_exception
@@ -414,14 +415,13 @@ class ReplicationController:
             self.mode = "offline"
             self._ports.set_replication_mode(self.mode)
             return done(LoadState(), Render())
-        answer = QMessageBox.warning(
+        confirmed = confirm_destructive_action(
             self._ports.dialog_parent(),
-            context.strings.text("network.leave_title"),
-            context.strings.text("network.leave_detail"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            title=context.strings.text("network.leave_title"),
+            detail=context.strings.text("network.leave_detail"),
+            action=context.strings.text("network.leave_confirm"),
         )
-        if answer != QMessageBox.StandardButton.Yes or self._context().closed:
+        if not confirmed or self._context().closed:
             return done()
         try:
             context.store.leave_iroh_room()

@@ -202,6 +202,15 @@ def default_data_path() -> Path:
     return user_data_path("pomodorough", appauthor=False) / "pomodorough.sqlite3"
 
 
+def _ends_timer(command: Any, timer: dict[str, Any]) -> bool:
+    """Return whether a pending command only finishes or cancels ``timer``."""
+    return (
+        isinstance(command, dict)
+        and command.get("timerId") == timer.get("id")
+        and command.get("type") in {"finish", "cancel"}
+    )
+
+
 class Store:
     def __init__(
         self,
@@ -315,6 +324,7 @@ class Store:
             _project_operation=self._project_operation,
             _project_canonical_with_pending=self._project_canonical_with_pending,
             _set_canonical_head=self._set_canonical_head_locked,
+            canonical_head=self.canonical_head,
             _retire_delivery_proof=self._retire_delivery_proof_locked,
             _prune_command_physical_times=self._prune_command_physical_times,
             _set_trusted_time_anchor=lambda anchor: self._set_trusted_time_anchor(anchor),
@@ -2311,8 +2321,7 @@ class Store:
         state = self.load(projection=True)
         projection = self.projected_state(now_ms=now_ms, state=state)
         current = projection.canonical_timer
-        if (not isinstance(current, dict) or current.get("status") not in statuses
-                or self._timer_fingerprint(current) != self._timer_fingerprint(timer)):
+        if not self._is_action_timer(current, timer, statuses):
             current = self._retained_terminal_context(state, timer, statuses)
             if current is None:
                 raise ValueError(error)
@@ -2321,6 +2330,24 @@ class Store:
         if validate_task and not any(task.get("id") == task_id for task in projection.tasks):
             task_id = None
         return current, settings["selectedPhase"], settings["durationsMs"], task_id
+
+    @classmethod
+    def _is_action_timer(
+        cls, current: Any, timer: dict[str, Any], statuses: set[str]
+    ) -> bool:
+        """Return whether the stored timer is the one the user acted on.
+
+        Every device that runs a timer finishes it when it expires, so the
+        finish the server keeps may come from another device. Its command id
+        then differs from the one on screen, but the timer still ended, and a
+        restart of an ended timer means the same thing either way. Active
+        timers keep the exact fingerprint check.
+        """
+        if not isinstance(current, dict) or current.get("status") not in statuses:
+            return False
+        if statuses.isdisjoint(ACTIVE_STATUSES) and current.get("id") == timer.get("id"):
+            return True
+        return cls._timer_fingerprint(current) == cls._timer_fingerprint(timer)
 
     @staticmethod
     def _retained_terminal_context(
@@ -2332,7 +2359,9 @@ class Store:
         recorded in history, so a synced completion leaves projected
         canonical empty while the UI still presents the retained timer.
         Nothing changed underneath in that state: accept the retained timer
-        when it is terminal, recorded in history, and no command is pending.
+        when it is terminal, recorded in history, and every pending command
+        only ends that same timer. This device's own finish is still pending
+        when another device's finish reached the server first.
         """
         if (
             not isinstance(timer, dict)
@@ -2340,7 +2369,7 @@ class Store:
             or timer.get("status") in ACTIVE_STATUSES
         ):
             return None
-        if state.get("pending"):
+        if not all(_ends_timer(command, timer) for command in state.get("pending") or []):
             return None
         snapshot = state.get("snapshot")
         history = snapshot.get("history", []) if isinstance(snapshot, dict) else []

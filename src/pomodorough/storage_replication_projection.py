@@ -183,14 +183,10 @@ class ReplicatedStateProjection:
                 "revision": 0,
                 "canonicalTimer": deepcopy(genesis["canonicalTimer"]),
                 "history": deepcopy(genesis["history"]),
-                "tasks": sorted(
-                    deepcopy(genesis["tasks"]),
-                    key=lambda item: (item["title"].encode(), item["id"].encode()),
-                ),
-                "knownTasks": sorted(
-                    deepcopy(genesis["tasks"]),
-                    key=lambda item: (item["title"].encode(), item["id"].encode()),
-                ),
+                # The genesis task list is in the shared Core task list order.
+                # Keep it; Desktop does not sort tasks itself.
+                "tasks": deepcopy(genesis["tasks"]),
+                "knownTasks": deepcopy(genesis["tasks"]),
                 "autoStartBreaks": genesis["autoStartBreaks"],
                 "selectedTaskId": settings["selectedTaskId"],
                 "user": None,

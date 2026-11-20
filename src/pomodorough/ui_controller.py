@@ -767,6 +767,9 @@ class ApplicationController:
             button.setProperty("authenticated", presentation.authenticated)
             button.style().unpolish(button)
             button.style().polish(button)
+            # DSK-14: a direct polish sends no event, so the button cannot
+            # drop the style sheet minimum by itself.
+            button.follow_size_hint()
             button.updateGeometry()
         if button.text() != presentation.text:
             button.setText(presentation.text)

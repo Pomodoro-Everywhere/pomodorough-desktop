@@ -128,16 +128,16 @@ class TuiTests(unittest.TestCase):
         rendered = "\n".join(lines)
 
         self.assertIn("TASK: Write tests", rendered)
-        self.assertIn("2 command(s) pending sync", rendered)
-        self.assertIn("3 duration preference(s) pending sync", rendered)
-        self.assertIn("4 auto-start preference operation(s) pending sync", rendered)
+        self.assertIn("2 timer changes pending sync", rendered)
+        self.assertIn("3 duration changes pending sync", rendered)
+        self.assertIn("4 auto-start changes pending sync", rendered)
         self.assertIn("Account history resolution pending", rendered)
         self.assertIn("Cannot pause now", rendered)
         self.assertIn("c dismiss", rendered)
         self.assertIn("Focus: Ship release", rendered)
-        self.assertIn("Cancelled | planned 2 min *", rendered)
-        self.assertIn("Short Break: Unassigned | Superseded | planned 1 min", rendered)
-        self.assertIn("Long Break: Rest | Completed | 15 min", rendered)
+        self.assertIn("Cancelled | planned 2 min | pending sync", rendered)
+        self.assertIn("Short break: Unassigned | Superseded | planned 1 min", rendered)
+        self.assertIn("Long break: Rest | Completed | 15 min", rendered)
 
     def test_build_lines_hides_task_during_breaks(self) -> None:
         for phase in ("short_break", "long_break"):
@@ -221,7 +221,10 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(screen.writes[1][4], tui.curses.A_NORMAL)
         self.assertTrue(all(write[3] == 39 for write in screen.writes))
         self.assertTrue(all(len(write[2]) <= 39 for write in screen.writes))
-        self.assertTrue(any("space start/pause/resume" in write[2] for write in screen.writes))
+        # 40 columns cannot hold the full legend on one row, so the short one shows.
+        self.assertIn(
+            "space start/pause  f finish  x cancel", [write[2] for write in screen.writes]
+        )
 
     def test_run_redraws_after_timeout_and_action_errors_then_quits(self) -> None:
         screen = FakeScreen(

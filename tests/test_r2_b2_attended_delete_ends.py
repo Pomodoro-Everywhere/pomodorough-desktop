@@ -16,7 +16,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from pomodorough.failure_notice import describe_failure
 from pomodorough.localization import Strings
@@ -336,9 +336,9 @@ def test_sign_out_does_not_count_an_undone_delete(app, tmp_path):
         queued = _queued_changes(window.store)
         asked: list[str] = []
 
-        def question(_parent, _title, detail, *_rest):
+        def question(_parent, *, detail, **_kwargs):
             asked.append(detail)
-            return QMessageBox.StandardButton.Cancel
+            return False
 
         with patch(QUESTION, question):
             window._account_action()

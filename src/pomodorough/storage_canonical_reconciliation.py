@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from .core import parse_timestamp_ms
 from .shared_core import SharedCoreOperationError
+from .storage_canonical_validation import CANONICAL_HEAD_FIELDS
 from .storage_model import _default_shared_core
 
 _CORE_QUEUE_OPERATION_FIELDS = {
@@ -571,6 +572,11 @@ class SharedCoreReconciliationAdapter:
             "serverTime": canonical["serverTime"],
             "serverHlcWallMs": canonical["serverHlcWallMs"],
             "serverHlcCounter": canonical["serverHlcCounter"],
+            **{
+                key: canonical[key]
+                for key in CANONICAL_HEAD_FIELDS
+                if key in canonical
+            },
         }
 
     def _normalized_core_queue_operation(
