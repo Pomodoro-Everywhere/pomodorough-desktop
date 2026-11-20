@@ -474,7 +474,7 @@ class ProductionBundleV2Tests(unittest.TestCase):
         from pomodorough.shared_core import SharedCore
 
         version = SharedCore().dispatch("core.version", {})
-        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.57.0"})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.57.1"})
         temporary = tempfile.TemporaryDirectory()
         try:
             store = Store(Path(temporary.name) / "state.sqlite3")
@@ -639,7 +639,7 @@ class DoubleVsAuthoritativeTests(unittest.TestCase):
         from pomodorough.shared_core import SharedCore
 
         version = SharedCore().dispatch("core.version", {})
-        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.57.0"})
+        self.assertEqual(version, {"schemaVersion": 1, "coreVersion": "0.57.1"})
         core = V2EmulatingSharedCore()
         local = {
             "commands": [],
